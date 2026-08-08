@@ -1451,10 +1451,25 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             gst_object_unref(state->bus);
             state->bus = nullptr;
         }
+        // A failed source can leave child elements in READY while the parent
+        // pipeline transition to PLAYING has already failed.  Dropping the last
+        // pipeline reference in that state is unsafe for some DVB drivers/plugins
+        // (notably dvbsrc/dvbbasebin) and can lead to use-after-free/heap corruption.
+        // Always drive the whole pipeline back to NULL before releasing it.
+        state->running = false;
+        state->active = false;
+        state->statusMessage = "error: " + playingError;
+
+        const GstStateChangeReturn stopResult = gst_element_set_state(pipeline, GST_STATE_NULL);
+        if (stopResult == GST_STATE_CHANGE_ASYNC) {
+            gst_element_get_state(pipeline, nullptr, nullptr, 2 * GST_SECOND);
+        }
+
         if (state->gstTranscoder) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
         }
+        state->pipeline = nullptr;
         gst_object_unref(pipeline);
         if (error) *error = playingError;
         return false;

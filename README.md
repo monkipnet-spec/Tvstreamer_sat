@@ -1028,3 +1028,9 @@ Conditional-access note: this release only discovers CA/CI and Phoenix-style ser
 For satellite streams the main stream tile now shows two live percentage meters read from the selected Linux DVB frontend: **Signal level** (`FE_READ_SIGNAL_STRENGTH`) and **Signal quality** / SNR (`FE_READ_SNR`). The bars refresh with the normal `/api/state` polling and are colour-coded red / amber / green. A LOCK / NO LOCK indicator is shown beside the signal level. When the stream is stopped or running on a backup source the DVB meters fall back to 0%.
 
 The redundant top **Output** information row was removed from stream tiles; output mode is still visible in the tile badge and URLs remain available through the URL button.
+
+### DVB startup failure hardening
+
+If a DVB frontend cannot start (for example because the selected adapter/frontend is already in use, inaccessible, or cannot lock with the requested parameters), TVStreamer5 now returns the complete GStreamer startup error without disposing `dvbbasebin`/`dvbsrc` while they are still in READY. The failed pipeline is explicitly driven to `GST_STATE_NULL` before the final reference is released. This prevents the GStreamer critical warning and heap-corruption/process-abort path that could otherwise turn a normal DVB startup failure into a web `Failed to fetch` error.
+
+When a satellite stream reports `GstDvbSrc: Failed to start`, check the selected frontend for another owner before changing tuning parameters, for example with `sudo fuser -v /dev/dvb/adapter5/frontend0 /dev/dvb/adapter5/demux0 /dev/dvb/adapter5/dvr0` and `ps -fp <PID>`. An existing Astra/other receiver process using the same hardware must be stopped or a different free frontend selected.
