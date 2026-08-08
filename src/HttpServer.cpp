@@ -456,9 +456,8 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/start-stream") {
-                handleStartStream(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = "{\"result\": \"ok\"}";
+                res.body() = handleStartStream(req.body());
             } else if (target == "/api/stop-stream") {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
@@ -1293,21 +1292,55 @@ std::string HttpServer::handleDeleteBackupFile(const std::string& body) {
     return Json::writeString(writer, response);
 }
 
-void HttpServer::handleStartStream(const std::string& body) {
+std::string HttpServer::handleStartStream(const std::string& body) {
+    Json::Value response;
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
-        std::cerr << "Invalid start-stream payload: " << errs << std::endl;
-        return;
+        const std::string message = "Invalid start-stream payload: " + errs;
+        std::cerr << message << std::endl;
+        response["result"] = "error";
+        response["error"] = message;
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
     }
+
     auto cfg = StreamConfig::fromJson(root);
-    if (!streamManager.startStream(cfg) &&
+    std::string startError;
+    bool started = streamManager.startStream(cfg, &startError);
+
+    if (!started &&
         !streamManager.isStreamActive(cfg.id) &&
         streamManager.snapshot().count(cfg.id) > 0) {
-        streamManager.restartStream(cfg);
+        std::string restartError;
+        started = streamManager.restartStream(cfg, &restartError);
+        if (!started && !restartError.empty()) {
+            startError = restartError;
+        }
     }
+
+    if (started) {
+        response["result"] = "ok";
+        response["stream_id"] = cfg.id;
+        if (cfg.satelliteEnabled && !cfg.conditionalAccessReader.empty()) {
+            Json::Value warnings(Json::arrayValue);
+            warnings.append(
+                "Выбранный conditional_access_reader сохранён в конфигурации, "
+                "но в этой сборке нет backend декодирования Phoenix/serial CA; устройство не используется GStreamer pipeline.");
+            response["warnings"] = warnings;
+        }
+    } else {
+        response["result"] = "error";
+        response["stream_id"] = cfg.id;
+        response["error"] = startError.empty()
+            ? ("Failed to start stream: " + (cfg.name.empty() ? cfg.id : cfg.name))
+            : startError;
+    }
+
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 void HttpServer::handleStopStream(const std::string& body) {
@@ -1514,6 +1547,11 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .modal.quality-open,.modal.stream-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal.active{display:flex}
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+.modal-content.error-modal{width:min(760px,100%);border-color:rgba(255,95,95,.32)}
+.error-modal-head{display:flex;align-items:center;gap:10px;margin-bottom:10px;color:#ffb8b8}
+.error-modal-icon{display:grid;place-items:center;flex:0 0 32px;width:32px;height:32px;border-radius:50%;background:rgba(255,95,95,.16);font-weight:800}
+.error-modal-message{padding:10px 12px;border-radius:10px;background:rgba(255,95,95,.08);border:1px solid rgba(255,95,95,.18);color:#ffd1d1;white-space:pre-wrap;overflow-wrap:anywhere}
+.error-modal-details{margin-top:10px;padding:10px 12px;border-radius:10px;background:#0b1018;border:1px solid rgba(255,255,255,.08);color:#b8c2d4;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
 .modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
@@ -2110,13 +2148,78 @@ function render(force=false) {
   lastTileStructureSignature = signature;
   updateLiveTiles();
 }
+function openStreamError(title, message, details='') {
+  subscribersModalOpen = false;
+  const content = document.getElementById('modalContent');
+  content.className = 'modal-content error-modal';
+  content.innerHTML = modalCloseButton() + `
+    <div class="error-modal-head"><span class="error-modal-icon">!</span><h2 style="margin:0">${escapeHtmlValue(title || 'Ошибка')}</h2></div>
+    <div class="error-modal-message">${escapeHtmlValue(message || 'Неизвестная ошибка')}</div>
+    ${details ? `<div class="error-modal-details">${escapeHtmlValue(details)}</div>` : ''}
+    <div class="modal-actions"><button class="button-primary" onclick="closeModal()">${t('close')}</button></div>`;
+  document.getElementById('modal').classList.remove('quality-open', 'stream-open');
+  document.getElementById('modal').classList.add('active');
+}
+async function checkStreamStartError(id, name) {
+  try {
+    const response = await fetch('/api/state', {cache:'no-store'});
+    const latest = await response.json();
+    const current = (latest.streams || []).find(stream => String(stream.id) === String(id));
+    if (!current) return;
+    const status = String(current.status || '').trim();
+    const lowered = status.toLowerCase();
+    const looksLikeError = lowered.startsWith('error:') ||
+      lowered.includes('failed') ||
+      lowered.includes('no input signal');
+    if (!current.active && looksLikeError) {
+      openStreamError('Ошибка запуска потока', `${name || id}: ${status}`);
+    }
+  } catch (_) {
+    // The primary start request already reports transport/JSON failures. A
+    // follow-up status check is best-effort and must not replace that error.
+  }
+}
 function toggleStream(id, active) {
   const url = active ? '/api/stop-stream' : '/api/start-stream';
-  const body = active ? {id} : state.streams.find(s=>s.id===id);
+  const stream = state.streams.find(s=>s.id===id);
+  const body = active ? {id} : stream;
   fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(()=>{
-      setTimeout(fetchState,500);
-      setTimeout(fetchState,1500);
+    .then(async response=>{
+      let data = {};
+      const text = await response.text();
+      try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {result:'error', error:text || `HTTP ${response.status}`}; }
+      if (!response.ok || data.result === 'error') {
+        const message = data.error || `HTTP ${response.status} ${response.statusText}`;
+        openStreamError(
+          active ? 'Ошибка остановки потока' : 'Ошибка запуска потока',
+          `${stream?.name || id}: ${message}`,
+          data.details || ''
+        );
+        throw new Error(message);
+      }
+      if (!active && Array.isArray(data.warnings) && data.warnings.length) {
+        openStreamError('Предупреждение запуска', `${stream?.name || id}: поток запущен с предупреждением`, data.warnings.join('\n'));
+      }
+      if (!active) {
+        // Some source errors arrive asynchronously after PLAYING was accepted.
+        // Re-check the live stream status so Start-button failures are visible
+        // instead of being left only in the tile/journal.
+        setTimeout(() => checkStreamStartError(id, stream?.name || id), 2500);
+        setTimeout(() => checkStreamStartError(id, stream?.name || id), 5500);
+      }
+      return data;
+    })
+    .catch(error=>{
+      if (!document.getElementById('modal')?.classList.contains('active')) {
+        openStreamError(
+          active ? 'Ошибка остановки потока' : 'Ошибка запуска потока',
+          `${stream?.name || id}: ${error.message || error}`
+        );
+      }
+    })
+    .finally(()=>{
+      setTimeout(fetchState,300);
+      setTimeout(fetchState,1200);
     });
 }
 function deleteStream(id) {

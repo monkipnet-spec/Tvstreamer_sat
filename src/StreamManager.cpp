@@ -1137,6 +1137,14 @@ std::string popPipelineError(GstBus* bus, const std::string& fallback) {
     return result;
 }
 
+void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SECOND) {
+    if (!pipeline) return;
+    const GstStateChangeReturn result = gst_element_set_state(pipeline, GST_STATE_NULL);
+    if (result == GST_STATE_CHANGE_ASYNC) {
+        gst_element_get_state(pipeline, nullptr, nullptr, timeout);
+    }
+}
+
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
@@ -1212,7 +1220,7 @@ bool StreamManager::acquireSatelliteTransponder(
     if (!pipeline || !source || !queue || !sink ||
         !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
-            gst_element_set_state(pipeline, GST_STATE_NULL);
+            stopPipelineAndWait(pipeline);
             gst_object_unref(pipeline);
         } else {
             if (source && !GST_OBJECT_PARENT(source)) gst_object_unref(source);
@@ -1255,7 +1263,7 @@ bool StreamManager::acquireSatelliteTransponder(
     setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
 
     if (!gst_element_link_many(source, queue, sink, nullptr)) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopPipelineAndWait(pipeline);
         gst_object_unref(pipeline);
         error = "failed to link shared DVB frontend pipeline";
         return false;
@@ -1266,7 +1274,7 @@ bool StreamManager::acquireSatelliteTransponder(
     const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateResult == GST_STATE_CHANGE_FAILURE) {
         error = popPipelineError(shared->bus, "failed to start shared DVB frontend");
-        gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopPipelineAndWait(pipeline);
         if (shared->bus) gst_object_unref(shared->bus);
         gst_object_unref(pipeline);
         return false;
@@ -1300,8 +1308,7 @@ void StreamManager::releaseSatelliteTransponder(const std::string& frontendKey) 
         satelliteTransponders.erase(found);
     }
     if (released->pipeline) {
-        gst_element_set_state(released->pipeline, GST_STATE_NULL);
-        gst_element_get_state(released->pipeline, nullptr, nullptr, GST_SECOND);
+        stopPipelineAndWait(released->pipeline);
     }
     if (released->bus) gst_object_unref(released->bus);
     if (released->pipeline) gst_object_unref(released->pipeline);
@@ -1350,7 +1357,7 @@ bool StreamManager::startSatelliteServiceRelay(
         (!wholeTransponder && (!addElementOrFail(pipeline, demux) || !addElementOrFail(pipeline, mux))) ||
         !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
-            gst_element_set_state(pipeline, GST_STATE_NULL);
+            stopPipelineAndWait(pipeline);
             gst_object_unref(pipeline);
         }
         releaseSatelliteServiceRelayPort(outputPort);
@@ -1392,7 +1399,7 @@ bool StreamManager::startSatelliteServiceRelay(
         : (gst_element_link_many(source, inputQueue, parse, demux, nullptr) &&
            gst_element_link_many(mux, outputQueue, sink, nullptr));
     if (!linked) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopPipelineAndWait(pipeline);
         gst_object_unref(pipeline);
         releaseSatelliteServiceRelayPort(outputPort);
         error = "failed to link satellite service relay pipeline";
@@ -1411,7 +1418,7 @@ bool StreamManager::startSatelliteServiceRelay(
     const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateResult == GST_STATE_CHANGE_FAILURE) {
         error = popPipelineError(relay->bus, "failed to start satellite service relay");
-        gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopPipelineAndWait(pipeline);
         if (relay->bus) gst_object_unref(relay->bus);
         gst_object_unref(pipeline);
         releaseSatelliteServiceRelayPort(outputPort);
@@ -1431,8 +1438,7 @@ void StreamManager::stopSatelliteServiceRelay(StreamState* state) {
     if (!state || !state->satelliteServiceRelay) return;
     auto relay = std::move(state->satelliteServiceRelay);
     if (relay->pipeline) {
-        gst_element_set_state(relay->pipeline, GST_STATE_NULL);
-        gst_element_get_state(relay->pipeline, nullptr, nullptr, GST_SECOND);
+        stopPipelineAndWait(relay->pipeline);
     }
     if (relay->bus) gst_object_unref(relay->bus);
     if (relay->pipeline) gst_object_unref(relay->pipeline);
@@ -1648,7 +1654,7 @@ bool StreamManager::startExternalSrtOutputs(StreamState* state, std::string& err
             }
             if (error.empty()) error = "failed to start transcoded SRT output relay";
             if (output->pipeline) {
-                gst_element_set_state(output->pipeline, GST_STATE_NULL);
+                stopPipelineAndWait(output->pipeline);
                 gst_object_unref(output->pipeline);
                 output->pipeline = nullptr;
             }
@@ -1671,11 +1677,14 @@ void StreamManager::stopExternalSrtOutputs(StreamState* state) {
     }
     for (auto& output : state->externalSrtOutputs) {
         if (!output) continue;
-        if (output->pipeline) {
-            gst_element_set_state(output->pipeline, GST_STATE_NULL);
+        if (output->bus) {
+            gst_bus_set_flushing(output->bus, TRUE);
         }
         if (output->busThread.joinable()) {
             output->busThread.join();
+        }
+        if (output->pipeline) {
+            stopPipelineAndWait(output->pipeline);
         }
         if (output->bus) {
             gst_object_unref(output->bus);
@@ -1821,6 +1830,15 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateChange == GST_STATE_CHANGE_ASYNC) {
+        const GstStateChangeReturn settled = gst_element_get_state(
+            pipeline, nullptr, nullptr, 1200 * GST_MSECOND);
+        if (settled == GST_STATE_CHANGE_FAILURE) {
+            stateChange = GST_STATE_CHANGE_FAILURE;
+        } else if (settled == GST_STATE_CHANGE_SUCCESS || settled == GST_STATE_CHANGE_NO_PREROLL) {
+            stateChange = settled;
+        }
+    }
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
         std::string playingError = "failed to set pipeline to PLAYING for stream: " + streamConfig.name;
@@ -1863,10 +1881,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         state->active = false;
         state->statusMessage = "error: " + playingError;
 
-        const GstStateChangeReturn stopResult = gst_element_set_state(pipeline, GST_STATE_NULL);
-        if (stopResult == GST_STATE_CHANGE_ASYNC) {
-            gst_element_get_state(pipeline, nullptr, nullptr, 2 * GST_SECOND);
-        }
+        stopPipelineAndWait(pipeline);
 
         if (state->gstTranscoder) {
             state->gstTranscoder->stop();
@@ -1894,7 +1909,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     if (duplicateStart) {
         state->running = false;
         if (state->pipeline) {
-            gst_element_set_state(state->pipeline, GST_STATE_NULL);
+            stopPipelineAndWait(state->pipeline);
         }
         if (state->bus) {
             gst_object_unref(state->bus);
@@ -1951,11 +1966,18 @@ bool StreamManager::stopStream(const std::string& id) {
 
     auto& state = *statePtr;
     stopExternalSrtOutputs(&state);
-    if (state.pipeline) {
-        gst_element_set_state(state.pipeline, GST_STATE_NULL);
+    // Stop the bus consumer before tearing down the GStreamer task graph.
+    // The old order put the pipeline into NULL while monitorBus() could still
+    // be polling the same bus, which is a plausible trigger for repeated
+    // gst_poll_wait/GST_IS_TASK critical assertions during shutdown.
+    if (state.bus) {
+        gst_bus_set_flushing(state.bus, TRUE);
     }
     if (state.busThread.joinable()) {
         state.busThread.join();
+    }
+    if (state.pipeline) {
+        stopPipelineAndWait(state.pipeline);
     }
     if (state.gstTranscoder) {
         state.gstTranscoder->stop();
@@ -2009,11 +2031,14 @@ void StreamManager::stopAll() {
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
         stopExternalSrtOutputs(&state);
-        if (state.pipeline) {
-            gst_element_set_state(state.pipeline, GST_STATE_NULL);
+        if (state.bus) {
+            gst_bus_set_flushing(state.bus, TRUE);
         }
         if (state.busThread.joinable()) {
             state.busThread.join();
+        }
+        if (state.pipeline) {
+            stopPipelineAndWait(state.pipeline);
         }
         if (state.gstTranscoder) {
             state.gstTranscoder->stop();
@@ -2568,7 +2593,7 @@ bool StreamManager::probeInputAvailable(
     if (!source || !sourceTail || !sink ||
         !addElementOrFail(pipeline, sink) ||
         !gst_element_link(sourceTail, sink)) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopPipelineAndWait(pipeline);
         gst_object_unref(pipeline);
         return false;
     }
@@ -2611,7 +2636,7 @@ bool StreamManager::probeInputAvailable(
     }
 
     available = available && receivedData.load(std::memory_order_relaxed);
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+    stopPipelineAndWait(pipeline);
     if (bus) {
         gst_object_unref(bus);
     }
@@ -2628,7 +2653,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     GstBus* oldBus = state->bus;
 
     if (oldPipeline) {
-        gst_element_set_state(oldPipeline, GST_STATE_NULL);
+        stopPipelineAndWait(oldPipeline);
     }
 
     state->runtimeConfig = state->config;
@@ -3967,12 +3992,15 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
 }
 
 void StreamManager::monitorBus(const std::string& id) {
-    auto found = streams.find(id);
-    if (found == streams.end()) {
-        return;
+    StreamState* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = streams.find(id);
+        if (found == streams.end()) {
+            return;
+        }
+        state = found->second.get();
     }
-
-    StreamState* state = found->second.get();
     GstBus* bus = state->bus;
 
     if (state->gstTranscoder && !state->pipeline) {
