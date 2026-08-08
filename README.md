@@ -1034,3 +1034,12 @@ The redundant top **Output** information row was removed from stream tiles; outp
 If a DVB frontend cannot start (for example because the selected adapter/frontend is already in use, inaccessible, or cannot lock with the requested parameters), TVStreamer5 now returns the complete GStreamer startup error without disposing `dvbbasebin`/`dvbsrc` while they are still in READY. The failed pipeline is explicitly driven to `GST_STATE_NULL` before the final reference is released. This prevents the GStreamer critical warning and heap-corruption/process-abort path that could otherwise turn a normal DVB startup failure into a web `Failed to fetch` error.
 
 When a satellite stream reports `GstDvbSrc: Failed to start`, check the selected frontend for another owner before changing tuning parameters, for example with `sudo fuser -v /dev/dvb/adapter5/frontend0 /dev/dvb/adapter5/demux0 /dev/dvb/adapter5/dvr0` and `ps -fp <PID>`. An existing Astra/other receiver process using the same hardware must be stopped or a different free frontend selected.
+
+
+### Satellite channel add workflow
+
+Satellite tuner setup and transponder scanning now live in a dedicated **Add channel** modal instead of the normal stream editor. The modal discovers the Linux DVB adapters/frontends, accepts the DVB-S/S2 tuning parameters, scans PAT/SDT/PMT, and presents the discovered services as a searchable multi-select list.
+
+After selecting one or more services, TVStreamer5 can create all corresponding stream tiles in one save operation. Each generated tile inherits the chosen adapter/frontend/transponder/LNB/MIS settings and gets its service SID, name/provider and discovered video/audio PIDs automatically. UDP output allocation can either advance the multicast IPv4 address while keeping one port or keep one address and advance the port. Generated tiles start stopped so the operator can review output/remap/transcode settings before starting them.
+
+The regular stream editor no longer exposes satellite tuning or scanning controls. Editing an existing satellite tile preserves its DVB source configuration while allowing normal output, backup, remap and transcoder settings to be changed.
