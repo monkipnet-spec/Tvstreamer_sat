@@ -95,6 +95,9 @@ struct StreamState {
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastSatelliteRelayRestart = std::chrono::steady_clock::time_point{};
+    uint32_t satelliteRelayRestartCount = 0;
+    uint32_t ccRecoveryBurstCount = 0;
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
     std::vector<uint8_t> inputTsRemainder;
@@ -150,6 +153,8 @@ private:
     bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
     bool prepareSharedSatelliteInput(StreamState* state, std::string& error);
     void releaseSharedSatelliteInput(StreamState* state);
+    bool restartSharedSatelliteInput(StreamState* state, const std::string& reason, std::string& error);
+    void throttleCaProviderStart(const std::string& providerId);
     bool acquireSatelliteTransponder(const StreamConfig& cfg, std::string& frontendKey, std::string& multicastAddress, uint16_t& multicastPort, std::string& error);
     void releaseSatelliteTransponder(const std::string& frontendKey);
     bool startSatelliteServiceRelay(StreamState* state, const std::string& multicastAddress, uint16_t multicastPort, std::string& error);
@@ -180,6 +185,7 @@ private:
     std::map<std::string, std::unique_ptr<StreamState>> streams;
     std::map<std::string, std::unique_ptr<SatelliteTransponderState>> satelliteTransponders;
     std::set<uint16_t> satelliteServiceRelayPorts;
+    std::map<std::string, std::chrono::steady_clock::time_point> caProviderLastStart;
     struct HttpClientSession {
         std::string streamId;
         std::string clientIp;

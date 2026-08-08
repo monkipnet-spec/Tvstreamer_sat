@@ -36,6 +36,9 @@ constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
+constexpr auto kCaProviderStartSpacing = std::chrono::milliseconds(1500);
+constexpr auto kSatelliteRelayRestartInterval = std::chrono::seconds(12);
+constexpr uint64_t kInputCcRecoveryThreshold = 80;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
@@ -1500,6 +1503,76 @@ void StreamManager::releaseSharedSatelliteInput(StreamState* state) {
     state->sharedSatelliteInput = false;
 }
 
+void StreamManager::throttleCaProviderStart(const std::string& providerId) {
+    if (providerId.empty()) {
+        return;
+    }
+
+    std::chrono::milliseconds delay{0};
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        const auto now = std::chrono::steady_clock::now();
+        auto& last = caProviderLastStart[providerId];
+        if (last.time_since_epoch().count() != 0) {
+            const auto nextAllowed = last + kCaProviderStartSpacing;
+            if (now < nextAllowed) {
+                delay = std::chrono::duration_cast<std::chrono::milliseconds>(nextAllowed - now);
+                last = nextAllowed;
+            } else {
+                last = now;
+            }
+        } else {
+            last = now;
+        }
+    }
+
+    if (delay.count() > 0) {
+        std::cerr << "CA provider start throttle: provider=" << providerId
+                  << " delay_ms=" << delay.count() << std::endl;
+        std::this_thread::sleep_for(delay);
+    }
+}
+
+bool StreamManager::restartSharedSatelliteInput(StreamState* state, const std::string& reason, std::string& error) {
+    if (!state || !state->config.satelliteEnabled || state->caProviderTransport) {
+        error = "not a shared DVB satellite input";
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (state->lastSatelliteRelayRestart.time_since_epoch().count() != 0 &&
+        now - state->lastSatelliteRelayRestart < kSatelliteRelayRestartInterval) {
+        error = "satellite relay restart throttled";
+        return false;
+    }
+    state->lastSatelliteRelayRestart = now;
+    ++state->satelliteRelayRestartCount;
+
+    std::cerr << "Restarting shared satellite input: stream=" << state->config.id
+              << " SID=" << state->config.satelliteServiceId
+              << " reason=" << reason
+              << " attempt=" << state->satelliteRelayRestartCount << std::endl;
+
+    releaseSharedSatelliteInput(state);
+    std::string prepareError;
+    if (!prepareSharedSatelliteInput(state, prepareError)) {
+        error = prepareError.empty() ? "failed to prepare shared satellite input" : prepareError;
+        state->statusMessage = "satellite relay recovery failed: " + error;
+        return false;
+    }
+
+    if (!restartPipelineWithInput(state, state->satelliteServiceRelayUri, false)) {
+        error = "failed to restart pipeline after satellite relay recovery";
+        state->statusMessage = "satellite relay recovery failed: " + error;
+        return false;
+    }
+
+    state->inputLossNotified = false;
+    state->primaryRetryPending = false;
+    state->statusMessage = "running after satellite relay recovery";
+    return true;
+}
+
 void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg) {
     if (!sink) {
         return;
@@ -1735,11 +1808,12 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         ? findCaProvider(configManager, streamConfig.caProviderId)
         : nullptr;
     if (caProvider) {
-        // v85 CA Provider is a dynamic reader/card/session manager. It no longer replaces the
+        // v85+ CA Provider is a dynamic reader/card/session manager. It no longer replaces the
         // satellite input with a pre-decoded endpoint. The MPEG-TS source remains the configured
         // DVB frontend; reader/card capability integrations can be attached independently.
         state->caProviderId = caProvider->id;
         state->caProviderName = caProvider->name;
+        throttleCaProviderStart(caProvider->id);
     }
     state->primaryInputUri = streamConfig.satelliteEnabled
         ? tvs::protocols::inputUriForGstreamer(streamConfig)
@@ -1846,6 +1920,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
+    state->ccRecoveryBurstCount = 0;
     attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -2740,6 +2815,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
+    state->ccRecoveryBurstCount = 0;
     attachBitrateProbes(state);
 
     GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
@@ -4108,6 +4184,34 @@ void StreamManager::monitorBus(const std::string& id) {
 
         if (!state->config.testPattern) {
             const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
+            const bool sharedSatellitePrimary = state->config.satelliteEnabled && state->sharedSatelliteInput && !state->usingBackup;
+            const bool excessiveInputCcErrors = state->inputCcErrorsDelta.load(std::memory_order_relaxed) >= kInputCcRecoveryThreshold;
+            if (sharedSatellitePrimary && state->config.backupInputUri.empty() &&
+                (inputTimedOut || excessiveInputCcErrors) &&
+                now - state->lastSatelliteRelayRestart >= kSatelliteRelayRestartInterval) {
+                std::string recoveryError;
+                const std::string reason = inputTimedOut ? "input timeout" : "continuity errors";
+                if (restartSharedSatelliteInput(state, reason, recoveryError)) {
+                    bus = state->bus;
+                    state->active = true;
+                    state->inputLossNotified = false;
+                    notifyStreamState(
+                        state->config,
+                        "🟢",
+                        telegramText(configManager, "Спутниковый relay восстановлен", "Satellite relay recovered"),
+                        telegramText(configManager, "Перезапущен внутренний DVB service relay", "Internal DVB service relay restarted") +
+                            "\n" + telegramText(configManager, "Причина", "Reason") + ": " + reason);
+                    continue;
+                } else if (!state->inputLossNotified) {
+                    state->inputLossNotified = true;
+                    state->statusMessage = "satellite relay recovery failed: " + recoveryError;
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "Не удалось восстановить спутниковый relay", "Satellite relay recovery failed"),
+                        telegramText(configManager, "Причина", "Reason") + ": " + recoveryError);
+                }
+            }
             if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
                 notifyStreamState(
                     state->config,
@@ -4204,7 +4308,7 @@ void StreamManager::monitorBus(const std::string& id) {
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
                 state->statusMessage = state->config.satelliteEnabled && !state->config.satelliteScrambled
-                    ? "no input signal (FTA; CA not involved)"
+                    ? "no input signal (FTA; CA not involved; relay recovery attempted)"
                     : "no input signal";
                 notifyStreamState(
                     state->config,
