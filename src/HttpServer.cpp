@@ -247,7 +247,7 @@ std::string primaryInputDisplay(const StreamConfig& cfg) {
     ss << (cfg.satelliteDeliverySystem == "dvb-s" ? "DVB-S" : "DVB-S2")
        << " adapter=" << cfg.satelliteAdapter
        << " frontend=" << cfg.satelliteFrontend
-       << " " << cfg.satelliteFrequency << "kHz"
+       << " " << (static_cast<double>(cfg.satelliteFrequency) / 1000.0) << "MHz"
        << " SR=" << cfg.satelliteSymbolRate << "kBd"
        << " " << cfg.satellitePolarization;
     if (cfg.satelliteServiceId > 0) {
@@ -1969,13 +1969,28 @@ function streamBitrateMode(stream) {
   if (type === 'udp-vbr') return 'VBR';
   return stream.cbr ? 'CBR' : 'VBR';
 }
+function satelliteFrequencyKhzToMhz(value) {
+  const khz = Number(value || 0);
+  if (!Number.isFinite(khz) || khz <= 0) return 0;
+  return khz / 1000;
+}
+function satelliteFrequencyMhzToKhz(value) {
+  const mhz = Number(value || 0);
+  if (!Number.isFinite(mhz) || mhz <= 0) return 0;
+  return Math.round(mhz * 1000);
+}
+function formatSatelliteFrequencyMhz(value) {
+  const mhz = satelliteFrequencyKhzToMhz(value);
+  if (!mhz) return '—';
+  return Number.isInteger(mhz) ? String(mhz) : mhz.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
 function satelliteInputSummary(stream) {
   const system = stream.satellite_delivery_system === 'dvb-s' ? 'DVB-S' : 'DVB-S2';
-  const freq = Number(stream.satellite_frequency || 0);
+  const freq = formatSatelliteFrequencyMhz(stream.satellite_frequency);
   const sr = Number(stream.satellite_symbol_rate || 0);
   const pol = String(stream.satellite_polarization || 'H').toUpperCase();
   const sid = Number(stream.satellite_service_id || 0);
-  return `${system} · ${freq || '—'} kHz · SR ${sr || '—'} kBd · ${pol}${sid ? ` · SID ${sid}` : ''}`;
+  return `${system} · ${freq} MHz · SR ${sr || '—'} kBd · ${pol}${sid ? ` · SID ${sid}` : ''}`;
 }
 function primaryInputSummary(stream) {
   return stream.satellite_enabled ? satelliteInputSummary(stream) : (stream.input_uri || '—');
@@ -2761,7 +2776,8 @@ function satelliteChannelScanPayload() {
     satellite_enabled: true,
     satellite_adapter: Number(document.getElementById('channelSatelliteAdapter')?.value || 0),
     satellite_frontend: Number(document.getElementById('channelSatelliteFrontend')?.value || 0),
-    satellite_frequency: Number(document.getElementById('channelSatelliteFrequency')?.value || 0),
+    // UI uses MHz for convenience; the existing config/GStreamer contract remains kHz.
+    satellite_frequency: satelliteFrequencyMhzToKhz(document.getElementById('channelSatelliteFrequency')?.value),
     satellite_symbol_rate: Number(document.getElementById('channelSatelliteSymbolRate')?.value || 0),
     satellite_polarization: document.getElementById('channelSatellitePolarization')?.value || 'H',
     satellite_delivery_system: document.getElementById('channelSatelliteDeliverySystem')?.value || 'dvb-s2',
@@ -3032,7 +3048,7 @@ function openSatelliteChannelModal() {
         <div class="form-row"><label>Система</label><select id="channelSatelliteDeliverySystem"><option value="dvb-s2">DVB-S2</option><option value="dvb-s">DVB-S</option></select></div>
         <div class="form-row"><label>Поляризация</label><select id="channelSatellitePolarization"><option value="H">Horizontal (H)</option><option value="V">Vertical (V)</option></select></div>
 
-        <div class="form-row"><label>Частота, kHz</label><input id="channelSatelliteFrequency" type="number" min="1" step="1" placeholder="11531000" /></div>
+        <div class="form-row"><label>Частота, MHz</label><input id="channelSatelliteFrequency" type="number" min="1" max="30000" step="0.001" placeholder="11531" inputmode="decimal" /></div>
         <div class="form-row"><label>Symbol rate, kBd</label><input id="channelSatelliteSymbolRate" type="number" min="1" step="1" value="22000" /></div>
         <div class="form-row"><label>Модуляция</label><select id="channelSatelliteModulation"><option value="auto">Auto</option><option value="qpsk">QPSK</option><option value="8psk">8PSK</option><option value="16apsk">16APSK</option><option value="32apsk">32APSK</option></select></div>
         <div class="form-row"><label>FEC</label><select id="channelSatelliteFec"><option value="auto">Auto</option>${['1/2','2/3','3/4','4/5','5/6','6/7','7/8','8/9','3/5','9/10','2/5'].map(v=>`<option value="${v}">${v}</option>`).join('')}</select></div>

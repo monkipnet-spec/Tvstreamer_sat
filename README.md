@@ -979,7 +979,7 @@ A stream can use a Linux DVB satellite tuner instead of the normal primary URL. 
 
 The panel supports adapter/frontend selection, frequency, symbol rate, DVB-S or DVB-S2, H/V polarization, modulation, FEC, pilot, rolloff, DiSEqC source, DVB-S2 MIS/Stream ID, service/program SID and universal-LNB LOF1/LOF2/switch frequencies. TVStreamer5 uses GStreamer `dvbbasebin` so a configured `satellite_service_id` is passed through `program-numbers` and the selected service is exposed as MPEG-TS to the normal output/remap/transcoding path.
 
-Units follow the GStreamer DVB API: satellite frequency is entered in **kHz** and symbol rate in **kBd**. Typical universal LNB defaults are LOF1 `9750000`, LOF2 `10600000`, switch `11700000` kHz. `DiSEqC source = -1` disables DiSEqC and `Stream ID = -1` disables MIS selection.
+For operator convenience, the **Add channel** form accepts satellite transponder frequency in **MHz** (for example `11531`). TVStreamer5 converts it to the existing internal **kHz** representation (`11531000`) before saving the configuration or passing it to GStreamer, so existing configs and DVB tuning behavior remain compatible. Symbol rate remains in **kBd**. Universal-LNB LOF1/LOF2/switch values remain technical **kHz** values: `9750000`, `10600000`, `11700000`. `DiSEqC source = -1` disables DiSEqC and `Stream ID = -1` disables MIS selection.
 
 Check tuner devices and the GStreamer DVB plugin on Linux:
 
