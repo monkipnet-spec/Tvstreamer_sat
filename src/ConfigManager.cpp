@@ -18,6 +18,30 @@ StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {
     return output;
 }
 
+
+CaProviderConfig CaProviderConfig::fromJson(const Json::Value& root) {
+    CaProviderConfig config;
+    config.id = root.get("id", "").asString();
+    config.name = root.get("name", config.id).asString();
+    config.backendType = root.get("backend_type", "external").asString();
+    if (config.backendType.empty()) config.backendType = "external";
+    config.endpoint = root.get("endpoint", "").asString();
+    config.maxChannels = std::clamp(root.get("max_channels", 8).asInt(), 1, 64);
+    config.enabled = root.get("enabled", true).asBool();
+    return config;
+}
+
+Json::Value CaProviderConfig::toJson() const {
+    Json::Value root;
+    root["id"] = id;
+    root["name"] = name;
+    root["backend_type"] = backendType;
+    root["endpoint"] = endpoint;
+    root["max_channels"] = std::clamp(maxChannels, 1, 64);
+    root["enabled"] = enabled;
+    return root;
+}
+
 Json::Value StreamOutputConfig::toJson() const {
     Json::Value root;
     root["output_type"] = outputType;
@@ -76,7 +100,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.satelliteLnbLof1 = root.get("satellite_lnb_lof1", Json::UInt(9750000)).asUInt();
     config.satelliteLnbLof2 = root.get("satellite_lnb_lof2", Json::UInt(10600000)).asUInt();
     config.satelliteLnbSlof = root.get("satellite_lnb_slof", Json::UInt(11700000)).asUInt();
-    config.conditionalAccessReader = root.get("conditional_access_reader", "").asString();
+    config.caProviderId = root.get("ca_provider_id", "").asString();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -148,7 +172,7 @@ Json::Value StreamConfig::toJson() const {
     root["satellite_lnb_lof1"] = satelliteLnbLof1;
     root["satellite_lnb_lof2"] = satelliteLnbLof2;
     root["satellite_lnb_slof"] = satelliteLnbSlof;
-    root["conditional_access_reader"] = conditionalAccessReader;
+    root["ca_provider_id"] = caProviderId;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;
@@ -182,6 +206,11 @@ Json::Value AppConfig::toJson() const {
     root["language"] = language;
     root["telegram_token"] = telegramToken;
     root["telegram_chat_id"] = telegramChatId;
+    Json::Value providers(Json::arrayValue);
+    for (const auto& provider : caProviders) {
+        providers.append(provider.toJson());
+    }
+    root["ca_providers"] = providers;
     Json::Value list(Json::arrayValue);
     for (const auto& stream : streams) {
         list.append(stream.toJson());
@@ -209,6 +238,12 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
+    if (root.isMember("ca_providers") && root["ca_providers"].isArray()) {
+        for (const auto& item : root["ca_providers"]) {
+            CaProviderConfig provider = CaProviderConfig::fromJson(item);
+            if (!provider.id.empty()) config.caProviders.push_back(provider);
+        }
+    }
     if (root.isMember("streams") && root["streams"].isArray()) {
         for (const auto& item : root["streams"]) {
             config.streams.push_back(StreamConfig::fromJson(item));

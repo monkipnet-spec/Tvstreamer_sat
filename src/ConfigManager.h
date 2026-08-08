@@ -16,6 +16,18 @@ struct StreamOutputConfig {
     static StreamOutputConfig fromJson(const Json::Value& root);
 };
 
+struct CaProviderConfig {
+    std::string id;
+    std::string name;
+    std::string backendType = "external";
+    std::string endpoint;
+    int maxChannels = 8;
+    bool enabled = true;
+
+    Json::Value toJson() const;
+    static CaProviderConfig fromJson(const Json::Value& root);
+};
+
 struct StreamConfig {
     std::string id;
     std::string name;
@@ -48,7 +60,7 @@ struct StreamConfig {
     uint32_t satelliteLnbLof1 = 9750000;
     uint32_t satelliteLnbLof2 = 10600000;
     uint32_t satelliteLnbSlof = 11700000;
-    std::string conditionalAccessReader;
+    std::string caProviderId;
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;
@@ -78,6 +90,7 @@ struct AppConfig {
     std::string language = "en";
     std::string telegramToken;
     std::string telegramChatId;
+    std::vector<CaProviderConfig> caProviders;
     std::vector<StreamConfig> streams;
 
     Json::Value toJson() const;

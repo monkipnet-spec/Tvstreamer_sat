@@ -825,6 +825,30 @@ std::string HttpServer::currentState() {
     for (const auto& element : transcoderCapabilities.missingElements) missing.append(element);
     transcoder["missing_elements"] = missing;
     root["transcoder"] = transcoder;
+    auto snap = streamManager.snapshot();
+    Json::Value caProviders(Json::arrayValue);
+    for (const auto& provider : configManager.config.caProviders) {
+      Json::Value item = provider.toJson();
+      unsigned assignedChannels = 0;
+      unsigned activeChannels = 0;
+      for (const auto& stream : configManager.config.streams) {
+        if (stream.caProviderId != provider.id) continue;
+        ++assignedChannels;
+        auto found = snap.find(stream.id);
+        if (found != snap.end() && found->second && found->second->active.load() && !found->second->usingBackup) {
+          ++activeChannels;
+        }
+      }
+      item["assigned_channels"] = assignedChannels;
+      item["active_channels"] = activeChannels;
+      item["available_channels"] = provider.maxChannels > static_cast<int>(activeChannels)
+        ? provider.maxChannels - static_cast<int>(activeChannels) : 0;
+      item["capacity_ok"] = activeChannels <= static_cast<unsigned>(provider.maxChannels);
+      item["backend_connected"] = false;
+      item["backend_status"] = "external integration point; built-in CA transport is not implemented";
+      caProviders.append(item);
+    }
+    root["ca_providers"] = caProviders;
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       Json::Value item = subscriber.toJson();
@@ -835,7 +859,6 @@ std::string HttpServer::currentState() {
     }
     root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
-    auto snap = streamManager.snapshot();
     for (const auto& cfg : configManager.config.streams) {
         Json::Value item = cfg.toJson();
         if (snap.count(cfg.id)) {
@@ -1144,6 +1167,9 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("language")) {
         nextConfig.language = configManager.config.language;
     }
+    if (!root.isMember("ca_providers")) {
+        nextConfig.caProviders = previousConfig.caProviders;
+    }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
     std::vector<StreamConfig> streamsToRestart;
@@ -1308,6 +1334,47 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     }
 
     auto cfg = StreamConfig::fromJson(root);
+    const CaProviderConfig* selectedCaProvider = nullptr;
+    if (!cfg.caProviderId.empty()) {
+        for (const auto& provider : configManager.config.caProviders) {
+            if (provider.id == cfg.caProviderId) {
+                selectedCaProvider = &provider;
+                break;
+            }
+        }
+        if (!selectedCaProvider) {
+            response["result"] = "error";
+            response["stream_id"] = cfg.id;
+            response["error"] = "CA provider '" + cfg.caProviderId + "' not found";
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        if (!selectedCaProvider->enabled) {
+            response["result"] = "error";
+            response["stream_id"] = cfg.id;
+            response["error"] = "CA provider '" + selectedCaProvider->name + "' is disabled";
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        unsigned activeOnProvider = 0;
+        const auto managed = streamManager.snapshot();
+        for (const auto& stream : configManager.config.streams) {
+            if (stream.id == cfg.id || stream.caProviderId != cfg.caProviderId) continue;
+            auto active = managed.find(stream.id);
+            if (active != managed.end() && active->second && active->second->active.load() && !active->second->usingBackup) {
+                ++activeOnProvider;
+            }
+        }
+        if (activeOnProvider >= static_cast<unsigned>(selectedCaProvider->maxChannels)) {
+            response["result"] = "error";
+            response["stream_id"] = cfg.id;
+            response["error"] = "CA provider '" + selectedCaProvider->name + "' reached max_channels=" +
+                std::to_string(selectedCaProvider->maxChannels);
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+    }
+
     std::string startError;
     bool started = streamManager.startStream(cfg, &startError);
 
@@ -1324,11 +1391,12 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     if (started) {
         response["result"] = "ok";
         response["stream_id"] = cfg.id;
-        if (cfg.satelliteEnabled && !cfg.conditionalAccessReader.empty()) {
+        if (cfg.satelliteEnabled && selectedCaProvider) {
             Json::Value warnings(Json::arrayValue);
             warnings.append(
-                "Выбранный conditional_access_reader сохранён в конфигурации, "
-                "но в этой сборке нет backend декодирования Phoenix/serial CA; устройство не используется GStreamer pipeline.");
+                "Канал назначен логическому CA provider '" + selectedCaProvider->name +
+                "' (max_channels=" + std::to_string(selectedCaProvider->maxChannels) +
+                "). Встроенный транспорт CA/descrambling отсутствует; provider является точкой интеграции с внешним авторизованным backend.");
             response["warnings"] = warnings;
         }
     } else {
@@ -1728,6 +1796,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <div class="system-menu-list">
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
+<button class="system-menu-item" onclick="openCaProvidersModal();closeSystemMenu()">CA Providers</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
@@ -1813,6 +1882,7 @@ function saveLanguagePreference(sourceState=state) {
       telegram_chat_id: sourceState.telegram_chat_id,
       http_port: sourceState.http_port,
       language,
+      ca_providers: sourceState.ca_providers || [],
       streams: sourceState.streams
     })
   }).catch(()=>{});
@@ -2032,6 +2102,7 @@ function streamTileStructureSignature(stream) {
     satellite_diseqc_source: stream.satellite_diseqc_source,
     satellite_stream_id: stream.satellite_stream_id,
     satellite_service_id: stream.satellite_service_id,
+    ca_provider_id: stream.ca_provider_id,
     backup_input_uri: stream.backup_input_uri,
     backup_input_type: stream.backup_input_type,
     backup_file_loop: stream.backup_file_loop,
@@ -2072,6 +2143,13 @@ function updateStreamTile(tile, stream) {
   if (status) status.textContent = stream.status || '';
 
   if (stream.satellite_enabled) {
+    const caProviderLabel = tile.querySelector('[data-role="ca-provider"]');
+    if (caProviderLabel) {
+      const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
+      caProviderLabel.textContent = provider
+        ? `${provider.name || provider.id} · ${Number(provider.active_channels || 0)}/${Number(provider.max_channels || 8)} active`
+        : (stream.ca_provider_id ? `${stream.ca_provider_id} · не найден` : '—');
+    }
     updateDvbMeter(tile, 'dvb-signal', stream.dvb_signal_percent);
     updateDvbMeter(tile, 'dvb-quality', stream.dvb_quality_percent);
     const lock = tile.querySelector('[data-role="dvb-lock"]');
@@ -2145,6 +2223,7 @@ function render(force=false) {
         </div>` : ''}
         <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}</span></div>
         <div class="info-row"><strong>${t('primary')}</strong><span>${primaryInputSummary(stream)}</span></div>
+        ${stream.satellite_enabled ? `<div class="info-row"><strong>CA Provider</strong><span data-role="ca-provider">${escapeHtmlValue(stream.ca_provider_id || '—')}</span></div>` : ''}
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
@@ -2445,7 +2524,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>Release 2</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>v80</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2490,11 +2569,106 @@ function openTelegramModal() {
     </div>
   `);
 }
+function caProviderRowHtml(provider={}) {
+  const id = String(provider.id || `ca-${Date.now()}-${Math.floor(Math.random()*10000)}`);
+  const assigned = Number(provider.assigned_channels || (state.streams || []).filter(stream => stream.ca_provider_id === id).length || 0);
+  const active = Number(provider.active_channels || 0);
+  const maxChannels = Math.max(1, Number(provider.max_channels || 8));
+  return `<div class="ca-provider-row" data-provider-id="${escapeHtmlValue(id)}" style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:10px">
+    <div class="form-grid">
+      <div class="form-row"><label>ID</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" ${provider.id?'readonly':''} /></div>
+      <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Основная карта / CAM" /></div>
+      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type"><option value="external" ${(provider.backend_type||'external')==='external'?'selected':''}>External authorized backend</option><option value="cam-service" ${provider.backend_type==='cam-service'?'selected':''}>CAM service</option><option value="custom" ${provider.backend_type==='custom'?'selected':''}>Custom integration</option></select></div>
+      <div class="form-row"><label>Endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(provider.endpoint || '')}" placeholder="URL / unix socket / service name" /></div>
+      <div class="form-row"><label>Max active channels</label><input data-ca-field="max_channels" type="number" min="1" max="64" value="${maxChannels}" /></div>
+      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${active}/${maxChannels} active · ${assigned} assigned</small></div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="button-secondary" type="button" onclick="removeCaProviderRow(this)">Удалить</button></div>
+  </div>`;
+}
+function openCaProvidersModal() {
+  const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
+  openModal(`
+    <h2>CA Providers</h2>
+    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам больше не привязываются.</div><small>Эта версия создаёт модель, лимиты и точку интеграции. Встроенного обмена CA/CW/ECM и descrambling backend в TVStreamer нет.</small></div>
+    <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">CA Providers пока не созданы.</div>'}</div>
+    <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить CA Provider</button>
+    <div id="caProviderSaveStatus" style="margin-top:10px;color:#ffb36b"></div>
+    <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">Отмена</button><button class="button-primary" onclick="saveCaProviders()">Сохранить</button></div>
+  `);
+}
+function addCaProviderRow() {
+  document.getElementById('caProvidersEmpty')?.remove();
+  const rows = document.getElementById('caProviderRows');
+  if (!rows) return;
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = caProviderRowHtml({name:`CA Provider ${(rows.querySelectorAll('.ca-provider-row').length || 0)+1}`,max_channels:8,enabled:true});
+  rows.appendChild(wrapper.firstElementChild);
+}
+function removeCaProviderRow(button) {
+  const row = button?.closest('.ca-provider-row');
+  if (!row) return;
+  const id = row.querySelector('[data-ca-field="id"]')?.value || row.dataset.providerId || '';
+  const assigned = (state.streams || []).filter(stream => stream.ca_provider_id === id).length;
+  if (assigned > 0) {
+    const status = document.getElementById('caProviderSaveStatus');
+    if (status) status.textContent = `Provider ${id} назначен ${assigned} каналам. Сначала переключите эти каналы на другой provider или «Без CA provider».`;
+    return;
+  }
+  row.remove();
+}
+function collectCaProviders() {
+  const providers = [];
+  const ids = new Set();
+  for (const row of document.querySelectorAll('.ca-provider-row')) {
+    const id = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
+    const name = String(row.querySelector('[data-ca-field="name"]')?.value || '').trim();
+    if (!id) throw new Error('У каждого CA Provider должен быть ID.');
+    if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`Недопустимый ID provider: ${id}`);
+    if (ids.has(id)) throw new Error(`Повторяющийся ID provider: ${id}`);
+    ids.add(id);
+    providers.push({
+      id,
+      name: name || id,
+      backend_type: row.querySelector('[data-ca-field="backend_type"]')?.value || 'external',
+      endpoint: String(row.querySelector('[data-ca-field="endpoint"]')?.value || '').trim(),
+      max_channels: Math.min(64, Math.max(1, Number(row.querySelector('[data-ca-field="max_channels"]')?.value || 8))),
+      enabled: row.querySelector('[data-ca-field="enabled"]')?.checked !== false
+    });
+  }
+  return providers;
+}
+function saveCaProviders() {
+  const status = document.getElementById('caProviderSaveStatus');
+  let providers;
+  try { providers = collectCaProviders(); }
+  catch (error) { if (status) status.textContent = error.message || String(error); return; }
+  const validIds = new Set(providers.map(provider => provider.id));
+  const missing = (state.streams || []).filter(stream => stream.ca_provider_id && !validIds.has(stream.ca_provider_id));
+  if (missing.length) {
+    if (status) status.textContent = `Нельзя удалить provider: ${missing.length} канал(ов) всё ещё ссылаются на удалённый ID.`;
+    return;
+  }
+  const payload = {
+    login: state.login,
+    server_name: state.server_name,
+    telegram_token: state.telegram_token,
+    telegram_chat_id: state.telegram_chat_id,
+    http_port: state.http_port,
+    language,
+    ca_providers: providers,
+    streams: state.streams
+  };
+  fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(response=>{ if(!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
+    .then(()=>{ state.ca_providers = providers; closeModal(); fetchState(); })
+    .catch(error=>{ if(status) status.textContent = `Ошибка сохранения: ${error.message || error}`; });
+}
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, conditional_access_reader:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, ca_provider_id:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2733,31 +2907,22 @@ function satelliteFrontendOptions(adapterNumber, selected) {
   if (!found) options.unshift(`<option value="${selectedNumber}" selected>Frontend ${selectedNumber} (сохранён, сейчас не найден)</option>`);
   return options.join('');
 }
-function conditionalAccessReaderOptions(selected) {
+function caProviderOptions(selected) {
   const selectedValue = String(selected || '');
-  const serialReaders = Array.isArray(state.dvb_devices?.serial_readers) ? state.dvb_devices.serial_readers : [];
-  const caDevices = dvbAdapters().flatMap(adapter => (Array.isArray(adapter.ca_devices) ? adapter.ca_devices : []).map(ca => ({...ca, adapter:Number(adapter.adapter)})));
-  const options = [`<option value="" ${selectedValue?'':'selected'}>Не выбран</option>`];
-  if (serialReaders.length) {
-    options.push('<optgroup label="USB serial / Phoenix candidates">');
-    serialReaders.forEach(reader => {
-      const device = String(reader.device || '');
-      const product = reader.product || reader.manufacturer || reader.driver || reader.name || device;
-      const candidate = reader.phoenix_candidate ? ' · Phoenix/serial' : '';
-      options.push(`<option value="${escapeHtmlValue(device)}" ${device===selectedValue?'selected':''}>${escapeHtmlValue(device)} · ${escapeHtmlValue(product)}${candidate}</option>`);
-    });
-    options.push('</optgroup>');
-  }
-  if (caDevices.length) {
-    options.push('<optgroup label="DVB CI/CAM devices">');
-    caDevices.forEach(ca => {
-      const device = String(ca.device || '');
-      options.push(`<option value="${escapeHtmlValue(device)}" ${device===selectedValue?'selected':''}>Adapter ${ca.adapter} · ${escapeHtmlValue(device)}</option>`);
-    });
-    options.push('</optgroup>');
-  }
-  if (selectedValue && !serialReaders.some(r=>r.device===selectedValue) && !caDevices.some(c=>c.device===selectedValue)) {
-    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (сохранён, сейчас не найден)</option>`);
+  const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
+  const options = [`<option value="" ${selectedValue?'':'selected'}>Без CA provider</option>`];
+  providers.forEach(provider => {
+    const id = String(provider.id || '');
+    if (!id) return;
+    const name = provider.name || id;
+    const active = Number(provider.active_channels || 0);
+    const max = Math.max(1, Number(provider.max_channels || 8));
+    const disabled = provider.enabled === false;
+    const status = disabled ? ' · отключён' : ` · ${active}/${max} active`;
+    options.push(`<option value="${escapeHtmlValue(id)}" ${id===selectedValue?'selected':''} ${disabled?'disabled':''}>${escapeHtmlValue(name)}${escapeHtmlValue(status)}</option>`);
+  });
+  if (selectedValue && !providers.some(provider => String(provider.id || '') === selectedValue)) {
+    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (provider не найден)</option>`);
   }
   return options.join('');
 }
@@ -2931,7 +3096,7 @@ function createSelectedSatelliteChannels() {
   const outputType = document.getElementById('satelliteOutputType')?.value || 'udp-cbr';
   const outputInterface = document.getElementById('satelliteOutputInterface')?.value || '';
   const targetBitrate = Math.max(1, Number(document.getElementById('satelliteOutputBitrate')?.value || 12000)) * 1000;
-  const caReader = document.getElementById('satelliteConditionalAccessReader')?.value || '';
+  const caProviderId = document.getElementById('satelliteCaProvider')?.value || '';
   if (basePort <= 0 || basePort > 65535) {
     if (status) status.textContent = 'Укажите корректный порт 1…65535.';
     return;
@@ -2976,7 +3141,7 @@ function createSelectedSatelliteChannels() {
       satellite_lnb_lof1: scan.satellite_lnb_lof1,
       satellite_lnb_lof2: scan.satellite_lnb_lof2,
       satellite_lnb_slof: scan.satellite_lnb_slof,
-      conditional_access_reader: caReader,
+      ca_provider_id: caProviderId,
       backup_input_uri: '',
       backup_input_type: 'url',
       backup_file_loop: false,
@@ -3016,6 +3181,7 @@ function createSelectedSatelliteChannels() {
     telegram_chat_id: state.telegram_chat_id,
     http_port: state.http_port,
     language,
+    ca_providers: state.ca_providers || [],
     streams: nextStreams
   };
   const button = document.getElementById('satelliteCreateChannelsButton');
@@ -3063,7 +3229,7 @@ function openSatelliteChannelModal() {
             <div class="form-row"><label>LNB LOF1, kHz</label><input id="channelSatelliteLnbLof1" type="number" value="9750000" /></div>
             <div class="form-row"><label>LNB LOF2, kHz</label><input id="channelSatelliteLnbLof2" type="number" value="10600000" /></div>
             <div class="form-row"><label>LNB switch, kHz</label><input id="channelSatelliteLnbSlof" type="number" value="11700000" /></div>
-            <div class="form-row"><label>Устройство CA / CI</label><select id="satelliteConditionalAccessReader">${conditionalAccessReaderOptions('')}</select></div>
+            <div class="form-row"><label>CA Provider</label><select id="satelliteCaProvider">${caProviderOptions('')}</select><small>Логический provider с общим лимитом активных каналов. Физическое устройство к каналу не привязывается.</small></div>
           </div>
         </details>
 
@@ -3131,7 +3297,7 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал». Здесь сохраняются общие параметры плитки, выхода, резерва и транскодирования.</small></div></div>` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
+        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал». Здесь сохраняются общие параметры плитки, выхода, резерва и транскодирования.</small></div></div><div class="form-row full"><label>CA Provider</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Канал использует только ID логического provider. Прямой выбор /dev/ttyUSB*, /dev/ttyACM* или DVB CA здесь отсутствует.</small></div>` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -3279,6 +3445,7 @@ function saveSettings() {
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
     http_port: httpPort,
     language,
+    ca_providers: state.ca_providers || [],
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;
@@ -3336,7 +3503,7 @@ function saveStream(id) {
     satellite_lnb_lof1: Number(previous.satellite_lnb_lof1 || 9750000),
     satellite_lnb_lof2: Number(previous.satellite_lnb_lof2 || 10600000),
     satellite_lnb_slof: Number(previous.satellite_lnb_slof || 11700000),
-    conditional_access_reader: previous.conditional_access_reader || '',
+    ca_provider_id: satelliteEnabled ? (document.getElementById('streamCaProvider')?.value || previous.ca_provider_id || '') : '',
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
@@ -3366,6 +3533,7 @@ function saveStream(id) {
     telegram_chat_id: state.telegram_chat_id,
     http_port: state.http_port,
     language,
+    ca_providers: state.ca_providers || [],
     streams: state.streams
   };
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
