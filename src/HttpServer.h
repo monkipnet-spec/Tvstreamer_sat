@@ -52,6 +52,7 @@ private:
     void refreshHttpPorts();
     std::string listInterfaces();
     std::string listDvbDevices();
+    std::string listSerialReaders();
     std::string handleScanSatellite(const std::string& body);
     std::string systemMetrics();
     std::string currentState();

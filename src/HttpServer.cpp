@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <filesystem>
 #include <cstdint>
 #include <cctype>
 #include <cstring>
@@ -103,6 +105,57 @@ std::string cleanFileName(const std::string& value) {
         name = name.substr(name.size() - 96);
     }
     return name;
+}
+
+bool safeDeviceNode(const std::string& device) {
+    if (device.rfind("/dev/ttyUSB", 0) != 0 && device.rfind("/dev/ttyACM", 0) != 0) {
+        return false;
+    }
+    for (char ch : device) {
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '/' || ch == '_' || ch == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::map<std::string, std::string> udevPropertiesForDevice(const std::string& device) {
+    std::map<std::string, std::string> properties;
+    if (!safeDeviceNode(device)) {
+        return properties;
+    }
+
+    const std::string command = "udevadm info --query=property --name=" + device + " 2>/dev/null";
+    FILE* pipe = ::popen(command.c_str(), "r");
+    if (!pipe) {
+        return properties;
+    }
+
+    char buffer[1024];
+    while (std::fgets(buffer, sizeof(buffer), pipe)) {
+        std::string line(buffer);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+            line.pop_back();
+        }
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        properties[line.substr(0, separator)] = line.substr(separator + 1);
+    }
+    ::pclose(pipe);
+    return properties;
+}
+
+std::string firstProperty(const std::map<std::string, std::string>& properties,
+                          std::initializer_list<const char*> names) {
+    for (const char* name : names) {
+        const auto it = properties.find(name);
+        if (it != properties.end() && !it->second.empty()) {
+            return it->second;
+        }
+    }
+    return "";
 }
 
 std::string base64Decode(const std::string& value) {
@@ -431,6 +484,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/dvb-devices") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listDvbDevices();
+            } else if (target == "/api/serial-readers") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = listSerialReaders();
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
               res.body() = systemMetrics();
@@ -672,6 +728,51 @@ std::string HttpServer::listInterfaces() {
 std::string HttpServer::listDvbDevices() {
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, tvs::dvb::enumerateDevices());
+}
+
+std::string HttpServer::listSerialReaders() {
+    Json::Value root(Json::arrayValue);
+    const std::filesystem::path byIdDirectory("/dev/serial/by-id");
+    std::error_code error;
+
+    if (!std::filesystem::exists(byIdDirectory, error) || error) {
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, root);
+    }
+
+    std::vector<std::filesystem::path> entries;
+    for (std::filesystem::directory_iterator iterator(byIdDirectory, error), end;
+         !error && iterator != end; iterator.increment(error)) {
+        entries.push_back(iterator->path());
+    }
+    std::sort(entries.begin(), entries.end());
+
+    for (const auto& byIdPath : entries) {
+        std::error_code canonicalError;
+        const auto resolved = std::filesystem::canonical(byIdPath, canonicalError);
+        if (canonicalError) {
+            continue;
+        }
+        const std::string device = resolved.string();
+        if (!safeDeviceNode(device)) {
+            continue;
+        }
+
+        const auto properties = udevPropertiesForDevice(device);
+        Json::Value item;
+        item["by_id"] = byIdPath.string();
+        item["by_id_name"] = byIdPath.filename().string();
+        item["device"] = device;
+        item["tty"] = resolved.filename().string();
+        item["vendor"] = firstProperty(properties, {"ID_VENDOR_FROM_DATABASE", "ID_VENDOR"});
+        item["model"] = firstProperty(properties, {"ID_MODEL_FROM_DATABASE", "ID_MODEL"});
+        item["serial"] = firstProperty(properties, {"ID_SERIAL_SHORT", "ID_SERIAL"});
+        item["usb_path"] = firstProperty(properties, {"ID_PATH", "ID_PATH_TAG"});
+        root.append(item);
+    }
+
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, root);
 }
 
 std::string HttpServer::handleScanSatellite(const std::string& body) {
@@ -2581,14 +2682,21 @@ function openTelegramModal() {
     </div>
   `);
 }
+function nextCaProviderId() {
+  const used = new Set((state.ca_providers || []).map(provider => String(provider.id || '')));
+  document.querySelectorAll?.('.ca-provider-row [data-ca-field="id"]').forEach(input => used.add(String(input.value || '')));
+  let index = 1;
+  while (used.has(`ca-card-${index}`)) index += 1;
+  return `ca-card-${index}`;
+}
 function caProviderRowHtml(provider={}) {
-  const id = String(provider.id || `ca-${Date.now()}-${Math.floor(Math.random()*10000)}`);
+  const id = String(provider.id || nextCaProviderId());
   const assigned = Number(provider.assigned_channels || (state.streams || []).filter(stream => stream.ca_provider_id === id).length || 0);
   const active = Number(provider.active_channels || 0);
   const maxChannels = Math.max(1, Number(provider.max_channels || 8));
   return `<div class="ca-provider-row" data-provider-id="${escapeHtmlValue(id)}" style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:10px">
     <div class="form-grid">
-      <div class="form-row"><label>ID</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" ${provider.id?'readonly':''} /></div>
+      <div class="form-row"><label>ID</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Например ca-card-1. При переименовании ссылки каналов обновятся при сохранении.</small></div>
       <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Основная карта / CAM" /></div>
       <div class="form-row"><label>Backend</label><select data-ca-field="backend_type"><option value="authorized-ts" ${provider.backend_type==='authorized-ts'?'selected':''}>Authorized pre-decoded TS</option><option value="external" ${(provider.backend_type||'external')==='external'?'selected':''}>External authorized backend</option><option value="cam-service" ${provider.backend_type==='cam-service'?'selected':''}>CAM service</option><option value="custom" ${provider.backend_type==='custom'?'selected':''}>Custom integration</option></select></div>
       <div class="form-row"><label>Endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(provider.endpoint || '')}" placeholder="udp://127.0.0.1:9000 или srt://host:port?streamid={service_id}" /></div>
@@ -2598,23 +2706,55 @@ function caProviderRowHtml(provider={}) {
     <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="button-secondary" type="button" onclick="removeCaProviderRow(this)">Удалить</button></div>
   </div>`;
 }
+function serialReaderTableHtml(readers=[]) {
+  if (!Array.isArray(readers) || !readers.length) {
+    return '<div style="color:#aeb8ca;padding:10px 0">Устройства /dev/serial/by-id/* не обнаружены.</div>';
+  }
+  return `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="text-align:left;color:#aeb8ca"><th style="padding:7px;border-bottom:1px solid #344155">By-ID</th><th style="padding:7px;border-bottom:1px solid #344155">Device</th><th style="padding:7px;border-bottom:1px solid #344155">Производитель</th><th style="padding:7px;border-bottom:1px solid #344155">Модель</th><th style="padding:7px;border-bottom:1px solid #344155">Serial</th></tr></thead>
+    <tbody>${readers.map(reader => `<tr><td style="padding:7px;border-bottom:1px solid #253044"><code title="${escapeHtmlValue(reader.by_id || '')}">${escapeHtmlValue(reader.by_id_name || reader.by_id || '')}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><strong>${escapeHtmlValue(reader.device || reader.tty || '')}</strong></td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.vendor || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.model || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044"><code>${escapeHtmlValue(reader.serial || '—')}</code></td></tr>`).join('')}</tbody>
+  </table></div>`;
+}
+async function refreshSerialReaders() {
+  const target = document.getElementById('serialReadersTable');
+  const status = document.getElementById('serialReadersStatus');
+  if (!target) return;
+  if (status) status.textContent = 'Поиск serial-reader устройств…';
+  try {
+    const response = await fetch('/api/serial-readers', {cache:'no-store'});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const readers = await response.json();
+    target.innerHTML = serialReaderTableHtml(readers);
+    if (status) status.textContent = `Обнаружено: ${Array.isArray(readers) ? readers.length : 0}`;
+  } catch (error) {
+    target.innerHTML = '<div style="color:#ff8f8f;padding:10px 0">Не удалось получить список serial-reader устройств.</div>';
+    if (status) status.textContent = error.message || String(error);
+  }
+}
 function openCaProvidersModal() {
   const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
   openModal(`
     <h2>CA Providers</h2>
-    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам больше не привязываются.</div><small>Backend «Authorized pre-decoded TS» принимает уже расшифрованный MPEG-TS от вашего авторизованного CAM/CA backend. В endpoint можно использовать {service_id}, {stream_id}, {frequency_khz}, {frequency_mhz}. TVStreamer не получает и не хранит CW/ECM.</small></div>
+    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам не привязываются.</div><small>Provider ID — внутренний идентификатор TVStreamer, а не ID карты. Для новых provider автоматически предлагаются понятные ID вида ca-card-1, ca-card-2. Backend «Authorized pre-decoded TS» принимает уже расшифрованный MPEG-TS от авторизованного CAM/CA backend.</small></div>
+    <div style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><strong>Обнаруженные serial-reader устройства</strong><div id="serialReadersStatus" style="font-size:12px;color:#aeb8ca;margin-top:3px">Поиск…</div></div><button class="button-secondary" type="button" onclick="refreshSerialReaders()">Обновить</button></div>
+      <div id="serialReadersTable" style="margin-top:8px"><div style="color:#aeb8ca;padding:10px 0">Загрузка…</div></div>
+      <small style="display:block;margin-top:8px">By-ID стабилен и предпочтительнее /dev/ttyUSBN. Производитель, модель и serial относятся к USB/serial-reader. Какая карта вставлена в ридер, должен сообщать внешний авторизованный backend.</small>
+    </div>
     <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">CA Providers пока не созданы.</div>'}</div>
     <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить CA Provider</button>
     <div id="caProviderSaveStatus" style="margin-top:10px;color:#ffb36b"></div>
     <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">Отмена</button><button class="button-primary" onclick="saveCaProviders()">Сохранить</button></div>
   `);
+  refreshSerialReaders();
 }
 function addCaProviderRow() {
   document.getElementById('caProvidersEmpty')?.remove();
   const rows = document.getElementById('caProviderRows');
   if (!rows) return;
   const wrapper = document.createElement('div');
-  wrapper.innerHTML = caProviderRowHtml({name:`CA Provider ${(rows.querySelectorAll('.ca-provider-row').length || 0)+1}`,max_channels:8,enabled:true});
+  const nextId = nextCaProviderId();
+  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${nextId.replace('ca-card-','')}`,max_channels:8,enabled:true});
   rows.appendChild(wrapper.firstElementChild);
 }
 function removeCaProviderRow(button) {
@@ -2655,8 +2795,19 @@ function saveCaProviders() {
   let providers;
   try { providers = collectCaProviders(); }
   catch (error) { if (status) status.textContent = error.message || String(error); return; }
+
+  const renameMap = new Map();
+  for (const row of document.querySelectorAll('.ca-provider-row')) {
+    const originalId = String(row.dataset.providerId || '').trim();
+    const nextId = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
+    if (originalId && nextId && originalId !== nextId) renameMap.set(originalId, nextId);
+  }
+  const updatedStreams = (state.streams || []).map(stream => {
+    const nextProviderId = renameMap.get(String(stream.ca_provider_id || ''));
+    return nextProviderId ? {...stream, ca_provider_id: nextProviderId} : {...stream};
+  });
   const validIds = new Set(providers.map(provider => provider.id));
-  const missing = (state.streams || []).filter(stream => stream.ca_provider_id && !validIds.has(stream.ca_provider_id));
+  const missing = updatedStreams.filter(stream => stream.ca_provider_id && !validIds.has(stream.ca_provider_id));
   if (missing.length) {
     if (status) status.textContent = `Нельзя удалить provider: ${missing.length} канал(ов) всё ещё ссылаются на удалённый ID.`;
     return;
@@ -2669,11 +2820,11 @@ function saveCaProviders() {
     http_port: state.http_port,
     language,
     ca_providers: providers,
-    streams: state.streams
+    streams: updatedStreams
   };
   fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(response=>{ if(!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
-    .then(()=>{ state.ca_providers = providers; closeModal(); fetchState(); })
+    .then(()=>{ state.ca_providers = providers; state.streams = updatedStreams; closeModal(); fetchState(); })
     .catch(error=>{ if(status) status.textContent = `Ошибка сохранения: ${error.message || error}`; });
 }
 function openStreamModal() {
