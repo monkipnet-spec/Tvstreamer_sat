@@ -1571,7 +1571,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:240px;height:240px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px;overflow:hidden}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
@@ -1584,7 +1584,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
-.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6}
+.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6;min-height:0;overflow:hidden}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
@@ -1599,7 +1599,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .dvb-meter-fill.good{background:#17c261}
 .tile .dvb-lock{font-size:9px;color:#ffb3b3}
 .tile .dvb-lock.locked{color:#b6f7c2}
-.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:auto}
 .tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
@@ -2065,6 +2065,28 @@ function satelliteInputSummary(stream) {
 function primaryInputSummary(stream) {
   return stream.satellite_enabled ? satelliteInputSummary(stream) : (stream.input_uri || '—');
 }
+function caProviderTileSummary(stream) {
+  if (!stream?.satellite_enabled) return '';
+  const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
+  if (provider) {
+    return `${provider.name || provider.id} ${Number(provider.active_channels || 0)}/${Number(provider.max_channels || 8)}`;
+  }
+  return stream.ca_provider_id ? `${stream.ca_provider_id} (не найден)` : 'без CA';
+}
+function satelliteTilePrimarySummary(stream) {
+  const system = stream.satellite_delivery_system === 'dvb-s' ? 'DVB-S' : 'DVB-S2';
+  const freq = formatSatelliteFrequencyMhz(stream.satellite_frequency);
+  const sr = Number(stream.satellite_symbol_rate || 0);
+  const pol = String(stream.satellite_polarization || 'H').toUpperCase();
+  return `${system} · ${freq} MHz · ${pol}${sr ? ` · ${sr}k` : ''} · CA ${caProviderTileSummary(stream)}`;
+}
+function satelliteTileActiveInputSummary(stream) {
+  const source = stream.active_input_label || t('primary');
+  if (stream.using_backup) return `${source} · ${stream.active_input_uri || stream.backup_input_uri || '—'}`;
+  const signal = clampPercent(stream.dvb_signal_percent);
+  const quality = clampPercent(stream.dvb_quality_percent);
+  return `${source} · S ${signal}% · Q ${quality}% · ${stream.dvb_has_lock ? t('lock') : t('noLock')}`;
+}
 function clampPercent(value) {
   const number = Number(value || 0);
   return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
@@ -2130,7 +2152,13 @@ function updateStreamTile(tile, stream) {
 
   const activeInput = tile.querySelector('[data-role="active-input"]');
   if (activeInput) {
-    activeInput.textContent = `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`;
+    activeInput.textContent = stream.satellite_enabled
+      ? satelliteTileActiveInputSummary(stream)
+      : `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`;
+  }
+  const primarySummary = tile.querySelector('[data-role="primary-summary"]');
+  if (primarySummary) {
+    primarySummary.textContent = stream.satellite_enabled ? satelliteTilePrimarySummary(stream) : primaryInputSummary(stream);
   }
 
   const bitrateIn = tile.querySelector('[data-role="bitrate-in"]');
@@ -2142,23 +2170,6 @@ function updateStreamTile(tile, stream) {
   const status = tile.querySelector('[data-role="stream-status"]');
   if (status) status.textContent = stream.status || '';
 
-  if (stream.satellite_enabled) {
-    const caProviderLabel = tile.querySelector('[data-role="ca-provider"]');
-    if (caProviderLabel) {
-      const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
-      caProviderLabel.textContent = provider
-        ? `${provider.name || provider.id} · ${Number(provider.active_channels || 0)}/${Number(provider.max_channels || 8)} active`
-        : (stream.ca_provider_id ? `${stream.ca_provider_id} · не найден` : '—');
-    }
-    updateDvbMeter(tile, 'dvb-signal', stream.dvb_signal_percent);
-    updateDvbMeter(tile, 'dvb-quality', stream.dvb_quality_percent);
-    const lock = tile.querySelector('[data-role="dvb-lock"]');
-    if (lock) {
-      const locked = !!stream.dvb_has_lock;
-      lock.className = `dvb-lock${locked ? ' locked' : ''}`;
-      lock.textContent = locked ? t('lock') : t('noLock');
-    }
-  }
 
   const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
   if (toggleButton) {
@@ -2198,7 +2209,7 @@ function render(force=false) {
     const links = streamLinks(stream);
     const primaryLink = links[0]?.url || stream.vlc_link || `${stream.output_host || ''}:${stream.output_port || ''}`;
     const tile = document.createElement('div');
-    tile.className = 'tile' + (stream.active ? ' active' : '');
+    tile.className = 'tile' + (stream.satellite_enabled ? ' satellite' : '') + (stream.active ? ' active' : '');
     tile.dataset.streamId = String(stream.id);
     tile.innerHTML = `
       <div class="top">
@@ -2210,20 +2221,8 @@ function render(force=false) {
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
-        ${stream.satellite_enabled ? `
-        <div class="dvb-meters">
-          <div>
-            <div class="dvb-meter-head"><strong>${t('signalLevel')}</strong><span><span data-role="dvb-signal-value">${clampPercent(stream.dvb_signal_percent)}%</span> · <span data-role="dvb-lock" class="dvb-lock${stream.dvb_has_lock ? ' locked' : ''}">${stream.dvb_has_lock ? t('lock') : t('noLock')}</span></span></div>
-            <div class="dvb-meter-track"><div data-role="dvb-signal-fill" class="dvb-meter-fill ${dvbMeterClass(stream.dvb_signal_percent)}" style="width:${clampPercent(stream.dvb_signal_percent)}%"></div></div>
-          </div>
-          <div>
-            <div class="dvb-meter-head"><strong>${t('signalQuality')}</strong><span data-role="dvb-quality-value">${clampPercent(stream.dvb_quality_percent)}%</span></div>
-            <div class="dvb-meter-track"><div data-role="dvb-quality-fill" class="dvb-meter-fill ${dvbMeterClass(stream.dvb_quality_percent)}" style="width:${clampPercent(stream.dvb_quality_percent)}%"></div></div>
-          </div>
-        </div>` : ''}
-        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}</span></div>
-        <div class="info-row"><strong>${t('primary')}</strong><span>${primaryInputSummary(stream)}</span></div>
-        ${stream.satellite_enabled ? `<div class="info-row"><strong>CA Provider</strong><span data-role="ca-provider">${escapeHtmlValue(stream.ca_provider_id || '—')}</span></div>` : ''}
+        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.satellite_enabled ? satelliteTileActiveInputSummary(stream) : `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`}</span></div>
+        <div class="info-row"><strong>${t('primary')}</strong><span data-role="primary-summary">${stream.satellite_enabled ? satelliteTilePrimarySummary(stream) : primaryInputSummary(stream)}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
@@ -2524,7 +2523,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>v80</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>v81</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
