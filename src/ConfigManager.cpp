@@ -76,6 +76,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.satelliteLnbLof1 = root.get("satellite_lnb_lof1", Json::UInt(9750000)).asUInt();
     config.satelliteLnbLof2 = root.get("satellite_lnb_lof2", Json::UInt(10600000)).asUInt();
     config.satelliteLnbSlof = root.get("satellite_lnb_slof", Json::UInt(11700000)).asUInt();
+    config.conditionalAccessReader = root.get("conditional_access_reader", "").asString();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -147,6 +148,7 @@ Json::Value StreamConfig::toJson() const {
     root["satellite_lnb_lof1"] = satelliteLnbLof1;
     root["satellite_lnb_lof2"] = satelliteLnbLof2;
     root["satellite_lnb_slof"] = satelliteLnbSlof;
+    root["conditional_access_reader"] = conditionalAccessReader;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;

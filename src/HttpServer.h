@@ -51,6 +51,8 @@ private:
     bool bindHttpPorts(const std::set<int>& ports);
     void refreshHttpPorts();
     std::string listInterfaces();
+    std::string listDvbDevices();
+    std::string handleScanSatellite(const std::string& body);
     std::string systemMetrics();
     std::string currentState();
     std::string qualityHistory(const std::string& target);

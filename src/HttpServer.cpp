@@ -1,5 +1,7 @@
 #include "HttpServer.h"
 
+#include "DvbManager.h"
+
 #include "utils.h"
 #include "TranscoderModule.h"
 #include "protocols/GstProtocolTypes.h"
@@ -426,6 +428,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
+            } else if (target == "/api/dvb-devices") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = listDvbDevices();
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
               res.body() = systemMetrics();
@@ -480,6 +485,9 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/scan-satellite") {
+              res.set(http::field::content_type, "application/json");
+              res.body() = handleScanSatellite(req.body());
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -660,6 +668,50 @@ std::string HttpServer::listInterfaces() {
     }
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
+}
+
+std::string HttpServer::listDvbDevices() {
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, tvs::dvb::enumerateDevices());
+}
+
+std::string HttpServer::handleScanSatellite(const std::string& body) {
+    Json::Value response;
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value request;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["result"] = "error";
+        response["error"] = "invalid satellite scan request: " + errors;
+    } else {
+        StreamConfig scanConfig = StreamConfig::fromJson(request);
+        scanConfig.satelliteEnabled = true;
+
+        // Tuning a frontend for a scan would retune a running channel that uses
+        // the same hardware. Refuse it instead of interrupting an active stream.
+        const auto snapshot = streamManager.snapshot();
+        bool busy = false;
+        std::string busyStream;
+        for (const auto& [id, state] : snapshot) {
+            if (!state || !state->active.load() || !state->config.satelliteEnabled) continue;
+            if (state->config.satelliteAdapter == scanConfig.satelliteAdapter &&
+                state->config.satelliteFrontend == scanConfig.satelliteFrontend) {
+                busy = true;
+                busyStream = id;
+                break;
+            }
+        }
+        if (busy) {
+            response["result"] = "error";
+            response["error"] = "DVB frontend is in use by active stream: " + busyStream;
+            response["busy_stream_id"] = busyStream;
+        } else {
+            response = tvs::dvb::scanTransponder(scanConfig, 7000);
+        }
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
   std::string HttpServer::systemMetrics() {
@@ -1643,6 +1695,7 @@ let metricsFetchPromise = null;
 let lastTileStructureSignature = '';
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
+let satelliteScanServices = [];
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -1667,12 +1720,16 @@ function fetchState() {
       return response.json();
     })
     .then(data => {
+      const cachedInterfaces = state.interfaces;
+      const cachedDvbDevices = state.dvb_devices;
       const storedLanguage = localStorage.getItem('tvstreamer-language');
       const serverLanguage = normalizeLanguage(data.language);
       language = normalizeLanguage(storedLanguage || language);
       localStorage.setItem('tvstreamer-language', language);
       data.language = language;
       state = data;
+      if (cachedInterfaces) state.interfaces = cachedInterfaces;
+      if (cachedDvbDevices) state.dvb_devices = cachedDvbDevices;
       applyLanguage();
       render(false);
       refreshSubscriberSessions();
@@ -2211,7 +2268,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, conditional_access_reader:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2404,6 +2461,171 @@ function uploadBackupReplacementFile(streamId, input) {
     if (status) status.textContent = 'Ошибка загрузки файла';
   });
 }
+function escapeHtmlValue(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+function dvbAdapters() {
+  return Array.isArray(state.dvb_devices?.adapters) ? state.dvb_devices.adapters : [];
+}
+function satelliteAdapterOptions(selected) {
+  const selectedNumber = Number(selected || 0);
+  const adapters = dvbAdapters();
+  if (!adapters.length) {
+    return `<option value="${selectedNumber}" selected>Adapter ${selectedNumber} (не найден в /dev/dvb)</option>`;
+  }
+  let found = false;
+  const options = adapters.map(adapter => {
+    const number = Number(adapter.adapter || 0);
+    if (number === selectedNumber) found = true;
+    const frontends = Array.isArray(adapter.frontends) ? adapter.frontends.length : 0;
+    return `<option value="${number}" ${number===selectedNumber?'selected':''}>Adapter ${number} · ${frontends} frontend</option>`;
+  });
+  if (!found) options.unshift(`<option value="${selectedNumber}" selected>Adapter ${selectedNumber} (сохранён, сейчас не найден)</option>`);
+  return options.join('');
+}
+function satelliteFrontendOptions(adapterNumber, selected) {
+  const selectedNumber = Number(selected || 0);
+  const adapter = dvbAdapters().find(item => Number(item.adapter) === Number(adapterNumber));
+  const frontends = Array.isArray(adapter?.frontends) ? adapter.frontends : [];
+  if (!frontends.length) {
+    return `<option value="${selectedNumber}" selected>Frontend ${selectedNumber} (не найден)</option>`;
+  }
+  let found = false;
+  const options = frontends.map(frontend => {
+    const number = Number(frontend.frontend || 0);
+    if (number === selectedNumber) found = true;
+    const systems = Array.isArray(frontend.delivery_systems) && frontend.delivery_systems.length
+      ? ` · ${frontend.delivery_systems.join('/')}` : '';
+    const name = frontend.name ? ` · ${frontend.name}` : '';
+    return `<option value="${number}" ${number===selectedNumber?'selected':''}>Frontend ${number}${escapeHtmlValue(name)}${escapeHtmlValue(systems)}</option>`;
+  });
+  if (!found) options.unshift(`<option value="${selectedNumber}" selected>Frontend ${selectedNumber} (сохранён, сейчас не найден)</option>`);
+  return options.join('');
+}
+function conditionalAccessReaderOptions(selected) {
+  const selectedValue = String(selected || '');
+  const serialReaders = Array.isArray(state.dvb_devices?.serial_readers) ? state.dvb_devices.serial_readers : [];
+  const caDevices = dvbAdapters().flatMap(adapter => (Array.isArray(adapter.ca_devices) ? adapter.ca_devices : []).map(ca => ({...ca, adapter:Number(adapter.adapter)})));
+  const options = [`<option value="" ${selectedValue?'':'selected'}>Не выбран</option>`];
+  if (serialReaders.length) {
+    options.push('<optgroup label="USB serial / Phoenix candidates">');
+    serialReaders.forEach(reader => {
+      const device = String(reader.device || '');
+      const product = reader.product || reader.manufacturer || reader.driver || reader.name || device;
+      const candidate = reader.phoenix_candidate ? ' · Phoenix/serial' : '';
+      options.push(`<option value="${escapeHtmlValue(device)}" ${device===selectedValue?'selected':''}>${escapeHtmlValue(device)} · ${escapeHtmlValue(product)}${candidate}</option>`);
+    });
+    options.push('</optgroup>');
+  }
+  if (caDevices.length) {
+    options.push('<optgroup label="DVB CI/CAM devices">');
+    caDevices.forEach(ca => {
+      const device = String(ca.device || '');
+      options.push(`<option value="${escapeHtmlValue(device)}" ${device===selectedValue?'selected':''}>Adapter ${ca.adapter} · ${escapeHtmlValue(device)}</option>`);
+    });
+    options.push('</optgroup>');
+  }
+  if (selectedValue && !serialReaders.some(r=>r.device===selectedValue) && !caDevices.some(c=>c.device===selectedValue)) {
+    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (сохранён, сейчас не найден)</option>`);
+  }
+  return options.join('');
+}
+function updateSatelliteFrontendOptions() {
+  const adapter = document.getElementById('streamSatelliteAdapter');
+  const frontend = document.getElementById('streamSatelliteFrontend');
+  if (!adapter || !frontend) return;
+  const previous = Number(frontend.value || 0);
+  frontend.innerHTML = satelliteFrontendOptions(Number(adapter.value || 0), previous);
+  if (![...frontend.options].some(option => Number(option.value) === previous)) frontend.selectedIndex = 0;
+}
+function satelliteScanPayload() {
+  return {
+    id: 'satellite-scan',
+    name: 'Satellite scan',
+    satellite_enabled: true,
+    satellite_adapter: Number(document.getElementById('streamSatelliteAdapter')?.value || 0),
+    satellite_frontend: Number(document.getElementById('streamSatelliteFrontend')?.value || 0),
+    satellite_frequency: Number(document.getElementById('streamSatelliteFrequency')?.value || 0),
+    satellite_symbol_rate: Number(document.getElementById('streamSatelliteSymbolRate')?.value || 0),
+    satellite_polarization: document.getElementById('streamSatellitePolarization')?.value || 'H',
+    satellite_delivery_system: document.getElementById('streamSatelliteDeliverySystem')?.value || 'dvb-s2',
+    satellite_modulation: document.getElementById('streamSatelliteModulation')?.value || 'auto',
+    satellite_fec: document.getElementById('streamSatelliteFec')?.value || 'auto',
+    satellite_pilot: document.getElementById('streamSatellitePilot')?.value || 'auto',
+    satellite_rolloff: document.getElementById('streamSatelliteRolloff')?.value || 'auto',
+    satellite_diseqc_source: Number(document.getElementById('streamSatelliteDiseqcSource')?.value ?? -1),
+    satellite_stream_id: Number(document.getElementById('streamSatelliteStreamId')?.value ?? -1),
+    satellite_service_id: 0,
+    satellite_lnb_lof1: Number(document.getElementById('streamSatelliteLnbLof1')?.value || 9750000),
+    satellite_lnb_lof2: Number(document.getElementById('streamSatelliteLnbLof2')?.value || 10600000),
+    satellite_lnb_slof: Number(document.getElementById('streamSatelliteLnbSlof')?.value || 11700000)
+  };
+}
+function applySatelliteService() {
+  const select = document.getElementById('streamSatelliteServiceSelect');
+  if (!select) return;
+  const serviceId = Number(select.value || 0);
+  const service = satelliteScanServices.find(item => Number(item.service_id) === serviceId);
+  if (!service) return;
+  const setValue = (id, value) => { const element = document.getElementById(id); if (element && value !== undefined && value !== null) element.value = value; };
+  setValue('streamSatelliteServiceId', service.service_id || 0);
+  setValue('streamServiceId', service.service_id || 1);
+  if (service.name && !String(service.name).startsWith('Service ')) setValue('streamServiceName', service.name);
+  if (service.provider) setValue('streamProvider', service.provider);
+  if (Number(service.video_pid || 0) > 0) setValue('streamVideoPid', service.video_pid);
+  if (Number(service.audio_pid || 0) > 0) setValue('streamAudioPid', service.audio_pid);
+}
+function scanSatelliteTransponder() {
+  const button = document.getElementById('streamSatelliteScanButton');
+  const status = document.getElementById('streamSatelliteScanStatus');
+  const select = document.getElementById('streamSatelliteServiceSelect');
+  const payload = satelliteScanPayload();
+  if (payload.satellite_frequency <= 0 || payload.satellite_symbol_rate <= 0) {
+    if (status) status.textContent = 'Укажите частоту и Symbol Rate.';
+    return;
+  }
+  if (button) button.disabled = true;
+  if (status) status.textContent = 'Настройка тюнера и сканирование PAT / SDT / PMT…';
+  if (select) { select.innerHTML = '<option value="">Сканирование…</option>'; select.disabled = true; }
+  satelliteScanServices = [];
+  fetch('/api/scan-satellite', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)
+  }).then(async response => {
+    const result = await response.json();
+    if (!response.ok || result.result !== 'ok') throw new Error(result.error || `HTTP ${response.status}`);
+    satelliteScanServices = Array.isArray(result.services) ? result.services : [];
+    if (select) {
+      const currentSid = Number(document.getElementById('streamSatelliteServiceId')?.value || 0);
+      select.innerHTML = satelliteScanServices.map(service => {
+        const sid = Number(service.service_id || 0);
+        const name = service.name || `Service ${sid}`;
+        const provider = service.provider ? ` · ${service.provider}` : '';
+        const ca = service.scrambled ? ' · CA' : ' · FTA';
+        const codecs = [service.video_codec, service.audio_codec].filter(Boolean).join('/');
+        return `<option value="${sid}" ${sid===currentSid?'selected':''}>SID ${sid} · ${escapeHtmlValue(name)}${escapeHtmlValue(provider)}${ca}${codecs?` · ${escapeHtmlValue(codecs)}`:''}</option>`;
+      }).join('') || '<option value="">Каналы не найдены</option>';
+      select.disabled = satelliteScanServices.length === 0;
+      if (satelliteScanServices.length && !satelliteScanServices.some(service => Number(service.service_id) === currentSid)) select.selectedIndex = 0;
+    }
+    const frontend = result.frontend_status || {};
+    const lockText = result.lock ? 'LOCK' : 'без LOCK';
+    const signal = Number(frontend.signal_strength_raw || 0);
+    const snr = Number(frontend.snr_raw || 0);
+    const signalText = signal ? ` · signal ${(signal * 100 / 65535).toFixed(1)}%` : '';
+    const snrText = snr ? ` · SNR ${(snr * 100 / 65535).toFixed(1)}%` : '';
+    if (status) status.textContent = `${lockText} · найдено каналов: ${satelliteScanServices.length}${signalText}${snrText}. Выберите канал ниже.`;
+  }).catch(error => {
+    if (status) status.textContent = `Ошибка сканирования: ${error.message || error}`;
+    if (select) { select.innerHTML = '<option value="">Нет результатов</option>'; select.disabled = true; }
+  }).finally(() => { if (button) button.disabled = false; });
+}
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
@@ -2420,6 +2642,10 @@ function openStreamForm(stream) {
     const transcoderStatus = transcoderAvailable
       ? `Доступно: H.264 ${transcoderInfo.video_encoder || 'encoder'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
       : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
+    const adapterOptions = satelliteAdapterOptions(stream.satellite_adapter || 0);
+    const frontendOptions = satelliteFrontendOptions(stream.satellite_adapter || 0, stream.satellite_frontend || 0);
+    const caReaderOptions = conditionalAccessReaderOptions(stream.conditional_access_reader || '');
+    satelliteScanServices = [];
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
@@ -2427,8 +2653,8 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Источник основного потока</label><div class="checkbox-inline"><input id="streamSatelliteEnabled" type="checkbox" ${stream.satellite_enabled ? 'checked' : ''} onchange="updatePrimaryInputMode()" /><span>Принимать канал со спутника DVB-S / DVB-S2 вместо основного URL</span></div></div>
         <div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
         <div class="form-row full" id="streamSatelliteSettings" style="display:${stream.satellite_enabled?'block':'none'}"><label>Настройка спутникового приёма</label><div class="form-grid" style="margin-top:8px">
-          <div class="form-row"><label>Adapter</label><input id="streamSatelliteAdapter" type="number" min="0" value="${Number(stream.satellite_adapter||0)}" /></div>
-          <div class="form-row"><label>Frontend</label><input id="streamSatelliteFrontend" type="number" min="0" value="${Number(stream.satellite_frontend||0)}" /></div>
+          <div class="form-row"><label>Adapter</label><select id="streamSatelliteAdapter" onchange="updateSatelliteFrontendOptions()">${adapterOptions}</select></div>
+          <div class="form-row"><label>Frontend</label><select id="streamSatelliteFrontend">${frontendOptions}</select></div>
           <div class="form-row"><label>Частота, kHz</label><input id="streamSatelliteFrequency" type="number" min="1" step="1" value="${Number(stream.satellite_frequency||0)}" placeholder="11265000" /></div>
           <div class="form-row"><label>Symbol rate, kBd</label><input id="streamSatelliteSymbolRate" type="number" min="1" step="1" value="${Number(stream.satellite_symbol_rate||27500)}" placeholder="27500" /></div>
           <div class="form-row"><label>Система</label><select id="streamSatelliteDeliverySystem"><option value="dvb-s2" ${(stream.satellite_delivery_system||'dvb-s2')==='dvb-s2'?'selected':''}>DVB-S2</option><option value="dvb-s" ${stream.satellite_delivery_system==='dvb-s'?'selected':''}>DVB-S</option></select></div>
@@ -2443,6 +2669,8 @@ function openStreamForm(stream) {
           <div class="form-row"><label>LNB LOF1, kHz</label><input id="streamSatelliteLnbLof1" type="number" value="${Number(stream.satellite_lnb_lof1||9750000)}" /></div>
           <div class="form-row"><label>LNB LOF2, kHz</label><input id="streamSatelliteLnbLof2" type="number" value="${Number(stream.satellite_lnb_lof2||10600000)}" /></div>
           <div class="form-row"><label>LNB switch, kHz</label><input id="streamSatelliteLnbSlof" type="number" value="${Number(stream.satellite_lnb_slof||11700000)}" /></div>
+          <div class="form-row full"><label>Сканирование транспондера</label><div class="row-inline"><button class="button-secondary" id="streamSatelliteScanButton" type="button" onclick="scanSatelliteTransponder()">Сканировать транспондер</button><span id="streamSatelliteScanStatus">Настройте параметры и запустите сканирование.</span></div><select id="streamSatelliteServiceSelect" style="margin-top:8px" onchange="applySatelliteService()" disabled><option value="">Сначала выполните сканирование</option></select><small>Сканер читает PAT / SDT / PMT и показывает SID, имя, провайдера, VPID/APID, кодеки и признак CA.</small></div>
+          <div class="form-row full"><label>Устройство условного доступа</label><select id="streamConditionalAccessReader">${caReaderOptions}</select><small>Список строится из найденных /dev/ttyUSB*, /dev/ttyACM* и DVB ca*. Выбор сохраняется как инвентарь для разрешённой оператором CA/CI интеграции. TVStreamer не извлекает и не кэширует control-word ключи.</small></div>
         </div><small>Для DVB-S/S2 частота указывается в kHz, Symbol Rate — в kBd. SID выбирает программу из транспондера.</small></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
@@ -2475,8 +2703,11 @@ function openStreamForm(stream) {
     updateOutputHints();
   };
 
-  if (!state.interfaces || !state.interfaces.length) {
-    loadInterfaces().then(renderStreamForm);
+  const loaders = [];
+  if (!state.interfaces || !state.interfaces.length) loaders.push(loadInterfaces());
+  if (!state.dvb_devices) loaders.push(loadDvbDevices());
+  if (loaders.length) {
+    Promise.all(loaders).then(renderStreamForm);
   } else {
     renderStreamForm();
   }
@@ -2661,6 +2892,7 @@ function saveStream(id) {
     satellite_lnb_lof1: Number(document.getElementById('streamSatelliteLnbLof1').value || 9750000),
     satellite_lnb_lof2: Number(document.getElementById('streamSatelliteLnbLof2').value || 10600000),
     satellite_lnb_slof: Number(document.getElementById('streamSatelliteLnbSlof').value || 11700000),
+    conditional_access_reader: document.getElementById('streamConditionalAccessReader')?.value || '',
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
@@ -3125,9 +3357,16 @@ function loadInterfaces() {
     .then(data=>{ state.interfaces=data; return data; })
     .catch(() => { state.interfaces=[]; return []; });
 }
+function loadDvbDevices() {
+  return fetch('/api/dvb-devices', {cache:'no-store'})
+    .then(r=>r.json())
+    .then(data=>{ state.dvb_devices=data || {adapters:[], serial_readers:[]}; return state.dvb_devices; })
+    .catch(() => { state.dvb_devices={adapters:[], serial_readers:[]}; return state.dvb_devices; });
+}
 window.onload = () => {
   applyLanguage();
   loadInterfaces();
+  loadDvbDevices();
   statePollLoop();
   metricsPollLoop();
 };

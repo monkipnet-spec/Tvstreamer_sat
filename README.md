@@ -1000,3 +1000,25 @@ docker run --device /dev/dvb/adapter0/frontend0 \
 ```
 
 The satellite source works both for normal MPEG-TS forwarding/remap and for the external GStreamer transcoder. With transcoding enabled, `dvbbasebin` feeds the selected program to `decodebin`, then the existing H.264/AAC and CBR output pipeline is used.
+
+### DVB hardware discovery and transponder service scan
+
+The satellite editor no longer asks for adapter/frontend numbers blindly. TVStreamer5 enumerates `/dev/dvb/adapter*` and each `frontend*` at runtime through `/api/dvb-devices`. The web form uses those results to build **Adapter** and **Frontend** drop-down lists. When the frontend can be opened, the list also shows its kernel-reported name and delivery systems such as DVB-S/DVB-S2.
+
+The same hardware inventory reports DVB `ca*` devices and serial USB devices under `/dev/ttyUSB*` and `/dev/ttyACM*`. FTDI/PL2303/CP210x/CH341/usbserial devices are marked as possible Phoenix/serial smart-card reader candidates. The selected reader path can be stored in `conditional_access_reader` so an authorized CA integration can identify the intended hardware.
+
+A new **«Сканировать транспондер»** action tunes the exact DVB-S/S2 parameters currently entered in the form through `dvbbasebin`, reads the resulting MPEG-TS and parses PAT, SDT and PMT tables. The result includes:
+
+- service/program SID;
+- service and provider names;
+- PMT PID;
+- first video and audio PIDs;
+- detected video/audio codec names;
+- FTA/CA indication from SDT/PMT CA descriptors;
+- frontend lock/signal/SNR information when exposed by the driver.
+
+Selecting a discovered service copies its SID into the satellite service selector and also fills the output service name/provider and VPID/APID fields when they were discovered. Scanning is refused while another active TVStreamer stream is already using the same adapter/frontend, because retuning it would interrupt that channel.
+
+The scanner uses the same GStreamer DVB source and the same frequency/symbol-rate/LNB/DiSEqC/MIS properties as normal satellite streaming, so it does not require `dvbv5-scan` or a separate channel database.
+
+Conditional-access note: this release only discovers CA/CI and Phoenix-style serial reader devices and stores the selected reader path. It does **not** extract, share or cache control-word keys. Encrypted services are shown with the `CA` marker; descrambling should be provided through an operator-authorized CAM/CI or another authorized CA integration.

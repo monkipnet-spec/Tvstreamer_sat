@@ -48,6 +48,7 @@ struct StreamConfig {
     uint32_t satelliteLnbLof1 = 9750000;
     uint32_t satelliteLnbLof2 = 10600000;
     uint32_t satelliteLnbSlof = 11700000;
+    std::string conditionalAccessReader;
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;
