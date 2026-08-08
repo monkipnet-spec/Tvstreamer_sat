@@ -5,7 +5,9 @@
 #include <jsoncpp/json/json.h>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,6 +40,22 @@ struct ExternalSrtOutputState {
     std::thread busThread;
 };
 
+struct SatelliteTransponderState {
+    StreamConfig tuningConfig;
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+    std::string multicastAddress;
+    uint16_t multicastPort = 0;
+    size_t consumers = 0;
+};
+
+struct SatelliteServiceRelayState {
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+    std::unique_ptr<RemapContext> context;
+    uint16_t outputPort = 0;
+};
+
 struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> running{false};
@@ -53,6 +71,11 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
+    StreamConfig runtimeConfig;
+    bool sharedSatelliteInput = false;
+    std::string satelliteFrontendKey;
+    std::string satelliteServiceRelayUri;
+    std::unique_ptr<SatelliteServiceRelayState> satelliteServiceRelay;
     std::atomic<uint64_t> inputBitrate{0};
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
@@ -122,6 +145,14 @@ private:
     void stopExternalSrtOutputs(StreamState* state);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
     bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
+    bool prepareSharedSatelliteInput(StreamState* state, std::string& error);
+    void releaseSharedSatelliteInput(StreamState* state);
+    bool acquireSatelliteTransponder(const StreamConfig& cfg, std::string& frontendKey, std::string& multicastAddress, uint16_t& multicastPort, std::string& error);
+    void releaseSatelliteTransponder(const std::string& frontendKey);
+    bool startSatelliteServiceRelay(StreamState* state, const std::string& multicastAddress, uint16_t multicastPort, std::string& error);
+    void stopSatelliteServiceRelay(StreamState* state);
+    uint16_t allocateSatelliteServiceRelayPort(const std::string& streamId);
+    void releaseSatelliteServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
@@ -144,6 +175,8 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
+    std::map<std::string, std::unique_ptr<SatelliteTransponderState>> satelliteTransponders;
+    std::set<uint16_t> satelliteServiceRelayPorts;
     struct HttpClientSession {
         std::string streamId;
         std::string clientIp;

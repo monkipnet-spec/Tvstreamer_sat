@@ -1043,3 +1043,25 @@ Satellite tuner setup and transponder scanning now live in a dedicated **Add cha
 After selecting one or more services, TVStreamer5 can create all corresponding stream tiles in one save operation. Each generated tile inherits the chosen adapter/frontend/transponder/LNB/MIS settings and gets its service SID, name/provider and discovered video/audio PIDs automatically. UDP output allocation can either advance the multicast IPv4 address while keeping one port or keep one address and advance the port. Generated tiles start stopped so the operator can review output/remap/transcode settings before starting them.
 
 The regular stream editor no longer exposes satellite tuning or scanning controls. Editing an existing satellite tile preserves its DVB source configuration while allowing normal output, backup, remap and transcoder settings to be changed.
+
+### Shared DVB frontend fan-out
+
+Satellite channels that use the same Linux DVB `adapter/frontend` and exactly the same transponder tuning parameters now share one physical tuner session. TVStreamer5 starts one `dvbbasebin` per tuned frontend, forwards the complete transport stream through an internal loopback multicast relay, then creates a lightweight per-channel SID selector (`tsdemux program-number -> mpegtsmux`) for each active tile. Each selected service is exposed on its own localhost UDP relay, so the existing passthrough, remap, transcoding and output protocol code can consume it without opening the DVB frontend again.
+
+This allows multiple services discovered on one transponder to run simultaneously from one frontend. Starting another tile on the same frontend and same transponder increments the shared frontend consumer count; stopping a tile removes only its service relay. The physical frontend is released only after the last channel using that transponder stops. Attempting to tune the same frontend to a different transponder while it still has active consumers is rejected with a clear startup error instead of retuning and interrupting the other channels.
+
+Expected diagnostics include:
+
+```text
+Shared DVB frontend started: 5:0 ... relay=udp://@239.255.250.x:45xxx
+Shared DVB frontend reused: 5:0 consumers=2 ...
+Satellite service relay started: stream=... SID=230 ... service=udp://127.0.0.1:47xxx
+```
+
+The stream-tile CBR/VBR badge is positioned beside the delete button so the tile header no longer has the bitrate-mode badge floating in the center.
+
+### Compact satellite channel wizard
+
+The **Add channel** satellite wizard uses a denser four-column layout for the common tuner parameters (adapter, frontend, delivery system, polarization, frequency, symbol rate, modulation and FEC). Less frequently changed Pilot, Rolloff, DiSEqC, MIS, LNB and CA/CI settings are grouped in a collapsible **Additional DVB / LNB / CA settings** section. Signal meters, service search/multi-selection and bulk-output allocation remain visible without requiring a very tall modal.
+
+On narrower screens the wizard automatically collapses to two columns and then one column. The discovered-service list is kept in a bounded scroll area so the scan controls and bulk-create actions stay close together.

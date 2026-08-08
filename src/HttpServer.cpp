@@ -1475,11 +1475,11 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
-.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-right:82px}
 .tile .delete-button{position:absolute;top:8px;right:8px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
 .tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
 .tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff}
-.tile .badge{position:absolute;left:50%;top:10px;transform:translateX(-50%);padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .badge{position:absolute;right:30px;top:8px;left:auto;transform:none;padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
@@ -1517,15 +1517,28 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
 .modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
-.modal-content.satellite-modal{width:min(960px,100%);max-height:calc(100% - 12px);margin:0 auto}
-.sat-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-.sat-scan-status{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:#cbd4e4;font-size:.82rem}
-.sat-signal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}
-.sat-signal-box{padding:8px 10px;border:1px solid rgba(255,255,255,.08);border-radius:11px;background:rgba(255,255,255,.025)}
-.sat-signal-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:5px;font-size:.78rem;color:#dbe3ef}
-.sat-result-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0 7px}
-.sat-result-tools input[type="search"]{flex:1;min-width:180px}
-.sat-channel-list{display:grid;gap:6px;max-height:310px;overflow:auto;padding-right:2px}
+.modal-content.satellite-modal{width:min(980px,100%);max-height:calc(100% - 12px);margin:0 auto;padding:14px 16px}
+.modal-content.satellite-modal h2{margin-bottom:9px}
+.sat-setup-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px 9px}
+.sat-setup-grid .form-row{gap:4px;min-width:0}
+.sat-setup-grid .form-row input,.sat-setup-grid .form-row select{box-sizing:border-box;width:100%;max-width:none;padding:6px 8px}
+.sat-section{grid-column:1/-1;padding:8px 10px;border:1px solid rgba(255,255,255,.07);border-radius:11px;background:rgba(255,255,255,.02)}
+.sat-section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;color:#dce5f3;font-size:.78rem;font-weight:700}
+.sat-advanced{grid-column:1/-1;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.018);padding:0 9px}
+.sat-advanced summary{cursor:pointer;padding:7px 0;color:#b9c6d8;font-size:.76rem;font-weight:700;user-select:none}
+.sat-advanced[open] summary{margin-bottom:6px;border-bottom:1px solid rgba(255,255,255,.06)}
+.sat-advanced-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px 9px;padding-bottom:9px}
+.sat-advanced-grid .form-row{gap:4px;min-width:0}
+.sat-advanced-grid .form-row input,.sat-advanced-grid .form-row select{box-sizing:border-box;width:100%;max-width:none;padding:6px 8px}
+.sat-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.sat-toolbar .button-primary{padding:7px 11px}
+.sat-scan-status{display:flex;align-items:center;gap:6px;flex:1;min-width:220px;color:#cbd4e4;font-size:.76rem}
+.sat-signal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:7px}
+.sat-signal-box{padding:6px 8px;border:1px solid rgba(255,255,255,.08);border-radius:9px;background:rgba(255,255,255,.025)}
+.sat-signal-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;font-size:.73rem;color:#dbe3ef}
+.sat-result-tools{display:grid;grid-template-columns:minmax(180px,1fr) auto;align-items:center;gap:7px;margin:6px 0}
+.sat-result-tools input[type="search"]{min-width:0;max-width:none}
+.sat-channel-list{display:grid;gap:5px;max-height:250px;overflow:auto;padding-right:2px}
 .sat-channel-row{display:grid;grid-template-columns:auto minmax(180px,1.5fr) minmax(70px,.55fr) minmax(80px,.7fr) minmax(110px,.9fr);gap:8px;align-items:center;padding:8px 9px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.025);font-size:.8rem}
 .sat-channel-row:hover{border-color:rgba(31,139,255,.3);background:rgba(31,139,255,.05)}
 .sat-channel-row.hidden{display:none}
@@ -1535,7 +1548,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-channel-meta{color:#c9d2e2;white-space:nowrap}
 .sat-ca{display:inline-block;padding:2px 6px;border-radius:999px;font-size:.7rem;background:rgba(23,194,97,.14);color:#b6f7c2}
 .sat-ca.scrambled{background:rgba(255,189,74,.14);color:#ffe0a3}
-@media(max-width:700px){.sat-signal-grid{grid-template-columns:1fr}.sat-channel-row{grid-template-columns:auto minmax(0,1fr);}.sat-channel-meta{grid-column:2}.sat-channel-codecs{grid-column:2}}
+@media(max-width:900px){.sat-setup-grid,.sat-advanced-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-result-tools{grid-template-columns:1fr auto}}
+@media(max-width:700px){.sat-setup-grid,.sat-advanced-grid,.sat-signal-grid{grid-template-columns:1fr}.sat-result-tools{grid-template-columns:1fr}.sat-channel-row{grid-template-columns:auto minmax(0,1fr);}.sat-channel-meta{grid-column:2}.sat-channel-codecs{grid-column:2}}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -2909,25 +2923,32 @@ function openSatelliteChannelModal() {
     satelliteScanServices = [];
     openModal(`
       <h2>Добавить канал со спутника</h2>
-      <div class="form-grid">
+      <div class="sat-setup-grid">
         <div class="form-row"><label>Adapter</label><select id="channelSatelliteAdapter" onchange="updateChannelSatelliteFrontendOptions()">${satelliteAdapterOptions(firstAdapter)}</select></div>
         <div class="form-row"><label>Frontend</label><select id="channelSatelliteFrontend">${satelliteFrontendOptions(firstAdapter, 0)}</select></div>
-        <div class="form-row"><label>Частота, kHz</label><input id="channelSatelliteFrequency" type="number" min="1" step="1" placeholder="11531000" /></div>
-        <div class="form-row"><label>Symbol rate, kBd</label><input id="channelSatelliteSymbolRate" type="number" min="1" step="1" value="22000" /></div>
         <div class="form-row"><label>Система</label><select id="channelSatelliteDeliverySystem"><option value="dvb-s2">DVB-S2</option><option value="dvb-s">DVB-S</option></select></div>
         <div class="form-row"><label>Поляризация</label><select id="channelSatellitePolarization"><option value="H">Horizontal (H)</option><option value="V">Vertical (V)</option></select></div>
+
+        <div class="form-row"><label>Частота, kHz</label><input id="channelSatelliteFrequency" type="number" min="1" step="1" placeholder="11531000" /></div>
+        <div class="form-row"><label>Symbol rate, kBd</label><input id="channelSatelliteSymbolRate" type="number" min="1" step="1" value="22000" /></div>
         <div class="form-row"><label>Модуляция</label><select id="channelSatelliteModulation"><option value="auto">Auto</option><option value="qpsk">QPSK</option><option value="8psk">8PSK</option><option value="16apsk">16APSK</option><option value="32apsk">32APSK</option></select></div>
         <div class="form-row"><label>FEC</label><select id="channelSatelliteFec"><option value="auto">Auto</option>${['1/2','2/3','3/4','4/5','5/6','6/7','7/8','8/9','3/5','9/10','2/5'].map(v=>`<option value="${v}">${v}</option>`).join('')}</select></div>
-        <div class="form-row"><label>Pilot</label><select id="channelSatellitePilot"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select></div>
-        <div class="form-row"><label>Rolloff</label><select id="channelSatelliteRolloff"><option value="auto">Auto</option><option value="35">0.35</option><option value="25">0.25</option><option value="20">0.20</option></select></div>
-        <div class="form-row"><label>DiSEqC source</label><input id="channelSatelliteDiseqcSource" type="number" min="-1" max="7" value="-1" /><small>-1 = выключено</small></div>
-        <div class="form-row"><label>Stream ID / MIS</label><input id="channelSatelliteStreamId" type="number" min="-1" max="255" value="-1" /><small>-1 = auto/off</small></div>
-        <div class="form-row"><label>LNB LOF1, kHz</label><input id="channelSatelliteLnbLof1" type="number" value="9750000" /></div>
-        <div class="form-row"><label>LNB LOF2, kHz</label><input id="channelSatelliteLnbLof2" type="number" value="10600000" /></div>
-        <div class="form-row"><label>LNB switch, kHz</label><input id="channelSatelliteLnbSlof" type="number" value="11700000" /></div>
-        <div class="form-row"><label>Устройство условного доступа</label><select id="satelliteConditionalAccessReader">${conditionalAccessReaderOptions('')}</select></div>
 
-        <div class="form-row full">
+        <details class="sat-advanced">
+          <summary>Дополнительные настройки DVB / LNB / CA</summary>
+          <div class="sat-advanced-grid">
+            <div class="form-row"><label>Pilot</label><select id="channelSatellitePilot"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select></div>
+            <div class="form-row"><label>Rolloff</label><select id="channelSatelliteRolloff"><option value="auto">Auto</option><option value="35">0.35</option><option value="25">0.25</option><option value="20">0.20</option></select></div>
+            <div class="form-row"><label>DiSEqC source</label><input id="channelSatelliteDiseqcSource" type="number" min="-1" max="7" value="-1" /></div>
+            <div class="form-row"><label>Stream ID / MIS</label><input id="channelSatelliteStreamId" type="number" min="-1" max="255" value="-1" /></div>
+            <div class="form-row"><label>LNB LOF1, kHz</label><input id="channelSatelliteLnbLof1" type="number" value="9750000" /></div>
+            <div class="form-row"><label>LNB LOF2, kHz</label><input id="channelSatelliteLnbLof2" type="number" value="10600000" /></div>
+            <div class="form-row"><label>LNB switch, kHz</label><input id="channelSatelliteLnbSlof" type="number" value="11700000" /></div>
+            <div class="form-row"><label>Устройство CA / CI</label><select id="satelliteConditionalAccessReader">${conditionalAccessReaderOptions('')}</select></div>
+          </div>
+        </details>
+
+        <div class="sat-section">
           <div class="sat-toolbar"><button class="button-primary" id="satelliteScanButton" type="button" onclick="scanSatelliteChannels()">Сканировать транспондер</button><span class="sat-scan-status" id="satelliteScanStatus">Настройте транспондер и запустите поиск каналов.</span></div>
           <div class="sat-signal-grid">
             <div class="sat-signal-box"><div class="sat-signal-head"><strong>Уровень сигнала</strong><span data-role="sat-scan-signal-value">0%</span></div><div class="dvb-meter-track"><div data-role="sat-scan-signal-fill" class="dvb-meter-fill bad" style="width:0%"></div></div></div>
@@ -2935,19 +2956,23 @@ function openSatelliteChannelModal() {
           </div>
         </div>
 
-        <div class="form-row full"><label>Найденные каналы</label>
-          <div class="sat-result-tools"><input id="satelliteChannelSearch" type="search" placeholder="Поиск по имени, провайдеру, SID или PID" oninput="filterSatelliteChannelResults()" /><label class="checkbox-inline"><input type="checkbox" onchange="toggleAllSatelliteChannels(this.checked)" /><span>Выбрать видимые</span></label><strong id="satelliteSelectionCount">Выбрано: 0</strong></div>
+        <div class="sat-section">
+          <div class="sat-section-title"><span>Найденные каналы</span><span id="satelliteSelectionCount">Выбрано: 0</span></div>
+          <div class="sat-result-tools"><input id="satelliteChannelSearch" type="search" placeholder="Поиск: имя, провайдер, SID, PID" oninput="filterSatelliteChannelResults()" /><label class="checkbox-inline"><input type="checkbox" onchange="toggleAllSatelliteChannels(this.checked)" /><span>Выбрать видимые</span></label></div>
           <div class="sat-channel-list" id="satelliteChannelResults"><div class="backup-library-empty">После сканирования найденные сервисы появятся здесь.</div></div>
         </div>
 
-        <div class="form-row full"><label>Выход для создаваемых плиток</label><div class="form-grid" style="margin-top:6px">
-          <div class="form-row"><label>Тип</label><select id="satelliteOutputType"><option value="udp-cbr">UDP MPEG-TS CBR</option><option value="udp-vbr">UDP MPEG-TS VBR</option></select></div>
-          <div class="form-row"><label>Интерфейс вывода</label><select id="satelliteOutputInterface"><option value="">Auto / все интерфейсы</option>${outputInterfaces}</select></div>
-          <div class="form-row"><label>Начальный IP</label><input id="satelliteOutputHost" value="239.100.1.1" placeholder="239.100.1.1" /></div>
-          <div class="form-row"><label>Порт</label><input id="satelliteOutputPort" type="number" min="1" max="65535" value="1234" /></div>
-          <div class="form-row"><label>Распределение</label><select id="satelliteOutputAllocation"><option value="increment-ip">Следующий multicast IP, порт одинаковый</option><option value="increment-port">IP одинаковый, следующий порт</option></select></div>
-          <div class="form-row"><label>CBR / target, кбит/с</label><input id="satelliteOutputBitrate" type="number" min="1" value="12000" /></div>
-        </div><small>Каждый выбранный сервис создаёт отдельную остановленную плитку. Имя, SID, VPID/APID и провайдер заполняются автоматически из PAT/SDT/PMT.</small></div>
+        <div class="sat-section">
+          <div class="sat-section-title"><span>Выход для создаваемых плиток</span><small>Каждый выбранный SID создаёт отдельную остановленную плитку.</small></div>
+          <div class="sat-setup-grid">
+            <div class="form-row"><label>Тип</label><select id="satelliteOutputType"><option value="udp-cbr">UDP MPEG-TS CBR</option><option value="udp-vbr">UDP MPEG-TS VBR</option></select></div>
+            <div class="form-row"><label>Интерфейс</label><select id="satelliteOutputInterface"><option value="">Auto / все интерфейсы</option>${outputInterfaces}</select></div>
+            <div class="form-row"><label>Начальный IP</label><input id="satelliteOutputHost" value="239.100.1.1" placeholder="239.100.1.1" /></div>
+            <div class="form-row"><label>Порт</label><input id="satelliteOutputPort" type="number" min="1" max="65535" value="1234" /></div>
+            <div class="form-row"><label>Распределение</label><select id="satelliteOutputAllocation"><option value="increment-ip">Следующий multicast IP</option><option value="increment-port">Следующий порт</option></select></div>
+            <div class="form-row"><label>CBR / target, кбит/с</label><input id="satelliteOutputBitrate" type="number" min="1" value="12000" /></div>
+          </div>
+        </div>
       </div>
       <div class="modal-actions">
         <span id="satelliteCreateStatus" style="margin-right:auto;color:#aeb8ca"></span>

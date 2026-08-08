@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -1084,6 +1085,58 @@ bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
            outputConfig.outputPort > 0;
 }
 
+std::string satelliteFrontendKeyForConfig(const StreamConfig& cfg) {
+    return std::to_string(cfg.satelliteAdapter) + ":" + std::to_string(cfg.satelliteFrontend);
+}
+
+bool sameSatelliteTune(const StreamConfig& left, const StreamConfig& right) {
+    return left.satelliteAdapter == right.satelliteAdapter &&
+           left.satelliteFrontend == right.satelliteFrontend &&
+           left.satelliteFrequency == right.satelliteFrequency &&
+           left.satelliteSymbolRate == right.satelliteSymbolRate &&
+           toLower(left.satellitePolarization) == toLower(right.satellitePolarization) &&
+           toLower(left.satelliteDeliverySystem) == toLower(right.satelliteDeliverySystem) &&
+           toLower(left.satelliteModulation) == toLower(right.satelliteModulation) &&
+           toLower(left.satelliteFec) == toLower(right.satelliteFec) &&
+           toLower(left.satellitePilot) == toLower(right.satellitePilot) &&
+           toLower(left.satelliteRolloff) == toLower(right.satelliteRolloff) &&
+           left.satelliteDiseqcSource == right.satelliteDiseqcSource &&
+           left.satelliteStreamId == right.satelliteStreamId &&
+           left.satelliteLnbLof1 == right.satelliteLnbLof1 &&
+           left.satelliteLnbLof2 == right.satelliteLnbLof2 &&
+           left.satelliteLnbSlof == right.satelliteLnbSlof;
+}
+
+std::string satelliteHubMulticastAddress(const StreamConfig& cfg) {
+    const unsigned slot = static_cast<unsigned>((cfg.satelliteAdapter * 16 + cfg.satelliteFrontend) % 250);
+    return "239.255.250." + std::to_string(slot + 1);
+}
+
+uint16_t satelliteHubMulticastPort(const StreamConfig& cfg) {
+    const unsigned slot = static_cast<unsigned>((cfg.satelliteAdapter * 16 + cfg.satelliteFrontend) % 1000);
+    return static_cast<uint16_t>(45000 + slot);
+}
+
+std::string popPipelineError(GstBus* bus, const std::string& fallback) {
+    if (!bus) return fallback;
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 1500 * GST_MSECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING));
+    if (!msg) return fallback;
+    std::string result = fallback;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError* err = nullptr;
+        gchar* dbg = nullptr;
+        gst_message_parse_error(msg, &err, &dbg);
+        if (err && err->message) result = err->message;
+        if (dbg && *dbg) result += std::string(" | ") + dbg;
+        if (err) g_error_free(err);
+        g_free(dbg);
+    }
+    gst_message_unref(msg);
+    return result;
+}
+
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
@@ -1095,6 +1148,343 @@ StreamManager::~StreamManager() {
     stopAll();
 }
 
+uint16_t StreamManager::allocateSatelliteServiceRelayPort(const std::string& streamId) {
+    constexpr uint16_t kFirstPort = 47000;
+    constexpr uint16_t kPortCount = 12000;
+    const size_t hash = std::hash<std::string>{}(streamId);
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for (uint16_t offset = 0; offset < kPortCount; ++offset) {
+        const uint16_t port = static_cast<uint16_t>(kFirstPort + ((hash + offset) % kPortCount));
+        if (satelliteServiceRelayPorts.insert(port).second) {
+            return port;
+        }
+    }
+    return 0;
+}
+
+void StreamManager::releaseSatelliteServiceRelayPort(uint16_t port) {
+    if (!port) return;
+    std::lock_guard<std::mutex> lock(managerMutex);
+    satelliteServiceRelayPorts.erase(port);
+}
+
+bool StreamManager::acquireSatelliteTransponder(
+    const StreamConfig& cfg,
+    std::string& frontendKey,
+    std::string& multicastAddress,
+    uint16_t& multicastPort,
+    std::string& error) {
+    frontendKey = satelliteFrontendKeyForConfig(cfg);
+    error.clear();
+
+    std::lock_guard<std::mutex> lock(managerMutex);
+    auto existing = satelliteTransponders.find(frontendKey);
+    if (existing != satelliteTransponders.end()) {
+        if (!sameSatelliteTune(existing->second->tuningConfig, cfg)) {
+            const auto& active = existing->second->tuningConfig;
+            std::ostringstream ss;
+            ss << "DVB adapter " << cfg.satelliteAdapter << " frontend " << cfg.satelliteFrontend
+               << " is already tuned to " << active.satelliteFrequency << " kHz SR "
+               << active.satelliteSymbolRate << " " << active.satellitePolarization
+               << "; stop those channels before tuning another transponder";
+            error = ss.str();
+            return false;
+        }
+        ++existing->second->consumers;
+        multicastAddress = existing->second->multicastAddress;
+        multicastPort = existing->second->multicastPort;
+        std::cerr << "Shared DVB frontend reused: " << frontendKey
+                  << " consumers=" << existing->second->consumers
+                  << " relay=udp://@" << multicastAddress << ":" << multicastPort << std::endl;
+        return true;
+    }
+
+    auto shared = std::make_unique<SatelliteTransponderState>();
+    shared->tuningConfig = cfg;
+    shared->multicastAddress = satelliteHubMulticastAddress(cfg);
+    shared->multicastPort = satelliteHubMulticastPort(cfg);
+    shared->consumers = 1;
+
+    GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(cfg.satelliteAdapter) + "_" + std::to_string(cfg.satelliteFrontend)).c_str());
+    GstElement* source = gst_element_factory_make("dvbbasebin", "shared_satellite_source");
+    GstElement* queue = gst_element_factory_make("queue", "shared_satellite_queue");
+    GstElement* sink = gst_element_factory_make("udpsink", "shared_satellite_multicast_sink");
+    if (!pipeline || !source || !queue || !sink ||
+        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+        } else {
+            if (source && !GST_OBJECT_PARENT(source)) gst_object_unref(source);
+            if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+            if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+        }
+        error = "failed to create shared DVB frontend pipeline";
+        return false;
+    }
+
+    configureQueue(queue, 12000000000ULL);
+    setIntPropertyIfPresent(source, "adapter", cfg.satelliteAdapter);
+    setIntPropertyIfPresent(source, "frontend", cfg.satelliteFrontend);
+    setUIntPropertyIfPresent(source, "frequency", cfg.satelliteFrequency);
+    setUIntPropertyIfPresent(source, "symbol-rate", cfg.satelliteSymbolRate);
+    setStringPropertyIfPresent(source, "polarity", cfg.satellitePolarization);
+    setSerializedPropertyIfPresent(source, "delsys", cfg.satelliteDeliverySystem);
+    setSerializedPropertyIfPresent(source, "modulation", cfg.satelliteModulation);
+    setSerializedPropertyIfPresent(source, "code-rate-hp", cfg.satelliteFec);
+    setSerializedPropertyIfPresent(source, "pilot", cfg.satellitePilot);
+    setSerializedPropertyIfPresent(source, "rolloff", cfg.satelliteRolloff);
+    setIntPropertyIfPresent(source, "diseqc-source", cfg.satelliteDiseqcSource);
+    setIntPropertyIfPresent(source, "stream-id", cfg.satelliteStreamId);
+    setUIntPropertyIfPresent(source, "lnb-lof1", cfg.satelliteLnbLof1);
+    setUIntPropertyIfPresent(source, "lnb-lof2", cfg.satelliteLnbLof2);
+    setUIntPropertyIfPresent(source, "lnb-slof", cfg.satelliteLnbSlof);
+    setUInt64PropertyIfPresent(source, "tuning-timeout", 10000000ULL);
+
+    g_object_set(sink,
+        "host", shared->multicastAddress.c_str(),
+        "port", static_cast<gint>(shared->multicastPort),
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+    setStringPropertyIfPresent(sink, "multicast-iface", "lo");
+    setBooleanPropertyIfPresent(sink, "auto-multicast", TRUE);
+    setBooleanPropertyIfPresent(sink, "loop", TRUE);
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setIntPropertyIfPresent(sink, "ttl-mc", 1);
+    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
+
+    if (!gst_element_link_many(source, queue, sink, nullptr)) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        error = "failed to link shared DVB frontend pipeline";
+        return false;
+    }
+
+    shared->pipeline = pipeline;
+    shared->bus = gst_element_get_bus(pipeline);
+    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        error = popPipelineError(shared->bus, "failed to start shared DVB frontend");
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        if (shared->bus) gst_object_unref(shared->bus);
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    multicastAddress = shared->multicastAddress;
+    multicastPort = shared->multicastPort;
+    std::cerr << "Shared DVB frontend started: " << frontendKey
+              << " frequency_khz=" << cfg.satelliteFrequency
+              << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
+              << " polarity=" << cfg.satellitePolarization
+              << " relay=udp://@" << multicastAddress << ":" << multicastPort << std::endl;
+    satelliteTransponders[frontendKey] = std::move(shared);
+    return true;
+}
+
+void StreamManager::releaseSatelliteTransponder(const std::string& frontendKey) {
+    if (frontendKey.empty()) return;
+    std::unique_ptr<SatelliteTransponderState> released;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = satelliteTransponders.find(frontendKey);
+        if (found == satelliteTransponders.end()) return;
+        if (found->second->consumers > 1) {
+            --found->second->consumers;
+            std::cerr << "Shared DVB frontend retained: " << frontendKey
+                      << " consumers=" << found->second->consumers << std::endl;
+            return;
+        }
+        released = std::move(found->second);
+        satelliteTransponders.erase(found);
+    }
+    if (released->pipeline) {
+        gst_element_set_state(released->pipeline, GST_STATE_NULL);
+        gst_element_get_state(released->pipeline, nullptr, nullptr, GST_SECOND);
+    }
+    if (released->bus) gst_object_unref(released->bus);
+    if (released->pipeline) gst_object_unref(released->pipeline);
+    std::cerr << "Shared DVB frontend stopped: " << frontendKey << std::endl;
+}
+
+bool StreamManager::startSatelliteServiceRelay(
+    StreamState* state,
+    const std::string& multicastAddress,
+    uint16_t multicastPort,
+    std::string& error) {
+    if (!state) {
+        error = "invalid stream state for satellite service relay";
+        return false;
+    }
+    const bool wholeTransponder = state->config.satelliteServiceId == 0;
+
+    const uint16_t outputPort = allocateSatelliteServiceRelayPort(state->config.id);
+    if (!outputPort) {
+        error = "no free internal UDP port for satellite service relay";
+        return false;
+    }
+
+    auto relay = std::make_unique<SatelliteServiceRelayState>();
+    relay->outputPort = outputPort;
+    if (!wholeTransponder) {
+        relay->context = std::make_unique<RemapContext>();
+        relay->context->config = state->config;
+        relay->context->config.cbr = false;
+        relay->context->config.targetBitrate = 0;
+        relay->context->config.remapEnabled = false;
+    }
+
+    GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
+    GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
+    GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
+    GstElement* parse = gst_element_factory_make("tsparse", "shared_transponder_parse");
+    GstElement* demux = wholeTransponder ? nullptr : gst_element_factory_make("tsdemux", "shared_service_demux");
+    GstElement* mux = wholeTransponder ? nullptr : gst_element_factory_make("mpegtsmux", "shared_service_mux");
+    GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
+    GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
+    if (!pipeline || !source || !inputQueue || !parse || !outputQueue || !sink ||
+        (!wholeTransponder && (!demux || !mux)) ||
+        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
+        !addElementOrFail(pipeline, parse) ||
+        (!wholeTransponder && (!addElementOrFail(pipeline, demux) || !addElementOrFail(pipeline, mux))) ||
+        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+        }
+        releaseSatelliteServiceRelayPort(outputPort);
+        error = "failed to create satellite service relay pipeline";
+        return false;
+    }
+
+    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+    g_object_set(source,
+        "address", multicastAddress.c_str(),
+        "port", static_cast<gint>(multicastPort),
+        "reuse", TRUE,
+        "auto-multicast", TRUE,
+        "buffer-size", 16 * 1024 * 1024,
+        "caps", caps,
+        nullptr);
+    if (caps) gst_caps_unref(caps);
+    setStringPropertyIfPresent(source, "multicast-iface", "lo");
+    configureQueue(inputQueue, 12000000000ULL);
+    configureTsPacketAlignment(parse);
+    setBooleanPropertyIfPresent(parse, "set-timestamps", FALSE);
+    if (!wholeTransponder) {
+        setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(state->config.satelliteServiceId));
+        configureTsMux(mux, relay->context->config);
+        sendServiceDescription(mux, relay->context->config);
+    }
+    configureQueue(outputQueue, 8000000000ULL);
+    g_object_set(sink,
+        "host", "127.0.0.1",
+        "port", static_cast<gint>(outputPort),
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
+
+    const bool linked = wholeTransponder
+        ? gst_element_link_many(source, inputQueue, parse, outputQueue, sink, nullptr)
+        : (gst_element_link_many(source, inputQueue, parse, demux, nullptr) &&
+           gst_element_link_many(mux, outputQueue, sink, nullptr));
+    if (!linked) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        releaseSatelliteServiceRelayPort(outputPort);
+        error = "failed to link satellite service relay pipeline";
+        return false;
+    }
+
+    if (!wholeTransponder) {
+        relay->context->mux = mux;
+        relay->context->sink = sink;
+        relay->context->flvMux = false;
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), relay->context.get());
+    }
+    relay->pipeline = pipeline;
+    relay->bus = gst_element_get_bus(pipeline);
+
+    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        error = popPipelineError(relay->bus, "failed to start satellite service relay");
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        if (relay->bus) gst_object_unref(relay->bus);
+        gst_object_unref(pipeline);
+        releaseSatelliteServiceRelayPort(outputPort);
+        return false;
+    }
+
+    state->satelliteServiceRelayUri = "udp://127.0.0.1:" + std::to_string(outputPort);
+    state->satelliteServiceRelay = std::move(relay);
+    std::cerr << "Satellite service relay started: stream=" << state->config.id
+              << " SID=" << state->config.satelliteServiceId
+              << " transponder=udp://@" << multicastAddress << ":" << multicastPort
+              << " service=" << state->satelliteServiceRelayUri << std::endl;
+    return true;
+}
+
+void StreamManager::stopSatelliteServiceRelay(StreamState* state) {
+    if (!state || !state->satelliteServiceRelay) return;
+    auto relay = std::move(state->satelliteServiceRelay);
+    if (relay->pipeline) {
+        gst_element_set_state(relay->pipeline, GST_STATE_NULL);
+        gst_element_get_state(relay->pipeline, nullptr, nullptr, GST_SECOND);
+    }
+    if (relay->bus) gst_object_unref(relay->bus);
+    if (relay->pipeline) gst_object_unref(relay->pipeline);
+    releaseSatelliteServiceRelayPort(relay->outputPort);
+}
+
+bool StreamManager::prepareSharedSatelliteInput(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "invalid stream state";
+        return false;
+    }
+    state->runtimeConfig = state->config;
+    if (!state->config.satelliteEnabled || state->config.testPattern) {
+        return true;
+    }
+
+    std::string multicastAddress;
+    uint16_t multicastPort = 0;
+    if (!acquireSatelliteTransponder(
+            state->config, state->satelliteFrontendKey, multicastAddress, multicastPort, error)) {
+        return false;
+    }
+    if (!startSatelliteServiceRelay(state, multicastAddress, multicastPort, error)) {
+        releaseSatelliteTransponder(state->satelliteFrontendKey);
+        state->satelliteFrontendKey.clear();
+        return false;
+    }
+
+    state->sharedSatelliteInput = true;
+    state->runtimeConfig = state->config;
+    state->runtimeConfig.satelliteEnabled = false;
+    state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
+    state->runtimeConfig.inputMode = "udp";
+    state->runtimeConfig.inputInterfaceAddress.clear();
+    state->runtimeConfig.inputInterfaceAddressConfigured = true;
+    std::cerr << "Satellite shared-input attached: stream=" << state->config.id
+              << " frontend=" << state->satelliteFrontendKey
+              << " SID=" << state->config.satelliteServiceId
+              << " source=" << state->satelliteServiceRelayUri << std::endl;
+    return true;
+}
+
+void StreamManager::releaseSharedSatelliteInput(StreamState* state) {
+    if (!state) return;
+    stopSatelliteServiceRelay(state);
+    if (!state->satelliteFrontendKey.empty()) {
+        releaseSatelliteTransponder(state->satelliteFrontendKey);
+    }
+    state->satelliteFrontendKey.clear();
+    state->satelliteServiceRelayUri.clear();
+    state->sharedSatelliteInput = false;
+}
 
 void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg) {
     if (!sink) {
@@ -1321,6 +1711,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
 
     auto state = std::make_unique<StreamState>();
     state->config = streamConfig;
+    state->runtimeConfig = streamConfig;
     state->primarySatelliteEnabled = streamConfig.satelliteEnabled;
     state->primaryInputUri = streamConfig.satelliteEnabled
         ? tvs::protocols::inputUriForGstreamer(streamConfig)
@@ -1331,23 +1722,32 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
 
+    std::string sharedSatelliteError;
+    if (!prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
+        state->statusMessage = "satellite shared input failed: " + sharedSatelliteError;
+        if (error) *error = sharedSatelliteError;
+        return false;
+    }
+
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
         std::string srtRelayError;
         if (!startExternalSrtOutputs(state.get(), srtRelayError)) {
             std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
                       << ": " << srtRelayError << std::endl;
             state->statusMessage = "transcoded srt output failed: " + srtRelayError;
+            releaseSharedSatelliteInput(state.get());
             if (error) *error = srtRelayError.empty() ? "failed to start transcoded SRT output" : srtRelayError;
             return false;
         }
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
-        if (!gstTranscoder->start(streamConfig, gstError)) {
+        if (!gstTranscoder->start(state->runtimeConfig, gstError)) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
             stopExternalSrtOutputs(state.get());
+            releaseSharedSatelliteInput(state.get());
             if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
@@ -1367,6 +1767,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
+        const std::string notificationInputUri = state->primaryInputUri;
 
         bool duplicateStart = false;
         {
@@ -1384,6 +1785,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 if (state->gstTranscoder) {
                     state->gstTranscoder->stop();
                 }
+                releaseSharedSatelliteInput(state.get());
             }
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
@@ -1392,13 +1794,14 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             streamConfig,
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + state->primaryInputUri);
+            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + notificationInputUri);
         return true;
     }
 
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
+        releaseSharedSatelliteInput(state.get());
         if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
     }
@@ -1471,11 +1874,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         }
         state->pipeline = nullptr;
         gst_object_unref(pipeline);
+        releaseSharedSatelliteInput(state.get());
         if (error) *error = playingError;
         return false;
     }
 
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
+    const std::string notificationInputUri = state->primaryInputUri;
     bool duplicateStart = false;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
@@ -1499,6 +1904,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             gst_object_unref(state->pipeline);
             state->pipeline = nullptr;
         }
+        releaseSharedSatelliteInput(state.get());
         if (error) *error = "duplicate stream start detected: " + streamConfig.id;
         return false;
     }
@@ -1506,7 +1912,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         streamConfig,
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
-        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + state->primaryInputUri);
+        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + notificationInputUri);
     return true;
 }
 
@@ -1563,6 +1969,7 @@ bool StreamManager::stopStream(const std::string& id) {
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
+    releaseSharedSatelliteInput(&state);
     state.outputContexts.clear();
     state.sourceContext.reset();
 
@@ -1618,6 +2025,7 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
         }
+        releaseSharedSatelliteInput(&state);
         state.outputContexts.clear();
         state.sourceContext.reset();
     }
@@ -2145,8 +2553,9 @@ bool StreamManager::probeInputAvailable(
     probeState.config = baseConfig;
     probeState.config.inputUri = inputUri;
     probeState.config.testPattern = false;
+    probeState.runtimeConfig = probeState.config;
     probeState.sourceContext = std::make_unique<RemapContext>();
-    probeState.sourceContext->config = probeState.config;
+    probeState.sourceContext->config = probeState.runtimeConfig;
 
     GstElement* pipeline = gst_pipeline_new(nullptr);
     if (!pipeline) {
@@ -2222,10 +2631,22 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         gst_element_set_state(oldPipeline, GST_STATE_NULL);
     }
 
-    state->config.inputUri = inputUri;
-    state->config.satelliteEnabled = !useBackup && state->primarySatelliteEnabled;
+    state->runtimeConfig = state->config;
+    if (useBackup) {
+        state->runtimeConfig.satelliteEnabled = false;
+        state->runtimeConfig.inputUri = inputUri;
+    } else if (state->sharedSatelliteInput) {
+        state->runtimeConfig.satelliteEnabled = false;
+        state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
+        state->runtimeConfig.inputMode = "udp";
+        state->runtimeConfig.inputInterfaceAddress.clear();
+        state->runtimeConfig.inputInterfaceAddressConfigured = true;
+    } else {
+        state->runtimeConfig.inputUri = inputUri;
+        state->runtimeConfig.satelliteEnabled = state->primarySatelliteEnabled;
+    }
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = state->config;
+    state->sourceContext->config = state->runtimeConfig;
     state->outputContexts.clear();
 
     GstElement* newPipeline = createPipeline(state);
@@ -2246,7 +2667,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->backupAttempted = useBackup;
     state->primaryRetryPending = !useBackup;
     state->inputLossNotified = false;
-    state->activeInputUri = inputUri;
+    state->activeInputUri = useBackup ? inputUri : state->primaryInputUri;
     state->active = true;
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
@@ -2334,7 +2755,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     if (!state) {
         return nullptr;
     }
-    const StreamConfig& cfg = state->config;
+    const StreamConfig& cfg = state->runtimeConfig;
     const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
     const std::string inputLower = toLower(input);
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
@@ -3671,8 +4092,18 @@ void StreamManager::monitorBus(const std::string& id) {
                     // The active backup-file pipeline keeps playing uninterrupted while
                     // availability is checked. Switch only after real media data arrives.
                     StreamConfig primaryProbeConfig = state->config;
-                    primaryProbeConfig.satelliteEnabled = state->primarySatelliteEnabled;
-                    if (probeInputAvailable(primaryProbeConfig, primaryUri, kInputFailoverDelay)) {
+                    std::string primaryProbeUri = primaryUri;
+                    if (state->sharedSatelliteInput) {
+                        primaryProbeConfig.satelliteEnabled = false;
+                        primaryProbeConfig.inputUri = state->satelliteServiceRelayUri;
+                        primaryProbeConfig.inputMode = "udp";
+                        primaryProbeConfig.inputInterfaceAddress.clear();
+                        primaryProbeConfig.inputInterfaceAddressConfigured = true;
+                        primaryProbeUri = state->satelliteServiceRelayUri;
+                    } else {
+                        primaryProbeConfig.satelliteEnabled = state->primarySatelliteEnabled;
+                    }
+                    if (probeInputAvailable(primaryProbeConfig, primaryProbeUri, kInputFailoverDelay)) {
                         notifyStreamState(
                             state->config,
                             "🟢",
