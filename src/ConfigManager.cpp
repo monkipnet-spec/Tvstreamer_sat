@@ -23,11 +23,17 @@ CaProviderConfig CaProviderConfig::fromJson(const Json::Value& root) {
     CaProviderConfig config;
     config.id = root.get("id", "").asString();
     config.name = root.get("name", config.id).asString();
-    config.backendType = root.get("backend_type", "external").asString();
-    if (config.backendType.empty()) config.backendType = "external";
-    config.endpoint = root.get("endpoint", "").asString();
-    config.maxChannels = std::clamp(root.get("max_channels", 8).asInt(), 1, 64);
+    config.readerById = root.get("reader_by_id", "").asString();
+    config.capacityMode = toLower(root.get("capacity_mode", "manual").asString());
+    if (config.capacityMode != "auto" && config.capacityMode != "manual") {
+        config.capacityMode = "manual";
+    }
+    // No provider-wide 8-channel assumption: each card/provider owns its own capacity.
+    config.maxChannels = std::clamp(root.get("max_channels", 1).asInt(), 1, 1024);
     config.enabled = root.get("enabled", true).asBool();
+    config.backendType = root.get("backend_type", "reader").asString();
+    if (config.backendType.empty()) config.backendType = "reader";
+    config.endpoint = root.get("endpoint", "").asString();
     return config;
 }
 
@@ -35,10 +41,13 @@ Json::Value CaProviderConfig::toJson() const {
     Json::Value root;
     root["id"] = id;
     root["name"] = name;
-    root["backend_type"] = backendType;
-    root["endpoint"] = endpoint;
-    root["max_channels"] = std::clamp(maxChannels, 1, 64);
+    root["reader_by_id"] = readerById;
+    root["capacity_mode"] = capacityMode == "auto" ? "auto" : "manual";
+    root["max_channels"] = std::clamp(maxChannels, 1, 1024);
     root["enabled"] = enabled;
+    // Keep legacy keys for backward compatibility; v85 does not use them as a channel transport.
+    root["backend_type"] = "reader";
+    root["endpoint"] = "";
     return root;
 }
 

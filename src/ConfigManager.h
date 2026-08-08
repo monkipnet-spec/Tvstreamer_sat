@@ -19,10 +19,17 @@ struct StreamOutputConfig {
 struct CaProviderConfig {
     std::string id;
     std::string name;
-    std::string backendType = "external";
-    std::string endpoint;
-    int maxChannels = 8;
+    // Stable Linux serial-reader identity. Prefer /dev/serial/by-id/* over ttyUSB/ttyACM numbers.
+    std::string readerById;
+    // Capacity belongs to the selected card/provider and is never a global TVStreamer constant.
+    // "manual" uses maxChannels. "auto" uses a capability reported by an authorized card
+    // interface when available and otherwise falls back to maxChannels.
+    std::string capacityMode = "manual";
+    int maxChannels = 1;
     bool enabled = true;
+    // Legacy fields are retained only so old v82-v84 configuration files can be loaded safely.
+    std::string backendType = "reader";
+    std::string endpoint;
 
     Json::Value toJson() const;
     static CaProviderConfig fromJson(const Json::Value& root);

@@ -49,31 +49,6 @@ const CaProviderConfig* findCaProvider(const ConfigManager& manager, const std::
     return nullptr;
 }
 
-bool isAuthorizedTsProvider(const CaProviderConfig& provider) {
-    const std::string type = toLower(provider.backendType);
-    return type == "authorized-ts" || type == "predecoded-ts" || type == "decrypted-ts";
-}
-
-void replaceAll(std::string& value, const std::string& token, const std::string& replacement) {
-    if (token.empty()) return;
-    size_t pos = 0;
-    while ((pos = value.find(token, pos)) != std::string::npos) {
-        value.replace(pos, token.size(), replacement);
-        pos += replacement.size();
-    }
-}
-
-std::string expandAuthorizedTsEndpoint(const CaProviderConfig& provider, const StreamConfig& cfg) {
-    std::string endpoint = provider.endpoint;
-    replaceAll(endpoint, "{stream_id}", cfg.id);
-    replaceAll(endpoint, "{service_id}", std::to_string(cfg.satelliteServiceId));
-    replaceAll(endpoint, "{frequency_khz}", std::to_string(cfg.satelliteFrequency));
-    std::ostringstream mhz;
-    mhz << (static_cast<double>(cfg.satelliteFrequency) / 1000.0);
-    replaceAll(endpoint, "{frequency_mhz}", mhz.str());
-    return endpoint;
-}
-
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
     if (!factory) {
@@ -1759,32 +1734,16 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     const CaProviderConfig* caProvider = streamConfig.satelliteEnabled
         ? findCaProvider(configManager, streamConfig.caProviderId)
         : nullptr;
-    if (caProvider && isAuthorizedTsProvider(*caProvider)) {
-        if (!caProvider->enabled) {
-            if (error) *error = "CA provider '" + caProvider->name + "' is disabled";
-            return false;
-        }
-        const std::string endpoint = expandAuthorizedTsEndpoint(*caProvider, streamConfig);
-        if (endpoint.empty()) {
-            if (error) *error = "CA provider '" + caProvider->name + "' has empty authorized TS endpoint";
-            return false;
-        }
-        state->caProviderTransport = true;
+    if (caProvider) {
+        // v85 CA Provider is a dynamic reader/card/session manager. It no longer replaces the
+        // satellite input with a pre-decoded endpoint. The MPEG-TS source remains the configured
+        // DVB frontend; reader/card capability integrations can be attached independently.
         state->caProviderId = caProvider->id;
         state->caProviderName = caProvider->name;
-        state->primarySatelliteEnabled = false;
-        state->runtimeConfig.satelliteEnabled = false;
-        state->runtimeConfig.inputUri = endpoint;
-        state->runtimeConfig.inputMode = "auto";
-        state->primaryInputUri = endpoint;
-        std::cerr << "Authorized pre-decoded TS provider: stream=" << streamConfig.id
-                  << " provider=" << caProvider->id
-                  << " endpoint=" << endpoint << std::endl;
-    } else {
-        state->primaryInputUri = streamConfig.satelliteEnabled
-            ? tvs::protocols::inputUriForGstreamer(streamConfig)
-            : streamConfig.inputUri;
     }
+    state->primaryInputUri = streamConfig.satelliteEnabled
+        ? tvs::protocols::inputUriForGstreamer(streamConfig)
+        : streamConfig.inputUri;
     state->activeInputUri = streamConfig.testPattern
         ? kTestPatternUri
         : state->primaryInputUri;

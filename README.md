@@ -1005,7 +1005,7 @@ The satellite source works both for normal MPEG-TS forwarding/remap and for the 
 
 The satellite editor no longer asks for adapter/frontend numbers blindly. TVStreamer5 enumerates `/dev/dvb/adapter*` and each `frontend*` at runtime through `/api/dvb-devices`. The web form uses those results to build **Adapter** and **Frontend** drop-down lists. When the frontend can be opened, the list also shows its kernel-reported name and delivery systems such as DVB-S/DVB-S2.
 
-The same hardware inventory reports DVB `ca*` devices and serial USB devices under `/dev/ttyUSB*` and `/dev/ttyACM*`. FTDI/PL2303/CP210x/CH341/usbserial devices are marked as possible Phoenix/serial smart-card reader candidates. The selected reader path can be stored in `conditional_access_reader` so an authorized CA integration can identify the intended hardware.
+The CA Provider/Card Manager also inventories serial readers from `/dev/serial/by-id/*` and resolves the current `/dev/ttyUSB*` or `/dev/ttyACM*` target plus udev vendor/model/serial metadata. Providers store the stable by-id path rather than a volatile tty number, so a reader remains associated with the same `ca-card-N` after reboot or USB renumbering.
 
 A new **«Сканировать транспондер»** action tunes the exact DVB-S/S2 parameters currently entered in the form through `dvbbasebin`, reads the resulting MPEG-TS and parses PAT, SDT and PMT tables. The result includes:
 
@@ -1021,7 +1021,7 @@ Selecting a discovered service copies its SID into the satellite service selecto
 
 The scanner uses the same GStreamer DVB source and the same frequency/symbol-rate/LNB/DiSEqC/MIS properties as normal satellite streaming, so it does not require `dvbv5-scan` or a separate channel database.
 
-Conditional-access note: this release only discovers CA/CI and Phoenix-style serial reader devices and stores the selected reader path. It does **not** extract, share or cache control-word keys. Encrypted services are shown with the `CA` marker; descrambling should be provided through an operator-authorized CAM/CI or another authorized CA integration.
+Conditional-access note: the Reader/Card Manager discovers and tracks Phoenix-style serial readers, associates them with per-card providers and enforces per-provider session capacity. It does **not** implement ECM/CW extraction, a software descrambler or a CW cache. Encrypted services are shown with the `CA` marker; descrambling still requires an authorized card/CAM integration.
 
 ### DVB tile signal meters
 
@@ -1065,3 +1065,11 @@ The stream-tile CBR/VBR badge is positioned beside the delete button so the tile
 The **Add channel** satellite wizard uses a denser four-column layout for the common tuner parameters (adapter, frontend, delivery system, polarization, frequency, symbol rate, modulation and FEC). Less frequently changed Pilot, Rolloff, DiSEqC, MIS, LNB and CA/CI settings are grouped in a collapsible **Additional DVB / LNB / CA settings** section. Signal meters, service search/multi-selection and bulk-output allocation remain visible without requiring a very tall modal.
 
 On narrower screens the wizard automatically collapses to two columns and then one column. The discovered-service list is kept in a bounded scroll area so the scan controls and bulk-create actions stay close together.
+
+## v85: Dynamic Reader/Card Manager
+
+`System -> CA Providers` no longer assumes a fixed number of Phoenix readers or a global eight-channel limit. The UI discovers any number of `/dev/serial/by-id/*` serial readers, resolves their current tty device and udev metadata, and lets each `ca-card-N` provider bind to one stable reader identity. Readers can disappear and return without changing the configured provider association.
+
+Each card/provider owns its own session capacity. `capacity_mode=manual` uses its configured `max_channels`; `capacity_mode=auto` is reserved for a documented card/provider capability interface and currently falls back to that same per-card value if no capability is reported. New providers start with a conservative fallback of 1 rather than a hard-coded 8. The start API rejects a stream when its selected card/provider is disabled, has no reader, the reader is offline, or that provider's effective capacity is already full.
+
+The old `Authorized pre-decoded TS` endpoint is no longer part of the CA Provider UI in v85. Selecting a card/provider does not replace the DVB input transport. This release provides reader discovery, stable identity, hot-plug status and session accounting only; it does not implement ECM/CW extraction, software descrambling or key caching.

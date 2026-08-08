@@ -158,6 +158,52 @@ std::string firstProperty(const std::map<std::string, std::string>& properties,
     return "";
 }
 
+Json::Value enumerateSerialReadersJson() {
+    Json::Value root(Json::arrayValue);
+    const std::filesystem::path byIdDirectory("/dev/serial/by-id");
+    std::error_code error;
+    if (!std::filesystem::exists(byIdDirectory, error) || error) {
+        return root;
+    }
+
+    std::vector<std::filesystem::path> entries;
+    for (std::filesystem::directory_iterator iterator(byIdDirectory, error), end;
+         !error && iterator != end; iterator.increment(error)) {
+        entries.push_back(iterator->path());
+    }
+    std::sort(entries.begin(), entries.end());
+
+    for (const auto& byIdPath : entries) {
+        std::error_code canonicalError;
+        const auto resolved = std::filesystem::canonical(byIdPath, canonicalError);
+        if (canonicalError) continue;
+        const std::string device = resolved.string();
+        if (!safeDeviceNode(device)) continue;
+
+        const auto properties = udevPropertiesForDevice(device);
+        Json::Value item;
+        item["by_id"] = byIdPath.string();
+        item["by_id_name"] = byIdPath.filename().string();
+        item["device"] = device;
+        item["tty"] = resolved.filename().string();
+        item["vendor"] = firstProperty(properties, {"ID_VENDOR_FROM_DATABASE", "ID_VENDOR"});
+        item["model"] = firstProperty(properties, {"ID_MODEL_FROM_DATABASE", "ID_MODEL"});
+        item["serial"] = firstProperty(properties, {"ID_SERIAL_SHORT", "ID_SERIAL"});
+        item["usb_path"] = firstProperty(properties, {"ID_PATH", "ID_PATH_TAG"});
+        item["online"] = true;
+        root.append(item);
+    }
+    return root;
+}
+
+const Json::Value* findSerialReaderById(const Json::Value& readers, const std::string& byId) {
+    if (byId.empty() || !readers.isArray()) return nullptr;
+    for (const auto& reader : readers) {
+        if (reader.get("by_id", "").asString() == byId) return &reader;
+    }
+    return nullptr;
+}
+
 std::string base64Decode(const std::string& value) {
     static const std::string alphabet =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -731,48 +777,8 @@ std::string HttpServer::listDvbDevices() {
 }
 
 std::string HttpServer::listSerialReaders() {
-    Json::Value root(Json::arrayValue);
-    const std::filesystem::path byIdDirectory("/dev/serial/by-id");
-    std::error_code error;
-
-    if (!std::filesystem::exists(byIdDirectory, error) || error) {
-        Json::StreamWriterBuilder writer;
-        return Json::writeString(writer, root);
-    }
-
-    std::vector<std::filesystem::path> entries;
-    for (std::filesystem::directory_iterator iterator(byIdDirectory, error), end;
-         !error && iterator != end; iterator.increment(error)) {
-        entries.push_back(iterator->path());
-    }
-    std::sort(entries.begin(), entries.end());
-
-    for (const auto& byIdPath : entries) {
-        std::error_code canonicalError;
-        const auto resolved = std::filesystem::canonical(byIdPath, canonicalError);
-        if (canonicalError) {
-            continue;
-        }
-        const std::string device = resolved.string();
-        if (!safeDeviceNode(device)) {
-            continue;
-        }
-
-        const auto properties = udevPropertiesForDevice(device);
-        Json::Value item;
-        item["by_id"] = byIdPath.string();
-        item["by_id_name"] = byIdPath.filename().string();
-        item["device"] = device;
-        item["tty"] = resolved.filename().string();
-        item["vendor"] = firstProperty(properties, {"ID_VENDOR_FROM_DATABASE", "ID_VENDOR"});
-        item["model"] = firstProperty(properties, {"ID_MODEL_FROM_DATABASE", "ID_MODEL"});
-        item["serial"] = firstProperty(properties, {"ID_SERIAL_SHORT", "ID_SERIAL"});
-        item["usb_path"] = firstProperty(properties, {"ID_PATH", "ID_PATH_TAG"});
-        root.append(item);
-    }
-
     Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, root);
+    return Json::writeString(writer, enumerateSerialReadersJson());
 }
 
 std::string HttpServer::handleScanSatellite(const std::string& body) {
@@ -927,6 +933,8 @@ std::string HttpServer::currentState() {
     transcoder["missing_elements"] = missing;
     root["transcoder"] = transcoder;
     auto snap = streamManager.snapshot();
+    const Json::Value serialReaders = enumerateSerialReadersJson();
+    root["serial_reader_count"] = Json::UInt(serialReaders.size());
     Json::Value caProviders(Json::arrayValue);
     for (const auto& provider : configManager.config.caProviders) {
       Json::Value item = provider.toJson();
@@ -940,19 +948,42 @@ std::string HttpServer::currentState() {
           ++activeChannels;
         }
       }
+
+      // v85 keeps capacity per provider/card. Auto mode is ready for a documented card capability
+      // interface; until such an interface reports a value, maxChannels is the explicit fallback.
+      const int effectiveMaxChannels = std::clamp(provider.maxChannels, 1, 1024);
+      const Json::Value* reader = findSerialReaderById(serialReaders, provider.readerById);
+      const bool readerOnline = reader != nullptr;
+
       item["assigned_channels"] = assignedChannels;
       item["active_channels"] = activeChannels;
-      item["available_channels"] = provider.maxChannels > static_cast<int>(activeChannels)
-        ? provider.maxChannels - static_cast<int>(activeChannels) : 0;
-      item["capacity_ok"] = activeChannels <= static_cast<unsigned>(provider.maxChannels);
-      const std::string backendType = toLower(provider.backendType);
-      const bool authorizedTs = backendType == "authorized-ts" || backendType == "predecoded-ts" || backendType == "decrypted-ts";
-      item["backend_connected"] = authorizedTs && activeChannels > 0;
-      item["backend_status"] = authorizedTs
-        ? (provider.endpoint.empty()
-            ? "authorized TS transport: endpoint is not configured"
-            : (activeChannels > 0 ? "authorized TS transport active" : "authorized TS transport configured"))
-        : "external integration point; TVStreamer does not handle CA keys";
+      item["effective_max_channels"] = effectiveMaxChannels;
+      item["available_channels"] = effectiveMaxChannels > static_cast<int>(activeChannels)
+        ? effectiveMaxChannels - static_cast<int>(activeChannels) : 0;
+      item["capacity_ok"] = activeChannels <= static_cast<unsigned>(effectiveMaxChannels);
+      item["capacity_source"] = provider.capacityMode == "auto" ? "auto-fallback" : "manual";
+      item["auto_capacity_available"] = false;
+      item["reader_online"] = readerOnline;
+      item["card_status"] = readerOnline ? "READER_ONLINE" : (provider.readerById.empty() ? "NO_READER" : "OFFLINE");
+      item["card_metadata_available"] = false;
+      if (reader) {
+        item["reader_device"] = reader->get("device", "");
+        item["reader_tty"] = reader->get("tty", "");
+        item["reader_vendor"] = reader->get("vendor", "");
+        item["reader_model"] = reader->get("model", "");
+        item["reader_serial"] = reader->get("serial", "");
+        item["reader_usb_path"] = reader->get("usb_path", "");
+      } else {
+        item["reader_device"] = "";
+        item["reader_tty"] = "";
+        item["reader_vendor"] = "";
+        item["reader_model"] = "";
+        item["reader_serial"] = "";
+        item["reader_usb_path"] = "";
+      }
+      item["manager_status"] = readerOnline
+        ? "serial reader online; card capability/descrambling interface is not configured"
+        : (provider.readerById.empty() ? "reader is not assigned" : "configured reader is offline");
       caProviders.append(item);
     }
     root["ca_providers"] = caProviders;
@@ -1463,6 +1494,27 @@ std::string HttpServer::handleStartStream(const std::string& body) {
             Json::StreamWriterBuilder writer;
             return Json::writeString(writer, response);
         }
+        if (cfg.satelliteEnabled) {
+            if (selectedCaProvider->readerById.empty()) {
+                response["result"] = "error";
+                response["stream_id"] = cfg.id;
+                response["error"] =
+                    "CA provider '" + selectedCaProvider->name +
+                    "' has no serial reader assigned. Open System -> CA Providers and select a /dev/serial/by-id reader.";
+                Json::StreamWriterBuilder writer;
+                return Json::writeString(writer, response);
+            }
+            const Json::Value readers = enumerateSerialReadersJson();
+            if (!findSerialReaderById(readers, selectedCaProvider->readerById)) {
+                response["result"] = "error";
+                response["stream_id"] = cfg.id;
+                response["error"] =
+                    "CA provider '" + selectedCaProvider->name +
+                    "' reader is offline: " + selectedCaProvider->readerById;
+                Json::StreamWriterBuilder writer;
+                return Json::writeString(writer, response);
+            }
+        }
         unsigned activeOnProvider = 0;
         const auto managed = streamManager.snapshot();
         for (const auto& stream : configManager.config.streams) {
@@ -1472,11 +1524,12 @@ std::string HttpServer::handleStartStream(const std::string& body) {
                 ++activeOnProvider;
             }
         }
-        if (activeOnProvider >= static_cast<unsigned>(selectedCaProvider->maxChannels)) {
+        const int effectiveMaxChannels = std::clamp(selectedCaProvider->maxChannels, 1, 1024);
+        if (activeOnProvider >= static_cast<unsigned>(effectiveMaxChannels)) {
             response["result"] = "error";
             response["stream_id"] = cfg.id;
-            response["error"] = "CA provider '" + selectedCaProvider->name + "' reached max_channels=" +
-                std::to_string(selectedCaProvider->maxChannels);
+            response["error"] = "CA provider '" + selectedCaProvider->name + "' reached its session limit " +
+                std::to_string(activeOnProvider) + "/" + std::to_string(effectiveMaxChannels);
             Json::StreamWriterBuilder writer;
             return Json::writeString(writer, response);
         }
@@ -1499,19 +1552,12 @@ std::string HttpServer::handleStartStream(const std::string& body) {
         response["result"] = "ok";
         response["stream_id"] = cfg.id;
         if (cfg.satelliteEnabled && selectedCaProvider) {
-            Json::Value warnings(Json::arrayValue);
-            const std::string backendType = toLower(selectedCaProvider->backendType);
-            if (backendType == "authorized-ts" || backendType == "predecoded-ts" || backendType == "decrypted-ts") {
-                warnings.append(
-                    "Канал использует authorized pre-decoded TS transport provider '" + selectedCaProvider->name +
-                    "' (max_channels=" + std::to_string(selectedCaProvider->maxChannels) +
-                    "). TVStreamer получает уже расшифрованный MPEG-TS и не получает/не хранит CW/ECM.");
-            } else {
-                warnings.append(
-                    "Канал назначен CA provider '" + selectedCaProvider->name +
-                    "'. Для этого backend типа TVStreamer не выполняет обмен ключами или descrambling.");
-            }
-            response["warnings"] = warnings;
+            response["ca_provider_id"] = selectedCaProvider->id;
+            response["ca_provider_name"] = selectedCaProvider->name;
+            response["ca_reader_by_id"] = selectedCaProvider->readerById;
+            response["ca_mode"] = "reader-card-manager";
+            response["ca_capacity_mode"] = selectedCaProvider->capacityMode;
+            response["ca_effective_max_channels"] = std::clamp(selectedCaProvider->maxChannels, 1, 1024);
         }
     } else {
         response["result"] = "error";
@@ -2183,7 +2229,9 @@ function caProviderTileSummary(stream) {
   if (!stream?.satellite_enabled) return '';
   const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
   if (provider) {
-    return `${provider.name || provider.id} ${Number(provider.active_channels || 0)}/${Number(provider.max_channels || 8)}`;
+    const max = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
+    const reader = provider.reader_online ? 'ONLINE' : (provider.reader_by_id ? 'OFFLINE' : 'NO READER');
+    return `${provider.name || provider.id} ${reader} ${Number(provider.active_channels || 0)}/${max}`;
   }
   return stream.ca_provider_id ? `${stream.ca_provider_id} (не найден)` : 'без CA';
 }
@@ -2637,7 +2685,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>v82</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>v85</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2682,6 +2730,7 @@ function openTelegramModal() {
     </div>
   `);
 }
+let serialReadersCache = [];
 function nextCaProviderId() {
   const used = new Set((state.ca_providers || []).map(provider => String(provider.id || '')));
   document.querySelectorAll?.('.ca-provider-row [data-ca-field="id"]').forEach(input => used.add(String(input.value || '')));
@@ -2689,19 +2738,57 @@ function nextCaProviderId() {
   while (used.has(`ca-card-${index}`)) index += 1;
   return `ca-card-${index}`;
 }
+function serialReaderLabel(reader={}) {
+  const serial = String(reader.serial || '').trim();
+  const model = String(reader.model || '').trim();
+  const device = String(reader.device || reader.tty || '').trim();
+  return [model || 'Serial reader', serial ? `#${serial}` : '', device ? `(${device})` : ''].filter(Boolean).join(' ');
+}
+function readerOptions(selected='') {
+  const selectedValue = String(selected || '');
+  const options = [`<option value="" ${selectedValue?'':'selected'}>— Reader не выбран —</option>`];
+  (serialReadersCache || []).forEach(reader => {
+    const value = String(reader.by_id || '');
+    if (!value) return;
+    options.push(`<option value="${escapeHtmlValue(value)}" ${value===selectedValue?'selected':''}>${escapeHtmlValue(serialReaderLabel(reader))}</option>`);
+  });
+  if (selectedValue && !(serialReadersCache || []).some(reader => String(reader.by_id || '') === selectedValue)) {
+    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (OFFLINE / сейчас не найден)</option>`);
+  }
+  return options.join('');
+}
+function updateCaReaderSelects() {
+  document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]').forEach(select => {
+    const previous = select.value || select.dataset.savedValue || '';
+    select.innerHTML = readerOptions(previous);
+    select.value = previous;
+  });
+}
 function caProviderRowHtml(provider={}) {
   const id = String(provider.id || nextCaProviderId());
   const assigned = Number(provider.assigned_channels || (state.streams || []).filter(stream => stream.ca_provider_id === id).length || 0);
   const active = Number(provider.active_channels || 0);
-  const maxChannels = Math.max(1, Number(provider.max_channels || 8));
+  const effectiveMax = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
+  const configuredMax = Math.max(1, Number(provider.max_channels || effectiveMax || 1));
+  const capacityMode = String(provider.capacity_mode || 'manual').toLowerCase() === 'auto' ? 'auto' : 'manual';
+  const readerById = String(provider.reader_by_id || '');
+  const online = provider.reader_online === true || (readerById && serialReadersCache.some(reader => String(reader.by_id || '') === readerById));
+  const statusText = !readerById ? 'Reader не назначен' : (online ? 'READER ONLINE' : 'READER OFFLINE');
+  const readerDetails = online
+    ? [provider.reader_model, provider.reader_serial ? `#${provider.reader_serial}` : '', provider.reader_device].filter(Boolean).join(' ')
+    : readerById;
+  const capacitySource = capacityMode === 'auto'
+    ? (provider.auto_capacity_available ? 'Auto: получено от карты/официального интерфейса' : `Auto: capability пока не сообщён, используется fallback ${configuredMax}`)
+    : `Manual: ${configuredMax}`;
   return `<div class="ca-provider-row" data-provider-id="${escapeHtmlValue(id)}" style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:10px">
     <div class="form-grid">
-      <div class="form-row"><label>ID</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Например ca-card-1. При переименовании ссылки каналов обновятся при сохранении.</small></div>
-      <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Основная карта / CAM" /></div>
-      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type"><option value="authorized-ts" ${provider.backend_type==='authorized-ts'?'selected':''}>Authorized pre-decoded TS</option><option value="external" ${(provider.backend_type||'external')==='external'?'selected':''}>External authorized backend</option><option value="cam-service" ${provider.backend_type==='cam-service'?'selected':''}>CAM service</option><option value="custom" ${provider.backend_type==='custom'?'selected':''}>Custom integration</option></select></div>
-      <div class="form-row"><label>Endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(provider.endpoint || '')}" placeholder="udp://127.0.0.1:9000 или srt://host:port?streamid={service_id}" /></div>
-      <div class="form-row"><label>Max active channels</label><input data-ca-field="max_channels" type="number" min="1" max="64" value="${maxChannels}" /></div>
-      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${active}/${maxChannels} active · ${assigned} assigned</small></div>
+      <div class="form-row"><label>ID карты/provider</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Стабильный ID TVStreamer, например ca-card-1. При переименовании ссылки каналов обновятся автоматически.</small></div>
+      <div class="form-row"><label>Название карты</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Карта 1 / Основная карта" /></div>
+      <div class="form-row full"><label>Физический Phoenix / serial reader</label><select data-ca-field="reader_by_id" data-saved-value="${escapeHtmlValue(readerById)}">${readerOptions(readerById)}</select><small>Хранится стабильный /dev/serial/by-id/*, а ttyUSB/ttyACM показывается только как текущее системное имя.</small></div>
+      <div class="form-row"><label>Лимит каналов</label><select data-ca-field="capacity_mode"><option value="manual" ${capacityMode==='manual'?'selected':''}>Manual</option><option value="auto" ${capacityMode==='auto'?'selected':''}>Auto from card/provider + fallback</option></select><small>${escapeHtmlValue(capacitySource)}</small></div>
+      <div class="form-row"><label>Manual / fallback max channels</label><input data-ca-field="max_channels" type="number" min="1" max="1024" value="${configuredMax}" /><small>Индивидуально для этой карты. В коде нет глобальной константы 8.</small></div>
+      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${escapeHtmlValue(statusText)}${readerDetails ? ` · ${escapeHtmlValue(readerDetails)}` : ''}</small></div>
+      <div class="form-row"><label>Сессии</label><div class="sat-signal-box"><strong>${active}/${effectiveMax} active</strong><div style="margin-top:3px;color:#aeb8ca">${assigned} assigned · ${Math.max(0,effectiveMax-active)} available</div></div></div>
     </div>
     <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="button-secondary" type="button" onclick="removeCaProviderRow(this)">Удалить</button></div>
   </div>`;
@@ -2710,9 +2797,10 @@ function serialReaderTableHtml(readers=[]) {
   if (!Array.isArray(readers) || !readers.length) {
     return '<div style="color:#aeb8ca;padding:10px 0">Устройства /dev/serial/by-id/* не обнаружены.</div>';
   }
+  const used = new Set([...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].map(select => String(select.value || select.dataset.savedValue || '')));
   return `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
-    <thead><tr style="text-align:left;color:#aeb8ca"><th style="padding:7px;border-bottom:1px solid #344155">By-ID</th><th style="padding:7px;border-bottom:1px solid #344155">Device</th><th style="padding:7px;border-bottom:1px solid #344155">Производитель</th><th style="padding:7px;border-bottom:1px solid #344155">Модель</th><th style="padding:7px;border-bottom:1px solid #344155">Serial</th></tr></thead>
-    <tbody>${readers.map(reader => `<tr><td style="padding:7px;border-bottom:1px solid #253044"><code title="${escapeHtmlValue(reader.by_id || '')}">${escapeHtmlValue(reader.by_id_name || reader.by_id || '')}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><strong>${escapeHtmlValue(reader.device || reader.tty || '')}</strong></td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.vendor || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.model || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044"><code>${escapeHtmlValue(reader.serial || '—')}</code></td></tr>`).join('')}</tbody>
+    <thead><tr style="text-align:left;color:#aeb8ca"><th style="padding:7px;border-bottom:1px solid #344155">By-ID</th><th style="padding:7px;border-bottom:1px solid #344155">Device</th><th style="padding:7px;border-bottom:1px solid #344155">Производитель</th><th style="padding:7px;border-bottom:1px solid #344155">Модель</th><th style="padding:7px;border-bottom:1px solid #344155">Serial</th><th style="padding:7px;border-bottom:1px solid #344155"></th></tr></thead>
+    <tbody>${readers.map(reader => { const byId=String(reader.by_id||''); const linked=used.has(byId); return `<tr><td style="padding:7px;border-bottom:1px solid #253044"><code title="${escapeHtmlValue(byId)}">${escapeHtmlValue(reader.by_id_name || byId)}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><strong>${escapeHtmlValue(reader.device || reader.tty || '')}</strong></td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.vendor || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.model || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044"><code>${escapeHtmlValue(reader.serial || '—')}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><button class="button-secondary" type="button" ${linked?'disabled':''} onclick="addCaProviderForReader(decodeURIComponent('${encodeURIComponent(byId)}'))">${linked?'Добавлен':'Создать Card'}</button></td></tr>`; }).join('')}</tbody>
   </table></div>`;
 }
 async function refreshSerialReaders() {
@@ -2724,25 +2812,49 @@ async function refreshSerialReaders() {
     const response = await fetch('/api/serial-readers', {cache:'no-store'});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const readers = await response.json();
-    target.innerHTML = serialReaderTableHtml(readers);
-    if (status) status.textContent = `Обнаружено: ${Array.isArray(readers) ? readers.length : 0}`;
+    serialReadersCache = Array.isArray(readers) ? readers : [];
+    updateCaReaderSelects();
+    target.innerHTML = serialReaderTableHtml(serialReadersCache);
+    if (status) status.textContent = `Обнаружено: ${serialReadersCache.length}`;
   } catch (error) {
+    serialReadersCache = [];
+    updateCaReaderSelects();
     target.innerHTML = '<div style="color:#ff8f8f;padding:10px 0">Не удалось получить список serial-reader устройств.</div>';
     if (status) status.textContent = error.message || String(error);
   }
 }
+function addCaProviderForReader(byId) {
+  const reader = (serialReadersCache || []).find(item => String(item.by_id || '') === String(byId || ''));
+  if (!reader) return;
+  const already = [...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].some(select => String(select.value || '') === String(byId));
+  if (already) return;
+  document.getElementById('caProvidersEmpty')?.remove();
+  const rows = document.getElementById('caProviderRows');
+  if (!rows) return;
+  const wrapper = document.createElement('div');
+  const nextId = nextCaProviderId();
+  const number = nextId.replace('ca-card-','');
+  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${number}`,reader_by_id:byId,capacity_mode:'manual',max_channels:1,enabled:true,reader_online:true,reader_device:reader.device,reader_model:reader.model,reader_serial:reader.serial});
+  rows.appendChild(wrapper.firstElementChild);
+  updateCaReaderSelects();
+  const table = document.getElementById('serialReadersTable');
+  if (table) table.innerHTML = serialReaderTableHtml(serialReadersCache);
+}
+function addAllDetectedReaders() {
+  (serialReadersCache || []).forEach(reader => addCaProviderForReader(reader.by_id));
+}
 function openCaProvidersModal() {
   const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
   openModal(`
-    <h2>CA Providers</h2>
-    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам не привязываются.</div><small>Provider ID — внутренний идентификатор TVStreamer, а не ID карты. Для новых provider автоматически предлагаются понятные ID вида ca-card-1, ca-card-2. Backend «Authorized pre-decoded TS» принимает уже расшифрованный MPEG-TS от авторизованного CAM/CA backend.</small></div>
+    <h2>CA Providers / Cards</h2>
+    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Динамический Reader/Card Manager</strong><div style="margin-top:4px;color:#aeb8ca">Количество Phoenix-reader устройств не фиксировано. Каждая карта/provider привязывается к стабильному /dev/serial/by-id/* и имеет собственный лимит одновременно активных каналов.</div><small>Режим Auto готов принимать лимит от документированного интерфейса карты/провайдера; пока capability не сообщён, используется индивидуальный fallback. TVStreamer не считает 8 глобальной константой.</small></div>
     <div style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><strong>Обнаруженные serial-reader устройства</strong><div id="serialReadersStatus" style="font-size:12px;color:#aeb8ca;margin-top:3px">Поиск…</div></div><button class="button-secondary" type="button" onclick="refreshSerialReaders()">Обновить</button></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><strong>Обнаруженные Phoenix / serial readers</strong><div id="serialReadersStatus" style="font-size:12px;color:#aeb8ca;margin-top:3px">Поиск…</div></div><div style="display:flex;gap:8px"><button class="button-secondary" type="button" onclick="refreshSerialReaders()">Обновить</button><button class="button-secondary" type="button" onclick="addAllDetectedReaders()">Добавить новые как Cards</button></div></div>
       <div id="serialReadersTable" style="margin-top:8px"><div style="color:#aeb8ca;padding:10px 0">Загрузка…</div></div>
-      <small style="display:block;margin-top:8px">By-ID стабилен и предпочтительнее /dev/ttyUSBN. Производитель, модель и serial относятся к USB/serial-reader. Какая карта вставлена в ридер, должен сообщать внешний авторизованный backend.</small>
+      <small style="display:block;margin-top:8px">By-ID остаётся стабильным даже если после reboot устройство сменит ttyUSB0 на ttyUSB2. Vendor/model/serial относятся к reader. Данные самой карты могут появиться здесь только через документированный card capability/status interface.</small>
     </div>
-    <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">CA Providers пока не созданы.</div>'}</div>
-    <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить CA Provider</button>
+    <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">Карты/providers пока не настроены.</div>'}</div>
+    <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить Card вручную</button>
     <div id="caProviderSaveStatus" style="margin-top:10px;color:#ffb36b"></div>
     <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">Отмена</button><button class="button-primary" onclick="saveCaProviders()">Сохранить</button></div>
   `);
@@ -2754,8 +2866,12 @@ function addCaProviderRow() {
   if (!rows) return;
   const wrapper = document.createElement('div');
   const nextId = nextCaProviderId();
-  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${nextId.replace('ca-card-','')}`,max_channels:8,enabled:true});
+  const number = nextId.replace('ca-card-','');
+  const already = new Set([...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].map(select => String(select.value || '')));
+  const reader = (serialReadersCache || []).find(item => !already.has(String(item.by_id || '')));
+  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${number}`,reader_by_id:reader?.by_id || '',capacity_mode:'manual',max_channels:1,enabled:true,reader_online:!!reader,reader_device:reader?.device,reader_model:reader?.model,reader_serial:reader?.serial});
   rows.appendChild(wrapper.firstElementChild);
+  updateCaReaderSelects();
 }
 function removeCaProviderRow(button) {
   const row = button?.closest('.ca-provider-row');
@@ -2764,28 +2880,37 @@ function removeCaProviderRow(button) {
   const assigned = (state.streams || []).filter(stream => stream.ca_provider_id === id).length;
   if (assigned > 0) {
     const status = document.getElementById('caProviderSaveStatus');
-    if (status) status.textContent = `Provider ${id} назначен ${assigned} каналам. Сначала переключите эти каналы на другой provider или «Без CA provider».`;
+    if (status) status.textContent = `Provider ${id} назначен ${assigned} каналам. Сначала переключите эти каналы на другую карту или «Без CA».`;
     return;
   }
   row.remove();
+  const table = document.getElementById('serialReadersTable');
+  if (table) table.innerHTML = serialReaderTableHtml(serialReadersCache);
 }
 function collectCaProviders() {
   const providers = [];
   const ids = new Set();
+  const readers = new Set();
   for (const row of document.querySelectorAll('.ca-provider-row')) {
     const id = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
     const name = String(row.querySelector('[data-ca-field="name"]')?.value || '').trim();
-    if (!id) throw new Error('У каждого CA Provider должен быть ID.');
+    const readerById = String(row.querySelector('[data-ca-field="reader_by_id"]')?.value || '').trim();
+    const capacityMode = row.querySelector('[data-ca-field="capacity_mode"]')?.value === 'auto' ? 'auto' : 'manual';
+    if (!id) throw new Error('У каждой карты/CA Provider должен быть ID.');
     if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`Недопустимый ID provider: ${id}`);
     if (ids.has(id)) throw new Error(`Повторяющийся ID provider: ${id}`);
+    if (readerById && readers.has(readerById)) throw new Error(`Reader ${readerById} уже назначен другой карте.`);
     ids.add(id);
+    if (readerById) readers.add(readerById);
     providers.push({
       id,
       name: name || id,
-      backend_type: row.querySelector('[data-ca-field="backend_type"]')?.value || 'external',
-      endpoint: String(row.querySelector('[data-ca-field="endpoint"]')?.value || '').trim(),
-      max_channels: Math.min(64, Math.max(1, Number(row.querySelector('[data-ca-field="max_channels"]')?.value || 8))),
-      enabled: row.querySelector('[data-ca-field="enabled"]')?.checked !== false
+      reader_by_id: readerById,
+      capacity_mode: capacityMode,
+      max_channels: Math.min(1024, Math.max(1, Number(row.querySelector('[data-ca-field="max_channels"]')?.value || 1))),
+      enabled: row.querySelector('[data-ca-field="enabled"]')?.checked !== false,
+      backend_type: 'reader',
+      endpoint: ''
     });
   }
   return providers;
@@ -3073,19 +3198,22 @@ function satelliteFrontendOptions(adapterNumber, selected) {
 function caProviderOptions(selected) {
   const selectedValue = String(selected || '');
   const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
-  const options = [`<option value="" ${selectedValue?'':'selected'}>Без CA provider</option>`];
+  const options = [`<option value="" ${selectedValue?'':'selected'}>Без CA карты/provider</option>`];
   providers.forEach(provider => {
     const id = String(provider.id || '');
     if (!id) return;
     const name = provider.name || id;
     const active = Number(provider.active_channels || 0);
-    const max = Math.max(1, Number(provider.max_channels || 8));
+    const max = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
     const disabled = provider.enabled === false;
-    const status = disabled ? ' · отключён' : ` · ${active}/${max} active`;
-    options.push(`<option value="${escapeHtmlValue(id)}" ${id===selectedValue?'selected':''} ${disabled?'disabled':''}>${escapeHtmlValue(name)}${escapeHtmlValue(status)}</option>`);
+    const readerOnline = provider.reader_online === true;
+    const readerSerial = String(provider.reader_serial || '').trim();
+    const readerState = provider.reader_by_id ? (readerOnline ? ` · reader ${readerSerial ? '#'+readerSerial : 'ONLINE'}` : ' · reader OFFLINE') : ' · reader не назначен';
+    const status = disabled ? ' · отключена' : ` · ${active}/${max} active`;
+    options.push(`<option value="${escapeHtmlValue(id)}" ${id===selectedValue?'selected':''} ${disabled?'disabled':''}>${escapeHtmlValue(name)}${escapeHtmlValue(readerState)}${escapeHtmlValue(status)}</option>`);
   });
   if (selectedValue && !providers.some(provider => String(provider.id || '') === selectedValue)) {
-    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (provider не найден)</option>`);
+    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (карта/provider не найден)</option>`);
   }
   return options.join('');
 }
@@ -3392,7 +3520,7 @@ function openSatelliteChannelModal() {
             <div class="form-row"><label>LNB LOF1, kHz</label><input id="channelSatelliteLnbLof1" type="number" value="9750000" /></div>
             <div class="form-row"><label>LNB LOF2, kHz</label><input id="channelSatelliteLnbLof2" type="number" value="10600000" /></div>
             <div class="form-row"><label>LNB switch, kHz</label><input id="channelSatelliteLnbSlof" type="number" value="11700000" /></div>
-            <div class="form-row"><label>CA Provider</label><select id="satelliteCaProvider">${caProviderOptions('')}</select><small>Логический provider с общим лимитом активных каналов. Физическое устройство к каналу не привязывается.</small></div>
+            <div class="form-row"><label>CA карта</label><select id="satelliteCaProvider">${caProviderOptions('')}</select><small>Выберите Card/provider, связанный со стабильным Phoenix reader. Лимит активных каналов задаётся отдельно для каждой карты.</small></div>
           </div>
         </details>
 
@@ -3460,7 +3588,7 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал». Здесь сохраняются общие параметры плитки, выхода, резерва и транскодирования.</small></div></div><div class="form-row full"><label>CA Provider</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Канал использует только ID логического provider. Прямой выбор /dev/ttyUSB*, /dev/ttyACM* или DVB CA здесь отсутствует.</small></div>` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
+        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал». Здесь сохраняются общие параметры плитки, выхода, резерва и транскодирования.</small></div></div><div class="form-row full"><label>CA карта</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Канал хранит ID Card/provider; физический reader сопоставляется в System → CA Providers по стабильному /dev/serial/by-id/*.</small></div>` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
