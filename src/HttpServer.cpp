@@ -1472,8 +1472,9 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     }
 
     auto cfg = StreamConfig::fromJson(root);
+    const bool caRequired = cfg.satelliteEnabled && cfg.satelliteScrambled;
     const CaProviderConfig* selectedCaProvider = nullptr;
-    if (!cfg.caProviderId.empty()) {
+    if (caRequired && !cfg.caProviderId.empty()) {
         for (const auto& provider : configManager.config.caProviders) {
             if (provider.id == cfg.caProviderId) {
                 selectedCaProvider = &provider;
@@ -1535,6 +1536,18 @@ std::string HttpServer::handleStartStream(const std::string& body) {
         }
     }
 
+    if (caRequired && cfg.caProviderId.empty()) {
+        response["result"] = "error";
+        response["stream_id"] = cfg.id;
+        response["error"] = "Scrambled satellite service requires a CA card/provider. FTA services do not require CA.";
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
+    if (!caRequired) {
+        // A stale CA assignment must never block an unencrypted service.
+        cfg.caProviderId.clear();
+    }
+
     std::string startError;
     bool started = streamManager.startStream(cfg, &startError);
 
@@ -1551,7 +1564,11 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     if (started) {
         response["result"] = "ok";
         response["stream_id"] = cfg.id;
-        if (cfg.satelliteEnabled && selectedCaProvider) {
+        if (cfg.satelliteEnabled && !cfg.satelliteScrambled) {
+            response["ca_mode"] = "fta-bypass";
+            response["ca_required"] = false;
+        }
+        if (cfg.satelliteEnabled && cfg.satelliteScrambled && selectedCaProvider) {
             response["ca_provider_id"] = selectedCaProvider->id;
             response["ca_provider_name"] = selectedCaProvider->name;
             response["ca_reader_by_id"] = selectedCaProvider->readerById;
@@ -2227,6 +2244,7 @@ function primaryInputSummary(stream) {
 }
 function caProviderTileSummary(stream) {
   if (!stream?.satellite_enabled) return '';
+  if (stream.satellite_scrambled === false) return 'FTA';
   const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
   if (provider) {
     const max = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
@@ -2240,7 +2258,8 @@ function satelliteTilePrimarySummary(stream) {
   const freq = formatSatelliteFrequencyMhz(stream.satellite_frequency);
   const sr = Number(stream.satellite_symbol_rate || 0);
   const pol = String(stream.satellite_polarization || 'H').toUpperCase();
-  return `${system} · ${freq} MHz · ${pol}${sr ? ` · ${sr}k` : ''} · CA ${caProviderTileSummary(stream)}`;
+  const caText = stream.satellite_scrambled === false ? 'FTA' : `CA ${caProviderTileSummary(stream)}`;
+  return `${system} · ${freq} MHz · ${pol}${sr ? ` · ${sr}k` : ''} · ${caText}`;
 }
 function satelliteTileActiveInputSummary(stream) {
   const source = stream.active_input_label || t('primary');
@@ -2286,6 +2305,7 @@ function streamTileStructureSignature(stream) {
     satellite_diseqc_source: stream.satellite_diseqc_source,
     satellite_stream_id: stream.satellite_stream_id,
     satellite_service_id: stream.satellite_service_id,
+    satellite_scrambled: stream.satellite_scrambled,
     ca_provider_id: stream.ca_provider_id,
     backup_input_uri: stream.backup_input_uri,
     backup_input_type: stream.backup_input_type,
@@ -2956,7 +2976,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, ca_provider_id:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_scrambled:false, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, ca_provider_id:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -3429,10 +3449,11 @@ function createSelectedSatelliteChannels() {
       satellite_diseqc_source: scan.satellite_diseqc_source,
       satellite_stream_id: scan.satellite_stream_id,
       satellite_service_id: sid,
+      satellite_scrambled: !!service.scrambled,
       satellite_lnb_lof1: scan.satellite_lnb_lof1,
       satellite_lnb_lof2: scan.satellite_lnb_lof2,
       satellite_lnb_slof: scan.satellite_lnb_slof,
-      ca_provider_id: caProviderId,
+      ca_provider_id: service.scrambled ? caProviderId : '',
       backup_input_uri: '',
       backup_input_type: 'url',
       backup_file_loop: false,
@@ -3588,7 +3609,7 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал». Здесь сохраняются общие параметры плитки, выхода, резерва и транскодирования.</small></div></div><div class="form-row full"><label>CA карта</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Канал хранит ID Card/provider; физический reader сопоставляется в System → CA Providers по стабильному /dev/serial/by-id/*.</small></div>` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
+        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал · ${stream.satellite_scrambled === false ? 'FTA' : 'CA'}</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал».</small></div></div>${stream.satellite_scrambled === false ? `<div class="form-row full"><label>CA карта</label><div class="sat-signal-box"><strong>Не требуется</strong><small>Сканирование PMT/SDT определило этот сервис как FTA. CA reader и его лимит при запуске не используются.</small></div></div>` : `<div class="form-row full"><label>CA карта</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Для зашифрованного сервиса выберите Card/provider.</small></div>`}` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -3791,10 +3812,11 @@ function saveStream(id) {
     satellite_diseqc_source: Number(previous.satellite_diseqc_source ?? -1),
     satellite_stream_id: Number(previous.satellite_stream_id ?? -1),
     satellite_service_id: Number(previous.satellite_service_id || 0),
+    satellite_scrambled: previous.satellite_scrambled === true,
     satellite_lnb_lof1: Number(previous.satellite_lnb_lof1 || 9750000),
     satellite_lnb_lof2: Number(previous.satellite_lnb_lof2 || 10600000),
     satellite_lnb_slof: Number(previous.satellite_lnb_slof || 11700000),
-    ca_provider_id: satelliteEnabled ? (document.getElementById('streamCaProvider')?.value || previous.ca_provider_id || '') : '',
+    ca_provider_id: satelliteEnabled && previous.satellite_scrambled === true ? (document.getElementById('streamCaProvider')?.value || previous.ca_provider_id || '') : '',
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,

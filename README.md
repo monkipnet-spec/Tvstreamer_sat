@@ -1,3 +1,5 @@
+# TVStreamer v86 — FTA auto-bypass
+
 # TVStreamer5 — Release 2
 
 TVStreamer5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2.**

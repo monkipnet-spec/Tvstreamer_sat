@@ -1731,7 +1731,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->runtimeConfig = streamConfig;
     state->primarySatelliteEnabled = streamConfig.satelliteEnabled;
 
-    const CaProviderConfig* caProvider = streamConfig.satelliteEnabled
+    const CaProviderConfig* caProvider = (streamConfig.satelliteEnabled && streamConfig.satelliteScrambled)
         ? findCaProvider(configManager, streamConfig.caProviderId)
         : nullptr;
     if (caProvider) {
@@ -4203,7 +4203,9 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
-                state->statusMessage = "no input signal";
+                state->statusMessage = state->config.satelliteEnabled && !state->config.satelliteScrambled
+                    ? "no input signal (FTA; CA not involved)"
+                    : "no input signal";
                 notifyStreamState(
                     state->config,
                     "🔴",

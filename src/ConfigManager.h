@@ -64,6 +64,9 @@ struct StreamConfig {
     int satelliteDiseqcSource = -1;
     int satelliteStreamId = -1;
     uint32_t satelliteServiceId = 1;
+    // True when PAT/PMT/SDT scan reported conditional-access descriptors for this service.
+    // FTA services bypass CA reader/session checks entirely.
+    bool satelliteScrambled = false;
     uint32_t satelliteLnbLof1 = 9750000;
     uint32_t satelliteLnbLof2 = 10600000;
     uint32_t satelliteLnbSlof = 11700000;

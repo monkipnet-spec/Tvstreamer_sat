@@ -110,6 +110,11 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.satelliteLnbLof2 = root.get("satellite_lnb_lof2", Json::UInt(10600000)).asUInt();
     config.satelliteLnbSlof = root.get("satellite_lnb_slof", Json::UInt(11700000)).asUInt();
     config.caProviderId = root.get("ca_provider_id", "").asString();
+    // New scans persist the actual FTA/CA flag. For pre-v86 configs preserve the
+    // previous behaviour when a CA provider had already been assigned.
+    config.satelliteScrambled = root.isMember("satellite_scrambled")
+        ? root["satellite_scrambled"].asBool()
+        : !config.caProviderId.empty();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -178,6 +183,7 @@ Json::Value StreamConfig::toJson() const {
     root["satellite_diseqc_source"] = satelliteDiseqcSource;
     root["satellite_stream_id"] = satelliteStreamId;
     root["satellite_service_id"] = satelliteServiceId;
+    root["satellite_scrambled"] = satelliteScrambled;
     root["satellite_lnb_lof1"] = satelliteLnbLof1;
     root["satellite_lnb_lof2"] = satelliteLnbLof2;
     root["satellite_lnb_slof"] = satelliteLnbSlof;
