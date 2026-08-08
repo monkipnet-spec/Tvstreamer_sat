@@ -1022,3 +1022,9 @@ Selecting a discovered service copies its SID into the satellite service selecto
 The scanner uses the same GStreamer DVB source and the same frequency/symbol-rate/LNB/DiSEqC/MIS properties as normal satellite streaming, so it does not require `dvbv5-scan` or a separate channel database.
 
 Conditional-access note: this release only discovers CA/CI and Phoenix-style serial reader devices and stores the selected reader path. It does **not** extract, share or cache control-word keys. Encrypted services are shown with the `CA` marker; descrambling should be provided through an operator-authorized CAM/CI or another authorized CA integration.
+
+### DVB tile signal meters
+
+For satellite streams the main stream tile now shows two live percentage meters read from the selected Linux DVB frontend: **Signal level** (`FE_READ_SIGNAL_STRENGTH`) and **Signal quality** / SNR (`FE_READ_SNR`). The bars refresh with the normal `/api/state` polling and are colour-coded red / amber / green. A LOCK / NO LOCK indicator is shown beside the signal level. When the stream is stopped or running on a backup source the DVB meters fall back to 0%.
+
+The redundant top **Output** information row was removed from stream tiles; output mode is still visible in the tile badge and URLs remain available through the URL button.

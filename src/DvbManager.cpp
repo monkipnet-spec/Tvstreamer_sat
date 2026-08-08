@@ -567,7 +567,7 @@ private:
     bool sdtSeen_ = false;
 };
 
-Json::Value frontendStatusJson(int adapter, int frontend) {
+Json::Value frontendStatusJsonImpl(int adapter, int frontend) {
     Json::Value result;
     const std::string path = "/dev/dvb/adapter" + std::to_string(adapter) +
         "/frontend" + std::to_string(frontend);
@@ -607,6 +607,10 @@ std::string gstErrorFromMessage(GstMessage* message) {
 }
 
 } // namespace
+
+Json::Value frontendStatus(int adapter, int frontend) {
+    return frontendStatusJsonImpl(adapter, frontend);
+}
 
 Json::Value enumerateDevices() {
     Json::Value root;
@@ -789,7 +793,7 @@ Json::Value scanTransponder(const StreamConfig& cfg, unsigned timeoutMs) {
         }
     }
 
-    Json::Value frontend = frontendStatusJson(cfg.satelliteAdapter, cfg.satelliteFrontend);
+    Json::Value frontend = frontendStatusJsonImpl(cfg.satelliteAdapter, cfg.satelliteFrontend);
     result["frontend_status"] = frontend;
     result["lock"] = frontend.isMember("has_lock")
         ? frontend.get("has_lock", false).asBool()

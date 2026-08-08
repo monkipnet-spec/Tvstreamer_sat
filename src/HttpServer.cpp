@@ -875,6 +875,28 @@ std::string HttpServer::currentState() {
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
+        if (cfg.satelliteEnabled) {
+            bool dvbActive = false;
+            auto activeIt = snap.find(cfg.id);
+            if (activeIt != snap.end() && activeIt->second) {
+                dvbActive = activeIt->second->active.load() && !activeIt->second->usingBackup;
+            }
+
+            Json::Value frontend;
+            if (dvbActive) {
+                frontend = tvs::dvb::frontendStatus(cfg.satelliteAdapter, cfg.satelliteFrontend);
+            }
+            const uint64_t signalRaw = frontend.get("signal_strength_raw", Json::UInt(0)).asUInt64();
+            const uint64_t snrRaw = frontend.get("snr_raw", Json::UInt(0)).asUInt64();
+            const auto percentFromRaw = [](uint64_t value) -> unsigned {
+                if (value >= 65535ULL) return 100U;
+                return static_cast<unsigned>((value * 100ULL + 32767ULL) / 65535ULL);
+            };
+            item["dvb_signal_percent"] = percentFromRaw(signalRaw);
+            item["dvb_quality_percent"] = percentFromRaw(snrRaw);
+            item["dvb_has_lock"] = dvbActive && frontend.get("has_lock", false).asBool();
+        }
+
         Json::Value links(Json::arrayValue);
         for (const auto& output : streamOutputs(cfg)) {
             Json::Value link;
@@ -1465,6 +1487,17 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+.tile .dvb-meters{display:grid;gap:5px;margin:1px 0 2px;padding:6px 7px;border:1px solid rgba(255,255,255,.07);border-radius:9px;background:rgba(255,255,255,.025)}
+.tile .dvb-meter-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#d8deea;font-size:10px}
+.tile .dvb-meter-head strong{font-size:10px;color:#fff;font-weight:600}
+.tile .dvb-meter-value{font-variant-numeric:tabular-nums;color:#fff}
+.tile .dvb-meter-track{height:7px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.09);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
+.tile .dvb-meter-fill{height:100%;width:0;border-radius:999px;transition:width .35s ease,background-color .35s ease}
+.tile .dvb-meter-fill.bad{background:#ff5f5f}
+.tile .dvb-meter-fill.warn{background:#ffbd4a}
+.tile .dvb-meter-fill.good{background:#17c261}
+.tile .dvb-lock{font-size:9px;color:#ffb3b3}
+.tile .dvb-lock.locked{color:#b6f7c2}
 .tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
@@ -1642,7 +1675,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 const translations = {
   en: {
     subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream',
-    interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
+    interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status', signalLevel:'Signal level', signalQuality:'Signal quality', lock:'LOCK', noLock:'NO LOCK',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     restartProgram:'Restart', restartConfirm:'Restart TVStreamer5 now?', restarting:'Restarting...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
@@ -1650,7 +1683,7 @@ const translations = {
   },
   ru: {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток',
-    interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
+    interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус', signalLevel:'Уровень сигнала', signalQuality:'Качество сигнала', lock:'LOCK', noLock:'НЕТ LOCK',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreamer5 сейчас?', restarting:'Перезапуск...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
@@ -1875,6 +1908,26 @@ function satelliteInputSummary(stream) {
 function primaryInputSummary(stream) {
   return stream.satellite_enabled ? satelliteInputSummary(stream) : (stream.input_uri || '—');
 }
+function clampPercent(value) {
+  const number = Number(value || 0);
+  return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
+}
+function dvbMeterClass(value) {
+  const percent = clampPercent(value);
+  if (percent >= 65) return 'good';
+  if (percent >= 35) return 'warn';
+  return 'bad';
+}
+function updateDvbMeter(tile, rolePrefix, value) {
+  const percent = clampPercent(value);
+  const fill = tile.querySelector(`[data-role="${rolePrefix}-fill"]`);
+  const label = tile.querySelector(`[data-role="${rolePrefix}-value"]`);
+  if (fill) {
+    fill.style.width = `${percent}%`;
+    fill.className = `dvb-meter-fill ${dvbMeterClass(percent)}`;
+  }
+  if (label) label.textContent = `${percent}%`;
+}
 function streamTileStructureSignature(stream) {
   return {
     id: stream.id,
@@ -1931,6 +1984,17 @@ function updateStreamTile(tile, stream) {
   const status = tile.querySelector('[data-role="stream-status"]');
   if (status) status.textContent = stream.status || '';
 
+  if (stream.satellite_enabled) {
+    updateDvbMeter(tile, 'dvb-signal', stream.dvb_signal_percent);
+    updateDvbMeter(tile, 'dvb-quality', stream.dvb_quality_percent);
+    const lock = tile.querySelector('[data-role="dvb-lock"]');
+    if (lock) {
+      const locked = !!stream.dvb_has_lock;
+      lock.className = `dvb-lock${locked ? ' locked' : ''}`;
+      lock.textContent = locked ? t('lock') : t('noLock');
+    }
+  }
+
   const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
   if (toggleButton) {
     toggleButton.className = stream.active ? 'stop-button' : 'start-button';
@@ -1981,7 +2045,17 @@ function render(force=false) {
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
-        <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
+        ${stream.satellite_enabled ? `
+        <div class="dvb-meters">
+          <div>
+            <div class="dvb-meter-head"><strong>${t('signalLevel')}</strong><span><span data-role="dvb-signal-value">${clampPercent(stream.dvb_signal_percent)}%</span> · <span data-role="dvb-lock" class="dvb-lock${stream.dvb_has_lock ? ' locked' : ''}">${stream.dvb_has_lock ? t('lock') : t('noLock')}</span></span></div>
+            <div class="dvb-meter-track"><div data-role="dvb-signal-fill" class="dvb-meter-fill ${dvbMeterClass(stream.dvb_signal_percent)}" style="width:${clampPercent(stream.dvb_signal_percent)}%"></div></div>
+          </div>
+          <div>
+            <div class="dvb-meter-head"><strong>${t('signalQuality')}</strong><span data-role="dvb-quality-value">${clampPercent(stream.dvb_quality_percent)}%</span></div>
+            <div class="dvb-meter-track"><div data-role="dvb-quality-fill" class="dvb-meter-fill ${dvbMeterClass(stream.dvb_quality_percent)}" style="width:${clampPercent(stream.dvb_quality_percent)}%"></div></div>
+          </div>
+        </div>` : ''}
         <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}</span></div>
         <div class="info-row"><strong>${t('primary')}</strong><span>${primaryInputSummary(stream)}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>

@@ -10,6 +10,11 @@ namespace tvs::dvb {
 // candidates that are currently present in the system.
 Json::Value enumerateDevices();
 
+// Reads the current Linux DVB frontend lock, signal strength and SNR statistics.
+// Raw signal/SNR values are the legacy 16-bit DVB API scale (0..65535) when
+// the frontend driver exposes them.
+Json::Value frontendStatus(int adapter, int frontend);
+
 // Tunes a DVB-S/S2 transponder through GStreamer's dvbbasebin and inspects the
 // MPEG-TS PAT/SDT/PMT tables. The returned JSON contains service names, SIDs,
 // elementary PIDs and whether the service advertises conditional access.
