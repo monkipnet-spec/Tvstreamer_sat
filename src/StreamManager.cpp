@@ -4,6 +4,7 @@
 #include "UdpInput.h"
 #include "UdpVbrOutput.h"
 #include "protocols/GstProtocolTypes.h"
+#include "protocols/GstInputProtocols.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
 
@@ -151,6 +152,12 @@ void setInt64PropertyIfPresent(GstElement* element, const char* propertyName, gi
 void setStringPropertyIfPresent(GstElement* element, const char* propertyName, const std::string& value) {
     if (hasProperty(element, propertyName) && !value.empty()) {
         g_object_set(element, propertyName, value.c_str(), nullptr);
+    }
+}
+
+void setSerializedPropertyIfPresent(GstElement* element, const char* propertyName, const std::string& value) {
+    if (hasProperty(element, propertyName) && !value.empty()) {
+        gst_util_set_object_arg(G_OBJECT(element), propertyName, value.c_str());
     }
 }
 
@@ -1314,8 +1321,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
 
     auto state = std::make_unique<StreamState>();
     state->config = streamConfig;
-    state->primaryInputUri = streamConfig.inputUri;
-    state->activeInputUri = streamConfig.testPattern ? kTestPatternUri : streamConfig.inputUri;
+    state->primarySatelliteEnabled = streamConfig.satelliteEnabled;
+    state->primaryInputUri = streamConfig.satelliteEnabled
+        ? tvs::protocols::inputUriForGstreamer(streamConfig)
+        : streamConfig.inputUri;
+    state->activeInputUri = streamConfig.testPattern
+        ? kTestPatternUri
+        : state->primaryInputUri;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = streamConfig;
 
@@ -1341,7 +1353,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         }
 
         std::cerr << "Pipeline for stream '" << streamConfig.name
-                  << "': gstreamer-transcoder input=" << streamConfig.inputUri
+                  << "': gstreamer-transcoder input=" << state->primaryInputUri
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
                   << " outputs=" << gstTranscoder->description() << std::endl;
@@ -1380,7 +1392,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             streamConfig,
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + streamConfig.inputUri);
+            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + state->primaryInputUri);
         return true;
     }
 
@@ -1479,7 +1491,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         streamConfig,
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
-        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + streamConfig.inputUri);
+        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + state->primaryInputUri);
     return true;
 }
 
@@ -1638,7 +1650,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     std::ostringstream desc;
     desc << "manual-pipeline"
-         << " input=" << cfg.inputUri
+         << " input=" << (cfg.satelliteEnabled ? tvs::protocols::inputUriForGstreamer(cfg) : cfg.inputUri)
          << " input_proto=" << tvs::stream_protocols::inputKindName(tvs::stream_protocols::inputKind(cfg))
          << " output_proto=" << tvs::stream_protocols::outputKindName(tvs::stream_protocols::outputKind(cfg))
          << " input_mode=" << cfg.inputMode
@@ -2196,6 +2208,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     }
 
     state->config.inputUri = inputUri;
+    state->config.satelliteEnabled = !useBackup && state->primarySatelliteEnabled;
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->config;
     state->outputContexts.clear();
@@ -2322,6 +2335,65 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
     if (tvs::stream_protocols::isTestPatternInput(inputProtocol)) {
         return createTestPatternChain(cfg, pipeline, terminalElement);
+    }
+
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Satellite) {
+        if (!hasElementFactory("dvbbasebin")) {
+            std::cerr << missingElementStatus("dvbbasebin")
+                      << " (install gstreamer1.0-plugins-bad)" << std::endl;
+            return nullptr;
+        }
+        if (cfg.satelliteFrequency == 0 || cfg.satelliteSymbolRate == 0) {
+            std::cerr << "satellite input requires frequency and symbol rate" << std::endl;
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("dvbbasebin", "satellite_input_src");
+        GstElement* queue = addQueue("input_queue", 8000000000ULL);
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+            return nullptr;
+        }
+
+        setIntPropertyIfPresent(src, "adapter", cfg.satelliteAdapter);
+        setIntPropertyIfPresent(src, "frontend", cfg.satelliteFrontend);
+        setUIntPropertyIfPresent(src, "frequency", cfg.satelliteFrequency);
+        setUIntPropertyIfPresent(src, "symbol-rate", cfg.satelliteSymbolRate);
+        setStringPropertyIfPresent(src, "polarity", cfg.satellitePolarization);
+        setSerializedPropertyIfPresent(src, "delsys", cfg.satelliteDeliverySystem);
+        setSerializedPropertyIfPresent(src, "modulation", cfg.satelliteModulation);
+        setSerializedPropertyIfPresent(src, "code-rate-hp", cfg.satelliteFec);
+        setSerializedPropertyIfPresent(src, "pilot", cfg.satellitePilot);
+        setSerializedPropertyIfPresent(src, "rolloff", cfg.satelliteRolloff);
+        setIntPropertyIfPresent(src, "diseqc-source", cfg.satelliteDiseqcSource);
+        setIntPropertyIfPresent(src, "stream-id", cfg.satelliteStreamId);
+        setUIntPropertyIfPresent(src, "lnb-lof1", cfg.satelliteLnbLof1);
+        setUIntPropertyIfPresent(src, "lnb-lof2", cfg.satelliteLnbLof2);
+        setUIntPropertyIfPresent(src, "lnb-slof", cfg.satelliteLnbSlof);
+        setUInt64PropertyIfPresent(src, "tuning-timeout", 10000000ULL);
+        if (cfg.satelliteServiceId > 0) {
+            setStringPropertyIfPresent(src, "program-numbers", std::to_string(cfg.satelliteServiceId));
+        }
+
+        if (!gst_element_link(src, queue)) {
+            std::cerr << "failed to link DVB-S/S2 source to input queue" << std::endl;
+            return nullptr;
+        }
+
+        std::cerr << "Satellite input: adapter=" << cfg.satelliteAdapter
+                  << " frontend=" << cfg.satelliteFrontend
+                  << " frequency_khz=" << cfg.satelliteFrequency
+                  << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
+                  << " polarity=" << cfg.satellitePolarization
+                  << " delsys=" << cfg.satelliteDeliverySystem
+                  << " modulation=" << cfg.satelliteModulation
+                  << " fec=" << cfg.satelliteFec
+                  << " diseqc=" << cfg.satelliteDiseqcSource
+                  << " stream_id=" << cfg.satelliteStreamId
+                  << " service_id=" << cfg.satelliteServiceId
+                  << std::endl;
+
+        terminalElement = queue;
+        return src;
     }
 
     if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtmp) {
@@ -3583,7 +3655,9 @@ void StreamManager::monitorBus(const std::string& id) {
                     // Probe the primary input with an independent temporary pipeline.
                     // The active backup-file pipeline keeps playing uninterrupted while
                     // availability is checked. Switch only after real media data arrives.
-                    if (probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                    StreamConfig primaryProbeConfig = state->config;
+                    primaryProbeConfig.satelliteEnabled = state->primarySatelliteEnabled;
+                    if (probeInputAvailable(primaryProbeConfig, primaryUri, kInputFailoverDelay)) {
                         notifyStreamState(
                             state->config,
                             "🟢",

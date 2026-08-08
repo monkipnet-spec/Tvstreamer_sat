@@ -1,4 +1,5 @@
 #include "ConfigManager.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <fstream>
@@ -51,6 +52,30 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");
     config.inputInterfaceAddress = root.get("input_interface_address", "").asString();
     config.inputMode = root.get("input_mode", "auto").asString();
+    config.satelliteEnabled = root.get("satellite_enabled", false).asBool();
+    config.satelliteAdapter = std::max(0, root.get("satellite_adapter", 0).asInt());
+    config.satelliteFrontend = std::max(0, root.get("satellite_frontend", 0).asInt());
+    config.satelliteFrequency = root.get("satellite_frequency", Json::UInt(0)).asUInt();
+    config.satelliteSymbolRate = root.get("satellite_symbol_rate", Json::UInt(27500)).asUInt();
+    config.satellitePolarization = root.get("satellite_polarization", "H").asString();
+    if (config.satellitePolarization != "H" && config.satellitePolarization != "V" &&
+        config.satellitePolarization != "h" && config.satellitePolarization != "v") {
+        config.satellitePolarization = "H";
+    }
+    config.satelliteDeliverySystem = root.get("satellite_delivery_system", "dvb-s2").asString();
+    if (config.satelliteDeliverySystem != "dvb-s" && config.satelliteDeliverySystem != "dvb-s2") {
+        config.satelliteDeliverySystem = "dvb-s2";
+    }
+    config.satelliteModulation = root.get("satellite_modulation", "auto").asString();
+    config.satelliteFec = root.get("satellite_fec", "auto").asString();
+    config.satellitePilot = root.get("satellite_pilot", "auto").asString();
+    config.satelliteRolloff = root.get("satellite_rolloff", "auto").asString();
+    config.satelliteDiseqcSource = std::clamp(root.get("satellite_diseqc_source", -1).asInt(), -1, 7);
+    config.satelliteStreamId = std::clamp(root.get("satellite_stream_id", -1).asInt(), -1, 255);
+    config.satelliteServiceId = root.get("satellite_service_id", Json::UInt(1)).asUInt();
+    config.satelliteLnbLof1 = root.get("satellite_lnb_lof1", Json::UInt(9750000)).asUInt();
+    config.satelliteLnbLof2 = root.get("satellite_lnb_lof2", Json::UInt(10600000)).asUInt();
+    config.satelliteLnbSlof = root.get("satellite_lnb_slof", Json::UInt(11700000)).asUInt();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -105,6 +130,23 @@ Json::Value StreamConfig::toJson() const {
         root["input_interface_address"] = inputInterfaceAddress;
     }
     root["input_mode"] = inputMode;
+    root["satellite_enabled"] = satelliteEnabled;
+    root["satellite_adapter"] = satelliteAdapter;
+    root["satellite_frontend"] = satelliteFrontend;
+    root["satellite_frequency"] = satelliteFrequency;
+    root["satellite_symbol_rate"] = satelliteSymbolRate;
+    root["satellite_polarization"] = satellitePolarization;
+    root["satellite_delivery_system"] = satelliteDeliverySystem;
+    root["satellite_modulation"] = satelliteModulation;
+    root["satellite_fec"] = satelliteFec;
+    root["satellite_pilot"] = satellitePilot;
+    root["satellite_rolloff"] = satelliteRolloff;
+    root["satellite_diseqc_source"] = satelliteDiseqcSource;
+    root["satellite_stream_id"] = satelliteStreamId;
+    root["satellite_service_id"] = satelliteServiceId;
+    root["satellite_lnb_lof1"] = satelliteLnbLof1;
+    root["satellite_lnb_lof2"] = satelliteLnbLof2;
+    root["satellite_lnb_slof"] = satelliteLnbSlof;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;
@@ -131,7 +173,8 @@ Json::Value StreamConfig::toJson() const {
 Json::Value AppConfig::toJson() const {
     Json::Value root;
     root["login"] = login;
-    root["password"] = password;
+    const std::string storedPassword = normalizeMd5Password(password);
+    root["password_md5"] = storedPassword.rfind("md5:", 0) == 0 ? storedPassword.substr(4) : storedPassword;
     root["server_name"] = serverName;
     root["http_port"] = httpPort;
     root["language"] = language;
@@ -148,7 +191,14 @@ Json::Value AppConfig::toJson() const {
 AppConfig AppConfig::fromJson(const Json::Value& root) {
     AppConfig config;
     config.login = root.get("login", "admin").asString();
-    config.password = root.get("password", "admin").asString();
+    if (root.isMember("password_md5") && !root.get("password_md5", "").asString().empty()) {
+        config.password = normalizeMd5Password(root.get("password_md5", "").asString());
+    } else {
+        const std::string legacyPassword = root.get("password", "admin").asString();
+        config.password = legacyPassword.rfind("md5:", 0) == 0
+            ? normalizeMd5Password(legacyPassword)
+            : "md5:" + md5Hex(legacyPassword);
+    }
     config.serverName = root.get("server_name", "TVStreamer5").asString();
     config.httpPort = root.get("http_port", 9000).asInt();
     config.language = root.get("language", "en").asString();
@@ -225,12 +275,14 @@ bool ConfigManager::load() {
         AppConfig defaultConfig;
         {
             std::lock_guard<std::mutex> lock(fileMutex);
+            defaultConfig.password = normalizeMd5Password(defaultConfig.password);
             config = defaultConfig;
         }
         if (!save()) return false;
         return loadSubscribers();
     }
 
+    bool needsPasswordMigration = false;
     {
         std::lock_guard<std::mutex> lock(fileMutex);
         std::ifstream input(configPath);
@@ -245,7 +297,13 @@ bool ConfigManager::load() {
             std::cerr << "Failed to parse config: " << errs << std::endl;
             return false;
         }
+        needsPasswordMigration = !root.isMember("password_md5");
         config = AppConfig::fromJson(root);
+    }
+
+    if (needsPasswordMigration) {
+        std::cerr << "Migrating config password to MD5 storage" << std::endl;
+        if (!save()) return false;
     }
     return loadSubscribers();
 }
@@ -272,6 +330,7 @@ bool ConfigManager::loadSubscribers() {
 
 bool ConfigManager::save() {
     std::lock_guard<std::mutex> lock(fileMutex);
+    config.password = normalizeMd5Password(config.password);
     std::ofstream output(configPath);
     if (!output.is_open()) {
         std::cerr << "Unable to open config file for writing: " << configPath << std::endl;

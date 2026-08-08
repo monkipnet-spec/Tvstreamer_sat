@@ -237,6 +237,23 @@ std::map<std::string, StreamConfig> streamConfigById(const std::vector<StreamCon
     return result;
 }
 
+std::string primaryInputDisplay(const StreamConfig& cfg) {
+    if (!cfg.satelliteEnabled) {
+        return cfg.inputUri;
+    }
+    std::ostringstream ss;
+    ss << (cfg.satelliteDeliverySystem == "dvb-s" ? "DVB-S" : "DVB-S2")
+       << " adapter=" << cfg.satelliteAdapter
+       << " frontend=" << cfg.satelliteFrontend
+       << " " << cfg.satelliteFrequency << "kHz"
+       << " SR=" << cfg.satelliteSymbolRate << "kBd"
+       << " " << cfg.satellitePolarization;
+    if (cfg.satelliteServiceId > 0) {
+        ss << " SID=" << cfg.satelliteServiceId;
+    }
+    return ss.str();
+}
+
 bool sameStreamConfig(const StreamConfig& left, const StreamConfig& right) {
     return left.toJson() == right.toJson();
 }
@@ -506,7 +523,7 @@ bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const
     const std::string login = decoded.substr(0, separator);
     const std::string password = decoded.substr(separator + 1);
     return constantTimeEquals(login, configManager.config.login) &&
-           constantTimeEquals(password, configManager.config.password);
+           verifyMd5Password(password, configManager.config.password);
 }
 
 bool HttpServer::isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const {
@@ -777,12 +794,12 @@ std::string HttpServer::currentState() {
             item["using_backup"] = streamState->usingBackup;
             item["active_input_uri"] = cfg.testPattern
                 ? "test://bars"
-                : (streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri);
+                : (streamState->activeInputUri.empty() ? primaryInputDisplay(cfg) : streamState->activeInputUri);
             item["active_input_label"] = cfg.testPattern
                 ? "Тест"
                 : (streamState->usingBackup
                     ? (toLower(cfg.backupInputType) == "file" ? "Файл замены" : "Резерв")
-                    : "Основной");
+                    : (cfg.satelliteEnabled ? "Спутник" : "Основной"));
             item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
             item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
             item["input_cc_errors"] = Json::UInt64(streamState->inputCcErrorsDelta.load());
@@ -795,8 +812,8 @@ std::string HttpServer::currentState() {
             item["active"] = false;
             item["status"] = "stopped";
             item["using_backup"] = false;
-            item["active_input_uri"] = cfg.testPattern ? "test://bars" : cfg.inputUri;
-            item["active_input_label"] = cfg.testPattern ? "Тест" : "Основной";
+            item["active_input_uri"] = cfg.testPattern ? "test://bars" : primaryInputDisplay(cfg);
+            item["active_input_label"] = cfg.testPattern ? "Тест" : (cfg.satelliteEnabled ? "Спутник" : "Основной");
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
             item["input_cc_errors"] = Json::UInt64(0);
@@ -1039,7 +1056,10 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
     }
-    if (!root.isMember("password") || root.get("password", "").asString().empty()) {
+    const bool passwordProvided =
+        (root.isMember("password") && !root.get("password", "").asString().empty()) ||
+        (root.isMember("password_md5") && !root.get("password_md5", "").asString().empty());
+    if (!passwordProvided) {
         nextConfig.password = configManager.config.password;
     }
     if (!root.isMember("server_name") || root.get("server_name", "").asString().empty()) {
@@ -1787,11 +1807,34 @@ function streamBitrateMode(stream) {
   if (type === 'udp-vbr') return 'VBR';
   return stream.cbr ? 'CBR' : 'VBR';
 }
+function satelliteInputSummary(stream) {
+  const system = stream.satellite_delivery_system === 'dvb-s' ? 'DVB-S' : 'DVB-S2';
+  const freq = Number(stream.satellite_frequency || 0);
+  const sr = Number(stream.satellite_symbol_rate || 0);
+  const pol = String(stream.satellite_polarization || 'H').toUpperCase();
+  const sid = Number(stream.satellite_service_id || 0);
+  return `${system} · ${freq || '—'} kHz · SR ${sr || '—'} kBd · ${pol}${sid ? ` · SID ${sid}` : ''}`;
+}
+function primaryInputSummary(stream) {
+  return stream.satellite_enabled ? satelliteInputSummary(stream) : (stream.input_uri || '—');
+}
 function streamTileStructureSignature(stream) {
   return {
     id: stream.id,
     name: stream.name,
     input_uri: stream.input_uri,
+    satellite_enabled: stream.satellite_enabled,
+    satellite_adapter: stream.satellite_adapter,
+    satellite_frontend: stream.satellite_frontend,
+    satellite_frequency: stream.satellite_frequency,
+    satellite_symbol_rate: stream.satellite_symbol_rate,
+    satellite_polarization: stream.satellite_polarization,
+    satellite_delivery_system: stream.satellite_delivery_system,
+    satellite_modulation: stream.satellite_modulation,
+    satellite_fec: stream.satellite_fec,
+    satellite_diseqc_source: stream.satellite_diseqc_source,
+    satellite_stream_id: stream.satellite_stream_id,
+    satellite_service_id: stream.satellite_service_id,
     backup_input_uri: stream.backup_input_uri,
     backup_input_type: stream.backup_input_type,
     backup_file_loop: stream.backup_file_loop,
@@ -1819,7 +1862,7 @@ function updateStreamTile(tile, stream) {
 
   const activeInput = tile.querySelector('[data-role="active-input"]');
   if (activeInput) {
-    activeInput.textContent = `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}`;
+    activeInput.textContent = `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`;
   }
 
   const bitrateIn = tile.querySelector('[data-role="bitrate-in"]');
@@ -1882,8 +1925,8 @@ function render(force=false) {
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
         <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
-        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
-        <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}</span></div>
+        <div class="info-row"><strong>${t('primary')}</strong><span>${primaryInputSummary(stream)}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
@@ -2141,7 +2184,7 @@ function openLoginModal() {
     <h2>${t('userTitle')}</h2>
     <div class="form-grid full">
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
-      <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
+      <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /><small>В конфигурации сохраняется только MD5-хэш пароля.</small></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
       <div class="form-row"><label>Порт web-интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
@@ -2168,7 +2211,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2381,7 +2424,26 @@ function openStreamForm(stream) {
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
+        <div class="form-row full"><label>Источник основного потока</label><div class="checkbox-inline"><input id="streamSatelliteEnabled" type="checkbox" ${stream.satellite_enabled ? 'checked' : ''} onchange="updatePrimaryInputMode()" /><span>Принимать канал со спутника DVB-S / DVB-S2 вместо основного URL</span></div></div>
+        <div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
+        <div class="form-row full" id="streamSatelliteSettings" style="display:${stream.satellite_enabled?'block':'none'}"><label>Настройка спутникового приёма</label><div class="form-grid" style="margin-top:8px">
+          <div class="form-row"><label>Adapter</label><input id="streamSatelliteAdapter" type="number" min="0" value="${Number(stream.satellite_adapter||0)}" /></div>
+          <div class="form-row"><label>Frontend</label><input id="streamSatelliteFrontend" type="number" min="0" value="${Number(stream.satellite_frontend||0)}" /></div>
+          <div class="form-row"><label>Частота, kHz</label><input id="streamSatelliteFrequency" type="number" min="1" step="1" value="${Number(stream.satellite_frequency||0)}" placeholder="11265000" /></div>
+          <div class="form-row"><label>Symbol rate, kBd</label><input id="streamSatelliteSymbolRate" type="number" min="1" step="1" value="${Number(stream.satellite_symbol_rate||27500)}" placeholder="27500" /></div>
+          <div class="form-row"><label>Система</label><select id="streamSatelliteDeliverySystem"><option value="dvb-s2" ${(stream.satellite_delivery_system||'dvb-s2')==='dvb-s2'?'selected':''}>DVB-S2</option><option value="dvb-s" ${stream.satellite_delivery_system==='dvb-s'?'selected':''}>DVB-S</option></select></div>
+          <div class="form-row"><label>Поляризация</label><select id="streamSatellitePolarization"><option value="H" ${String(stream.satellite_polarization||'H').toUpperCase()==='H'?'selected':''}>Horizontal (H)</option><option value="V" ${String(stream.satellite_polarization||'H').toUpperCase()==='V'?'selected':''}>Vertical (V)</option></select></div>
+          <div class="form-row"><label>Модуляция</label><select id="streamSatelliteModulation"><option value="auto" ${(stream.satellite_modulation||'auto')==='auto'?'selected':''}>Auto</option><option value="qpsk" ${stream.satellite_modulation==='qpsk'?'selected':''}>QPSK</option><option value="8psk" ${stream.satellite_modulation==='8psk'?'selected':''}>8PSK</option><option value="16apsk" ${stream.satellite_modulation==='16apsk'?'selected':''}>16APSK</option><option value="32apsk" ${stream.satellite_modulation==='32apsk'?'selected':''}>32APSK</option></select></div>
+          <div class="form-row"><label>FEC</label><select id="streamSatelliteFec"><option value="auto" ${(stream.satellite_fec||'auto')==='auto'?'selected':''}>Auto</option>${['1/2','2/3','3/4','4/5','5/6','6/7','7/8','8/9','3/5','9/10','2/5'].map(v=>`<option value="${v}" ${stream.satellite_fec===v?'selected':''}>${v}</option>`).join('')}</select></div>
+          <div class="form-row"><label>Pilot</label><select id="streamSatellitePilot"><option value="auto" ${(stream.satellite_pilot||'auto')==='auto'?'selected':''}>Auto</option><option value="on" ${stream.satellite_pilot==='on'?'selected':''}>On</option><option value="off" ${stream.satellite_pilot==='off'?'selected':''}>Off</option></select></div>
+          <div class="form-row"><label>Rolloff</label><select id="streamSatelliteRolloff"><option value="auto" ${(stream.satellite_rolloff||'auto')==='auto'?'selected':''}>Auto</option><option value="35" ${stream.satellite_rolloff==='35'?'selected':''}>0.35</option><option value="25" ${stream.satellite_rolloff==='25'?'selected':''}>0.25</option><option value="20" ${stream.satellite_rolloff==='20'?'selected':''}>0.20</option></select></div>
+          <div class="form-row"><label>DiSEqC source</label><input id="streamSatelliteDiseqcSource" type="number" min="-1" max="7" value="${Number.isFinite(Number(stream.satellite_diseqc_source))?Number(stream.satellite_diseqc_source):-1}" /><small>-1 = выключено</small></div>
+          <div class="form-row"><label>Stream ID / MIS</label><input id="streamSatelliteStreamId" type="number" min="-1" max="255" value="${Number.isFinite(Number(stream.satellite_stream_id))?Number(stream.satellite_stream_id):-1}" /><small>-1 = auto/off</small></div>
+          <div class="form-row"><label>SID канала</label><input id="streamSatelliteServiceId" type="number" min="0" max="65535" value="${Number.isFinite(Number(stream.satellite_service_id))?Number(stream.satellite_service_id):1}" /><small>Program number; 0 = весь транспондер</small></div>
+          <div class="form-row"><label>LNB LOF1, kHz</label><input id="streamSatelliteLnbLof1" type="number" value="${Number(stream.satellite_lnb_lof1||9750000)}" /></div>
+          <div class="form-row"><label>LNB LOF2, kHz</label><input id="streamSatelliteLnbLof2" type="number" value="${Number(stream.satellite_lnb_lof2||10600000)}" /></div>
+          <div class="form-row"><label>LNB switch, kHz</label><input id="streamSatelliteLnbSlof" type="number" value="${Number(stream.satellite_lnb_slof||11700000)}" /></div>
+        </div><small>Для DVB-S/S2 частота указывается в kHz, Symbol Rate — в kBd. SID выбирает программу из транспондера.</small></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -2406,6 +2468,7 @@ function openStreamForm(stream) {
     updateHeaderHeight();
     document.getElementById('modal').classList.add('stream-open');
     document.getElementById('streamCbr').checked = outputType === 'udp-cbr' || (outputType !== 'udp-vbr' && stream.cbr);
+    updatePrimaryInputMode();
     updateBackupInputMode();
     updateTranscodeControls();
     loadUploadedBackupFiles();
@@ -2417,6 +2480,13 @@ function openStreamForm(stream) {
   } else {
     renderStreamForm();
   }
+}
+function updatePrimaryInputMode() {
+  const enabled = document.getElementById('streamSatelliteEnabled')?.checked === true;
+  const urlSettings = document.getElementById('streamPrimaryUrlSettings');
+  const satelliteSettings = document.getElementById('streamSatelliteSettings');
+  if (urlSettings) urlSettings.style.display = enabled ? 'none' : '';
+  if (satelliteSettings) satelliteSettings.style.display = enabled ? 'block' : 'none';
 }
 function updateTranscodeControls() {
   const enabled = document.getElementById('streamTranscodeEnabled');
@@ -2550,6 +2620,15 @@ function saveStream(id) {
   const selectedCbr = selectedOutputType === 'udp-cbr'
     ? true
     : (selectedOutputType === 'udp-vbr' ? false : document.getElementById('streamCbr').checked);
+  const satelliteEnabled = document.getElementById('streamSatelliteEnabled')?.checked === true;
+  if (satelliteEnabled) {
+    const frequency = Number(document.getElementById('streamSatelliteFrequency')?.value || 0);
+    const symbolRate = Number(document.getElementById('streamSatelliteSymbolRate')?.value || 0);
+    if (frequency <= 0 || symbolRate <= 0) {
+      alert('Для спутникового входа укажите частоту и Symbol Rate.');
+      return;
+    }
+  }
   const payload = {
     id: id,
     name: document.getElementById('streamName').value,
@@ -2565,6 +2644,23 @@ function saveStream(id) {
     interface_address: document.getElementById('streamInterface').value,
     input_interface_address: document.getElementById('streamInputInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
+    satellite_enabled: document.getElementById('streamSatelliteEnabled').checked,
+    satellite_adapter: Number(document.getElementById('streamSatelliteAdapter').value || 0),
+    satellite_frontend: Number(document.getElementById('streamSatelliteFrontend').value || 0),
+    satellite_frequency: Number(document.getElementById('streamSatelliteFrequency').value || 0),
+    satellite_symbol_rate: Number(document.getElementById('streamSatelliteSymbolRate').value || 0),
+    satellite_polarization: document.getElementById('streamSatellitePolarization').value,
+    satellite_delivery_system: document.getElementById('streamSatelliteDeliverySystem').value,
+    satellite_modulation: document.getElementById('streamSatelliteModulation').value,
+    satellite_fec: document.getElementById('streamSatelliteFec').value,
+    satellite_pilot: document.getElementById('streamSatellitePilot').value,
+    satellite_rolloff: document.getElementById('streamSatelliteRolloff').value,
+    satellite_diseqc_source: Number(document.getElementById('streamSatelliteDiseqcSource').value || -1),
+    satellite_stream_id: Number(document.getElementById('streamSatelliteStreamId').value || -1),
+    satellite_service_id: Number(document.getElementById('streamSatelliteServiceId').value || 0),
+    satellite_lnb_lof1: Number(document.getElementById('streamSatelliteLnbLof1').value || 9750000),
+    satellite_lnb_lof2: Number(document.getElementById('streamSatelliteLnbLof2').value || 10600000),
+    satellite_lnb_slof: Number(document.getElementById('streamSatelliteLnbSlof').value || 11700000),
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,

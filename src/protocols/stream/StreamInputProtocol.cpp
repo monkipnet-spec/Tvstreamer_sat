@@ -17,6 +17,7 @@ InputProtocolKind inputKind(const StreamConfig& cfg) {
     const std::string input = toLower(cfg.inputUri);
     const std::string mode = toLower(cfg.inputMode);
     if (inputs::isTestInput(input, mode, cfg.testPattern)) return InputProtocolKind::TestPattern;
+    if (cfg.satelliteEnabled) return InputProtocolKind::Satellite;
     if (inputs::isUdpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Udp;
     if (inputs::isRtpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Rtp;
     if (inputs::isSrtInput(input, mode, cfg.testPattern)) return InputProtocolKind::Srt;
@@ -31,6 +32,7 @@ InputProtocolKind inputKind(const StreamConfig& cfg) {
 std::string inputKindName(InputProtocolKind kind) {
     switch (kind) {
         case InputProtocolKind::TestPattern: return "test";
+        case InputProtocolKind::Satellite: return "satellite";
         case InputProtocolKind::Udp: return "udp";
         case InputProtocolKind::Rtp: return "rtp";
         case InputProtocolKind::Http: return "http";
@@ -47,6 +49,8 @@ std::vector<const char*> requiredElementsForInput(InputProtocolKind kind) {
     switch (kind) {
         case InputProtocolKind::TestPattern:
             return {"videotestsrc", "audiotestsrc", "x264enc", "avenc_aac", "mpegtsmux"};
+        case InputProtocolKind::Satellite:
+            return {"dvbbasebin"};
         case InputProtocolKind::Udp:
             return {"udpsrc"};
         case InputProtocolKind::Rtp:

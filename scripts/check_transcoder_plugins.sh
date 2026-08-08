@@ -67,6 +67,7 @@ if ((${#missing[@]} > 0)); then
 fi
 
 input_elements=(
+  "satellite DVB-S/S2:dvbbasebin"
   "http/https:souphttpsrc"
   "hls:souphttpsrc hlsdemux"
   "udp:udpsrc"

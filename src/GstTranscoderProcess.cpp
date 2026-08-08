@@ -522,6 +522,18 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
         return {};
     }
 
+    std::vector<std::string> missingInput;
+    validateFactories(tvs::protocols::requiredInputElements(baseConfig), missingInput);
+    if (!missingInput.empty()) {
+        std::ostringstream ss;
+        ss << "missing input protocol elements";
+        for (size_t i = 0; i < missingInput.size(); ++i) {
+            ss << (i == 0 ? ": " : ", ") << missingInput[i];
+        }
+        error = ss.str();
+        return {};
+    }
+
     std::vector<std::string> args = {"gst-launch-1.0", "-e"};
     GstOutputSpec outputSpec;
     if (!tvs::protocols::appendOutputMuxAndSink(args, outputConfig, outputSpec, error)) {

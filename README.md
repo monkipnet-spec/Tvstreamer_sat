@@ -964,3 +964,39 @@ journalctl -u tvstreamer5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Tr
 For an SRT Listener with transcoding enabled, the external `gst-launch-1.0` process must terminate at an internal loopback `udpsink`; the public `srtsink` is owned by TVStreamer5 so that the normal `caller-added`/`caller-removed` subscriber monitoring callbacks are used. The startup description should therefore contain `srt-listener-relay@127.0.0.1:`. If the UI still shows `srt-listener@srt://...`, an older/partial SRT output module is deployed.
 
 The external transcoder command is now logged before process startup, and early `gst-launch-1.0` stderr is appended to the persistent web startup error so an exit code such as 255 is accompanied by the actual GStreamer error text.
+
+### MD5 password storage
+
+The web password is no longer written to `tvstreamer5-config.json` in clear text. TVStreamer5 stores only a lowercase MD5 digest in the `password_md5` field. Existing configurations that still contain a legacy plaintext `password` are migrated automatically on the next successful startup and rewritten without the clear-text field.
+
+HTTP Basic authentication itself is unchanged for clients: the browser/player still sends the normal password, while TVStreamer5 computes its MD5 digest and compares it with the stored digest. Changing the password from the web settings also writes only `password_md5`.
+
+MD5 is provided here for compatibility with the requested configuration format. It is a one-way hash, not encryption, and it is not suitable as a modern password-hardening algorithm against offline attacks. Protect the configuration file and use HTTPS/reverse-proxy TLS for the web interface.
+
+### Satellite DVB-S / DVB-S2 primary input
+
+A stream can use a Linux DVB satellite tuner instead of the normal primary URL. Enable **«Принимать канал со спутника DVB-S / DVB-S2 вместо основного URL»** in the stream editor. The normal primary URL/interface/mode controls are hidden and the satellite tuner panel becomes available.
+
+The panel supports adapter/frontend selection, frequency, symbol rate, DVB-S or DVB-S2, H/V polarization, modulation, FEC, pilot, rolloff, DiSEqC source, DVB-S2 MIS/Stream ID, service/program SID and universal-LNB LOF1/LOF2/switch frequencies. TVStreamer5 uses GStreamer `dvbbasebin` so a configured `satellite_service_id` is passed through `program-numbers` and the selected service is exposed as MPEG-TS to the normal output/remap/transcoding path.
+
+Units follow the GStreamer DVB API: satellite frequency is entered in **kHz** and symbol rate in **kBd**. Typical universal LNB defaults are LOF1 `9750000`, LOF2 `10600000`, switch `11700000` kHz. `DiSEqC source = -1` disables DiSEqC and `Stream ID = -1` disables MIS selection.
+
+Check tuner devices and the GStreamer DVB plugin on Linux:
+
+```bash
+ls -l /dev/dvb/adapter*/frontend*
+gst-inspect-1.0 dvbbasebin
+gst-inspect-1.0 dvbsrc
+./scripts/check_transcoder_plugins.sh
+```
+
+For Docker, the DVB devices must be passed into the container explicitly, for example:
+
+```bash
+docker run --device /dev/dvb/adapter0/frontend0 \
+           --device /dev/dvb/adapter0/demux0 \
+           --device /dev/dvb/adapter0/dvr0 \
+           ...
+```
+
+The satellite source works both for normal MPEG-TS forwarding/remap and for the external GStreamer transcoder. With transcoding enabled, `dvbbasebin` feeds the selected program to `decodebin`, then the existing H.264/AAC and CBR output pipeline is used.

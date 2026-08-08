@@ -9,6 +9,7 @@ namespace tvs::stream_protocols {
 
 enum class InputProtocolKind {
     TestPattern,
+    Satellite,
     Udp,
     Rtp,
     Http,
