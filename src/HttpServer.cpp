@@ -844,8 +844,14 @@ std::string HttpServer::currentState() {
       item["available_channels"] = provider.maxChannels > static_cast<int>(activeChannels)
         ? provider.maxChannels - static_cast<int>(activeChannels) : 0;
       item["capacity_ok"] = activeChannels <= static_cast<unsigned>(provider.maxChannels);
-      item["backend_connected"] = false;
-      item["backend_status"] = "external integration point; built-in CA transport is not implemented";
+      const std::string backendType = toLower(provider.backendType);
+      const bool authorizedTs = backendType == "authorized-ts" || backendType == "predecoded-ts" || backendType == "decrypted-ts";
+      item["backend_connected"] = authorizedTs && activeChannels > 0;
+      item["backend_status"] = authorizedTs
+        ? (provider.endpoint.empty()
+            ? "authorized TS transport: endpoint is not configured"
+            : (activeChannels > 0 ? "authorized TS transport active" : "authorized TS transport configured"))
+        : "external integration point; TVStreamer does not handle CA keys";
       caProviders.append(item);
     }
     root["ca_providers"] = caProviders;
@@ -1393,10 +1399,17 @@ std::string HttpServer::handleStartStream(const std::string& body) {
         response["stream_id"] = cfg.id;
         if (cfg.satelliteEnabled && selectedCaProvider) {
             Json::Value warnings(Json::arrayValue);
-            warnings.append(
-                "Канал назначен логическому CA provider '" + selectedCaProvider->name +
-                "' (max_channels=" + std::to_string(selectedCaProvider->maxChannels) +
-                "). Встроенный транспорт CA/descrambling отсутствует; provider является точкой интеграции с внешним авторизованным backend.");
+            const std::string backendType = toLower(selectedCaProvider->backendType);
+            if (backendType == "authorized-ts" || backendType == "predecoded-ts" || backendType == "decrypted-ts") {
+                warnings.append(
+                    "Канал использует authorized pre-decoded TS transport provider '" + selectedCaProvider->name +
+                    "' (max_channels=" + std::to_string(selectedCaProvider->maxChannels) +
+                    "). TVStreamer получает уже расшифрованный MPEG-TS и не получает/не хранит CW/ECM.");
+            } else {
+                warnings.append(
+                    "Канал назначен CA provider '" + selectedCaProvider->name +
+                    "'. Для этого backend типа TVStreamer не выполняет обмен ключами или descrambling.");
+            }
             response["warnings"] = warnings;
         }
     } else {
@@ -2523,7 +2536,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>v81</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>v82</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2577,8 +2590,8 @@ function caProviderRowHtml(provider={}) {
     <div class="form-grid">
       <div class="form-row"><label>ID</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" ${provider.id?'readonly':''} /></div>
       <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Основная карта / CAM" /></div>
-      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type"><option value="external" ${(provider.backend_type||'external')==='external'?'selected':''}>External authorized backend</option><option value="cam-service" ${provider.backend_type==='cam-service'?'selected':''}>CAM service</option><option value="custom" ${provider.backend_type==='custom'?'selected':''}>Custom integration</option></select></div>
-      <div class="form-row"><label>Endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(provider.endpoint || '')}" placeholder="URL / unix socket / service name" /></div>
+      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type"><option value="authorized-ts" ${provider.backend_type==='authorized-ts'?'selected':''}>Authorized pre-decoded TS</option><option value="external" ${(provider.backend_type||'external')==='external'?'selected':''}>External authorized backend</option><option value="cam-service" ${provider.backend_type==='cam-service'?'selected':''}>CAM service</option><option value="custom" ${provider.backend_type==='custom'?'selected':''}>Custom integration</option></select></div>
+      <div class="form-row"><label>Endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(provider.endpoint || '')}" placeholder="udp://127.0.0.1:9000 или srt://host:port?streamid={service_id}" /></div>
       <div class="form-row"><label>Max active channels</label><input data-ca-field="max_channels" type="number" min="1" max="64" value="${maxChannels}" /></div>
       <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${active}/${maxChannels} active · ${assigned} assigned</small></div>
     </div>
@@ -2589,7 +2602,7 @@ function openCaProvidersModal() {
   const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
   openModal(`
     <h2>CA Providers</h2>
-    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам больше не привязываются.</div><small>Эта версия создаёт модель, лимиты и точку интеграции. Встроенного обмена CA/CW/ECM и descrambling backend в TVStreamer нет.</small></div>
+    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Логический CA provider</strong><div style="margin-top:4px;color:#aeb8ca">Один provider назначается нескольким спутниковым каналам и ограничивает число одновременно активных каналов. Физические /dev/ttyUSB* и /dev/ttyACM* к отдельным каналам больше не привязываются.</div><small>Backend «Authorized pre-decoded TS» принимает уже расшифрованный MPEG-TS от вашего авторизованного CAM/CA backend. В endpoint можно использовать {service_id}, {stream_id}, {frequency_khz}, {frequency_mhz}. TVStreamer не получает и не хранит CW/ECM.</small></div>
     <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">CA Providers пока не созданы.</div>'}</div>
     <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить CA Provider</button>
     <div id="caProviderSaveStatus" style="margin-top:10px;color:#ffb36b"></div>

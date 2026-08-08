@@ -41,6 +41,39 @@ constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr const char* kTestPatternUri = "test://bars";
 
+const CaProviderConfig* findCaProvider(const ConfigManager& manager, const std::string& id) {
+    if (id.empty()) return nullptr;
+    for (const auto& provider : manager.config.caProviders) {
+        if (provider.id == id) return &provider;
+    }
+    return nullptr;
+}
+
+bool isAuthorizedTsProvider(const CaProviderConfig& provider) {
+    const std::string type = toLower(provider.backendType);
+    return type == "authorized-ts" || type == "predecoded-ts" || type == "decrypted-ts";
+}
+
+void replaceAll(std::string& value, const std::string& token, const std::string& replacement) {
+    if (token.empty()) return;
+    size_t pos = 0;
+    while ((pos = value.find(token, pos)) != std::string::npos) {
+        value.replace(pos, token.size(), replacement);
+        pos += replacement.size();
+    }
+}
+
+std::string expandAuthorizedTsEndpoint(const CaProviderConfig& provider, const StreamConfig& cfg) {
+    std::string endpoint = provider.endpoint;
+    replaceAll(endpoint, "{stream_id}", cfg.id);
+    replaceAll(endpoint, "{service_id}", std::to_string(cfg.satelliteServiceId));
+    replaceAll(endpoint, "{frequency_khz}", std::to_string(cfg.satelliteFrequency));
+    std::ostringstream mhz;
+    mhz << (static_cast<double>(cfg.satelliteFrequency) / 1000.0);
+    replaceAll(endpoint, "{frequency_mhz}", mhz.str());
+    return endpoint;
+}
+
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
     if (!factory) {
@@ -1722,17 +1755,44 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->config = streamConfig;
     state->runtimeConfig = streamConfig;
     state->primarySatelliteEnabled = streamConfig.satelliteEnabled;
-    state->primaryInputUri = streamConfig.satelliteEnabled
-        ? tvs::protocols::inputUriForGstreamer(streamConfig)
-        : streamConfig.inputUri;
+
+    const CaProviderConfig* caProvider = streamConfig.satelliteEnabled
+        ? findCaProvider(configManager, streamConfig.caProviderId)
+        : nullptr;
+    if (caProvider && isAuthorizedTsProvider(*caProvider)) {
+        if (!caProvider->enabled) {
+            if (error) *error = "CA provider '" + caProvider->name + "' is disabled";
+            return false;
+        }
+        const std::string endpoint = expandAuthorizedTsEndpoint(*caProvider, streamConfig);
+        if (endpoint.empty()) {
+            if (error) *error = "CA provider '" + caProvider->name + "' has empty authorized TS endpoint";
+            return false;
+        }
+        state->caProviderTransport = true;
+        state->caProviderId = caProvider->id;
+        state->caProviderName = caProvider->name;
+        state->primarySatelliteEnabled = false;
+        state->runtimeConfig.satelliteEnabled = false;
+        state->runtimeConfig.inputUri = endpoint;
+        state->runtimeConfig.inputMode = "auto";
+        state->primaryInputUri = endpoint;
+        std::cerr << "Authorized pre-decoded TS provider: stream=" << streamConfig.id
+                  << " provider=" << caProvider->id
+                  << " endpoint=" << endpoint << std::endl;
+    } else {
+        state->primaryInputUri = streamConfig.satelliteEnabled
+            ? tvs::protocols::inputUriForGstreamer(streamConfig)
+            : streamConfig.inputUri;
+    }
     state->activeInputUri = streamConfig.testPattern
         ? kTestPatternUri
         : state->primaryInputUri;
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = streamConfig;
+    state->sourceContext->config = state->runtimeConfig;
 
     std::string sharedSatelliteError;
-    if (!prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
+    if (!state->caProviderTransport && !prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
         state->statusMessage = "satellite shared input failed: " + sharedSatelliteError;
         if (error) *error = sharedSatelliteError;
         return false;
@@ -1816,7 +1876,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     }
 
     std::cerr << "Pipeline for stream '" << streamConfig.name
-              << "': " << buildPipelineDescription(streamConfig) << std::endl;
+              << "': " << buildPipelineDescription(state->runtimeConfig) << std::endl;
 
     state->pipeline = pipeline;
     state->bus = gst_element_get_bus(pipeline);
@@ -2786,6 +2846,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
 
     auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
+        if (state->caProviderTransport && maxSizeTime < 8000000000ULL) {
+            maxSizeTime = 8000000000ULL;
+        }
         GstElement* queue = gst_element_factory_make("queue", name);
         if (!addElementOrFail(pipeline, queue)) {
             return nullptr;
@@ -4155,6 +4218,30 @@ void StreamManager::monitorBus(const std::string& id) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                 }
+            } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() &&
+                       state->caProviderTransport && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+                state->lastPrimaryRetry = now;
+                state->statusMessage = "reconnecting authorized TS provider";
+                if (restartPipelineWithInput(state, state->primaryInputUri, false)) {
+                    bus = state->bus;
+                    state->active = true;
+                    state->inputLossNotified = false;
+                    state->statusMessage = "running via authorized TS provider";
+                    notifyStreamState(
+                        state->config,
+                        "🟢",
+                        telegramText(configManager, "CA Provider переподключён", "CA Provider reconnected"),
+                        telegramText(configManager, "Авторизованный TS endpoint снова активен", "Authorized TS endpoint is active again") +
+                            "\nURL: " + state->primaryInputUri);
+                } else if (!state->inputLossNotified) {
+                    state->inputLossNotified = true;
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "CA Provider недоступен", "CA Provider unavailable"),
+                        telegramText(configManager, "Повтор подключения через 10 секунд", "Retrying in 10 seconds") +
+                            "\nURL: " + state->primaryInputUri);
+                }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
                 state->statusMessage = "no input signal";
@@ -4186,6 +4273,24 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: " + message;
                 state->active = false;
+                if (state->caProviderTransport) {
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "Ошибка CA Provider transport", "CA Provider transport error"),
+                        telegramText(configManager, "Пробую восстановить authorized TS endpoint", "Trying to restore authorized TS endpoint") +
+                            "\n" + telegramText(configManager, "Причина", "Reason") + ": " + message);
+                    gst_message_unref(msg);
+                    if (restartPipelineWithInput(state, state->primaryInputUri, false)) {
+                        bus = state->bus;
+                        state->active = true;
+                        state->inputLossNotified = false;
+                        state->statusMessage = "running via authorized TS provider";
+                        continue;
+                    }
+                    state->statusMessage = "authorized TS provider reconnect failed";
+                    return;
+                }
                 notifyStreamState(
                     state->config,
                     "🔴",

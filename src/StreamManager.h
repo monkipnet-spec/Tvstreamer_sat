@@ -64,6 +64,9 @@ struct StreamState {
     bool primaryRetryPending = false;
     bool inputLossNotified = false;
     bool primarySatelliteEnabled = false;
+    bool caProviderTransport = false;
+    std::string caProviderId;
+    std::string caProviderName;
     std::string statusMessage = "stopped";
     std::string primaryInputUri;
     std::string activeInputUri;
