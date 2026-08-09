@@ -31,7 +31,7 @@ void appendSatelliteSource(std::vector<std::string>& args, const StreamConfig& c
         "lnb-lof1=" + std::to_string(cfg.satelliteLnbLof1),
         "lnb-lof2=" + std::to_string(cfg.satelliteLnbLof2),
         "lnb-slof=" + std::to_string(cfg.satelliteLnbSlof),
-        "tuning-timeout=10000000"
+        "tuning-timeout=5000000000"
     });
     if (cfg.satelliteServiceId > 0) {
         args.push_back("program-numbers=" + std::to_string(cfg.satelliteServiceId));

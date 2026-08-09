@@ -1299,7 +1299,7 @@ bool StreamManager::acquireSatelliteTransponder(
     setUIntPropertyIfPresent(source, "lnb-lof1", cfg.satelliteLnbLof1);
     setUIntPropertyIfPresent(source, "lnb-lof2", cfg.satelliteLnbLof2);
     setUIntPropertyIfPresent(source, "lnb-slof", cfg.satelliteLnbSlof);
-    setUInt64PropertyIfPresent(source, "tuning-timeout", 10000000ULL);
+    setUInt64PropertyIfPresent(source, "tuning-timeout", 5000000000ULL); // v98: 5 s on GStreamer 1.20 (nanoseconds)
     // v90: for the shared transponder hub prefer dvbsrc and request the full
     // transport stream. dvbbasebin may expose only selected program pads and on
     // some DVB-S2 services the downstream SID relay never receives TS packets.
@@ -3114,7 +3114,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         setUIntPropertyIfPresent(src, "lnb-lof1", cfg.satelliteLnbLof1);
         setUIntPropertyIfPresent(src, "lnb-lof2", cfg.satelliteLnbLof2);
         setUIntPropertyIfPresent(src, "lnb-slof", cfg.satelliteLnbSlof);
-        setUInt64PropertyIfPresent(src, "tuning-timeout", 10000000ULL);
+        setUInt64PropertyIfPresent(src, "tuning-timeout", 5000000000ULL); // v98: 5 s on GStreamer 1.20 (nanoseconds)
         if (cfg.satelliteServiceId > 0) {
             setStringPropertyIfPresent(src, "program-numbers", std::to_string(cfg.satelliteServiceId));
         }
