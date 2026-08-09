@@ -45,6 +45,11 @@ static bool isCWValid(const CachedCW& cached) {
     return elapsed < cached.ttl_seconds;
 }
 
+// Внутренняя функция очистки кэша (вызывается с захваченным мьютексом)
+static void clearCacheLocked() {
+    g_cwCache.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Заглушка для реального получения CW от backend (будет реализована отдельно)
 // ---------------------------------------------------------------------------
@@ -95,7 +100,7 @@ CWResponse getCW(const CaProviderConfig& provider, uint16_t sid,
 
 void clearCache() {
     std::lock_guard<std::mutex> lock(g_cacheMutex);
-    g_cwCache.clear();
+    clearCacheLocked();
 }
 
 void setCacheTTL(int ttlSeconds) {
@@ -104,7 +109,7 @@ void setCacheTTL(int ttlSeconds) {
 }
 
 // ---------------------------------------------------------------------------
-// Существующие функции (без изменений, кроме добавления вызова clearCache при остановке)
+// Существующие функции (без изменений)
 // ---------------------------------------------------------------------------
 bool safeDeviceNode(const std::string& device) {
     if (device.rfind("/dev/ttyUSB", 0) != 0 && device.rfind("/dev/ttyACM", 0) != 0) {
@@ -283,7 +288,7 @@ Json::Value backendStatusJson(const CaProviderConfig& provider, const Json::Valu
 // Функция для остановки/очистки кэша (вызывается при завершении программы)
 // ---------------------------------------------------------------------------
 void shutdownCaProvider() {
-    clearCache();
+    clearCache();  // теперь это публичная функция, конфликта нет
 }
 
 } // namespace ca_provider
