@@ -82,7 +82,11 @@ add_executable(TVStreamer
     src/protocols/outputs/GstRtmpOutputProtocol.cpp
     src/HttpServer.cpp
 )
-
+target_link_libraries(TVStreamer PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    pthread
+)
 target_link_libraries(TVStreamer
     ${GSTREAMER_LIBRARIES}
     ${LIBCURL_LIBRARIES}
