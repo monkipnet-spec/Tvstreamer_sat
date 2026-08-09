@@ -1611,6 +1611,7 @@ bool StreamManager::restartSharedSatelliteInput(StreamState* state, const std::s
         error = "satellite service relay has no packets for SID " + std::to_string(state->config.satelliteServiceId) +
                 "; rescan transponder or verify service_id/video_pid/audio_pid";
         state->statusMessage = error;
+        state->satelliteRelayRecoveryDisabled = true;
         std::cerr << "Satellite relay recovery disabled after repeated no-input: stream="
                   << state->config.id << " SID=" << state->config.satelliteServiceId << std::endl;
         return false;
@@ -1887,11 +1888,34 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->runtimeConfig;
 
+    // v93: FTA services use the DVB frontend directly.  The previous path
+    // inserted a second per-service pipeline (shared transponder -> tsdemux ->
+    // mpegtsmux -> loopback UDP -> playback pipeline).  On some DVB-S2 services
+    // tsdemux discovered the correct H.264/audio pads but the intermediate mux
+    // produced no loopback packets, so the watchdog kept restarting a healthy
+    // tuned frontend.  dvbbasebin already supports program-numbers and can hand
+    // the selected FTA service straight to the normal output pipeline.
+    //
+    // Keep the shared-transponder architecture only for scrambled services,
+    // where a future CA backend may need a common transport stream.
+    const bool useSharedSatelliteInput =
+        streamConfig.satelliteEnabled && streamConfig.satelliteScrambled;
+
     std::string sharedSatelliteError;
-    if (!state->caProviderTransport && !prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
+    if (!state->caProviderTransport && useSharedSatelliteInput &&
+        !prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
         state->statusMessage = "satellite shared input failed: " + sharedSatelliteError;
         if (error) *error = sharedSatelliteError;
         return false;
+    }
+    if (streamConfig.satelliteEnabled && !streamConfig.satelliteScrambled) {
+        std::cerr << "FTA direct DVB input selected: stream=" << streamConfig.id
+                  << " adapter=" << streamConfig.satelliteAdapter
+                  << " frontend=" << streamConfig.satelliteFrontend
+                  << " SID=" << streamConfig.satelliteServiceId
+                  << " frequency_khz=" << streamConfig.satelliteFrequency
+                  << std::endl;
+        state->statusMessage = "starting FTA via direct DVB-S/S2 input";
     }
 
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
@@ -4275,7 +4299,8 @@ void StreamManager::monitorBus(const std::string& id) {
             const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
             const bool sharedSatellitePrimary = state->config.satelliteEnabled && state->sharedSatelliteInput && !state->usingBackup;
             const bool excessiveInputCcErrors = state->inputCcErrorsDelta.load(std::memory_order_relaxed) >= kInputCcRecoveryThreshold;
-            if (sharedSatellitePrimary && state->config.backupInputUri.empty() &&
+            if (sharedSatellitePrimary && !state->satelliteRelayRecoveryDisabled &&
+                state->config.backupInputUri.empty() &&
                 (inputTimedOut || excessiveInputCcErrors) &&
                 now - state->lastSatelliteRelayRestart >= kSatelliteRelayRestartInterval) {
                 std::string recoveryError;

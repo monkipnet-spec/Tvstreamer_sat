@@ -103,6 +103,7 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSatelliteRelayRestart = std::chrono::steady_clock::time_point{};
     uint32_t satelliteRelayRestartCount = 0;
+    bool satelliteRelayRecoveryDisabled = false;
     uint32_t ccRecoveryBurstCount = 0;
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
