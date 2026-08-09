@@ -46,7 +46,7 @@ static bool isCWValid(const CachedCW& cached) {
 }
 
 // Внутренняя функция очистки кэша (вызывается с захваченным мьютексом)
-static void clearCacheLocked() {
+static void clearCacheInternal() {
     g_cwCache.clear();
 }
 
@@ -100,7 +100,7 @@ CWResponse getCW(const CaProviderConfig& provider, uint16_t sid,
 
 void clearCache() {
     std::lock_guard<std::mutex> lock(g_cacheMutex);
-    clearCacheLocked();
+    clearCacheInternal();
 }
 
 void setCacheTTL(int ttlSeconds) {
