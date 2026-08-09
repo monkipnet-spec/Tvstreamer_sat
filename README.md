@@ -1075,3 +1075,8 @@ On narrower screens the wizard automatically collapses to two columns and then o
 Each card/provider owns its own session capacity. `capacity_mode=manual` uses its configured `max_channels`; `capacity_mode=auto` is reserved for a documented card/provider capability interface and currently falls back to that same per-card value if no capability is reported. New providers start with a conservative fallback of 1 rather than a hard-coded 8. The start API rejects a stream when its selected card/provider is disabled, has no reader, the reader is offline, or that provider's effective capacity is already full.
 
 The old `Authorized pre-decoded TS` endpoint is no longer part of the CA Provider UI in v85. Selecting a card/provider does not replace the DVB input transport. This release provides reader discovery, stable identity, hot-plug status and session accounting only; it does not implement ECM/CW extraction, software descrambling or key caching.
+
+
+## v94
+
+FTA DVB-S/S2 direct input now always performs single-service SID filtering/remux in the main pipeline. This prevents full-transponder passthrough on HTTP/UDP/SRT when `remap` is disabled. OpenSSL 3 is a permanent build dependency via `OpenSSL::SSL` and `OpenSSL::Crypto`.

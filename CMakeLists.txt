@@ -89,7 +89,7 @@ target_link_libraries(TVStreamer
     ${LIBCURL_LIBRARIES}
     ${JSONCPP_LIBRARIES}
     ${Boost_LIBRARIES}
-	OpenSSL::SSL
+    OpenSSL::SSL
     OpenSSL::Crypto
     pthread
     glib-2.0

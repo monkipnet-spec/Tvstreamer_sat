@@ -3484,8 +3484,28 @@ bool StreamManager::buildOutputBranch(
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
-    const bool needsRemux = outputConfig.remapEnabled && !transcodedInput;
+
+    // v94: a direct FTA DVB-S/S2 source can still expose the complete
+    // transponder transport stream even when dvbbasebin program-numbers is
+    // configured.  Passing that TS straight to HTTP/UDP makes VLC see every
+    // service on the transponder and may leave only PSI/audio traffic for the
+    // selected channel.  For FTA satellite services always perform a local
+    // single-service demux/remux in the main pipeline.  This does not use the
+    // old loopback UDP service relay.
+    const bool forceFtaSatelliteServiceRemux =
+        state && state->config.satelliteEnabled &&
+        !state->config.satelliteScrambled &&
+        state->config.satelliteServiceId > 0 &&
+        !transcodedInput;
+    const bool needsRemux = (outputConfig.remapEnabled || forceFtaSatelliteServiceRemux) && !transcodedInput;
     if (needsRemux) {
+        if (forceFtaSatelliteServiceRemux) {
+            std::cerr << "FTA single-service remux: stream=" << state->config.id
+                      << " SID=" << state->config.satelliteServiceId
+                      << " video_pid=" << state->config.videoPid
+                      << " audio_pid=" << state->config.audioPid
+                      << " branch=" << branchIndex << std::endl;
+        }
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
     return buildPassthroughPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
@@ -3574,6 +3594,21 @@ bool StreamManager::buildRemapPipeline(
     configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
     sendServiceDescription(mux, cfg);
+
+    // v94: explicitly select the scanned DVB service in tsdemux.
+    // program-numbers on dvbbasebin is not sufficient on every driver/plugin
+    // combination; some frontends still expose the whole transport stream.
+    // The output branch therefore filters by the actual scanned satellite SID
+    // before linking elementary video/audio streams into the new mpegtsmux.
+    if (state->config.satelliteEnabled && state->config.satelliteServiceId > 0) {
+        setIntPropertyIfPresent(
+            demux,
+            "program-number",
+            static_cast<gint>(state->config.satelliteServiceId));
+        std::cerr << "FTA/DVB service filter configured: SID="
+                  << state->config.satelliteServiceId
+                  << " branch=" << branchIndex << std::endl;
+    }
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
