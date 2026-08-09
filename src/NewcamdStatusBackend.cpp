@@ -9,15 +9,27 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <openssl/des.h>
-#include <openssl/md5.h>
 #include <openssl/evp.h>
+#include <openssl/md5.h>
+#include <openssl/err.h>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <iostream>
 
 namespace ca_provider {
+
+// ---------------------------------------------------------------------------
+// Инициализация OpenSSL (один раз)
+// ---------------------------------------------------------------------------
+static void initOpenSSL() {
+    static bool initialized = false;
+    if (!initialized) {
+        OpenSSL_add_all_algorithms();
+        ERR_load_crypto_strings();
+        initialized = true;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Парсинг endpoint с поддержкой полного URL
@@ -87,6 +99,8 @@ bool NewcamdStatusBackend::parseEndpoint(const std::string& endpoint, std::strin
 // Полная проверка с аутентификацией
 // ---------------------------------------------------------------------------
 NewcamdStatusResult NewcamdStatusBackend::probe(const std::string& endpoint, int timeoutMs) {
+    initOpenSSL();
+    
     NewcamdStatusResult result;
     
     std::string host, username, password, des_key;
@@ -244,6 +258,8 @@ NewcamdStatusBackend::NewcamdClient::NewcamdClient(const std::string& host, int 
         last_error_ = "Invalid DES key length (must be 14 bytes)";
         state_ = STATE_ERROR;
     }
+    
+    initOpenSSL();
 }
 
 NewcamdStatusBackend::NewcamdClient::~NewcamdClient() {
@@ -481,6 +497,119 @@ void NewcamdStatusBackend::NewcamdClient::createLoginKey(const uint8_t* random,
 }
 
 // ---------------------------------------------------------------------------
+// Шифрование DES-EDE2-CBC с использованием EVP
+// ---------------------------------------------------------------------------
+bool NewcamdStatusBackend::NewcamdClient::encryptDesEde2Cbc(const uint8_t* key,
+                                                             const uint8_t* iv,
+                                                             const uint8_t* input,
+                                                             size_t input_len,
+                                                             uint8_t* output,
+                                                             size_t* output_len) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+
+    // Используем DES-EDE2-CBC (два ключа)
+    const EVP_CIPHER* cipher = EVP_des_ede2_cbc();
+    
+    int outlen = 0;
+    int total_len = 0;
+    
+    // Инициализация шифрования
+    if (EVP_EncryptInit_ex(ctx, cipher, nullptr, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    // Шифрование
+    if (EVP_EncryptUpdate(ctx, output, &outlen, input, input_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    total_len = outlen;
+    
+    // Финализация
+    if (EVP_EncryptFinal_ex(ctx, output + total_len, &outlen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    total_len += outlen;
+    
+    *output_len = total_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
+}
+
+bool NewcamdStatusBackend::NewcamdClient::decryptDesEde2Cbc(const uint8_t* key,
+                                                             const uint8_t* iv,
+                                                             const uint8_t* input,
+                                                             size_t input_len,
+                                                             uint8_t* output,
+                                                             size_t* output_len) {
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+
+    const EVP_CIPHER* cipher = EVP_des_ede2_cbc();
+    
+    int outlen = 0;
+    int total_len = 0;
+    
+    // Инициализация дешифрования
+    if (EVP_DecryptInit_ex(ctx, cipher, nullptr, key, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    // Дешифрование
+    if (EVP_DecryptUpdate(ctx, output, &outlen, input, input_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    total_len = outlen;
+    
+    // Финализация
+    if (EVP_DecryptFinal_ex(ctx, output + total_len, &outlen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    total_len += outlen;
+    
+    *output_len = total_len;
+    EVP_CIPHER_CTX_free(ctx);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Упрощенные методы шифрования для существующего кода
+// ---------------------------------------------------------------------------
+bool NewcamdStatusBackend::NewcamdClient::desEncrypt(uint8_t* data, uint16_t len,
+                                                      const uint8_t* key) {
+    unsigned char iv[8] = {0};  // Нулевой IV для Newcamd
+    size_t output_len = 0;
+    uint8_t output[1024];
+    
+    if (!encryptDesEde2Cbc(key, iv, data, len, output, &output_len)) {
+        return false;
+    }
+    
+    memcpy(data, output, output_len);
+    return true;
+}
+
+bool NewcamdStatusBackend::NewcamdClient::desDecrypt(uint8_t* data, uint16_t len,
+                                                      const uint8_t* key) {
+    unsigned char iv[8] = {0};  // Нулевой IV для Newcamd
+    size_t output_len = 0;
+    uint8_t output[1024];
+    
+    if (!decryptDesEde2Cbc(key, iv, data, len, output, &output_len)) {
+        return false;
+    }
+    
+    memcpy(data, output, output_len);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Отправка сообщения
 // ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::sendMessage(net_msg_type_t cmd,
@@ -597,39 +726,6 @@ net_msg_type_t NewcamdStatusBackend::NewcamdClient::receiveMessage(uint8_t* buff
     }
 
     return static_cast<net_msg_type_t>(cmd);
-}
-
-// ---------------------------------------------------------------------------
-// Шифрование/дешифрование Triple DES
-// ---------------------------------------------------------------------------
-bool NewcamdStatusBackend::NewcamdClient::desEncrypt(uint8_t* data, uint16_t len,
-                                                      const uint8_t* key) {
-    DES_key_schedule ks1, ks2;
-    DES_cblock key1, key2;
-    memcpy(key1, key, 8);
-    memcpy(key2, key + 8, 8);
-    
-    if (DES_set_key_checked(&key1, &ks1) != 0) return false;
-    if (DES_set_key_checked(&key2, &ks2) != 0) return false;
-
-    unsigned char iv[8] = {0};  // Нулевой IV для Newcamd
-    DES_ede2_cbc_encrypt(data, data, len, &ks1, &ks2, &ks1, DES_ENCRYPT);
-    return true;
-}
-
-bool NewcamdStatusBackend::NewcamdClient::desDecrypt(uint8_t* data, uint16_t len,
-                                                      const uint8_t* key) {
-    DES_key_schedule ks1, ks2;
-    DES_cblock key1, key2;
-    memcpy(key1, key, 8);
-    memcpy(key2, key + 8, 8);
-    
-    if (DES_set_key_checked(&key1, &ks1) != 0) return false;
-    if (DES_set_key_checked(&key2, &ks2) != 0) return false;
-
-    unsigned char iv[8] = {0};  // Нулевой IV для Newcamd
-    DES_ede2_cbc_encrypt(data, data, len, &ks1, &ks2, &ks1, DES_DECRYPT);
-    return true;
 }
 
 // ---------------------------------------------------------------------------

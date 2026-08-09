@@ -150,6 +150,14 @@ private:
     void createLoginKey(const uint8_t* random, const uint8_t* des_key);
     void createSessionKey(const uint8_t* password_hash);
     
+    // Новые методы шифрования с использованием EVP
+    bool encryptDesEde2Cbc(const uint8_t* key, const uint8_t* iv,
+                           const uint8_t* input, size_t input_len,
+                           uint8_t* output, size_t* output_len);
+    bool decryptDesEde2Cbc(const uint8_t* key, const uint8_t* iv,
+                           const uint8_t* input, size_t input_len,
+                           uint8_t* output, size_t* output_len);
+    
     bool desEncrypt(uint8_t* data, uint16_t len, const uint8_t* key);
     bool desDecrypt(uint8_t* data, uint16_t len, const uint8_t* key);
     
