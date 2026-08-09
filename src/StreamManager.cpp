@@ -1225,7 +1225,10 @@ bool StreamManager::acquireSatelliteTransponder(
     shared->consumers = 1;
 
     GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(cfg.satelliteAdapter) + "_" + std::to_string(cfg.satelliteFrontend)).c_str());
-    GstElement* source = gst_element_factory_make("dvbbasebin", "shared_satellite_source");
+    GstElement* source = gst_element_factory_make("dvbsrc", "shared_satellite_source");
+    if (!source) {
+        source = gst_element_factory_make("dvbbasebin", "shared_satellite_source");
+    }
     GstElement* queue = gst_element_factory_make("queue", "shared_satellite_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "shared_satellite_multicast_sink");
     if (!pipeline || !source || !queue || !sink ||
@@ -1259,6 +1262,11 @@ bool StreamManager::acquireSatelliteTransponder(
     setUIntPropertyIfPresent(source, "lnb-lof2", cfg.satelliteLnbLof2);
     setUIntPropertyIfPresent(source, "lnb-slof", cfg.satelliteLnbSlof);
     setUInt64PropertyIfPresent(source, "tuning-timeout", 10000000ULL);
+    // v90: for the shared transponder hub prefer dvbsrc and request the full
+    // transport stream. dvbbasebin may expose only selected program pads and on
+    // some DVB-S2 services the downstream SID relay never receives TS packets.
+    // PID 8192 means full TS for dvbsrc. If the property is absent this is a no-op.
+    setStringPropertyIfPresent(source, "pids", "8192");
 
     g_object_set(sink,
         "host", shared->multicastAddress.c_str(),
@@ -1294,6 +1302,7 @@ bool StreamManager::acquireSatelliteTransponder(
     multicastAddress = shared->multicastAddress;
     multicastPort = shared->multicastPort;
     std::cerr << "Shared DVB frontend started: " << frontendKey
+              << " source=" << GST_OBJECT_NAME(source)
               << " frequency_khz=" << cfg.satelliteFrequency
               << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
               << " polarity=" << cfg.satellitePolarization
@@ -1553,30 +1562,18 @@ bool StreamManager::restartSharedSatelliteInput(StreamState* state, const std::s
               << " reason=" << reason
               << " attempt=" << state->satelliteRelayRestartCount << std::endl;
 
-    // v89: if the per-service relay did not produce any packets, do not keep
-    // destroying and recreating the same multicast relay in a loop. On some
-    // DVB-S/S2 services tsdemux can fail to expose the selected SID even though
-    // the frontend is locked. Repeated relay restarts also hit a GStreamer race
-    // during live pipeline teardown. Fall back to the older direct DVB path for
-    // this stream: dvbbasebin tunes the frontend and filters the configured
-    // program-number itself. This fixes single-channel FTA playback and avoids
-    // the crash loop. Other channels can still use the shared relay normally.
-    if (state->satelliteRelayRestartCount >= 1) {
-        std::cerr << "Satellite relay produced no input; switching stream "
-                  << state->config.id << " SID=" << state->config.satelliteServiceId
-                  << " to direct DVB-S/S2 input fallback" << std::endl;
-        releaseSharedSatelliteInput(state);
-        state->sharedSatelliteInput = false;
-        state->satelliteServiceRelayUri.clear();
-        if (!restartPipelineWithInput(state, state->primaryInputUri, false)) {
-            error = "failed to switch to direct DVB-S/S2 input fallback";
-            state->statusMessage = "satellite direct fallback failed: " + error;
-            return false;
-        }
-        state->inputLossNotified = false;
-        state->primaryRetryPending = false;
-        state->statusMessage = "running via direct DVB-S/S2 fallback";
-        return true;
+    // v90: do not switch to a second direct DVB pipeline on the same frontend.
+    // For this architecture the reliable path is: dvbsrc full transponder hub
+    // -> per-service relay. If the selected SID still produces no packets after
+    // one relay rebuild, stop recovery attempts and report the real problem
+    // instead of entering a GStreamer teardown/restart crash loop.
+    if (state->satelliteRelayRestartCount > 1) {
+        error = "satellite service relay has no packets for SID " + std::to_string(state->config.satelliteServiceId) +
+                "; rescan transponder or verify service_id/video_pid/audio_pid";
+        state->statusMessage = error;
+        std::cerr << "Satellite relay recovery disabled after repeated no-input: stream="
+                  << state->config.id << " SID=" << state->config.satelliteServiceId << std::endl;
+        return false;
     }
 
     releaseSharedSatelliteInput(state);
@@ -2772,6 +2769,9 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
 
+    if (oldBus && GST_IS_BUS(oldBus)) {
+        gst_bus_set_flushing(oldBus, TRUE);
+    }
     if (oldPipeline) {
         stopPipelineAndWait(oldPipeline);
     }
@@ -4348,6 +4348,14 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
                         "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
                         "\nURL: " + state->activeInputUri);
+            }
+        }
+
+        if (!bus || !GST_IS_BUS(bus)) {
+            bus = state->bus;
+            if (!bus || !GST_IS_BUS(bus)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
             }
         }
 
