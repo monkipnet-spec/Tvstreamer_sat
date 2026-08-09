@@ -15,6 +15,7 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <vector>
 
 namespace ca_provider {
 
@@ -339,6 +340,9 @@ bool NewcamdStatusBackend::NewcamdClient::authenticate() {
     return performLogin();
 }
 
+// ---------------------------------------------------------------------------
+// Исправленный метод performLogin() без использования устаревшего MD5
+// ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     auto start = std::chrono::steady_clock::now();
     
@@ -356,7 +360,6 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     createLoginKey(random_key_, des_key_);
 
     // Хешируем пароль через EVP (избегаем устаревшего MD5)
-    uint8_t password_hash[MD5_DIGEST_LENGTH];
     EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
     if (!mdctx) {
         last_error_ = "Failed to create EVP context";
@@ -372,8 +375,9 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
         last_error_ = "EVP_DigestUpdate failed";
         return false;
     }
-    unsigned int md_len = 0;
-    if (EVP_DigestFinal_ex(mdctx, password_hash, &md_len) != 1 || md_len != MD5_DIGEST_LENGTH) {
+    unsigned int md_len = EVP_MD_get_size(EVP_md5());
+    std::vector<uint8_t> password_hash(md_len);
+    if (EVP_DigestFinal_ex(mdctx, password_hash.data(), &md_len) != 1) {
         EVP_MD_CTX_free(mdctx);
         last_error_ = "EVP_DigestFinal failed";
         return false;
@@ -385,8 +389,8 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     uint16_t login_len = 0;
     memcpy(login_data, username_.c_str(), username_.length() + 1);
     login_len += username_.length() + 1;
-    memcpy(login_data + login_len, password_hash, MD5_DIGEST_LENGTH);
-    login_len += MD5_DIGEST_LENGTH;
+    memcpy(login_data + login_len, password_hash.data(), md_len);
+    login_len += md_len;
 
     // Отправляем зашифрованным login_key
     if (!sendMessage(MSG_CLIENT_2_SERVER_LOGIN, login_data, login_len,
@@ -496,8 +500,7 @@ bool NewcamdStatusBackend::NewcamdClient::encryptDesEde2Cbc(const uint8_t* key,
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return false;
 
-    // Используем EVP_des_ede_cbc() — двухключевой Triple DES (EDE)
-    const EVP_CIPHER* cipher = EVP_des_ede_cbc();
+    const EVP_CIPHER* cipher = EVP_des_ede_cbc();  // двухключевой Triple DES (EDE)
     
     int outlen = 0;
     int total_len = 0;
