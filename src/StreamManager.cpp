@@ -44,6 +44,42 @@ constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr const char* kTestPatternUri = "test://bars";
 
+struct MulticastInterfaceSelection {
+    std::string name;
+    std::string address;
+};
+
+MulticastInterfaceSelection selectInternalMulticastInterface(const StreamConfig& cfg) {
+    const auto interfaces = enumerateNetworkInterfaces();
+
+    auto usable = [](const NetworkInterface& iface) {
+        return !iface.name.empty() && !iface.address.empty() && iface.isUp && iface.supportsMulticast;
+    };
+
+    // Prefer an explicitly configured input interface, then the stream/output
+    // interface.  Both may be either an IPv4 address or a Linux interface name.
+    const std::string preferredInput = cfg.inputInterfaceAddressConfigured
+        ? cfg.inputInterfaceAddress : std::string{};
+    for (const auto& preferred : {preferredInput, cfg.interfaceAddress}) {
+        if (preferred.empty() || preferred == "127.0.0.1" || preferred == "lo") continue;
+        for (const auto& iface : interfaces) {
+            if (usable(iface) && (iface.address == preferred || iface.name == preferred)) {
+                return {iface.name, iface.address};
+            }
+        }
+    }
+
+    // Internal DVB multicast must never be pinned to loopback.  utils.cpp
+    // intentionally excludes lo because Linux loopback normally has no
+    // IFF_MULTICAST flag.  Pick the first usable real interface instead.
+    for (const auto& iface : interfaces) {
+        if (usable(iface)) {
+            return {iface.name, iface.address};
+        }
+    }
+    return {};
+}
+
 const CaProviderConfig* findCaProvider(const ConfigManager& manager, const std::string& id) {
     if (id.empty()) return nullptr;
     for (const auto& provider : manager.config.caProviders) {
@@ -1268,13 +1304,21 @@ bool StreamManager::acquireSatelliteTransponder(
     // PID 8192 means full TS for dvbsrc. If the property is absent this is a no-op.
     setStringPropertyIfPresent(source, "pids", "8192");
 
+    const auto internalMulticastInterface = selectInternalMulticastInterface(cfg);
+    if (internalMulticastInterface.name.empty()) {
+        stopPipelineAndWait(pipeline);
+        gst_object_unref(pipeline);
+        error = "no active multicast-capable network interface for shared DVB hub";
+        return false;
+    }
+
     g_object_set(sink,
         "host", shared->multicastAddress.c_str(),
         "port", static_cast<gint>(shared->multicastPort),
         "sync", FALSE,
         "async", FALSE,
         nullptr);
-    setStringPropertyIfPresent(sink, "multicast-iface", "lo");
+    setStringPropertyIfPresent(sink, "multicast-iface", internalMulticastInterface.name);
     setBooleanPropertyIfPresent(sink, "auto-multicast", TRUE);
     setBooleanPropertyIfPresent(sink, "loop", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
@@ -1306,7 +1350,9 @@ bool StreamManager::acquireSatelliteTransponder(
               << " frequency_khz=" << cfg.satelliteFrequency
               << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
               << " polarity=" << cfg.satellitePolarization
-              << " relay=udp://@" << multicastAddress << ":" << multicastPort << std::endl;
+              << " relay=udp://@" << multicastAddress << ":" << multicastPort
+              << " iface=" << internalMulticastInterface.name
+              << " localaddr=" << internalMulticastInterface.address << std::endl;
     satelliteTransponders[frontendKey] = std::move(shared);
     return true;
 }
@@ -1395,7 +1441,15 @@ bool StreamManager::startSatelliteServiceRelay(
         "caps", caps,
         nullptr);
     if (caps) gst_caps_unref(caps);
-    setStringPropertyIfPresent(source, "multicast-iface", "lo");
+    const auto internalMulticastInterface = selectInternalMulticastInterface(state->config);
+    if (internalMulticastInterface.name.empty()) {
+        stopPipelineAndWait(pipeline);
+        gst_object_unref(pipeline);
+        releaseSatelliteServiceRelayPort(outputPort);
+        error = "no active multicast-capable network interface for satellite service relay";
+        return false;
+    }
+    setStringPropertyIfPresent(source, "multicast-iface", internalMulticastInterface.name);
     configureQueue(inputQueue, 12000000000ULL);
     configureTsPacketAlignment(parse);
     setBooleanPropertyIfPresent(parse, "set-timestamps", FALSE);
@@ -1539,15 +1593,25 @@ bool StreamManager::prepareSharedSatelliteInput(StreamState* state, std::string&
         state->runtimeConfig.satelliteEnabled = false;
         state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
         state->runtimeConfig.inputMode = "udp";
-        // The shared hub transmits with multicast-iface=lo.  Pin the receiver to
-        // loopback as well so systems with several NICs do not join the group on
-        // an unrelated interface.
-        state->runtimeConfig.inputInterfaceAddress = "127.0.0.1";
+        // v96: join the internal multicast on the same real multicast-capable
+        // interface used by the shared DVB hub. Never force 127.0.0.1/lo here:
+        // Linux loopback is not advertised by enumerateNetworkInterfaces() as a
+        // multicast-capable interface, which caused the v95 startup failure.
+        const auto internalMulticastInterface = selectInternalMulticastInterface(state->config);
+        if (internalMulticastInterface.address.empty()) {
+            releaseSatelliteTransponder(state->satelliteFrontendKey);
+            state->satelliteFrontendKey.clear();
+            error = "no active multicast-capable network interface for FTA shared DVB input";
+            return false;
+        }
+        state->runtimeConfig.inputInterfaceAddress = internalMulticastInterface.address;
         state->runtimeConfig.inputInterfaceAddressConfigured = true;
         std::cerr << "FTA shared-transponder input attached: stream=" << state->config.id
                   << " frontend=" << state->satelliteFrontendKey
                   << " SID=" << state->config.satelliteServiceId
-                  << " source=" << state->satelliteServiceRelayUri << std::endl;
+                  << " source=" << state->satelliteServiceRelayUri
+                  << " iface=" << internalMulticastInterface.name
+                  << " localaddr=" << internalMulticastInterface.address << std::endl;
         return true;
     }
 
