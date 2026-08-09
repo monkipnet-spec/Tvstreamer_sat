@@ -1405,6 +1405,45 @@ bool StreamManager::startSatelliteServiceRelay(
         sendServiceDescription(mux, relay->context->config);
     }
     configureQueue(outputQueue, 8000000000ULL);
+
+    // v92: measure service-relay activity at the last queue before udpsink.
+    // The previous watchdog only trusted the downstream playback pipeline's
+    // input probe.  On the DVB-S2 shared-input path that probe could remain at
+    // zero even while tsdemux had already discovered and linked the service,
+    // causing a healthy FTA relay to be restarted every five seconds.
+    GstPad* relayOutputPad = gst_element_get_static_pad(outputQueue, "src");
+    if (relayOutputPad) {
+        gst_pad_add_probe(
+            relayOutputPad,
+            static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
+            +[](GstPad*, GstPadProbeInfo* info, gpointer userData) -> GstPadProbeReturn {
+                auto* relayState = static_cast<SatelliteServiceRelayState*>(userData);
+                if (!relayState) return GST_PAD_PROBE_OK;
+                if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+                    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+                    if (buffer) {
+                        relayState->outputBytes.fetch_add(
+                            gst_buffer_get_size(buffer), std::memory_order_relaxed);
+                    }
+                } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+                    GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
+                    if (list) {
+                        guint n = gst_buffer_list_length(list);
+                        uint64_t bytes = 0;
+                        for (guint i = 0; i < n; ++i) {
+                            GstBuffer* buffer = gst_buffer_list_get(list, i);
+                            if (buffer) bytes += gst_buffer_get_size(buffer);
+                        }
+                        relayState->outputBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    }
+                }
+                return GST_PAD_PROBE_OK;
+            },
+            relay.get(),
+            nullptr);
+        gst_object_unref(relayOutputPad);
+    }
+
     g_object_set(sink,
         "host", "127.0.0.1",
         "port", static_cast<gint>(outputPort),
@@ -1488,6 +1527,7 @@ bool StreamManager::prepareSharedSatelliteInput(StreamState* state, std::string&
     }
 
     state->sharedSatelliteInput = true;
+    state->lastSatelliteRelayBytesSeen = 0;
     state->runtimeConfig = state->config;
     state->runtimeConfig.satelliteEnabled = false;
     state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
@@ -4188,6 +4228,24 @@ void StreamManager::monitorBus(const std::string& id) {
             // input activity; its dedicated monitor loop updates the synthetic input counters.
             state->lastInputActivity = now;
         }
+        // v92: shared DVB-S2 liveness is based on bytes emitted by the
+        // per-service relay itself.  Seeing tsdemux pads means the service was
+        // found, and bytes on this probe mean the selected SID is actively
+        // being remuxed toward the loopback UDP source.  Do not restart that
+        // healthy relay just because the generic downstream input probe did
+        // not advance.
+        if (state->sharedSatelliteInput && state->satelliteServiceRelay) {
+            const uint64_t relayBytes = state->satelliteServiceRelay->outputBytes.load(std::memory_order_relaxed);
+            if (relayBytes != state->lastSatelliteRelayBytesSeen) {
+                state->lastSatelliteRelayBytesSeen = relayBytes;
+                state->lastInputActivity = now;
+                if (state->inputLossNotified && !state->usingBackup) {
+                    state->inputLossNotified = false;
+                    state->statusMessage = "running (DVB-S2 service relay active)";
+                }
+            }
+        }
+
         const uint64_t currentInputBytes = state->inputBytes.load();
         if (currentInputBytes != state->lastInputBytesSeen) {
             state->lastInputBytesSeen = currentInputBytes;

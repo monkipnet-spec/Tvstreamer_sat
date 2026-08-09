@@ -868,7 +868,8 @@ std::string HttpServer::currentState() {
       item["capacity_source"] = provider.capacityMode == "auto" ? "auto-fallback" : "manual";
       item["auto_capacity_available"] = false;
       item["reader_online"] = readerOnline;
-      item["card_status"] = ca_provider::cardStatus(provider, serialReaders);
+      const Json::Value backendStatus = ca_provider::backendStatusJson(provider, serialReaders);
+      item["card_status"] = backendStatus.get("status", "UNKNOWN");
       item["card_metadata_available"] = false;
       if (reader) {
         item["reader_device"] = reader->get("device", "");
@@ -885,7 +886,8 @@ std::string HttpServer::currentState() {
         item["reader_serial"] = "";
         item["reader_usb_path"] = "";
       }
-      item["manager_status"] = ca_provider::managerStatus(provider, serialReaders);
+      item["manager_status"] = backendStatus.get("message", "");
+      item["backend_status"] = backendStatus;
       caProviders.append(item);
     }
     root["ca_providers"] = caProviders;
@@ -1398,6 +1400,16 @@ std::string HttpServer::handleStartStream(const std::string& body) {
             return Json::writeString(writer, response);
         }
         if (cfg.satelliteEnabled) {
+            if (!ca_provider::isReaderBackend(*selectedCaProvider)) {
+                response["result"] = "error";
+                response["stream_id"] = cfg.id;
+                response["error"] =
+                    "CA provider '" + selectedCaProvider->name +
+                    "' uses backend '" + selectedCaProvider->backendType +
+                    "'. v91 newcamd-status is monitoring-only and cannot be used as a channel descrambler.";
+                Json::StreamWriterBuilder writer;
+                return Json::writeString(writer, response);
+            }
             if (selectedCaProvider->readerById.empty()) {
                 response["result"] = "error";
                 response["stream_id"] = cfg.id;
@@ -2693,27 +2705,46 @@ function caProviderRowHtml(provider={}) {
   const effectiveMax = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
   const configuredMax = Math.max(1, Number(provider.max_channels || effectiveMax || 1));
   const capacityMode = String(provider.capacity_mode || 'manual').toLowerCase() === 'auto' ? 'auto' : 'manual';
+  const backendType = String(provider.backend_type || 'reader') === 'newcamd-status' ? 'newcamd-status' : 'reader';
+  const endpoint = String(provider.endpoint || '');
   const readerById = String(provider.reader_by_id || '');
   const online = provider.reader_online === true || (readerById && serialReadersCache.some(reader => String(reader.by_id || '') === readerById));
-  const statusText = !readerById ? 'Reader не назначен' : (online ? 'READER ONLINE' : 'READER OFFLINE');
+  const backendStatus = provider.backend_status || {};
+  const networkOnline = backendStatus.online === true;
+  const statusText = backendType === 'newcamd-status'
+    ? (networkOnline ? 'TCP ONLINE' : (endpoint ? 'TCP OFFLINE' : 'ENDPOINT NOT CONFIGURED'))
+    : (!readerById ? 'Reader не назначен' : (online ? 'READER ONLINE' : 'READER OFFLINE'));
   const readerDetails = online
     ? [provider.reader_model, provider.reader_serial ? `#${provider.reader_serial}` : '', provider.reader_device].filter(Boolean).join(' ')
     : readerById;
+  const backendDetails = backendType === 'newcamd-status'
+    ? [endpoint, backendStatus.message || provider.manager_status || 'status-only backend'].filter(Boolean).join(' · ')
+    : readerDetails;
   const capacitySource = capacityMode === 'auto'
     ? (provider.auto_capacity_available ? 'Auto: получено от карты/официального интерфейса' : `Auto: capability пока не сообщён, используется fallback ${configuredMax}`)
     : `Manual: ${configuredMax}`;
   return `<div class="ca-provider-row" data-provider-id="${escapeHtmlValue(id)}" style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:10px">
     <div class="form-grid">
-      <div class="form-row"><label>ID карты/provider</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Стабильный ID TVStreamer, например ca-card-1. При переименовании ссылки каналов обновятся автоматически.</small></div>
-      <div class="form-row"><label>Название карты</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Карта 1 / Основная карта" /></div>
-      <div class="form-row full"><label>Физический Phoenix / serial reader</label><select data-ca-field="reader_by_id" data-saved-value="${escapeHtmlValue(readerById)}">${readerOptions(readerById)}</select><small>Хранится стабильный /dev/serial/by-id/*, а ttyUSB/ttyACM показывается только как текущее системное имя.</small></div>
-      <div class="form-row"><label>Лимит каналов</label><select data-ca-field="capacity_mode"><option value="manual" ${capacityMode==='manual'?'selected':''}>Manual</option><option value="auto" ${capacityMode==='auto'?'selected':''}>Auto from card/provider + fallback</option></select><small>${escapeHtmlValue(capacitySource)}</small></div>
-      <div class="form-row"><label>Manual / fallback max channels</label><input data-ca-field="max_channels" type="number" min="1" max="1024" value="${configuredMax}" /><small>Индивидуально для этой карты. В коде нет глобальной константы 8.</small></div>
-      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${escapeHtmlValue(statusText)}${readerDetails ? ` · ${escapeHtmlValue(readerDetails)}` : ''}</small></div>
+      <div class="form-row"><label>ID карты/provider</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Стабильный ID TVStreamer, например ca-card-1.</small></div>
+      <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Карта 1 / CA monitor" /></div>
+      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type" onchange="updateCaBackendFields(this.closest('.ca-provider-row'))"><option value="reader" ${backendType==='reader'?'selected':''}>Phoenix / serial reader</option><option value="newcamd-status" ${backendType==='newcamd-status'?'selected':''}>Newcamd Status (TCP only)</option></select><small>Newcamd Status проверяет только доступность TCP endpoint и не обрабатывает ECM/CW/EMM.</small></div>
+      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${escapeHtmlValue(statusText)}${backendDetails ? ` · ${escapeHtmlValue(backendDetails)}` : ''}</small></div>
+      <div class="form-row full ca-backend-reader" style="${backendType==='reader'?'':'display:none'}"><label>Физический Phoenix / serial reader</label><select data-ca-field="reader_by_id" data-saved-value="${escapeHtmlValue(readerById)}">${readerOptions(readerById)}</select><small>Хранится стабильный /dev/serial/by-id/*.</small></div>
+      <div class="form-row full ca-backend-newcamd" style="${backendType==='newcamd-status'?'':'display:none'}"><label>Newcamd TCP endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(endpoint)}" placeholder="192.168.1.10:10000" /><small>Только host:port для health-check. Логин, DES key, ECM/CW и EMM этим backend не используются.</small></div>
+      <div class="form-row"><label>Лимит каналов</label><select data-ca-field="capacity_mode"><option value="manual" ${capacityMode==='manual'?'selected':''}>Manual</option><option value="auto" ${capacityMode==='auto'?'selected':''}>Auto + fallback</option></select><small>${escapeHtmlValue(capacitySource)}</small></div>
+      <div class="form-row"><label>Manual / fallback max channels</label><input data-ca-field="max_channels" type="number" min="1" max="1024" value="${configuredMax}" /></div>
       <div class="form-row"><label>Сессии</label><div class="sat-signal-box"><strong>${active}/${effectiveMax} active</strong><div style="margin-top:3px;color:#aeb8ca">${assigned} assigned · ${Math.max(0,effectiveMax-active)} available</div></div></div>
     </div>
     <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="button-secondary" type="button" onclick="removeCaProviderRow(this)">Удалить</button></div>
   </div>`;
+}
+function updateCaBackendFields(row) {
+  if (!row) return;
+  const type = row.querySelector('[data-ca-field="backend_type"]')?.value || 'reader';
+  const reader = row.querySelector('.ca-backend-reader');
+  const network = row.querySelector('.ca-backend-newcamd');
+  if (reader) reader.style.display = type === 'reader' ? '' : 'none';
+  if (network) network.style.display = type === 'newcamd-status' ? '' : 'none';
 }
 function serialReaderTableHtml(readers=[]) {
   if (!Array.isArray(readers) || !readers.length) {
@@ -2769,7 +2800,7 @@ function openCaProvidersModal() {
   const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
   openModal(`
     <h2>CA Providers / Cards</h2>
-    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Динамический Reader/Card Manager</strong><div style="margin-top:4px;color:#aeb8ca">Количество Phoenix-reader устройств не фиксировано. Каждая карта/provider привязывается к стабильному /dev/serial/by-id/* и имеет собственный лимит одновременно активных каналов.</div><small>Режим Auto готов принимать лимит от документированного интерфейса карты/провайдера; пока capability не сообщён, используется индивидуальный fallback. TVStreamer не считает 8 глобальной константой.</small></div>
+    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Модульные CA Provider backends</strong><div style="margin-top:4px;color:#aeb8ca">Количество Phoenix-reader устройств не фиксировано. Каждая карта/provider привязывается к стабильному /dev/serial/by-id/* и имеет собственный лимит одновременно активных каналов.</div><small>Режим Auto готов принимать лимит от документированного интерфейса карты/провайдера; пока capability не сообщён, используется индивидуальный fallback. TVStreamer не считает 8 глобальной константой.</small></div>
     <div style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:14px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><strong>Обнаруженные Phoenix / serial readers</strong><div id="serialReadersStatus" style="font-size:12px;color:#aeb8ca;margin-top:3px">Поиск…</div></div><div style="display:flex;gap:8px"><button class="button-secondary" type="button" onclick="refreshSerialReaders()">Обновить</button><button class="button-secondary" type="button" onclick="addAllDetectedReaders()">Добавить новые как Cards</button></div></div>
       <div id="serialReadersTable" style="margin-top:8px"><div style="color:#aeb8ca;padding:10px 0">Загрузка…</div></div>
@@ -2816,23 +2847,26 @@ function collectCaProviders() {
   for (const row of document.querySelectorAll('.ca-provider-row')) {
     const id = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
     const name = String(row.querySelector('[data-ca-field="name"]')?.value || '').trim();
+    const backendType = row.querySelector('[data-ca-field="backend_type"]')?.value === 'newcamd-status' ? 'newcamd-status' : 'reader';
     const readerById = String(row.querySelector('[data-ca-field="reader_by_id"]')?.value || '').trim();
+    const endpoint = String(row.querySelector('[data-ca-field="endpoint"]')?.value || '').trim();
     const capacityMode = row.querySelector('[data-ca-field="capacity_mode"]')?.value === 'auto' ? 'auto' : 'manual';
     if (!id) throw new Error('У каждой карты/CA Provider должен быть ID.');
     if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`Недопустимый ID provider: ${id}`);
     if (ids.has(id)) throw new Error(`Повторяющийся ID provider: ${id}`);
-    if (readerById && readers.has(readerById)) throw new Error(`Reader ${readerById} уже назначен другой карте.`);
+    if (backendType === 'reader' && readerById && readers.has(readerById)) throw new Error(`Reader ${readerById} уже назначен другой карте.`);
+    if (backendType === 'newcamd-status' && endpoint && !/^([^\s:]+|\[[^\]]+\]):\d{1,5}$/.test(endpoint)) throw new Error(`Newcamd Status endpoint должен быть host:port: ${endpoint}`);
     ids.add(id);
-    if (readerById) readers.add(readerById);
+    if (backendType === 'reader' && readerById) readers.add(readerById);
     providers.push({
       id,
       name: name || id,
-      reader_by_id: readerById,
+      reader_by_id: backendType === 'reader' ? readerById : '',
       capacity_mode: capacityMode,
       max_channels: Math.min(1024, Math.max(1, Number(row.querySelector('[data-ca-field="max_channels"]')?.value || 1))),
       enabled: row.querySelector('[data-ca-field="enabled"]')?.checked !== false,
-      backend_type: 'reader',
-      endpoint: ''
+      backend_type: backendType,
+      endpoint: backendType === 'newcamd-status' ? endpoint : ''
     });
   }
   return providers;

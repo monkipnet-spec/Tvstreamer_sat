@@ -54,6 +54,11 @@ struct SatelliteServiceRelayState {
     GstBus* bus = nullptr;
     std::unique_ptr<RemapContext> context;
     uint16_t outputPort = 0;
+    // Count packets that actually leave the per-service relay.  The main
+    // playback pipeline has its own probes, but this counter is the most
+    // reliable liveness signal for shared DVB-S/S2 input because it is
+    // measured immediately before the loopback UDP sink.
+    std::atomic<uint64_t> outputBytes{0};
 };
 
 struct StreamState {
@@ -93,6 +98,7 @@ struct StreamState {
     uint64_t lastInputCcErrorsSample = 0;
     uint64_t lastOutputCcErrorsSample = 0;
     uint64_t lastInputBytesSeen = 0;
+    uint64_t lastSatelliteRelayBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSatelliteRelayRestart = std::chrono::steady_clock::time_point{};

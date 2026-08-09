@@ -45,9 +45,9 @@ Json::Value CaProviderConfig::toJson() const {
     root["capacity_mode"] = capacityMode == "auto" ? "auto" : "manual";
     root["max_channels"] = std::clamp(maxChannels, 1, 1024);
     root["enabled"] = enabled;
-    // Keep legacy keys for backward compatibility; v85 does not use them as a channel transport.
-    root["backend_type"] = "reader";
-    root["endpoint"] = "";
+    // v91 keeps backend selection/configuration. Network status backends are status-only.
+    root["backend_type"] = backendType.empty() ? "reader" : backendType;
+    root["endpoint"] = endpoint;
     return root;
 }
 

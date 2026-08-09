@@ -1,4 +1,5 @@
 #include "CaProviderManager.h"
+#include "NewcamdStatusBackend.h"
 
 #include <algorithm>
 #include <cctype>
@@ -125,16 +126,64 @@ int effectiveMaxChannels(const CaProviderConfig& provider) {
     return std::clamp(provider.maxChannels, 1, 1024);
 }
 
+bool isReaderBackend(const CaProviderConfig& provider) {
+    return provider.backendType.empty() || provider.backendType == "reader";
+}
+
 std::string cardStatus(const CaProviderConfig& provider, const Json::Value& serialReaders) {
+    if (!isReaderBackend(provider)) {
+        if (provider.backendType == "newcamd-status") {
+            const auto status = NewcamdStatusBackend::probe(provider.endpoint);
+            return status.status;
+        }
+        return "BACKEND_UNKNOWN";
+    }
     if (provider.readerById.empty()) return "NO_READER";
     return findSerialReaderById(serialReaders, provider.readerById) ? "READER_ONLINE" : "OFFLINE";
 }
 
 std::string managerStatus(const CaProviderConfig& provider, const Json::Value& serialReaders) {
+    if (provider.backendType == "newcamd-status") {
+        const auto status = NewcamdStatusBackend::probe(provider.endpoint);
+        if (!status.configured) return "newcamd status endpoint is not configured";
+        return status.online ? "newcamd TCP endpoint online (status-only backend)"
+                             : "newcamd TCP endpoint offline: " + status.error;
+    }
+    if (!isReaderBackend(provider)) return "unknown CA provider backend";
     if (provider.readerById.empty()) return "reader is not assigned";
     return findSerialReaderById(serialReaders, provider.readerById)
         ? "serial reader online; card capability/descrambling interface is not configured"
         : "configured reader is offline";
+}
+
+Json::Value backendStatusJson(const CaProviderConfig& provider, const Json::Value& serialReaders) {
+    Json::Value root;
+    root["type"] = provider.backendType.empty() ? "reader" : provider.backendType;
+    if (provider.backendType == "newcamd-status") {
+        const auto status = NewcamdStatusBackend::probe(provider.endpoint);
+        root["status"] = status.status;
+        root["message"] = !status.configured
+            ? "newcamd status endpoint is not configured"
+            : (status.online ? "newcamd TCP endpoint online (status-only backend)"
+                             : "newcamd TCP endpoint offline: " + status.error);
+        root["configured"] = status.configured;
+        root["online"] = status.online;
+        root["host"] = status.host;
+        root["port"] = status.port;
+        root["error"] = status.error;
+        root["capabilities"] = "tcp-status-only";
+    } else {
+        const bool configured = !provider.readerById.empty();
+        const bool online = configured && findSerialReaderById(serialReaders, provider.readerById);
+        root["status"] = !configured ? "NO_READER" : (online ? "READER_ONLINE" : "OFFLINE");
+        root["message"] = !configured ? "reader is not assigned"
+            : (online ? "serial reader online; card capability/descrambling interface is not configured"
+                      : "configured reader is offline");
+        root["configured"] = configured;
+        root["online"] = online;
+        root["capabilities"] = "serial-reader-inventory";
+    }
+    return root;
 }
 
 } // namespace ca_provider

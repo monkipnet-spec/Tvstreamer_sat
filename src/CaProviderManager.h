@@ -5,6 +5,8 @@
 #include <jsoncpp/json/json.h>
 #include <string>
 
+namespace ca_provider { struct NewcamdStatusResult; }
+
 namespace ca_provider {
 
 // Enumerates serial Phoenix/USB readers through stable /dev/serial/by-id links.
@@ -24,5 +26,11 @@ int effectiveMaxChannels(const CaProviderConfig& provider);
 
 std::string cardStatus(const CaProviderConfig& provider, const Json::Value& serialReaders);
 std::string managerStatus(const CaProviderConfig& provider, const Json::Value& serialReaders);
+
+// Returns true for the local serial-reader backend.
+bool isReaderBackend(const CaProviderConfig& provider);
+
+// Backend status for UI/API. newcamd-status performs TCP reachability only.
+Json::Value backendStatusJson(const CaProviderConfig& provider, const Json::Value& serialReaders);
 
 } // namespace ca_provider
