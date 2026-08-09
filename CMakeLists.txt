@@ -11,6 +11,7 @@ pkg_check_modules(LIBCURL REQUIRED libcurl)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 
 find_package(Boost REQUIRED COMPONENTS system thread)
+find_package(OpenSSL REQUIRED)
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/src
