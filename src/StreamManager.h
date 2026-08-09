@@ -33,6 +33,10 @@ struct RemapContext {
     // v97: first-buffer probes for the FTA single-service remux path.
     // They make it possible to distinguish elementary-stream, mux and HTTP
     // output failures without touching the working DVB frontend.
+    std::atomic<bool> demuxVideoActivityLogged {false};
+    std::atomic<bool> demuxAudioActivityLogged {false};
+    std::atomic<bool> queueVideoActivityLogged {false};
+    std::atomic<bool> queueAudioActivityLogged {false};
     std::atomic<bool> videoActivityLogged {false};
     std::atomic<bool> audioActivityLogged {false};
     std::atomic<bool> muxActivityLogged {false};

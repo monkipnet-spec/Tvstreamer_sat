@@ -18,6 +18,7 @@
 #include <functional>
 #include <thread>
 #include <vector>
+#include <utility>
 
 #include <glib.h>
 #include <gio/gio.h>
@@ -3731,7 +3732,7 @@ bool StreamManager::buildRemapPipeline(
                 auto* probeCtx = static_cast<RemapContext*>(userData);
                 bool expected = false;
                 if (probeCtx && probeCtx->muxActivityLogged.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA remux activity: MUX produced first MPEG-TS buffer" << std::endl;
+                    std::cerr << "FTA flow: MUX first MPEG-TS buffer" << std::endl;
                 }
                 return GST_PAD_PROBE_OK;
             }, contextPtr, nullptr);
@@ -3744,7 +3745,7 @@ bool StreamManager::buildRemapPipeline(
                 auto* probeCtx = static_cast<RemapContext*>(userData);
                 bool expected = false;
                 if (probeCtx && probeCtx->httpActivityLogged.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA remux activity: OUTPUT sink received first MPEG-TS buffer" << std::endl;
+                    std::cerr << "FTA flow: HTTP/OUTPUT first MPEG-TS buffer" << std::endl;
                 }
                 return GST_PAD_PROBE_OK;
             }, contextPtr, nullptr);
@@ -3899,6 +3900,28 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
+    // v99: probe the selected tsdemux pad itself. A pad-added signal only proves
+    // that PMT/caps were discovered; this probe proves that elementary buffers
+    // actually leave tsdemux for the selected service.
+    gst_pad_add_probe(
+        pad, GST_PAD_PROBE_TYPE_BUFFER,
+        +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+            auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
+            if (pair && pair->first) {
+                auto& flag = pair->second
+                    ? pair->first->demuxAudioActivityLogged
+                    : pair->first->demuxVideoActivityLogged;
+                bool expected = false;
+                if (flag.compare_exchange_strong(expected, true)) {
+                    std::cerr << "FTA flow: DEMUX " << (pair->second ? "AUDIO" : "VIDEO")
+                              << " first buffer" << std::endl;
+                }
+            }
+            return GST_PAD_PROBE_OK;
+        },
+        new std::pair<RemapContext*, bool>(ctx, isAudio),
+        +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
+
     std::string parserFactory = parserForCaps(caps, capsString);
     if (caps) {
         gst_caps_unref(caps);
@@ -3934,12 +3957,35 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     configureQueue(queue);
+
+    // v99: observe the queue output independently of the parser.
+    if (GstPad* queueSrcPad = gst_element_get_static_pad(queue, "src")) {
+        gst_pad_add_probe(
+            queueSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
+            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+                auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
+                if (pair && pair->first) {
+                    auto& flag = pair->second
+                        ? pair->first->queueAudioActivityLogged
+                        : pair->first->queueVideoActivityLogged;
+                    bool expected = false;
+                    if (flag.compare_exchange_strong(expected, true)) {
+                        std::cerr << "FTA flow: " << (pair->second ? "AUDIO" : "VIDEO")
+                                  << " QUEUE first buffer" << std::endl;
+                    }
+                }
+                return GST_PAD_PROBE_OK;
+            },
+            new std::pair<RemapContext*, bool>(ctx, isAudio),
+            +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
+        gst_object_unref(queueSrcPad);
+    }
+
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
-    // v97: link the complete dynamic branch first, then synchronise the newly
-    // added elements with the live parent.  Starting queue/parser before their
-    // downstream mux pad exists can leave a live dynamic branch without data.
+    // Link the complete dynamic branch first, then activate it against the
+    // live parent. v99 verifies every state transition instead of assuming it succeeded.
     const bool parserLinked = capsfilter
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
         : gst_element_link(queue, parser);
@@ -3989,8 +4035,8 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                 auto& flag = pair->second ? pair->first->audioActivityLogged : pair->first->videoActivityLogged;
                 bool expected = false;
                 if (flag.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA remux activity: " << (pair->second ? "AUDIO" : "VIDEO")
-                              << " parser produced first elementary buffer" << std::endl;
+                    std::cerr << "FTA flow: " << (pair->second ? "AUDIO" : "VIDEO")
+                              << " PARSER first buffer" << std::endl;
                 }
             }
             return GST_PAD_PROBE_OK;
@@ -3999,13 +4045,44 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
-        // The branch is now complete: demux -> queue -> parser -> mux.  Only now
-        // move dynamic elements to the parent's PLAYING state.
-        gst_element_sync_state_with_parent(queue);
-        gst_element_sync_state_with_parent(parser);
+        // v99: activate each dynamic element explicitly and verify the result.
+        // If sync-with-parent fails while the live pipeline is transitioning,
+        // fall back to an explicit PLAYING state request instead of silently
+        // leaving a NULL/READY queue or parser attached to a live tsdemux pad.
+        const gboolean queueSynced = gst_element_sync_state_with_parent(queue);
+        const gboolean parserSynced = gst_element_sync_state_with_parent(parser);
+        gboolean capsSynced = TRUE;
         if (capsfilter) {
-            gst_element_sync_state_with_parent(capsfilter);
+            capsSynced = gst_element_sync_state_with_parent(capsfilter);
         }
+
+        GstState parentCurrent = GST_STATE_NULL;
+        GstState parentPending = GST_STATE_VOID_PENDING;
+        gst_element_get_state(pipeline, &parentCurrent, &parentPending, 0);
+
+        auto ensurePlaying = [](GstElement* element, gboolean synced) {
+            if (!element || synced) {
+                return GST_STATE_CHANGE_SUCCESS;
+            }
+            return gst_element_set_state(element, GST_STATE_PLAYING);
+        };
+        const GstStateChangeReturn queueFallback = ensurePlaying(queue, queueSynced);
+        const GstStateChangeReturn parserFallback = ensurePlaying(parser, parserSynced);
+        const GstStateChangeReturn capsFallback = capsfilter
+            ? ensurePlaying(capsfilter, capsSynced)
+            : GST_STATE_CHANGE_SUCCESS;
+
+        std::cerr << "FTA dynamic branch state: " << (isAudio ? "audio" : "video")
+                  << " parent=" << gst_element_state_get_name(parentCurrent)
+                  << " pending=" << gst_element_state_get_name(parentPending)
+                  << " queue_sync=" << (queueSynced ? "ok" : "failed")
+                  << " parser_sync=" << (parserSynced ? "ok" : "failed")
+                  << " caps_sync=" << (capsSynced ? "ok" : "failed")
+                  << " queue_fallback=" << static_cast<int>(queueFallback)
+                  << " parser_fallback=" << static_cast<int>(parserFallback)
+                  << " caps_fallback=" << static_cast<int>(capsFallback)
+                  << std::endl;
+
         std::cerr << "remap linked " << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid << std::endl;
