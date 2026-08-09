@@ -31,6 +31,7 @@ add_executable(TVStreamer
     src/main.cpp
     src/utils.cpp
     src/ConfigManager.cpp
+    src/CaProviderManager.cpp
     src/DvbManager.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp

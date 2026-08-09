@@ -1553,6 +1553,32 @@ bool StreamManager::restartSharedSatelliteInput(StreamState* state, const std::s
               << " reason=" << reason
               << " attempt=" << state->satelliteRelayRestartCount << std::endl;
 
+    // v89: if the per-service relay did not produce any packets, do not keep
+    // destroying and recreating the same multicast relay in a loop. On some
+    // DVB-S/S2 services tsdemux can fail to expose the selected SID even though
+    // the frontend is locked. Repeated relay restarts also hit a GStreamer race
+    // during live pipeline teardown. Fall back to the older direct DVB path for
+    // this stream: dvbbasebin tunes the frontend and filters the configured
+    // program-number itself. This fixes single-channel FTA playback and avoids
+    // the crash loop. Other channels can still use the shared relay normally.
+    if (state->satelliteRelayRestartCount >= 1) {
+        std::cerr << "Satellite relay produced no input; switching stream "
+                  << state->config.id << " SID=" << state->config.satelliteServiceId
+                  << " to direct DVB-S/S2 input fallback" << std::endl;
+        releaseSharedSatelliteInput(state);
+        state->sharedSatelliteInput = false;
+        state->satelliteServiceRelayUri.clear();
+        if (!restartPipelineWithInput(state, state->primaryInputUri, false)) {
+            error = "failed to switch to direct DVB-S/S2 input fallback";
+            state->statusMessage = "satellite direct fallback failed: " + error;
+            return false;
+        }
+        state->inputLossNotified = false;
+        state->primaryRetryPending = false;
+        state->statusMessage = "running via direct DVB-S/S2 fallback";
+        return true;
+    }
+
     releaseSharedSatelliteInput(state);
     std::string prepareError;
     if (!prepareSharedSatelliteInput(state, prepareError)) {
@@ -3631,6 +3657,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     bool isAudio = capsString.find("audio/") != std::string::npos;
     bool isVideo = capsString.find("video/") != std::string::npos;
     bool isPrivateTs = capsString.find("private") != std::string::npos || capsString.find("subpicture") != std::string::npos;
+
+    std::cerr << "tsdemux pad detected: caps=" << capsString
+              << " audio=" << (isAudio ? "yes" : "no")
+              << " video=" << (isVideo ? "yes" : "no")
+              << " private=" << (isPrivateTs ? "yes" : "no") << std::endl;
 
     if ((!isAudio && !isVideo) || isPrivateTs) {
         if (caps) gst_caps_unref(caps);

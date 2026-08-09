@@ -1,5 +1,6 @@
 #include "HttpServer.h"
 
+#include "CaProviderManager.h"
 #include "DvbManager.h"
 
 #include "utils.h"
@@ -105,103 +106,6 @@ std::string cleanFileName(const std::string& value) {
         name = name.substr(name.size() - 96);
     }
     return name;
-}
-
-bool safeDeviceNode(const std::string& device) {
-    if (device.rfind("/dev/ttyUSB", 0) != 0 && device.rfind("/dev/ttyACM", 0) != 0) {
-        return false;
-    }
-    for (char ch : device) {
-        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '/' || ch == '_' || ch == '-')) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::map<std::string, std::string> udevPropertiesForDevice(const std::string& device) {
-    std::map<std::string, std::string> properties;
-    if (!safeDeviceNode(device)) {
-        return properties;
-    }
-
-    const std::string command = "udevadm info --query=property --name=" + device + " 2>/dev/null";
-    FILE* pipe = ::popen(command.c_str(), "r");
-    if (!pipe) {
-        return properties;
-    }
-
-    char buffer[1024];
-    while (std::fgets(buffer, sizeof(buffer), pipe)) {
-        std::string line(buffer);
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-            line.pop_back();
-        }
-        const auto separator = line.find('=');
-        if (separator == std::string::npos) {
-            continue;
-        }
-        properties[line.substr(0, separator)] = line.substr(separator + 1);
-    }
-    ::pclose(pipe);
-    return properties;
-}
-
-std::string firstProperty(const std::map<std::string, std::string>& properties,
-                          std::initializer_list<const char*> names) {
-    for (const char* name : names) {
-        const auto it = properties.find(name);
-        if (it != properties.end() && !it->second.empty()) {
-            return it->second;
-        }
-    }
-    return "";
-}
-
-Json::Value enumerateSerialReadersJson() {
-    Json::Value root(Json::arrayValue);
-    const std::filesystem::path byIdDirectory("/dev/serial/by-id");
-    std::error_code error;
-    if (!std::filesystem::exists(byIdDirectory, error) || error) {
-        return root;
-    }
-
-    std::vector<std::filesystem::path> entries;
-    for (std::filesystem::directory_iterator iterator(byIdDirectory, error), end;
-         !error && iterator != end; iterator.increment(error)) {
-        entries.push_back(iterator->path());
-    }
-    std::sort(entries.begin(), entries.end());
-
-    for (const auto& byIdPath : entries) {
-        std::error_code canonicalError;
-        const auto resolved = std::filesystem::canonical(byIdPath, canonicalError);
-        if (canonicalError) continue;
-        const std::string device = resolved.string();
-        if (!safeDeviceNode(device)) continue;
-
-        const auto properties = udevPropertiesForDevice(device);
-        Json::Value item;
-        item["by_id"] = byIdPath.string();
-        item["by_id_name"] = byIdPath.filename().string();
-        item["device"] = device;
-        item["tty"] = resolved.filename().string();
-        item["vendor"] = firstProperty(properties, {"ID_VENDOR_FROM_DATABASE", "ID_VENDOR"});
-        item["model"] = firstProperty(properties, {"ID_MODEL_FROM_DATABASE", "ID_MODEL"});
-        item["serial"] = firstProperty(properties, {"ID_SERIAL_SHORT", "ID_SERIAL"});
-        item["usb_path"] = firstProperty(properties, {"ID_PATH", "ID_PATH_TAG"});
-        item["online"] = true;
-        root.append(item);
-    }
-    return root;
-}
-
-const Json::Value* findSerialReaderById(const Json::Value& readers, const std::string& byId) {
-    if (byId.empty() || !readers.isArray()) return nullptr;
-    for (const auto& reader : readers) {
-        if (reader.get("by_id", "").asString() == byId) return &reader;
-    }
-    return nullptr;
 }
 
 std::string base64Decode(const std::string& value) {
@@ -778,7 +682,7 @@ std::string HttpServer::listDvbDevices() {
 
 std::string HttpServer::listSerialReaders() {
     Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, enumerateSerialReadersJson());
+    return Json::writeString(writer, ca_provider::enumerateSerialReadersJson());
 }
 
 std::string HttpServer::handleScanSatellite(const std::string& body) {
@@ -933,7 +837,7 @@ std::string HttpServer::currentState() {
     transcoder["missing_elements"] = missing;
     root["transcoder"] = transcoder;
     auto snap = streamManager.snapshot();
-    const Json::Value serialReaders = enumerateSerialReadersJson();
+    const Json::Value serialReaders = ca_provider::enumerateSerialReadersJson();
     root["serial_reader_count"] = Json::UInt(serialReaders.size());
     Json::Value caProviders(Json::arrayValue);
     for (const auto& provider : configManager.config.caProviders) {
@@ -951,8 +855,8 @@ std::string HttpServer::currentState() {
 
       // v85 keeps capacity per provider/card. Auto mode is ready for a documented card capability
       // interface; until such an interface reports a value, maxChannels is the explicit fallback.
-      const int effectiveMaxChannels = std::clamp(provider.maxChannels, 1, 1024);
-      const Json::Value* reader = findSerialReaderById(serialReaders, provider.readerById);
+      const int effectiveMaxChannels = ca_provider::effectiveMaxChannels(provider);
+      const Json::Value* reader = ca_provider::findSerialReaderById(serialReaders, provider.readerById);
       const bool readerOnline = reader != nullptr;
 
       item["assigned_channels"] = assignedChannels;
@@ -964,7 +868,7 @@ std::string HttpServer::currentState() {
       item["capacity_source"] = provider.capacityMode == "auto" ? "auto-fallback" : "manual";
       item["auto_capacity_available"] = false;
       item["reader_online"] = readerOnline;
-      item["card_status"] = readerOnline ? "READER_ONLINE" : (provider.readerById.empty() ? "NO_READER" : "OFFLINE");
+      item["card_status"] = ca_provider::cardStatus(provider, serialReaders);
       item["card_metadata_available"] = false;
       if (reader) {
         item["reader_device"] = reader->get("device", "");
@@ -981,9 +885,7 @@ std::string HttpServer::currentState() {
         item["reader_serial"] = "";
         item["reader_usb_path"] = "";
       }
-      item["manager_status"] = readerOnline
-        ? "serial reader online; card capability/descrambling interface is not configured"
-        : (provider.readerById.empty() ? "reader is not assigned" : "configured reader is offline");
+      item["manager_status"] = ca_provider::managerStatus(provider, serialReaders);
       caProviders.append(item);
     }
     root["ca_providers"] = caProviders;
@@ -1505,8 +1407,8 @@ std::string HttpServer::handleStartStream(const std::string& body) {
                 Json::StreamWriterBuilder writer;
                 return Json::writeString(writer, response);
             }
-            const Json::Value readers = enumerateSerialReadersJson();
-            if (!findSerialReaderById(readers, selectedCaProvider->readerById)) {
+            const Json::Value readers = ca_provider::enumerateSerialReadersJson();
+            if (!ca_provider::findSerialReaderById(readers, selectedCaProvider->readerById)) {
                 response["result"] = "error";
                 response["stream_id"] = cfg.id;
                 response["error"] =
@@ -1525,7 +1427,7 @@ std::string HttpServer::handleStartStream(const std::string& body) {
                 ++activeOnProvider;
             }
         }
-        const int effectiveMaxChannels = std::clamp(selectedCaProvider->maxChannels, 1, 1024);
+        const int effectiveMaxChannels = ca_provider::effectiveMaxChannels(*selectedCaProvider);
         if (activeOnProvider >= static_cast<unsigned>(effectiveMaxChannels)) {
             response["result"] = "error";
             response["stream_id"] = cfg.id;
@@ -1574,7 +1476,7 @@ std::string HttpServer::handleStartStream(const std::string& body) {
             response["ca_reader_by_id"] = selectedCaProvider->readerById;
             response["ca_mode"] = "reader-card-manager";
             response["ca_capacity_mode"] = selectedCaProvider->capacityMode;
-            response["ca_effective_max_channels"] = std::clamp(selectedCaProvider->maxChannels, 1, 1024);
+            response["ca_effective_max_channels"] = ca_provider::effectiveMaxChannels(*selectedCaProvider);
         }
     } else {
         response["result"] = "error";
