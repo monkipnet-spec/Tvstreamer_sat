@@ -1520,6 +1520,37 @@ bool StreamManager::prepareSharedSatelliteInput(StreamState* state, std::string&
             state->config, state->satelliteFrontendKey, multicastAddress, multicastPort, error)) {
         return false;
     }
+
+    // v95: FTA channels must not open the DVB frontend a second time.  The
+    // scanner/shared hub has already proven that adapter/frontend can be tuned
+    // successfully.  Feed the full transponder multicast directly into the
+    // channel's main pipeline and let the v94 single-service tsdemux/remux pick
+    // the configured SID there.  This removes both failure modes seen in v94:
+    //   1) dvbbasebin/dvbsrc "Failed to start" because the frontend is busy;
+    //   2) the old per-service loopback relay watchdog/restart loop.
+    // Scrambled services keep the per-service relay path for now because their
+    // CA backend may need a dedicated service branch later.
+    if (!state->config.satelliteScrambled) {
+        state->sharedSatelliteInput = true;
+        state->lastSatelliteRelayBytesSeen = 0;
+        state->satelliteServiceRelayUri =
+            "udp://@" + multicastAddress + ":" + std::to_string(multicastPort);
+        state->runtimeConfig = state->config;
+        state->runtimeConfig.satelliteEnabled = false;
+        state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
+        state->runtimeConfig.inputMode = "udp";
+        // The shared hub transmits with multicast-iface=lo.  Pin the receiver to
+        // loopback as well so systems with several NICs do not join the group on
+        // an unrelated interface.
+        state->runtimeConfig.inputInterfaceAddress = "127.0.0.1";
+        state->runtimeConfig.inputInterfaceAddressConfigured = true;
+        std::cerr << "FTA shared-transponder input attached: stream=" << state->config.id
+                  << " frontend=" << state->satelliteFrontendKey
+                  << " SID=" << state->config.satelliteServiceId
+                  << " source=" << state->satelliteServiceRelayUri << std::endl;
+        return true;
+    }
+
     if (!startSatelliteServiceRelay(state, multicastAddress, multicastPort, error)) {
         releaseSatelliteTransponder(state->satelliteFrontendKey);
         state->satelliteFrontendKey.clear();
@@ -1888,18 +1919,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->runtimeConfig;
 
-    // v93: FTA services use the DVB frontend directly.  The previous path
-    // inserted a second per-service pipeline (shared transponder -> tsdemux ->
-    // mpegtsmux -> loopback UDP -> playback pipeline).  On some DVB-S2 services
-    // tsdemux discovered the correct H.264/audio pads but the intermediate mux
-    // produced no loopback packets, so the watchdog kept restarting a healthy
-    // tuned frontend.  dvbbasebin already supports program-numbers and can hand
-    // the selected FTA service straight to the normal output pipeline.
-    //
-    // Keep the shared-transponder architecture only for scrambled services,
-    // where a future CA backend may need a common transport stream.
-    const bool useSharedSatelliteInput =
-        streamConfig.satelliteEnabled && streamConfig.satelliteScrambled;
+    // v95: every satellite channel acquires the shared tuned transponder first.
+    // FTA then reads that hub multicast directly and performs the v94 SID filter
+    // inside the main output pipeline.  This guarantees that only one GStreamer
+    // DVB source owns /dev/dvb/adapterN/frontendM at a time.
+    const bool useSharedSatelliteInput = streamConfig.satelliteEnabled;
 
     std::string sharedSatelliteError;
     if (!state->caProviderTransport && useSharedSatelliteInput &&
@@ -1909,13 +1933,14 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         return false;
     }
     if (streamConfig.satelliteEnabled && !streamConfig.satelliteScrambled) {
-        std::cerr << "FTA direct DVB input selected: stream=" << streamConfig.id
+        std::cerr << "FTA shared DVB hub selected: stream=" << streamConfig.id
                   << " adapter=" << streamConfig.satelliteAdapter
                   << " frontend=" << streamConfig.satelliteFrontend
                   << " SID=" << streamConfig.satelliteServiceId
                   << " frequency_khz=" << streamConfig.satelliteFrequency
+                  << " source=" << state->satelliteServiceRelayUri
                   << std::endl;
-        state->statusMessage = "starting FTA via direct DVB-S/S2 input";
+        state->statusMessage = "starting FTA via shared DVB-S/S2 transponder hub";
     }
 
     if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
@@ -2848,7 +2873,12 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         state->runtimeConfig.satelliteEnabled = false;
         state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
         state->runtimeConfig.inputMode = "udp";
-        state->runtimeConfig.inputInterfaceAddress.clear();
+        if (state->config.satelliteEnabled && !state->config.satelliteScrambled &&
+            state->satelliteServiceRelay == nullptr) {
+            state->runtimeConfig.inputInterfaceAddress = "127.0.0.1";
+        } else {
+            state->runtimeConfig.inputInterfaceAddress.clear();
+        }
         state->runtimeConfig.inputInterfaceAddressConfigured = true;
     } else {
         state->runtimeConfig.inputUri = inputUri;
@@ -4332,7 +4362,8 @@ void StreamManager::monitorBus(const std::string& id) {
 
         if (!state->config.testPattern) {
             const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
-            const bool sharedSatellitePrimary = state->config.satelliteEnabled && state->sharedSatelliteInput && !state->usingBackup;
+            const bool sharedSatellitePrimary = state->config.satelliteEnabled && state->sharedSatelliteInput &&
+                state->satelliteServiceRelay != nullptr && !state->usingBackup;
             const bool excessiveInputCcErrors = state->inputCcErrorsDelta.load(std::memory_order_relaxed) >= kInputCcRecoveryThreshold;
             if (sharedSatellitePrimary && !state->satelliteRelayRecoveryDisabled &&
                 state->config.backupInputUri.empty() &&
@@ -4400,7 +4431,12 @@ void StreamManager::monitorBus(const std::string& id) {
                         primaryProbeConfig.satelliteEnabled = false;
                         primaryProbeConfig.inputUri = state->satelliteServiceRelayUri;
                         primaryProbeConfig.inputMode = "udp";
-                        primaryProbeConfig.inputInterfaceAddress.clear();
+                        if (state->config.satelliteEnabled && !state->config.satelliteScrambled &&
+                            state->satelliteServiceRelay == nullptr) {
+                            primaryProbeConfig.inputInterfaceAddress = "127.0.0.1";
+                        } else {
+                            primaryProbeConfig.inputInterfaceAddress.clear();
+                        }
                         primaryProbeConfig.inputInterfaceAddressConfigured = true;
                         primaryProbeUri = state->satelliteServiceRelayUri;
                     } else {
