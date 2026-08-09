@@ -806,12 +806,14 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
     (void)cfg;
-    // multifdsink must follow the incoming buffer timestamps. With sync disabled
-    // it writes every available MPEG-TS buffer immediately, producing short
-    // network bursts followed by idle gaps. Timestamp-synchronised delivery
-    // smooths HTTP output without modifying the transport stream itself.
+    // v97: multifdsink is a network fan-out sink, not a renderer.  In the
+    // DVB single-service remux path mpegtsmux can preserve/derive timestamps
+    // from PCR/PTS that are not aligned to the pipeline clock.  sync=TRUE can
+    // therefore hold every TS buffer indefinitely even though muxing works and
+    // the HTTP request already received 200 OK.  Send buffers as soon as the
+    // mux produces them; pacing belongs to the upstream queue/CBR pacer.
     g_object_set(sink,
-        "sync", TRUE,
+        "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         nullptr);
@@ -3719,6 +3721,36 @@ bool StreamManager::buildRemapPipeline(
     context->sink = sink;
     context->config = cfg;
     RemapContext* contextPtr = context.get();
+
+    // v97 diagnostics: prove that mpegtsmux produces TS and that the HTTP sink
+    // receives it.  Only the first buffer is logged to keep journal noise low.
+    if (GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src")) {
+        gst_pad_add_probe(
+            muxSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
+            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+                auto* probeCtx = static_cast<RemapContext*>(userData);
+                bool expected = false;
+                if (probeCtx && probeCtx->muxActivityLogged.compare_exchange_strong(expected, true)) {
+                    std::cerr << "FTA remux activity: MUX produced first MPEG-TS buffer" << std::endl;
+                }
+                return GST_PAD_PROBE_OK;
+            }, contextPtr, nullptr);
+        gst_object_unref(muxSrcPad);
+    }
+    if (GstPad* sinkPad = gst_element_get_static_pad(sink, "sink")) {
+        gst_pad_add_probe(
+            sinkPad, GST_PAD_PROBE_TYPE_BUFFER,
+            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+                auto* probeCtx = static_cast<RemapContext*>(userData);
+                bool expected = false;
+                if (probeCtx && probeCtx->httpActivityLogged.compare_exchange_strong(expected, true)) {
+                    std::cerr << "FTA remux activity: OUTPUT sink received first MPEG-TS buffer" << std::endl;
+                }
+                return GST_PAD_PROBE_OK;
+            }, contextPtr, nullptr);
+        gst_object_unref(sinkPad);
+    }
+
     state->outputContexts.push_back(std::move(context));
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
     return true;
@@ -3905,12 +3937,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
-    gst_element_sync_state_with_parent(queue);
-    gst_element_sync_state_with_parent(parser);
-    if (capsfilter) {
-        gst_element_sync_state_with_parent(capsfilter);
-    }
-
+    // v97: link the complete dynamic branch first, then synchronise the newly
+    // added elements with the live parent.  Starting queue/parser before their
+    // downstream mux pad exists can leave a live dynamic branch without data.
     const bool parserLinked = capsfilter
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
         : gst_element_link(queue, parser);
@@ -3951,7 +3980,32 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
+    // Log the first elementary buffer that reaches the parser output.
+    gst_pad_add_probe(
+        parserSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
+        +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
+            auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
+            if (pair && pair->first) {
+                auto& flag = pair->second ? pair->first->audioActivityLogged : pair->first->videoActivityLogged;
+                bool expected = false;
+                if (flag.compare_exchange_strong(expected, true)) {
+                    std::cerr << "FTA remux activity: " << (pair->second ? "AUDIO" : "VIDEO")
+                              << " parser produced first elementary buffer" << std::endl;
+                }
+            }
+            return GST_PAD_PROBE_OK;
+        },
+        new std::pair<RemapContext*, bool>(ctx, isAudio),
+        +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
+
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+        // The branch is now complete: demux -> queue -> parser -> mux.  Only now
+        // move dynamic elements to the parent's PLAYING state.
+        gst_element_sync_state_with_parent(queue);
+        gst_element_sync_state_with_parent(parser);
+        if (capsfilter) {
+            gst_element_sync_state_with_parent(capsfilter);
+        }
         std::cerr << "remap linked " << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid << std::endl;
