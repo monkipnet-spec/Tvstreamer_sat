@@ -10,7 +10,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <openssl/evp.h>
-#include <openssl/md5.h>
 #include <openssl/err.h>
 #include <chrono>
 #include <sstream>
@@ -32,7 +31,7 @@ static void initOpenSSL() {
 }
 
 // ---------------------------------------------------------------------------
-// Парсинг endpoint с поддержкой полного URL
+// Парсинг endpoint
 // ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::parseEndpoint(const std::string& endpoint, std::string& host, int& port,
                                          std::string& username, std::string& password,
@@ -50,7 +49,6 @@ bool NewcamdStatusBackend::parseEndpoint(const std::string& endpoint, std::strin
     const std::string prefix = "newcamd://";
     if (value.rfind(prefix, 0) == 0) value.erase(0, prefix.size());
 
-    // Парсим user:pass@
     size_t at_pos = value.find('@');
     if (at_pos != std::string::npos) {
         std::string userpass = value.substr(0, at_pos);
@@ -62,12 +60,10 @@ bool NewcamdStatusBackend::parseEndpoint(const std::string& endpoint, std::strin
         value.erase(0, at_pos + 1);
     }
 
-    // Парсим host:port/key/EMM
     size_t slash1 = value.find('/');
     std::string hostport = (slash1 != std::string::npos) ? value.substr(0, slash1) : value;
     std::string rest = (slash1 != std::string::npos) ? value.substr(slash1 + 1) : "";
 
-    // Парсим host:port
     if (!hostport.empty() && hostport.front() == '[') {
         size_t close = hostport.find(']');
         if (close == std::string::npos || close + 2 > hostport.size() || hostport[close + 1] != ':')
@@ -81,7 +77,6 @@ bool NewcamdStatusBackend::parseEndpoint(const std::string& endpoint, std::strin
         try { port = std::stoi(hostport.substr(colon + 1)); } catch (...) { return false; }
     }
 
-    // Парсим ключ и EMM
     if (!rest.empty()) {
         size_t slash2 = rest.find('/');
         if (slash2 != std::string::npos) {
@@ -117,7 +112,6 @@ NewcamdStatusResult NewcamdStatusBackend::probe(const std::string& endpoint, int
     result.port = port;
     result.configured = true;
 
-    // Создаем клиент
     NewcamdClient client(host, port, username, password, des_key, timeoutMs);
     
     auto start = std::chrono::steady_clock::now();
@@ -163,7 +157,7 @@ NewcamdStatusResult NewcamdStatusBackend::probe(const std::string& endpoint, int
 }
 
 // ---------------------------------------------------------------------------
-// Базовая проверка только TCP (оригинальная функциональность)
+// Базовая TCP проверка
 // ---------------------------------------------------------------------------
 NewcamdStatusResult NewcamdStatusBackend::probeTCP(const std::string& endpoint, int timeoutMs) {
     NewcamdStatusResult result;
@@ -252,7 +246,6 @@ NewcamdStatusBackend::NewcamdClient::NewcamdClient(const std::string& host, int 
     memset(session_key_, 0, sizeof(session_key_));
     memset(cam_id_, 0, sizeof(cam_id_));
     
-    // Парсим hex-ключ
     size_t key_len = 0;
     if (!hexToBytes(des_key_hex_, des_key_, key_len) || key_len != 14) {
         last_error_ = "Invalid DES key length (must be 14 bytes)";
@@ -266,12 +259,8 @@ NewcamdStatusBackend::NewcamdClient::~NewcamdClient() {
     disconnect();
 }
 
-// ---------------------------------------------------------------------------
-// Подключение к серверу
-// ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::connect() {
     if (state_ == STATE_ERROR) return false;
-    
     std::lock_guard<std::mutex> lock(mutex_);
     return connectToServer();
 }
@@ -332,7 +321,6 @@ bool NewcamdStatusBackend::NewcamdClient::connectToServer() {
     ::freeaddrinfo(resolved);
     
     if (connected) {
-        // Возвращаем блокирующий режим
         int flags = ::fcntl(sock_fd_, F_GETFL, 0);
         if (flags >= 0) ::fcntl(sock_fd_, F_SETFL, flags & ~O_NONBLOCK);
         state_ = STATE_CONNECTED;
@@ -342,15 +330,11 @@ bool NewcamdStatusBackend::NewcamdClient::connectToServer() {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Аутентификация
-// ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::authenticate() {
     if (state_ != STATE_CONNECTED) {
         last_error_ = "Not connected";
         return false;
     }
-
     std::lock_guard<std::mutex> lock(mutex_);
     return performLogin();
 }
@@ -358,7 +342,7 @@ bool NewcamdStatusBackend::NewcamdClient::authenticate() {
 bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     auto start = std::chrono::steady_clock::now();
     
-    // Шаг 1: Получаем 14 байт от сервера
+    // Получаем 14 байт от сервера
     uint8_t buffer[256];
     ssize_t recv_len = ::recv(sock_fd_, buffer, 14, 0);
     if (recv_len != 14) {
@@ -368,15 +352,35 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
 
     memcpy(random_key_, buffer, 14);
 
-    // Шаг 2: Вычисляем login_key = XOR(random_key, des_key)
+    // Вычисляем login_key = XOR(random_key, des_key)
     createLoginKey(random_key_, des_key_);
 
-    // Шаг 3: Хешируем пароль
+    // Хешируем пароль через EVP (избегаем устаревшего MD5)
     uint8_t password_hash[MD5_DIGEST_LENGTH];
-    MD5(reinterpret_cast<const unsigned char*>(password_.c_str()),
-        password_.length(), password_hash);
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx) {
+        last_error_ = "Failed to create EVP context";
+        return false;
+    }
+    if (EVP_DigestInit_ex(mdctx, EVP_md5(), nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        last_error_ = "EVP_DigestInit failed";
+        return false;
+    }
+    if (EVP_DigestUpdate(mdctx, password_.c_str(), password_.length()) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        last_error_ = "EVP_DigestUpdate failed";
+        return false;
+    }
+    unsigned int md_len = 0;
+    if (EVP_DigestFinal_ex(mdctx, password_hash, &md_len) != 1 || md_len != MD5_DIGEST_LENGTH) {
+        EVP_MD_CTX_free(mdctx);
+        last_error_ = "EVP_DigestFinal failed";
+        return false;
+    }
+    EVP_MD_CTX_free(mdctx);
 
-    // Шаг 4: Формируем логин-пакет
+    // Формируем логин-пакет
     uint8_t login_data[256];
     uint16_t login_len = 0;
     memcpy(login_data, username_.c_str(), username_.length() + 1);
@@ -384,14 +388,14 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     memcpy(login_data + login_len, password_hash, MD5_DIGEST_LENGTH);
     login_len += MD5_DIGEST_LENGTH;
 
-    // Шаг 5: Отправляем зашифрованным login_key
+    // Отправляем зашифрованным login_key
     if (!sendMessage(MSG_CLIENT_2_SERVER_LOGIN, login_data, login_len,
                      nullptr, 0, true)) {
         last_error_ = "Failed to send login packet";
         return false;
     }
 
-    // Шаг 6: Получаем ответ
+    // Получаем ответ
     uint8_t response[256];
     uint16_t resp_len = 0;
     uint8_t custom[8];
@@ -418,9 +422,6 @@ bool NewcamdStatusBackend::NewcamdClient::performLogin() {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Получение информации о карте
-// ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::getCardInfo() {
     if (state_ != STATE_READY) {
         last_error_ = "Not authenticated";
@@ -429,13 +430,11 @@ bool NewcamdStatusBackend::NewcamdClient::getCardInfo() {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Отправляем запрос данных карты
     if (!sendMessage(MSG_CARD_DATA_REQ, nullptr, 0, nullptr, 0, true)) {
         last_error_ = "Failed to request card data";
         return false;
     }
 
-    // Получаем ответ
     uint8_t buffer[256];
     uint16_t len = 0;
     uint8_t custom[8];
@@ -447,12 +446,10 @@ bool NewcamdStatusBackend::NewcamdClient::getCardInfo() {
         return false;
     }
 
-    // Парсим данные карты
     if (len >= 8) {
         card_caid_ = (buffer[0] << 8) | buffer[1];
         uint16_t prov_count = (buffer[2] << 8) | buffer[3];
 
-        // Извлекаем провайдеров
         for (int i = 0; i < prov_count && i < 4; i++) {
             uint16_t prov = (buffer[4 + i*2] << 8) | buffer[5 + i*2];
             card_providers_.push_back(prov);
@@ -466,9 +463,6 @@ bool NewcamdStatusBackend::NewcamdClient::getCardInfo() {
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// Отключение
-// ---------------------------------------------------------------------------
 void NewcamdStatusBackend::NewcamdClient::disconnect() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (sock_fd_ >= 0) {
@@ -480,24 +474,18 @@ void NewcamdStatusBackend::NewcamdClient::disconnect() {
     received_msg_id_ = 0;
 }
 
-// ---------------------------------------------------------------------------
-// Генерация ключей
-// ---------------------------------------------------------------------------
 void NewcamdStatusBackend::NewcamdClient::createLoginKey(const uint8_t* random,
                                                           const uint8_t* des_key) {
     for (int i = 0; i < 14; i++) {
         login_key_[i] = random[i] ^ des_key[i];
     }
-    // DES ключ должен быть 16 байт, расширяем для Triple DES
     login_key_[14] = login_key_[0];
     login_key_[15] = login_key_[1];
-
-    // Копируем в сессионный ключ
     memcpy(session_key_, login_key_, 16);
 }
 
 // ---------------------------------------------------------------------------
-// Шифрование DES-EDE2-CBC с использованием EVP
+// Шифрование DES-EDE-CBC с использованием EVP (двухключевой)
 // ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::encryptDesEde2Cbc(const uint8_t* key,
                                                              const uint8_t* iv,
@@ -508,26 +496,23 @@ bool NewcamdStatusBackend::NewcamdClient::encryptDesEde2Cbc(const uint8_t* key,
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return false;
 
-    // Используем DES-EDE2-CBC (два ключа)
-    const EVP_CIPHER* cipher = EVP_des_ede2_cbc();
+    // Используем EVP_des_ede_cbc() — двухключевой Triple DES (EDE)
+    const EVP_CIPHER* cipher = EVP_des_ede_cbc();
     
     int outlen = 0;
     int total_len = 0;
     
-    // Инициализация шифрования
     if (EVP_EncryptInit_ex(ctx, cipher, nullptr, key, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
     
-    // Шифрование
     if (EVP_EncryptUpdate(ctx, output, &outlen, input, input_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
     total_len = outlen;
     
-    // Финализация
     if (EVP_EncryptFinal_ex(ctx, output + total_len, &outlen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
@@ -548,25 +533,22 @@ bool NewcamdStatusBackend::NewcamdClient::decryptDesEde2Cbc(const uint8_t* key,
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return false;
 
-    const EVP_CIPHER* cipher = EVP_des_ede2_cbc();
+    const EVP_CIPHER* cipher = EVP_des_ede_cbc();
     
     int outlen = 0;
     int total_len = 0;
     
-    // Инициализация дешифрования
     if (EVP_DecryptInit_ex(ctx, cipher, nullptr, key, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
     
-    // Дешифрование
     if (EVP_DecryptUpdate(ctx, output, &outlen, input, input_len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
     }
     total_len = outlen;
     
-    // Финализация
     if (EVP_DecryptFinal_ex(ctx, output + total_len, &outlen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         return false;
@@ -610,7 +592,7 @@ bool NewcamdStatusBackend::NewcamdClient::desDecrypt(uint8_t* data, uint16_t len
 }
 
 // ---------------------------------------------------------------------------
-// Отправка сообщения
+// Отправка/приём сообщений
 // ---------------------------------------------------------------------------
 bool NewcamdStatusBackend::NewcamdClient::sendMessage(net_msg_type_t cmd,
                                                        const uint8_t* data, uint16_t len,
@@ -620,7 +602,6 @@ bool NewcamdStatusBackend::NewcamdClient::sendMessage(net_msg_type_t cmd,
     uint16_t header_len = (proto_version_ == VERSION_524) ? 8 : 12;
     uint16_t total_len = header_len + len;
 
-    // Заголовок
     packet[0] = (total_len >> 8) & 0xFF;
     packet[1] = total_len & 0xFF;
     packet[2] = (sent_msg_id_ >> 8) & 0xFF;
@@ -637,7 +618,7 @@ bool NewcamdStatusBackend::NewcamdClient::sendMessage(net_msg_type_t cmd,
             packet[4] = packet[5] = packet[6] = packet[7] = 0;
         }
         packet[8] = static_cast<uint8_t>(cmd);
-        packet[9] = (len >> 8) & 0x0F;  // 12-bit length
+        packet[9] = (len >> 8) & 0x0F;
         packet[10] = len & 0xFF;
         packet[11] = 0;
     } else {
@@ -671,9 +652,6 @@ bool NewcamdStatusBackend::NewcamdClient::sendMessage(net_msg_type_t cmd,
     return sent == total_len;
 }
 
-// ---------------------------------------------------------------------------
-// Приём сообщения
-// ---------------------------------------------------------------------------
 net_msg_type_t NewcamdStatusBackend::NewcamdClient::receiveMessage(uint8_t* buffer,
                                                                     uint16_t* len,
                                                                     uint8_t* custom_data,
@@ -748,7 +726,7 @@ bool NewcamdStatusBackend::NewcamdClient::hexToBytes(const std::string& hex,
 
 void NewcamdStatusBackend::NewcamdClient::debugDump(const uint8_t* data, uint16_t len,
                                                      const char* prefix) {
-    // Отключено для production, можно включить при необходимости
+    // Отключено для production
     (void)data;
     (void)len;
     (void)prefix;
