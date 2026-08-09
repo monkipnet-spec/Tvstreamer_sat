@@ -1,4 +1,3 @@
-// CaProviderManager.cpp
 #include "CaProviderManager.h"
 #include "NewcamdStatusBackend.h"
 
@@ -9,108 +8,11 @@
 #include <map>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <mutex>
-#include <chrono>
 #include <unistd.h>
 
 namespace ca_provider {
 namespace {
 
-// ---------------------------------------------------------------------------
-// Кэш ключей (CW) в памяти
-// ---------------------------------------------------------------------------
-struct CachedCW {
-    uint8_t cw0[8];
-    uint8_t cw1[8];
-    std::chrono::steady_clock::time_point timestamp;
-    int ttl_seconds;  // время жизни в секундах (обычно 6-8 для CW)
-};
-
-// Глобальный кэш: ключ = "caid:provider:sid"
-static std::unordered_map<std::string, CachedCW> g_cwCache;
-static std::mutex g_cacheMutex;
-
-// Вспомогательная функция для формирования ключа
-static std::string buildCacheKey(uint16_t caid, uint16_t provider, uint16_t sid) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%04x:%04x:%04x", caid, provider, sid);
-    return std::string(buf);
-}
-
-// Проверка валидности CW (не истекло)
-static bool isCWValid(const CachedCW& cached) {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - cached.timestamp).count();
-    return elapsed < cached.ttl_seconds;
-}
-
-// Внутренняя функция очистки кэша (вызывается с захваченным мьютексом)
-static void clearCacheInternal() {
-    g_cwCache.clear();
-}
-
-// ---------------------------------------------------------------------------
-// Заглушка для реального получения CW от backend (будет реализована отдельно)
-// ---------------------------------------------------------------------------
-static CWResponse requestCWFromBackend(const CaProviderConfig& provider,
-                                       uint16_t sid, uint16_t caid, uint16_t providerId) {
-    // В реальном коде здесь должен быть вызов NewcamdClient::sendECM
-    // или аналогичного метода для других backend'ов.
-    // Пока возвращаем пустой ответ с успехом=false
-    CWResponse response{};
-    response.success = false;
-    return response;
-}
-
-// ---------------------------------------------------------------------------
-// Публичные функции для работы с кэшем
-// ---------------------------------------------------------------------------
-CWResponse getCW(const CaProviderConfig& provider, uint16_t sid,
-                 uint16_t caid, uint16_t providerId) {
-    std::lock_guard<std::mutex> lock(g_cacheMutex);
-
-    // Проверяем, есть ли в кэше
-    std::string key = buildCacheKey(caid, providerId, sid);
-    auto it = g_cwCache.find(key);
-    if (it != g_cwCache.end() && isCWValid(it->second)) {
-        CWResponse response{};
-        response.success = true;
-        memcpy(response.cw_0, it->second.cw0, 8);
-        memcpy(response.cw_1, it->second.cw1, 8);
-        response.caid = caid;
-        response.provider = providerId;
-        response.sid = sid;
-        return response;
-    }
-
-    // Нет в кэше или истекло – запрашиваем у backend
-    CWResponse fresh = requestCWFromBackend(provider, sid, caid, providerId);
-    if (fresh.success) {
-        // Сохраняем в кэш с TTL = 7 секунд (типично для CW)
-        CachedCW cached;
-        memcpy(cached.cw0, fresh.cw_0, 8);
-        memcpy(cached.cw1, fresh.cw_1, 8);
-        cached.timestamp = std::chrono::steady_clock::now();
-        cached.ttl_seconds = 7;
-        g_cwCache[key] = cached;
-    }
-    return fresh;
-}
-
-void clearCache() {
-    std::lock_guard<std::mutex> lock(g_cacheMutex);
-    clearCacheInternal();
-}
-
-void setCacheTTL(int ttlSeconds) {
-    // Можно установить глобальный TTL, но пока оставим как заглушку
-    (void)ttlSeconds;
-}
-
-// ---------------------------------------------------------------------------
-// Существующие функции (без изменений)
-// ---------------------------------------------------------------------------
 bool safeDeviceNode(const std::string& device) {
     if (device.rfind("/dev/ttyUSB", 0) != 0 && device.rfind("/dev/ttyACM", 0) != 0) {
         return false;
@@ -282,13 +184,6 @@ Json::Value backendStatusJson(const CaProviderConfig& provider, const Json::Valu
         root["capabilities"] = "serial-reader-inventory";
     }
     return root;
-}
-
-// ---------------------------------------------------------------------------
-// Функция для остановки/очистки кэша (вызывается при завершении программы)
-// ---------------------------------------------------------------------------
-void shutdownCaProvider() {
-    clearCache();  // теперь это публичная функция, конфликта нет
 }
 
 } // namespace ca_provider
