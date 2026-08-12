@@ -31,6 +31,7 @@ add_executable(TVStreammerSAT5
     src/main.cpp
     src/utils.cpp
     src/ConfigManager.cpp
+    src/DvbSatellite.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp

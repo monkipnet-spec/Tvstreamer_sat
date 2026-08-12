@@ -51,7 +51,7 @@ RUN set -eux; \
     for element in \
       uridecodebin decodebin queue videoconvert deinterlace videoscale videorate \
       capsfilter x264enc h264parse audioconvert audioresample audiorate aacparse \
-      mpegtsmux udpsink; do \
+      mpegtsmux udpsink dvbsrc tsparse tsdemux appsink; do \
         gst-inspect-1.0 "$element" >/dev/null; \
     done; \
     if gst-inspect-1.0 voaacenc >/dev/null 2>&1; then :; \

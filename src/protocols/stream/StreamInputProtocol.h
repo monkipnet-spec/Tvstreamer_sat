@@ -16,6 +16,7 @@ enum class InputProtocolKind {
     Srt,
     Rtsp,
     Rtmp,
+    Dvb,
     File,
     Unknown
 };
@@ -28,5 +29,6 @@ bool isTestPatternInput(InputProtocolKind kind);
 bool isUdpLikeInput(InputProtocolKind kind);
 bool isHttpLikeInput(InputProtocolKind kind);
 bool isFileInput(InputProtocolKind kind);
+bool isDvbInput(InputProtocolKind kind);
 
 } // namespace tvs::stream_protocols

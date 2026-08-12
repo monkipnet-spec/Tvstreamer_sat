@@ -2,6 +2,7 @@
 
 #include "utils.h"
 #include "TranscoderModule.h"
+#include "DvbSatellite.h"
 #include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <set>
 #include <thread>
 #include <vector>
 #include <unistd.h>
@@ -28,7 +30,7 @@
 namespace {
 
 constexpr const char* kProgramRelease = "Release 2";
-constexpr const char* kProgramVersion = "v115";
+constexpr const char* kProgramVersion = "v116";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -424,6 +426,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = currentState();
+            } else if (target == "/api/dvb-adapters") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = dvbAdapters();
             } else if (target.rfind("/api/quality-history", 0) == 0) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = qualityHistory(target);
@@ -469,6 +474,15 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/dvb-signal") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleDvbTune(req.body(), false);
+            } else if (target == "/api/dvb-scan") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleDvbTune(req.body(), true);
+            } else if (target == "/api/dvb-add-channels") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleDvbAddChannels(req.body());
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -832,6 +846,140 @@ std::string HttpServer::currentState() {
     root["streams"] = streams;
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, root);
+}
+
+std::string HttpServer::dvbAdapters() {
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, DvbSatellite::adapters());
+}
+
+std::string HttpServer::handleDvbTune(const std::string& body, bool scan) {
+    Json::Value response;
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value request;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["error"] = "invalid DVB request: " + errors;
+    } else {
+        response = scan ? DvbSatellite::scan(request) : DvbSatellite::signal(request);
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
+}
+
+std::string HttpServer::handleDvbAddChannels(const std::string& body) {
+    Json::Value response;
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value request;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["error"] = "invalid channel selection: " + errors;
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
+
+    if (!request["channels"].isArray() || request["channels"].size() == 0) {
+        response["error"] = "No satellite channels selected";
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
+
+    std::string outputType = toLower(request.get("output_type", "udp-vbr").asString());
+    if (outputType != "udp-vbr" && outputType != "udp-cbr") outputType = "udp-vbr";
+    std::string outputHost = request.get("output_host", "239.255.10.1").asString();
+    if (outputHost.empty()) outputHost = "239.255.10.1";
+    int basePort = std::clamp(request.get("base_port", 5000).asInt(), 1, 65535);
+    const std::string interfaceAddress = request.get("interface_address", "").asString();
+    const bool autoStart = request.get("auto_start", false).asBool();
+    const uint64_t targetBitrate = std::clamp<uint64_t>(
+        request.get("target_bitrate_kbps", Json::UInt64(12000)).asUInt64(), 500, 100000) * 1000ULL;
+
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    std::set<int> occupiedPorts;
+    for (const auto& existing : configManager.config.streams) {
+        if (existing.outputHost == outputHost) occupiedPorts.insert(existing.outputPort);
+        for (const auto& extra : existing.additionalOutputs) {
+            if (extra.outputHost == outputHost) occupiedPorts.insert(extra.outputPort);
+        }
+    }
+    int nextPort = basePort;
+    size_t created = 0;
+    size_t skipped = 0;
+    Json::Value createdItems(Json::arrayValue);
+
+    for (Json::ArrayIndex index = 0; index < request["channels"].size(); ++index) {
+        const Json::Value& item = request["channels"][index];
+        const uint32_t sid = item.get("service_id", 0).asUInt();
+        const std::string inputUri = item.get("input_uri", "").asString();
+        if (sid == 0 || inputUri.empty()) {
+            ++skipped;
+            continue;
+        }
+
+        DvbSatelliteParams params;
+        std::string dvbError;
+        if (!DvbSatellite::parseUri(inputUri, params, dvbError)) {
+            ++skipped;
+            continue;
+        }
+
+        const bool duplicate = std::any_of(
+            configManager.config.streams.begin(), configManager.config.streams.end(),
+            [&](const StreamConfig& existing) {
+                return existing.inputUri == inputUri && existing.inputServiceId == sid;
+            });
+        if (duplicate) {
+            ++skipped;
+            continue;
+        }
+
+        StreamConfig config;
+        config.id = "sat-" + std::to_string(now) + "-" + std::to_string(sid) + "-" + std::to_string(index);
+        config.name = item.get("name", "").asString();
+        if (config.name.empty()) config.name = "Satellite " + std::to_string(sid);
+        config.inputUri = inputUri;
+        config.inputMode = "auto";
+        config.testPattern = false;
+        config.autoStart = autoStart;
+        config.outputType = outputType;
+        config.outputMode = "listener";
+        config.outputHost = outputHost;
+        while (nextPort <= 65535 && occupiedPorts.count(nextPort)) ++nextPort;
+        if (nextPort > 65535) {
+            ++skipped;
+            continue;
+        }
+        config.outputPort = nextPort;
+        occupiedPorts.insert(nextPort);
+        ++nextPort;
+        config.interfaceAddress = interfaceAddress;
+        config.cbr = outputType == "udp-cbr";
+        config.targetBitrate = targetBitrate;
+        config.remapEnabled = false;
+        config.transcodeEnabled = false;
+        config.inputServiceId = sid;
+        config.serviceId = sid;
+        config.serviceName = config.name;
+        config.serviceProvider = item.get("provider", "").asString();
+        config.videoPid = 0;
+        config.audioPid = 0;
+
+        configManager.config.streams.push_back(config);
+        Json::Value createdItem = config.toJson();
+        createdItems.append(createdItem);
+        ++created;
+    }
+
+    if (created > 0) configManager.save();
+    response["result"] = "ok";
+    response["created"] = Json::UInt64(created);
+    response["skipped"] = Json::UInt64(skipped);
+    response["channels"] = createdItems;
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target) {
@@ -1534,6 +1682,15 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .subscriber-session{display:flex;align-items:center;gap:6px;white-space:nowrap;color:#9aa3b1;font-size:.72rem}
 .subscriber-session.active{color:#b6f7c2}
 .reset-session{padding:5px 7px;border:1px solid rgba(255,184,77,.25);border-radius:7px;background:rgba(255,184,77,.12);color:#ffe0a3;cursor:pointer;font-size:.7rem}
+
+.modal.satellite-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
+.modal-content.satellite-modal{width:min(920px,100%);max-height:calc(100% - 12px);margin:0 auto}
+.sat-signal-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) auto;gap:10px;align-items:center;margin-bottom:14px;padding:12px;background:rgba(31,139,255,.08);border:1px solid rgba(57,189,248,.18);border-radius:14px}
+.sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
+.sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
+@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 68px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(5),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(5){display:none}}
+@media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
+
 </style>
 </head>
 <body>
@@ -1568,6 +1725,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 </details>
 <button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
 <button class="button-secondary" onclick="openSubscribersModal()" data-i18n="subscribers">Subscribers</button>
+<button class="button-secondary" onclick="openAddChannelModal()" data-i18n="addChannel">+ Add channel</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 </div>
 </header>
@@ -1579,7 +1737,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <script>
 const translations = {
   en: {
-    subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream',
+    subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream', addChannel:'+ Add channel',
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
     restartProgram:'Restart', restartConfirm:'Restart TVStreammerSAT5 now?', restarting:'Restarting...',
@@ -1587,7 +1745,7 @@ const translations = {
     about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', donateWallet:'Telegram Wallet', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
-    subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток',
+    subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток', addChannel:'+ Добавить канал',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
     restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreammerSAT5 сейчас?', restarting:'Перезапуск...',
@@ -1633,6 +1791,10 @@ let metricsFetchPromise = null;
 let lastTileStructureSignature = '';
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
+let satelliteSignalTimer = null;
+let satelliteSignalPending = false;
+let satelliteScanning = false;
+let satelliteServices = [];
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -1750,13 +1912,14 @@ function openModal(html) {
   subscribersModalOpen = false;
   document.getElementById('modalContent').innerHTML = modalCloseButton() + html;
   document.getElementById('modalContent').className = 'modal-content';
-  document.getElementById('modal').classList.remove('quality-open', 'stream-open');
+  document.getElementById('modal').classList.remove('quality-open', 'stream-open', 'satellite-open');
   document.getElementById('modal').classList.add('active');
 }
 function closeModal() {
   subscribersModalOpen = false;
   stopQualityAutoRefresh();
-  document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open');
+  stopSatelliteSignalPolling();
+  document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open', 'satellite-open');
 }
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
@@ -2130,7 +2293,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 2'} / ${state.program_version||'v115'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 2'} / ${state.program_version||'v116'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2178,6 +2341,234 @@ function openTelegramModal() {
     </div>
   `);
 }
+function satEscape(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function satelliteTunePayload() {
+  const adapter = Number(document.getElementById('satAdapter')?.value || 0);
+  const frontend = Number(document.getElementById('satFrontend')?.value || 0);
+  return {
+    adapter,
+    frontend,
+    frequency_mhz:Number(document.getElementById('satFrequency')?.value || 0),
+    symbol_rate:Number(document.getElementById('satSymbolRate')?.value || 0),
+    polarity:document.getElementById('satPolarity')?.value || 'H',
+    delivery_system:document.getElementById('satDeliverySystem')?.value || 'dvb-s2',
+    modulation:document.getElementById('satModulation')?.value || 'auto',
+    fec:document.getElementById('satFec')?.value || 'auto',
+    diseqc_source:Number(document.getElementById('satDiseqc')?.value ?? -1),
+    lnb_lof1_mhz:Number(document.getElementById('satLof1')?.value || 9750),
+    lnb_lof2_mhz:Number(document.getElementById('satLof2')?.value || 10600),
+    lnb_slof_mhz:Number(document.getElementById('satSlof')?.value || 11700),
+    stream_id:Number(document.getElementById('satStreamId')?.value ?? -1)
+  };
+}
+function updateSatelliteMeters(data={}) {
+  const signal = Math.max(0, Math.min(100, Number(data.signal || 0)));
+  const quality = Math.max(0, Math.min(100, Number(data.quality || 0)));
+  const signalValue = document.getElementById('satSignalValue');
+  const qualityValue = document.getElementById('satQualityValue');
+  const signalBar = document.getElementById('satSignalBar');
+  const qualityBar = document.getElementById('satQualityBar');
+  const lock = document.getElementById('satLock');
+  if (signalValue) signalValue.textContent = `${Math.round(signal)}%${Number.isFinite(Number(data.signal_db)) ? ` / ${Number(data.signal_db).toFixed(1)} dB` : ''}`;
+  if (qualityValue) qualityValue.textContent = `${Math.round(quality)}%${Number.isFinite(Number(data.cnr_db)) ? ` / C/N ${Number(data.cnr_db).toFixed(1)} dB` : ''}`;
+  if (signalBar) signalBar.style.width = `${signal}%`;
+  if (qualityBar) qualityBar.style.width = `${quality}%`;
+  if (lock) {
+    lock.textContent = data.locked ? 'LOCK' : 'NO LOCK';
+    lock.classList.toggle('locked', !!data.locked);
+  }
+}
+function stopSatelliteSignalPolling() {
+  clearInterval(satelliteSignalTimer);
+  satelliteSignalTimer = null;
+  satelliteSignalPending = false;
+  satelliteScanning = false;
+}
+async function updateSatelliteSignal() {
+  if (satelliteScanning || satelliteSignalPending || !document.getElementById('satFrequency')) return;
+  satelliteSignalPending = true;
+  try {
+    const response = await fetch('/api/dvb-signal', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(satelliteTunePayload())
+    });
+    const data = await response.json();
+    updateSatelliteMeters(data);
+    const info = document.getElementById('satDeviceInfo');
+    if (info && data.error && !data.locked) info.textContent = data.error;
+  } catch (error) {
+    const info = document.getElementById('satDeviceInfo');
+    if (info) info.textContent = 'Ошибка чтения DVB frontend';
+  } finally {
+    satelliteSignalPending = false;
+  }
+}
+function scheduleSatelliteSignalPolling() {
+  clearInterval(satelliteSignalTimer);
+  satelliteSignalTimer = setInterval(updateSatelliteSignal, 2500);
+  updateSatelliteSignal();
+}
+async function loadSatelliteAdapters() {
+  const info = document.getElementById('satDeviceInfo');
+  try {
+    const response = await fetch('/api/dvb-adapters');
+    const data = await response.json();
+    const adapters = Array.isArray(data.adapters) ? data.adapters : [];
+    if (!data.dvbsrc_available) {
+      if (info) info.textContent = 'GStreamer dvbsrc не найден. Установите gstreamer1.0-plugins-bad.';
+      return;
+    }
+    if (!adapters.length) {
+      if (info) info.textContent = 'DVB frontend не обнаружен в /dev/dvb. Adapter/frontend можно указать вручную.';
+      return;
+    }
+    const first = adapters[0];
+    const adapterInput = document.getElementById('satAdapter');
+    const frontendInput = document.getElementById('satFrontend');
+    if (adapterInput) adapterInput.value = first.adapter;
+    if (frontendInput) frontendInput.value = first.frontend;
+    if (info) info.textContent = `Обнаружено DVB frontend: ${adapters.map(item=>item.device).join(', ')}`;
+    updateSatelliteSignal();
+  } catch (error) {
+    if (info) info.textContent = 'Не удалось получить список DVB frontend';
+  }
+}
+function renderSatelliteServices() {
+  const container = document.getElementById('satServices');
+  const count = document.getElementById('satFoundCount');
+  if (count) count.textContent = String(satelliteServices.length);
+  if (!container) return;
+  if (!satelliteServices.length) {
+    container.innerHTML = '<div class="sat-empty">Каналы не найдены. Проверьте частоту, Symbol Rate, поляризацию и уровень сигнала.</div>';
+    return;
+  }
+  container.innerHTML = `
+    <div class="sat-service-head"><span><input id="satSelectAll" type="checkbox" checked onchange="toggleAllSatelliteServices(this.checked)" /></span><span>Канал</span><span>Провайдер</span><span>SID</span><span>PMT PID</span></div>
+    ${satelliteServices.map((service,index)=>`
+      <label class="sat-service-row">
+        <input class="sat-service-check" type="checkbox" data-index="${index}" checked />
+        <span class="sat-service-name" title="${satEscape(service.name)}">${satEscape(service.name || ('Service ' + service.service_id))}</span>
+        <span class="sat-service-provider" title="${satEscape(service.provider)}">${satEscape(service.provider || '—')}</span>
+        <span>${Number(service.service_id || 0)}</span>
+        <span>${Number(service.pmt_pid || 0)}</span>
+      </label>`).join('')}`;
+}
+function toggleAllSatelliteServices(checked) {
+  document.querySelectorAll('.sat-service-check').forEach(input => { input.checked = checked; });
+}
+async function startSatelliteScan() {
+  const button = document.getElementById('satScanButton');
+  const status = document.getElementById('satScanStatus');
+  satelliteScanning = true;
+  clearInterval(satelliteSignalTimer);
+  satelliteSignalTimer = null;
+  if (button) button.disabled = true;
+  if (status) status.textContent = 'Сканирование транспондера...';
+  while (satelliteSignalPending) await new Promise(resolve=>setTimeout(resolve, 80));
+  try {
+    const response = await fetch('/api/dvb-scan', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(satelliteTunePayload())
+    });
+    const data = await response.json();
+    updateSatelliteMeters(data);
+    satelliteServices = Array.isArray(data.services) ? data.services : [];
+    renderSatelliteServices();
+    if (status) {
+      status.textContent = data.error && !satelliteServices.length
+        ? data.error
+        : `Найдено каналов: ${satelliteServices.length}${data.error ? ` (${data.error})` : ''}`;
+    }
+  } catch (error) {
+    satelliteServices = [];
+    renderSatelliteServices();
+    if (status) status.textContent = 'Ошибка сканирования DVB-S/S2';
+  } finally {
+    satelliteScanning = false;
+    if (button) button.disabled = false;
+    if (document.getElementById('satFrequency')) scheduleSatelliteSignalPolling();
+  }
+}
+async function saveSelectedSatelliteChannels() {
+  const selected = [...document.querySelectorAll('.sat-service-check:checked')]
+    .map(input => satelliteServices[Number(input.dataset.index)])
+    .filter(Boolean);
+  if (!selected.length) {
+    alert('Выберите хотя бы один канал.');
+    return;
+  }
+  const saveButton = document.getElementById('satSaveButton');
+  if (saveButton) saveButton.disabled = true;
+  const payload = {
+    channels:selected,
+    output_type:document.getElementById('satOutputType')?.value || 'udp-vbr',
+    output_host:document.getElementById('satOutputHost')?.value || '239.255.10.1',
+    base_port:Number(document.getElementById('satBasePort')?.value || 5000),
+    target_bitrate_kbps:Number(document.getElementById('satTargetBitrate')?.value || 12000),
+    auto_start:document.getElementById('satAutoStart')?.checked === true
+  };
+  try {
+    const response = await fetch('/api/dvb-add-channels', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (result.error) throw new Error(result.error);
+    closeModal();
+    fetchState();
+  } catch (error) {
+    alert(error.message || 'Не удалось сохранить спутниковые каналы');
+    if (saveButton) saveButton.disabled = false;
+  }
+}
+function openAddChannelModal() {
+  satelliteServices = [];
+  openModal(`
+    <h2>Добавить канал — DVB-S/S2</h2>
+    <div class="sat-signal-panel">
+      <div class="sat-meter"><div class="sat-meter-head"><span>Сигнал</span><strong id="satSignalValue">0%</strong></div><div class="sat-bar"><span id="satSignalBar"></span></div></div>
+      <div class="sat-meter"><div class="sat-meter-head"><span>Качество</span><strong id="satQualityValue">0%</strong></div><div class="sat-bar"><span id="satQualityBar"></span></div></div>
+      <span id="satLock" class="sat-lock">NO LOCK</span>
+    </div>
+    <div class="sat-form">
+      <div class="sat-field"><label>Adapter</label><input id="satAdapter" type="number" min="0" max="31" value="0" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>Frontend</label><input id="satFrontend" type="number" min="0" max="31" value="0" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>Частота, MHz</label><input id="satFrequency" type="number" min="900" max="14000" step="0.001" value="11727" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>Symbol Rate, kSym/s</label><input id="satSymbolRate" type="number" min="100" max="60000" step="1" value="27500" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>Поляризация</label><select id="satPolarity" onchange="updateSatelliteSignal()"><option value="H">H — Horizontal</option><option value="V">V — Vertical</option></select></div>
+      <div class="sat-field"><label>Стандарт</label><select id="satDeliverySystem" onchange="updateSatelliteSignal()"><option value="dvb-s2">DVB-S2</option><option value="dvb-s">DVB-S</option></select></div>
+      <div class="sat-field"><label>Модуляция</label><select id="satModulation" onchange="updateSatelliteSignal()"><option value="auto">Auto</option><option value="qpsk">QPSK</option><option value="8psk">8PSK</option><option value="16apsk">16APSK</option><option value="32apsk">32APSK</option></select></div>
+      <div class="sat-field"><label>FEC</label><select id="satFec" onchange="updateSatelliteSignal()"><option value="auto">Auto</option><option>1/2</option><option>2/3</option><option>3/4</option><option>4/5</option><option>5/6</option><option>7/8</option><option>8/9</option><option>9/10</option><option>3/5</option></select></div>
+      <div class="sat-field"><label>DiSEqC source</label><input id="satDiseqc" type="number" min="-1" max="7" value="-1" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>LNB LOF1, MHz</label><input id="satLof1" type="number" value="9750" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>LNB LOF2, MHz</label><input id="satLof2" type="number" value="10600" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>LNB SLOF, MHz</label><input id="satSlof" type="number" value="11700" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field"><label>ISI / Stream ID</label><input id="satStreamId" type="number" min="-1" max="255" value="-1" onchange="updateSatelliteSignal()" /></div>
+    </div>
+    <div id="satDeviceInfo" class="sat-scan-status" style="margin-top:8px">Поиск DVB frontend...</div>
+    <div class="sat-actions">
+      <button id="satScanButton" class="button-primary" onclick="startSatelliteScan()">Сканировать каналы</button>
+      <span id="satScanStatus" class="sat-scan-status">Найдено: <span id="satFoundCount">0</span></span>
+    </div>
+    <div id="satServices" class="sat-services"><div class="sat-empty">Нажмите «Сканировать каналы».</div></div>
+    <div class="sat-output">
+      <div class="sat-field"><label>Выход</label><select id="satOutputType"><option value="udp-vbr">UDP VBR</option><option value="udp-cbr">UDP CBR</option></select></div>
+      <div class="sat-field"><label>Multicast / IP</label><input id="satOutputHost" value="239.255.10.1" /></div>
+      <div class="sat-field"><label>Первый UDP порт</label><input id="satBasePort" type="number" min="1" max="65535" value="5000" /></div>
+      <div class="sat-field"><label>CBR bitrate, кбит/с</label><input id="satTargetBitrate" type="number" min="500" max="100000" value="12000" /></div>
+      <div class="sat-field wide"><label>Автозапуск</label><div class="checkbox-inline"><input id="satAutoStart" type="checkbox" /><span>Запускать созданные каналы после перезапуска</span></div></div>
+    </div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Отмена</button>
+      <button id="satSaveButton" class="button-primary" onclick="saveSelectedSatelliteChannels()">Сохранить выбранные</button>
+    </div>
+  `);
+  document.getElementById('modalContent').classList.add('satellite-modal');
+  updateHeaderHeight();
+  document.getElementById('modal').classList.add('satellite-open');
+  loadSatelliteAdapters();
+  scheduleSatelliteSignalPolling();
+}
+
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),

@@ -10,6 +10,7 @@
 #include "protocols/stream/inputs/StreamSrtInputProtocol.h"
 #include "protocols/stream/inputs/StreamTestInputProtocol.h"
 #include "protocols/stream/inputs/StreamUdpInputProtocol.h"
+#include "DvbSatellite.h"
 
 namespace tvs::stream_protocols {
 
@@ -24,6 +25,7 @@ InputProtocolKind inputKind(const StreamConfig& cfg) {
     if (inputs::isRtmpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Rtmp;
     if (inputs::isHlsInput(input, mode, cfg.testPattern)) return InputProtocolKind::Hls;
     if (inputs::isHttpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Http;
+    if (DvbSatellite::isDvbUri(cfg.inputUri)) return InputProtocolKind::Dvb;
     if (inputs::isFileInput(input, mode, cfg.testPattern)) return InputProtocolKind::File;
     return InputProtocolKind::Unknown;
 }
@@ -38,6 +40,7 @@ std::string inputKindName(InputProtocolKind kind) {
         case InputProtocolKind::Srt: return "srt";
         case InputProtocolKind::Rtsp: return "rtsp";
         case InputProtocolKind::Rtmp: return "rtmp";
+        case InputProtocolKind::Dvb: return "dvb";
         case InputProtocolKind::File: return "file";
         default: return "unknown";
     }
@@ -61,6 +64,8 @@ std::vector<const char*> requiredElementsForInput(InputProtocolKind kind) {
             return {"rtspsrc", "mpegtsmux"};
         case InputProtocolKind::Rtmp:
             return {"rtmpsrc", "flvdemux", "mpegtsmux"};
+        case InputProtocolKind::Dvb:
+            return {"dvbsrc", "tsparse", "tsdemux", "mpegtsmux"};
         case InputProtocolKind::File:
             return {"filesrc"};
         default:
@@ -82,6 +87,10 @@ bool isHttpLikeInput(InputProtocolKind kind) {
 
 bool isFileInput(InputProtocolKind kind) {
     return kind == InputProtocolKind::File;
+}
+
+bool isDvbInput(InputProtocolKind kind) {
+    return kind == InputProtocolKind::Dvb;
 }
 
 } // namespace tvs::stream_protocols

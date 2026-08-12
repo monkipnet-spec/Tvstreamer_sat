@@ -29,11 +29,19 @@ if [[ "${CONFIG_BASENAME}" != "tvstreammersat5-config.json" ]]; then
     VOLUME_ARGS+=(-v "${CONFIG_FILE}:/data/tvstreammersat5-config.json")
 fi
 
+DEVICE_ARGS=()
+if [[ -d /dev/dvb ]]; then
+    while IFS= read -r device; do
+        DEVICE_ARGS+=(--device "${device}:${device}")
+    done < <(find /dev/dvb -type c -print | sort)
+fi
+
 RUN_ARGS=(
     --rm
     -it
     --init
     --network host
+    "${DEVICE_ARGS[@]}"
     "${VOLUME_ARGS[@]}"
     -w /data
     -e "GST_DEBUG=${GST_DEBUG:-1}"

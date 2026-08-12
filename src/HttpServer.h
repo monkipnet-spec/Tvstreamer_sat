@@ -54,6 +54,9 @@ private:
     std::string systemMetrics();
     std::string currentState();
     std::string qualityHistory(const std::string& target);
+    std::string dvbAdapters();
+    std::string handleDvbTune(const std::string& body, bool scan);
+    std::string handleDvbAddChannels(const std::string& body);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
     bool serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res);
     void handleSaveConfig(const std::string& body);

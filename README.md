@@ -1,8 +1,26 @@
 # TVStreammerSAT5 — Release 2
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2 / v115.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2 / v116.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
+
+## DVB-S/S2 satellite channel scanner (v116)
+
+The web interface includes **Add channel / Добавить канал** for satellite tuners exposed by Linux as `/dev/dvb/adapterN/frontendN`. The dialog accepts satellite frequency in **MHz**, symbol rate in kSym/s, polarity, DVB-S/DVB-S2, modulation/FEC, DiSEqC input, LNB LOF values and optional DVB-S2 stream ID.
+
+While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port.
+
+Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; the runtime tunes `dvbsrc`, selects that program with `tsdemux`, and remuxes the service to MPEG-TS before the normal output pipeline.
+
+Runtime requirements:
+
+```bash
+ls -l /dev/dvb/adapter*/frontend*
+gst-inspect-1.0 dvbsrc
+```
+
+The service user must have read/write access to the DVB devices. If TVStreammerSAT5 runs inside a container, the `/dev/dvb` devices must be passed through to that container. Multiple selected services from one transponder share the same physical tuner frequency; retuning that frontend to another transponder affects streams using the same frontend.
+
 
 ## Main features
 

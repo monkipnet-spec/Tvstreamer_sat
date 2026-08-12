@@ -2,6 +2,7 @@
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "UdpInput.h"
+#include "DvbSatellite.h"
 #include "protocols/GstProtocolTypes.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
@@ -2703,6 +2704,72 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
     if (tvs::stream_protocols::isTestPatternInput(inputProtocol)) {
         return createTestPatternChain(cfg, pipeline, terminalElement);
+    }
+
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Dvb) {
+        if (!hasElementFactory("dvbsrc") || !hasElementFactory("tsparse") ||
+            !hasElementFactory("tsdemux") || !hasElementFactory("mpegtsmux")) {
+            std::cerr << "missing DVB input elements: dvbsrc, tsparse, tsdemux or mpegtsmux" << std::endl;
+            return nullptr;
+        }
+
+        DvbSatelliteParams params;
+        std::string dvbError;
+        if (!DvbSatellite::parseUri(cfg.inputUri, params, dvbError)) {
+            std::cerr << "invalid DVB input: " << dvbError << std::endl;
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("dvbsrc", "input_dvb_src");
+        GstElement* parse = gst_element_factory_make("tsparse", "input_dvb_tsparse");
+        GstElement* preDemuxQueue = gst_element_factory_make("queue", "input_dvb_pre_demux_queue");
+        GstElement* demux = gst_element_factory_make("tsdemux", "input_dvb_demux");
+        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_dvb_mux");
+        GstElement* queue = gst_element_factory_make("queue", "input_queue");
+        if (!src || !parse || !preDemuxQueue || !demux || !mux || !queue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, parse) ||
+            !addElementOrFail(pipeline, preDemuxQueue) ||
+            !addElementOrFail(pipeline, demux) ||
+            !addElementOrFail(pipeline, mux) ||
+            !addElementOrFail(pipeline, queue)) {
+            return nullptr;
+        }
+
+        if (!DvbSatellite::configureSource(src, params, dvbError)) {
+            std::cerr << "DVB source configuration failed: " << dvbError << std::endl;
+            return nullptr;
+        }
+        configureTsPacketAlignment(parse);
+        configureQueue(preDemuxQueue, 3000000000ULL);
+        configureQueue(queue, 3000000000ULL);
+        configureTsMux(mux, cfg);
+        if (cfg.inputServiceId > 0) {
+            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(cfg.inputServiceId));
+        }
+        if (!gst_element_link_many(src, parse, preDemuxQueue, demux, nullptr) ||
+            !gst_element_link(mux, queue)) {
+            std::cerr << "DVB input pipeline link failed" << std::endl;
+            return nullptr;
+        }
+
+        state->sourceContext = std::make_unique<RemapContext>();
+        state->sourceContext->mux = mux;
+        state->sourceContext->config = cfg;
+        state->sourceContext->flvMux = false;
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
+        sendServiceDescription(mux, cfg);
+
+        std::cerr << "DVB-S/S2 input: adapter=" << params.adapter
+                  << " frontend=" << params.frontend
+                  << " frequency_mhz=" << (static_cast<double>(params.frequencyKHz) / 1000.0)
+                  << " symbol_rate=" << params.symbolRateK
+                  << " polarity=" << params.polarity
+                  << " delsys=" << params.deliverySystem
+                  << " input_sid=" << cfg.inputServiceId << std::endl;
+
+        terminalElement = queue;
+        return src;
     }
 
     if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtmp) {
