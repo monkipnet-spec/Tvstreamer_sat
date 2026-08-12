@@ -2725,7 +2725,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         GstElement* preDemuxQueue = gst_element_factory_make("queue", "input_dvb_pre_demux_queue");
         GstElement* demux = gst_element_factory_make("tsdemux", "input_dvb_demux");
         GstElement* mux = gst_element_factory_make("mpegtsmux", "input_dvb_mux");
-        GstElement* queue = gst_element_factory_make("queue", "input_queue");
+        // This queue is after SID selection + remux, so DVB input bitrate on the tile
+        // reflects the selected service instead of the complete transponder.
+        GstElement* queue = gst_element_factory_make("queue", "input_selected_queue");
         if (!src || !parse || !preDemuxQueue || !demux || !mux || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, parse) ||
@@ -3856,7 +3858,12 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
     gboolean inputAttached = FALSE;
     gboolean outputAttached = FALSE;
 
-    GstElement* inputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_queue");
+    // DVB uses input_selected_queue after tsdemux + SID selection so the
+    // displayed input bitrate is the service bitrate, not the transponder.
+    GstElement* inputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_selected_queue");
+    if (!inputQueue) {
+        inputQueue = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_queue");
+    }
     if (inputQueue) {
         GstPad* sinkPad = gst_element_get_static_pad(inputQueue, "sink");
         if (sinkPad) {

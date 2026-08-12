@@ -39,6 +39,8 @@ constexpr std::size_t kMaxBufferedBytes = 32 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kStartupPcrGraceNanoseconds = 2000ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kStartupMinimumPcrSamples = 1;
 constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -500,20 +502,24 @@ private:
 
             moveAvailableChunks();
 
-            // Do not expose a half-initialized transport to UDP. On some
-            // starts mpegtsmux needs a short settling period before a stable
-            // PCR sequence is present in the buffered SPTS.
+            // The 5-second startup reservoir is intentional and required by
+            // WISI equipment.  The old code additionally required five PCR
+            // packets before it would send the first UDP datagram.  That could
+            // deadlock forever when a mux produced PCR less frequently (or a
+            // test source had not produced five PCR samples yet).  One PCR is
+            // sufficient to lock the periodic 20 ms output PCR generator.
             std::size_t startupPcrPackets = 0;
             for (const auto& packet : realPackets) {
                 if (packet.hasPcr) {
                     ++startupPcrPackets;
-                    if (startupPcrPackets >= 5) {
-                        break;
-                    }
                 }
             }
 
-            if (!realPackets.empty() && startupPcrPackets >= 5) {
+            const bool haveTransport = !realPackets.empty();
+            const bool havePcrLock = startupPcrPackets >= kStartupMinimumPcrSamples;
+            const bool pcrGraceExpired = now >= startAt + kStartupPcrGraceNanoseconds;
+
+            if (haveTransport && (havePcrLock || pcrGraceExpired)) {
                 const uint64_t startupBytes = bufferedBytes.load(std::memory_order_relaxed);
                 startupReservoirBytes.store(startupBytes, std::memory_order_relaxed);
                 startupPcrSamples.store(startupPcrPackets, std::memory_order_relaxed);
@@ -531,6 +537,16 @@ private:
                     : estimatedInputBitrate;
                 realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
                 updateTransportBitrate();
+
+                if (havePcrLock) {
+                    std::cerr << "UDP WISI startup: 5s reservoir ready, PCR lock acquired"
+                              << " samples=" << startupPcrPackets
+                              << " buffered=" << startupBytes << "B" << std::endl;
+                } else {
+                    std::cerr << "UDP WISI startup WARNING: 5s reservoir ready but no PCR"
+                              << " after additional 2s grace; starting TS to avoid deadlock"
+                              << " buffered=" << startupBytes << "B" << std::endl;
+                }
                 return true;
             }
 
@@ -1064,6 +1080,7 @@ GstElement* createSink(
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
               << " vbr_rate=auto"
               << " packetization=7x188 startup_reservoir_ms=5000"
+              << " startup_pcr_min=1 startup_pcr_grace_ms=2000"
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing=reservoir-rate-controller"
               << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"

@@ -29,8 +29,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 2";
-constexpr const char* kProgramVersion = "v116";
+constexpr const char* kProgramRelease = "Release 4";
+constexpr const char* kProgramVersion = "v118";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -2293,7 +2293,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 2'} / ${state.program_version||'v116'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 4'} / ${state.program_version||'v118'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2505,6 +2505,7 @@ async function saveSelectedSatelliteChannels() {
     output_host:document.getElementById('satOutputHost')?.value || '239.255.10.1',
     base_port:Number(document.getElementById('satBasePort')?.value || 5000),
     target_bitrate_kbps:Number(document.getElementById('satTargetBitrate')?.value || 12000),
+    interface_address:document.getElementById('satOutputInterface')?.value || '',
     auto_start:document.getElementById('satAutoStart')?.checked === true
   };
   try {
@@ -2555,6 +2556,7 @@ function openAddChannelModal() {
       <div class="sat-field"><label>Multicast / IP</label><input id="satOutputHost" value="239.255.10.1" /></div>
       <div class="sat-field"><label>Первый UDP порт</label><input id="satBasePort" type="number" min="1" max="65535" value="5000" /></div>
       <div class="sat-field"><label>CBR bitrate, кбит/с</label><input id="satTargetBitrate" type="number" min="500" max="100000" value="12000" /></div>
+      <div class="sat-field"><label>Выходной интерфейс</label><select id="satOutputInterface"><option value="">Авто (системный маршрут)</option>${(state.interfaces||[]).map(i=>`<option value="${satEscape(i.address)}">${satEscape(i.name)} (${satEscape(i.address)})</option>`).join('')}</select></div>
       <div class="sat-field wide"><label>Автозапуск</label><div class="checkbox-inline"><input id="satAutoStart" type="checkbox" /><span>Запускать созданные каналы после перезапуска</span></div></div>
     </div>
     <div class="modal-actions">

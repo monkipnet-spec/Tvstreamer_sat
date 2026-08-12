@@ -1,16 +1,22 @@
-# TVStreammerSAT5 — Release 2
+# TVStreammerSAT5 — Release 4
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2 / v116.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 4 / v118.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
-## DVB-S/S2 satellite channel scanner (v116)
+## DVB-S/S2 satellite channel scanner (v116+)
 
 The web interface includes **Add channel / Добавить канал** for satellite tuners exposed by Linux as `/dev/dvb/adapterN/frontendN`. The dialog accepts satellite frequency in **MHz**, symbol rate in kSym/s, polarity, DVB-S/DVB-S2, modulation/FEC, DiSEqC input, LNB LOF values and optional DVB-S2 stream ID.
 
-While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port.
+While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
 
 Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; the runtime tunes `dvbsrc`, selects that program with `tsdemux`, and remuxes the service to MPEG-TS before the normal output pipeline.
+
+### WISI-compatible UDP reservoir (v118)
+
+UDP VBR/CBR uses the stable application-level MPEG-TS sender with **7 x 188 = 1316 byte datagrams** and an intentional **5 second startup reservoir**. The reservoir is retained for WISI equipment compatibility. The sender then maintains the adaptive reservoir and a periodic 20 ms PCR cadence.
+
+Release 4 removes the previous startup deadlock condition: after the full 5 second reservoir is accumulated the sender needs only one PCR sample to lock the periodic PCR generator, instead of five. If no PCR is seen at all, a bounded 2 second PCR grace period expires and UDP starts with a warning rather than waiting forever. This fallback does not shorten or bypass the 5 second WISI reservoir.
 
 Runtime requirements:
 
@@ -41,7 +47,7 @@ The service user must have read/write access to the DVB devices. If TVStreammerS
 - VLC playlist generation.
 - Docker build/run scripts for host-network deployments.
 
-## Release 2 architecture
+## Release 4 architecture
 
 Normal streams and transcoded streams use separate protocol modules. The normal pipeline remains in-process; transcoding is performed by an external GStreamer process.
 
@@ -97,8 +103,8 @@ A local backup file is also supported by the normal stream path. The input inter
 The web UI currently exposes:
 
 ```text
-udp-vbr   reservoir-smoothed MPEG-TS over UDP, bitrate follows the source
-udp-cbr   reservoir-shaped CBR MPEG-TS over UDP at Target bitrate
+udp-vbr   MPEG-TS over native GStreamer udpsink, bitrate follows the selected service
+udp-cbr   MPEG-TS over native GStreamer udpsink with mpegtsmux NULL padding to Target bitrate
 rtp       MPEG-TS over RTP/UDP
 srt       MPEG-TS over SRT listener or caller
 http      MPEG-TS over HTTP
@@ -108,7 +114,7 @@ rtmp      RTMP push
 youtube   RTMP push to YouTube Live
 ```
 
-UDP VBR and UDP CBR now use one in-process MPEG-TS output engine. Both modes rebuild passthrough input as a clean SPTS, wait for a 5-second startup reservoir with PCR priming, keep a 2.5-second working reservoir, emit 7 MPEG-TS packets per UDP datagram, and generate a periodic 20 ms PCR timeline. UDP CBR pads with PID `0x1FFF` to the configured Target bitrate. UDP VBR follows the measured source rate with a small transport headroom instead of using the Target bitrate as a fixed output rate. There is no separate compatibility switch in the UI.
+UDP VBR and UDP CBR use the standard GStreamer `udpsink` network element. The previous custom `appsink`/C++ UDP reservoir and PCR rewriter has been removed from the active output path because it could hold the stream before first packet delivery. MPEG-TS is packetized as 7 × 188-byte packets per UDP datagram. UDP VBR follows the selected service rate. UDP CBR uses `mpegtsmux` NULL padding to the configured Target bitrate. When an output interface is configured, TVStreammerSAT5 resolves an interface address/name and applies both the multicast interface and local bind address to `udpsink`.
 
 RTP MPEG-TS output is selectable in the web UI. It uses `rtpmp2tpay` over UDP; with MTU 1400 the payload fits 7 MPEG-TS packets (7 × 188 = 1316 bytes), which is suitable for IPTV headends.
 
@@ -164,7 +170,7 @@ Enable `remap_enabled` and set the required values:
 
 For UDP/SRT/HTTP MPEG-TS paths the mux/remap code uses MPEG-TS request pads and service mapping where the selected pipeline supports it.
 
-**Known Release 2 limitation:** exact configured elementary PIDs are not currently guaranteed after **transcoded HLS** segmentation. Verify the generated `.ts` segments with `ffprobe -show_programs -show_streams` when exact HLS PID values are required. Do not rely only on the `.m3u8` playlist to verify remap.
+**Known Release 4 limitation:** exact configured elementary PIDs are not currently guaranteed after **transcoded HLS** segmentation. Verify the generated `.ts` segments with `ffprobe -show_programs -show_streams` when exact HLS PID values are required. Do not rely only on the `.m3u8` playlist to verify remap.
 
 ## HLS behavior
 
@@ -174,7 +180,7 @@ Transcoded HLS is generated under:
 /tmp/tvstreammersat5-hls/<stream-id>/
 ```
 
-Release 2 uses a three-segment live playlist:
+Release 4 uses a three-segment live playlist:
 
 ```text
 playlist-length = 3
@@ -286,7 +292,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 2
+Description=TVStreammerSAT5 Release 4
 After=network-online.target
 Wants=network-online.target
 
@@ -844,7 +850,7 @@ Network monitoring:
 
 ## Notes
 
-- Release 2 no longer uses FFmpeg as the active transcoder engine.
+- Release 4 no longer uses FFmpeg as the active transcoder engine.
 - Non-transcoded behavior should be treated as the stable baseline when diagnosing protocol-specific transcoder issues.
 - Exact HLS PID preservation after transcoding remains a known limitation and must be verified on generated segments.
 - For live IPTV, transport stability depends on source quality, kernel socket buffers, routing, multicast interface selection and available CPU for x264 encoding.
@@ -875,7 +881,7 @@ Recommended first receiver test for transcoded SRT is 2500-3000 ms latency.
 
 ### Проверка GStreamer внутри Docker
 
-Release 2 инициализирует GStreamer до запуска HTTP-интерфейса. Это важно: страница настройки потоков проверяет наличие элементов транскодера сразу после запуска приложения. Если registry GStreamer еще не инициализирован, интерфейс ошибочно может показать все элементы как отсутствующие, даже если пакеты установлены в контейнере.
+Release 4 инициализирует GStreamer до запуска HTTP-интерфейса. Это важно: страница настройки потоков проверяет наличие элементов транскодера сразу после запуска приложения. Если registry GStreamer еще не инициализирован, интерфейс ошибочно может показать все элементы как отсутствующие, даже если пакеты установлены в контейнере.
 
 После пересборки контейнера можно проверить runtime напрямую:
 
@@ -900,7 +906,7 @@ Dockerfile также выполняет обязательную проверк
 
 ### Web UI polling and external transcoder sockets
 
-Release 2 updates live dashboard values without rebuilding every stream card on every poll. The `/api/state` and `/api/system-metrics` requests run as independent sequential polling loops: the next request is scheduled only after the previous request finishes. This avoids overlapping HTTP requests behind reverse proxies such as Nginx/HestiaCP and prevents visible dashboard flicker on busy servers.
+Release 4 updates live dashboard values without rebuilding every stream card on every poll. The `/api/state` and `/api/system-metrics` requests run as independent sequential polling loops: the next request is scheduled only after the previous request finishes. This avoids overlapping HTTP requests behind reverse proxies such as Nginx/HestiaCP and prevents visible dashboard flicker on busy servers.
 
 A full stream-card render is now performed only when the stream configuration, stream order or UI language changes. Runtime values such as Online/Offline, backup state, active input, input/output bitrate and status are updated in place.
 
@@ -914,7 +920,7 @@ The listening ports should belong to `TVStreammerSAT5` only; `gst-launch-1.0` sh
 
 ### SRT после транскодирования
 
-В Release 2 внешний GStreamer-транскодер кодирует видео/звук и отдаёт готовый MPEG-TS во внутренний loopback UDP relay. Сам SRT Listener теперь снова принадлежит процессу `TVStreammerSAT5`, как и SRT без транскодинга. Поэтому события `caller-added` и `caller-removed` приходят напрямую из `srtsink`, а окно абонентов видит подключение сразу, без опроса `ss`.
+В Release 4 внешний GStreamer-транскодер кодирует видео/звук и отдаёт готовый MPEG-TS во внутренний loopback UDP relay. Сам SRT Listener теперь снова принадлежит процессу `TVStreammerSAT5`, как и SRT без транскодинга. Поэтому события `caller-added` и `caller-removed` приходят напрямую из `srtsink`, а окно абонентов видит подключение сразу, без опроса `ss`.
 
 Смысл полей SRT такой же, как у обычного SRT-потока:
 
