@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(TVStreamer CXX)
+project(TVStreammerSAT5 CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,7 +11,6 @@ pkg_check_modules(LIBCURL REQUIRED libcurl)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 
 find_package(Boost REQUIRED COMPONENTS system thread)
-find_package(OpenSSL REQUIRED)
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/src
@@ -28,19 +27,13 @@ link_directories(
     ${Boost_LIBRARY_DIRS}
 )
 
-add_executable(TVStreamer
+add_executable(TVStreammerSAT5
     src/main.cpp
     src/utils.cpp
     src/ConfigManager.cpp
-    src/CaProviderManager.cpp
-    src/NewcamdStatusBackend.cpp
-    src/DvbManager.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
-    src/UdpTsOutput.cpp
-    src/UdpVbrOutput.cpp
-    src/UdpCbrOutput.cpp
-    src/UdpOutput.cpp
+    src/StableUdpOutput.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp
@@ -84,13 +77,11 @@ add_executable(TVStreamer
     src/HttpServer.cpp
 )
 
-target_link_libraries(TVStreamer
+target_link_libraries(TVStreammerSAT5
     ${GSTREAMER_LIBRARIES}
     ${LIBCURL_LIBRARIES}
     ${JSONCPP_LIBRARIES}
     ${Boost_LIBRARIES}
-    OpenSSL::SSL
-    OpenSSL::Crypto
     pthread
     glib-2.0
     gio-2.0

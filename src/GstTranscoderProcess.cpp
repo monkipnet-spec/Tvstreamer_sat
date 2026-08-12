@@ -207,6 +207,79 @@ bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& e
     return true;
 }
 
+
+uint32_t effectiveInputServiceId(const StreamConfig& cfg) {
+    // input_service_id=0 means AUTO. In AUTO mode the decoder sees the live
+    // source directly and performs its normal program selection. Never fall
+    // back to output service_id: that value is reserved for output remapping.
+    return cfg.inputServiceId;
+}
+
+bool isSidAwareMpegTsInput(const StreamConfig& cfg) {
+    const uint32_t sid = effectiveInputServiceId(cfg);
+    if (sid == 0 || cfg.testPattern) return false;
+    const std::string uri = toLower(tvs::protocols::inputUriForGstreamer(cfg));
+    // Live IPTV/SRT transport streams are the paths where automatic URI
+    // decoding can silently pick program 1 instead of the configured SID.
+    // Keep non-TS containers/adaptive inputs on uridecodebin.
+    return uri.rfind("srt://", 0) == 0 ||
+           uri.rfind("udp://", 0) == 0;
+}
+
+bool appendTranscoderDecodeInput(
+    std::vector<std::string>& args,
+    const StreamConfig& cfg,
+    std::string& error) {
+    if (!isSidAwareMpegTsInput(cfg)) {
+        tvs::protocols::appendDecodeInput(args, cfg);
+        return true;
+    }
+
+    std::vector<std::string> missing;
+    validateFactories({"urisourcebin", "tsparse", "tsdemux", "decodebin3"}, missing);
+    if (!missing.empty()) {
+        std::ostringstream ss;
+        ss << "missing SID-aware transcoder input elements";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            ss << (i == 0 ? ": " : ", ") << missing[i];
+        }
+        error = ss.str();
+        return false;
+    }
+
+    const uint32_t inputSid = effectiveInputServiceId(cfg);
+    const std::string uri = tvs::protocols::inputUriForGstreamer(cfg);
+
+    // Select the requested MPEG-TS service *before* decodebin.  The old
+    // uridecodebin-only path auto-selected the first/default program, which is
+    // why transcoding worked for SID 1 but produced no usable UDP output when
+    // Input SID was another program.  ':' asks gst-launch to link all compatible
+    // elementary pads from the selected tsdemux program into decodebin3.
+    args.insert(args.end(), {
+        "urisourcebin",
+        "name=input_uri_src",
+        "uri=" + uri,
+        "use-buffering=false",
+        "input_uri_src.", "!",
+        "queue",
+        "name=transcode_sid_input_queue",
+        "max-size-buffers=0",
+        "max-size-bytes=0",
+        "max-size-time=8000000000",
+        "!", "tsparse",
+        "!", "tsdemux",
+        "name=transcode_sid_demux",
+        "program-number=" + std::to_string(inputSid),
+        "latency=700",
+        "transcode_sid_demux.", ":", "decodebin3", "name=dec"
+    });
+
+    std::cerr << "GStreamer transcoder input selector: input_sid=" << inputSid
+              << " method=tsdemux-program-number decode=decodebin3"
+              << " uri=" << uri << std::endl;
+    return true;
+}
+
 void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec) {
     int width = 1920;
     int height = 1080;
@@ -218,10 +291,13 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {"dec.", "!"});
     addQueue(args, "transcode_video_queue", 8000000000ULL);
     args.insert(args.end(), {
+        "!", "watchdog",
+        "name=transcode_input_watchdog",
+        "timeout=5000",
         "!", "video/x-raw",
         "!", "videoconvert",
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
-        "!", "videoscale", "add-borders=true", "method=lanczos",
+        "!", "videoscale", "add-borders=false", "method=lanczos",
         "!", "videorate", "drop-only=false",
         "!", scaledVideoCaps(width, height),
         "!", "x264enc",
@@ -332,7 +408,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     });
     addQueue(args, "test_video_queue", 3000000000ULL);
     args.insert(args.end(), {
-        "!", "videoconvert", "!", "videoscale", "add-borders=true", "method=lanczos", "!", "videorate",
+        "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate",
         "!", scaledVideoCaps(width, height),
         "!", "x264enc", "tune=zerolatency", "speed-preset=superfast",
         property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
@@ -377,7 +453,7 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 
     std::vector<std::string> required = tvs::protocols::requiredInputElements();
     const std::vector<std::string> common = {
-        "queue", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "queue", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
         "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
     required.insert(required.end(), common.begin(), common.end());
@@ -410,7 +486,7 @@ bool GstTranscoderProcess::spawnProcess(
         return false;
     }
 
-    // gst-launch does not need any TVStreamer sockets. Mark every currently open
+    // gst-launch does not need any TVStreammerSAT5 sockets. Mark every currently open
     // non-standard descriptor close-on-exec before forking so HTTP/metrics/listener
     // sockets cannot remain alive in the external transcoder process.
     markOpenDescriptorsCloseOnExec();
@@ -522,28 +598,33 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
         return {};
     }
 
-    std::vector<std::string> missingInput;
-    validateFactories(tvs::protocols::requiredInputElements(baseConfig), missingInput);
-    if (!missingInput.empty()) {
-        std::ostringstream ss;
-        ss << "missing input protocol elements";
-        for (size_t i = 0; i < missingInput.size(); ++i) {
-            ss << (i == 0 ? ": " : ", ") << missingInput[i];
-        }
-        error = ss.str();
-        return {};
-    }
-
     std::vector<std::string> args = {"gst-launch-1.0", "-e"};
     GstOutputSpec outputSpec;
     if (!tvs::protocols::appendOutputMuxAndSink(args, outputConfig, outputSpec, error)) {
         return {};
     }
 
+    if (outputSpec.kind == tvs::protocols::OutputKind::Http ||
+        outputSpec.kind == tvs::protocols::OutputKind::Srt) {
+        std::cerr << "Transcoded HTTP/SRT post-mux A/V reservoir: output="
+                  << tvs::protocols::normalizedOutputType(outputConfig)
+                  << " reservoir_ms=1500 queue_max_ms=6000"
+                  << " placement=after-mpegtsmux-remap-and-cbr-pacer"
+                  << " remap_preserved="
+                  << (outputConfig.remapEnabled ? "yes" : "not-requested")
+                  << std::endl;
+    }
+
     if (baseConfig.testPattern) {
         addTestSources(args, baseConfig, outputSpec, error);
     } else {
-        tvs::protocols::appendDecodeInput(args, baseConfig);
+        std::cerr << "Transcoder input watchdog: timeout_ms=5000"
+                  << " source=" << tvs::protocols::inputUriForGstreamer(baseConfig)
+                  << " action=exit-for-parent-failover"
+                  << std::endl;
+        if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
+            return {};
+        }
         addVideoBranch(args, baseConfig, outputSpec);
         addAudioBranch(args, baseConfig, outputSpec, error);
     }
@@ -600,10 +681,14 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         std::cerr << "GStreamer transcoder started pid=" << child.pid
                   << " output=" << description
                   << " remap=" << (config.remapEnabled ? "on" : "off")
+                  << " input_sid=" << effectiveInputServiceId(config)
                   << " service=" << config.serviceId
                   << " vpid=" << config.videoPid
                   << " apid=" << config.audioPid;
-        if (tvs::protocols::isTsOutput(tvs::protocols::outputKind(output))) {
+        const auto outputKind = tvs::protocols::outputKind(output);
+        if (outputKind == tvs::protocols::OutputKind::FifoRelay) {
+            std::cerr << " ts-relay=unpaced";
+        } else if (tvs::protocols::isTsOutput(outputKind)) {
             std::cerr << " ts-cbr-bitrate=" << tvs::protocols::muxBitrate(output);
         } else {
             std::cerr << " encoder-cbr-bitrate=" << tvs::protocols::safeVideoBitrate(output);

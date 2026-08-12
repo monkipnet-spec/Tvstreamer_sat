@@ -22,7 +22,7 @@ uint32_t hlsServiceId(const StreamConfig& cfg) {
 }
 
 std::string prepareHlsDirectory(const StreamConfig& cfg) {
-    const std::string dir = "/tmp/tvstreamer5-hls/" + cfg.id;
+    const std::string dir = "/tmp/tvstreammersat5-hls/" + cfg.id;
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
     ec.clear();

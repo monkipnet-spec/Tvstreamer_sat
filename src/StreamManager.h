@@ -5,9 +5,7 @@
 #include <jsoncpp/json/json.h>
 #include <array>
 #include <atomic>
-#include <cstdint>
 #include <map>
-#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,19 +26,15 @@ struct RemapContext {
     bool audioLinked = false;
     bool flvMux = false;
     bool programMapApplied = false;
+    GstPad* preallocatedVideoMuxPad = nullptr;
+    GstPad* preallocatedAudioMuxPad = nullptr;
     std::string videoPadName;
     std::string audioPadName;
-    // v97: first-buffer probes for the FTA single-service remux path.
-    // They make it possible to distinguish elementary-stream, mux and HTTP
-    // output failures without touching the working DVB frontend.
-    std::atomic<bool> demuxVideoActivityLogged {false};
-    std::atomic<bool> demuxAudioActivityLogged {false};
-    std::atomic<bool> queueVideoActivityLogged {false};
-    std::atomic<bool> queueAudioActivityLogged {false};
-    std::atomic<bool> videoActivityLogged {false};
-    std::atomic<bool> audioActivityLogged {false};
-    std::atomic<bool> muxActivityLogged {false};
-    std::atomic<bool> httpActivityLogged {false};
+
+    ~RemapContext() {
+        if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);
+        if (preallocatedAudioMuxPad) gst_object_unref(preallocatedAudioMuxPad);
+    }
 };
 
 
@@ -51,27 +45,6 @@ struct ExternalSrtOutputState {
     std::thread busThread;
 };
 
-struct SatelliteTransponderState {
-    StreamConfig tuningConfig;
-    GstElement* pipeline = nullptr;
-    GstBus* bus = nullptr;
-    std::string multicastAddress;
-    uint16_t multicastPort = 0;
-    size_t consumers = 0;
-};
-
-struct SatelliteServiceRelayState {
-    GstElement* pipeline = nullptr;
-    GstBus* bus = nullptr;
-    std::unique_ptr<RemapContext> context;
-    uint16_t outputPort = 0;
-    // Count packets that actually leave the per-service relay.  The main
-    // playback pipeline has its own probes, but this counter is the most
-    // reliable liveness signal for shared DVB-S/S2 input because it is
-    // measured immediately before the loopback UDP sink.
-    std::atomic<uint64_t> outputBytes{0};
-};
-
 struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> running{false};
@@ -79,10 +52,6 @@ struct StreamState {
     bool backupAttempted = false;
     bool primaryRetryPending = false;
     bool inputLossNotified = false;
-    bool primarySatelliteEnabled = false;
-    bool caProviderTransport = false;
-    std::string caProviderId;
-    std::string caProviderName;
     std::string statusMessage = "stopped";
     std::string primaryInputUri;
     std::string activeInputUri;
@@ -90,11 +59,8 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
-    StreamConfig runtimeConfig;
-    bool sharedSatelliteInput = false;
-    std::string satelliteFrontendKey;
-    std::string satelliteServiceRelayUri;
-    std::unique_ptr<SatelliteServiceRelayState> satelliteServiceRelay;
+    // Runtime PAT result used only when input_service_id=0 (Auto).
+    // The configured value remains 0; effective selection is kept in state->config.
     std::atomic<uint64_t> inputBitrate{0};
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
@@ -109,13 +75,8 @@ struct StreamState {
     uint64_t lastInputCcErrorsSample = 0;
     uint64_t lastOutputCcErrorsSample = 0;
     uint64_t lastInputBytesSeen = 0;
-    uint64_t lastSatelliteRelayBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point lastSatelliteRelayRestart = std::chrono::steady_clock::time_point{};
-    uint32_t satelliteRelayRestartCount = 0;
-    bool satelliteRelayRecoveryDisabled = false;
-    uint32_t ccRecoveryBurstCount = 0;
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
     std::vector<uint8_t> inputTsRemainder;
@@ -168,23 +129,16 @@ private:
     bool startExternalSrtOutputs(StreamState* state, std::string& error);
     void stopExternalSrtOutputs(StreamState* state);
     bool restartPipelineWithInput(StreamState* state, const std::string& inputUri, bool useBackup);
+    bool restartTranscodedInput(StreamState* state, const std::string& inputUri, bool useBackup);
+    bool restartActiveInput(StreamState* state, const std::string& inputUri, bool useBackup);
     bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
-    bool prepareSharedSatelliteInput(StreamState* state, std::string& error);
-    void releaseSharedSatelliteInput(StreamState* state);
-    bool restartSharedSatelliteInput(StreamState* state, const std::string& reason, std::string& error);
-    void throttleCaProviderStart(const std::string& providerId);
-    bool acquireSatelliteTransponder(const StreamConfig& cfg, std::string& frontendKey, std::string& multicastAddress, uint16_t& multicastPort, std::string& error);
-    void releaseSatelliteTransponder(const std::string& frontendKey);
-    bool startSatelliteServiceRelay(StreamState* state, const std::string& multicastAddress, uint16_t multicastPort, std::string& error);
-    void stopSatelliteServiceRelay(StreamState* state);
-    uint16_t allocateSatelliteServiceRelayPort(const std::string& streamId);
-    void releaseSatelliteServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_data);
     void monitorBus(const std::string& id);
     void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
+    GstElement* createTranscodedUdpRelayPipeline(StreamState* state, std::string& error);
     uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
@@ -201,9 +155,6 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
-    std::map<std::string, std::unique_ptr<SatelliteTransponderState>> satelliteTransponders;
-    std::set<uint16_t> satelliteServiceRelayPorts;
-    std::map<std::string, std::chrono::steady_clock::time_point> caProviderLastStart;
     struct HttpClientSession {
         std::string streamId;
         std::string clientIp;

@@ -1,8 +1,6 @@
-# TVStreamer v86 — FTA auto-bypass
+# TVStreammerSAT5 — Release 2
 
-# TVStreamer5 — Release 2
-
-TVStreamer5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 2 / v115.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -81,8 +79,9 @@ A local backup file is also supported by the normal stream path. The input inter
 The web UI currently exposes:
 
 ```text
-udp-vbr   MPEG-TS over UDP
-udp-cbr   paced/CBR MPEG-TS over UDP
+udp-vbr   reservoir-smoothed MPEG-TS over UDP, bitrate follows the source
+udp-cbr   reservoir-shaped CBR MPEG-TS over UDP at Target bitrate
+rtp       MPEG-TS over RTP/UDP
 srt       MPEG-TS over SRT listener or caller
 http      MPEG-TS over HTTP
 hls       HLS playlist + MPEG-TS segments
@@ -91,7 +90,9 @@ rtmp      RTMP push
 youtube   RTMP push to YouTube Live
 ```
 
-RTP protocol modules exist in the codebase for MPEG-TS/RTP processing, but Release 2 does not expose RTP output as a selectable item in the current web UI.
+UDP VBR and UDP CBR now use one in-process MPEG-TS output engine. Both modes rebuild passthrough input as a clean SPTS, wait for a 5-second startup reservoir with PCR priming, keep a 2.5-second working reservoir, emit 7 MPEG-TS packets per UDP datagram, and generate a periodic 20 ms PCR timeline. UDP CBR pads with PID `0x1FFF` to the configured Target bitrate. UDP VBR follows the measured source rate with a small transport headroom instead of using the Target bitrate as a fixed output rate. There is no separate compatibility switch in the UI.
+
+RTP MPEG-TS output is selectable in the web UI. It uses `rtpmp2tpay` over UDP; with MTU 1400 the payload fits 7 MPEG-TS packets (7 × 188 = 1316 bytes), which is suitable for IPTV headends.
 
 HTTP and HLS player URLs use the application HTTP server:
 
@@ -152,7 +153,7 @@ For UDP/SRT/HTTP MPEG-TS paths the mux/remap code uses MPEG-TS request pads and 
 Transcoded HLS is generated under:
 
 ```text
-/tmp/tvstreamer5-hls/<stream-id>/
+/tmp/tvstreammersat5-hls/<stream-id>/
 ```
 
 Release 2 uses a three-segment live playlist:
@@ -167,7 +168,7 @@ The HLS directory for a stream is cleared when a new transcoded HLS pipeline sta
 
 ## Transcoding
 
-Transcoding is optional. When disabled, TVStreamer5 uses the normal passthrough/remap pipeline.
+Transcoding is optional. When disabled, TVStreammerSAT5 uses the normal passthrough/remap pipeline.
 
 The current transcoder video path is approximately:
 
@@ -211,10 +212,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
 
-Run from the directory that contains `tvstreamer5-config.json`:
+Run from the directory that contains `tvstreammersat5-config.json`:
 
 ```bash
-./build/TVStreamer
+./build/TVStreammerSAT5
 ```
 
 Default web UI:
@@ -258,23 +259,23 @@ ca-certificates
 ## Install as a systemd service
 
 ```bash
-sudo mkdir -p /opt/tvstreamer5
-sudo install -m 755 build/TVStreamer /opt/tvstreamer5/TVStreamer
-sudo cp tvstreamer5-config.json /opt/tvstreamer5/
+sudo mkdir -p /opt/tvstreammersat5
+sudo install -m 755 build/TVStreammerSAT5 /opt/tvstreammersat5/TVStreammerSAT5
+sudo cp tvstreammersat5-config.json /opt/tvstreammersat5/
 ```
 
-Example `/etc/systemd/system/tvstreamer5.service`:
+Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreamer5 Release 2
+Description=TVStreammerSAT5 Release 2
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/tvstreamer5
-ExecStart=/opt/tvstreamer5/TVStreamer
+WorkingDirectory=/opt/tvstreammersat5
+ExecStart=/opt/tvstreammersat5/TVStreammerSAT5
 Restart=always
 RestartSec=3
 
@@ -286,13 +287,13 @@ Enable it:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now tvstreamer5
-sudo systemctl status tvstreamer5 --no-pager --full
+sudo systemctl enable --now tvstreammersat5
+sudo systemctl status tvstreammersat5 --no-pager --full
 ```
 
 ## Docker
 
-TVStreamer5 can be built and run entirely in Docker. This keeps compiler and
+TVStreammerSAT5 can be built and run entirely in Docker. This keeps compiler and
 GStreamer development packages out of the host operating system. The runtime
 container still uses the host network because IPTV multicast, RTP, SRT listener
 mode and interface-specific bindings work most reliably with `--network host`.
@@ -364,12 +365,12 @@ docker version
 Membership in the `docker` group effectively grants root-level access to the
 host. Keep using `sudo docker ...` instead if that is preferable for the server.
 
-### Build the TVStreamer5 Docker image
+### Build the TVStreammerSAT5 Docker image
 
 From the repository directory:
 
 ```bash
-cd /home/monk/TVStreamer5
+cd /home/monk/TVStreammerSAT5
 chmod +x scripts/build_container.sh scripts/run_container.sh
 ./scripts/build_container.sh
 ```
@@ -377,45 +378,45 @@ chmod +x scripts/build_container.sh scripts/run_container.sh
 The default image name is:
 
 ```text
-tvstreamer5:release2
+tvstreammersat5:release2
 ```
 
 Verify that the image exists:
 
 ```bash
-docker image ls tvstreamer5:release2
-docker image inspect tvstreamer5:release2 >/dev/null && echo "TVStreamer5 image OK"
+docker image ls tvstreammersat5:release2
+docker image inspect tvstreammersat5:release2 >/dev/null && echo "TVStreammerSAT5 image OK"
 ```
 
 The build script can be launched from any working directory because it resolves
 the repository path from the script location itself. To use another image name:
 
 ```bash
-IMAGE_NAME=my-tvstreamer:release2 ./scripts/build_container.sh
+IMAGE_NAME=my-tvstreammersat5:release2 ./scripts/build_container.sh
 ```
 
 A direct equivalent build command is:
 
 ```bash
-docker build --pull -t tvstreamer5:release2 .
+docker build --pull -t tvstreammersat5:release2 .
 ```
 
-### Prepare persistent TVStreamer5 data
+### Prepare persistent TVStreammerSAT5 data
 
 For a production container, keep configuration and application data outside the
 container. Example:
 
 ```bash
-sudo mkdir -p /srv/tvstreamer5
-sudo cp tvstreamer5-config.json /srv/tvstreamer5/tvstreamer5-config.json
-sudo chown -R "$USER":"$USER" /srv/tvstreamer5
+sudo mkdir -p /srv/tvstreammersat5
+sudo cp tvstreammersat5-config.json /srv/tvstreammersat5/tvstreammersat5-config.json
+sudo chown -R "$USER":"$USER" /srv/tvstreammersat5
 ```
 
-The `/srv/tvstreamer5` directory can then persist:
+The `/srv/tvstreammersat5` directory can then persist:
 
 ```text
-tvstreamer5-config.json
-tvstreamer5-subscribers.json
+tvstreammersat5-config.json
+tvstreammersat5-subscribers.json
 backup-files/
 ```
 
@@ -424,7 +425,7 @@ backup-files/
 The supplied run script starts an interactive temporary container:
 
 ```bash
-CONFIG_FILE=/srv/tvstreamer5/tvstreamer5-config.json \
+CONFIG_FILE=/srv/tvstreammersat5/tvstreammersat5-config.json \
   ./scripts/run_container.sh
 ```
 
@@ -436,27 +437,27 @@ To increase GStreamer logging temporarily:
 
 ```bash
 GST_DEBUG=2 \
-CONFIG_FILE=/srv/tvstreamer5/tvstreamer5-config.json \
+CONFIG_FILE=/srv/tvstreammersat5/tvstreammersat5-config.json \
   ./scripts/run_container.sh
 ```
 
-### Run TVStreamer5 as a background Docker service
+### Run TVStreammerSAT5 as a background Docker service
 
 Create the persistent production container:
 
 ```bash
 docker run -d \
-  --name tvstreamer5 \
+  --name tvstreammersat5 \
   --restart unless-stopped \
   --init \
   --network host \
-  -v /srv/tvstreamer5:/data \
+  -v /srv/tvstreammersat5:/data \
   -w /data \
   -e GST_DEBUG=1 \
-  tvstreamer5:release2
+  tvstreammersat5:release2
 ```
 
-The web interface then uses the HTTP port configured by TVStreamer5, normally:
+The web interface then uses the HTTP port configured by TVStreammerSAT5, normally:
 
 ```text
 http://SERVER_IP:9000
@@ -464,14 +465,14 @@ http://SERVER_IP:9000
 
 `--network host` is intentional. With host networking, Docker does not need
 `-p 9000:9000`, `-p` mappings for UDP multicast, or separate SRT port
-forwarding. TVStreamer5 binds directly to the host's interfaces and ports.
+forwarding. TVStreammerSAT5 binds directly to the host's interfaces and ports.
 
 ### Docker management from the console
 
-The following commands manage the `tvstreamer5` container directly from a Linux
+The following commands manage the `tvstreammersat5` container directly from a Linux
 console. If the current user is not in the `docker` group, prefix each
 `docker ...` command with `sudo`. Commands that stop or restart the Docker daemon
-affect **all** containers on the host, not only TVStreamer5.
+affect **all** containers on the host, not only TVStreammerSAT5.
 
 ```bash
 # Show Docker Engine status
@@ -492,95 +493,95 @@ docker ps
 # Show running and stopped containers
 docker ps -a
 
-# Show only TVStreamer5
-docker ps -a --filter name=tvstreamer5
+# Show only TVStreammerSAT5
+docker ps -a --filter name=tvstreammersat5
 
-# Start TVStreamer5
-docker start tvstreamer5
+# Start TVStreammerSAT5
+docker start tvstreammersat5
 
-# Stop TVStreamer5 gracefully
-docker stop -t 15 tvstreamer5
+# Stop TVStreammerSAT5 gracefully
+docker stop -t 15 tvstreammersat5
 
-# Restart TVStreamer5
-docker restart -t 15 tvstreamer5
+# Restart TVStreammerSAT5
+docker restart -t 15 tvstreammersat5
 
 # Show container state, exit code and restart count
-docker inspect tvstreamer5 --format \
+docker inspect tvstreammersat5 --format \
   'status={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} restart={{.RestartCount}}'
 
 # Follow logs in real time
-docker logs -f tvstreamer5
+docker logs -f tvstreammersat5
 
 # Show the last 200 log lines
-docker logs --tail 200 tvstreamer5
+docker logs --tail 200 tvstreammersat5
 
 # Show logs from the last 10 minutes
-docker logs --since 10m tvstreamer5
+docker logs --since 10m tvstreammersat5
 
 # Show CPU, RAM and network usage
-docker stats tvstreamer5
+docker stats tvstreammersat5
 
 # Open a shell inside the running container
-docker exec -it tvstreamer5 bash
+docker exec -it tvstreammersat5 bash
 
-# Show processes running in the TVStreamer5 container
-docker top tvstreamer5
+# Show processes running in the TVStreammerSAT5 container
+docker top tvstreammersat5
 
 # Check GStreamer plugins inside the container
-docker exec tvstreamer5 gst-inspect-1.0 x264enc
-docker exec tvstreamer5 gst-inspect-1.0 srtsink
-docker exec tvstreamer5 gst-inspect-1.0 rtspclientsink
+docker exec tvstreammersat5 gst-inspect-1.0 x264enc
+docker exec tvstreammersat5 gst-inspect-1.0 srtsink
+docker exec tvstreammersat5 gst-inspect-1.0 rtspclientsink
 
 # Check the config visible inside the container
-docker exec tvstreamer5 ls -lah /data
-docker exec tvstreamer5 test -f /data/tvstreamer5-config.json && echo "config OK"
+docker exec tvstreammersat5 ls -lah /data
+docker exec tvstreammersat5 test -f /data/tvstreammersat5-config.json && echo "config OK"
 
 # Inspect mounted host directories
-docker inspect tvstreamer5 --format '{{json .Mounts}}'
+docker inspect tvstreammersat5 --format '{{json .Mounts}}'
 
 # Inspect container network mode
-docker inspect tvstreamer5 --format '{{.HostConfig.NetworkMode}}'
+docker inspect tvstreammersat5 --format '{{.HostConfig.NetworkMode}}'
 
 # Show the image used by the container
-docker inspect tvstreamer5 --format '{{.Config.Image}}'
+docker inspect tvstreammersat5 --format '{{.Config.Image}}'
 
-# Show installed TVStreamer5 images
-docker image ls 'tvstreamer5*'
+# Show installed TVStreammerSAT5 images
+docker image ls 'tvstreammersat5*'
 
 # Show Docker disk usage
 docker system df
 ```
 
-### Update TVStreamer5 in Docker
+### Update TVStreammerSAT5 in Docker
 
 After pulling new source code, rebuild the image and recreate the container. A
 running container does not automatically switch to a newly built image.
 
 ```bash
-cd /home/monk/TVStreamer5
+cd /home/monk/TVStreammerSAT5
 git pull origin main
 
 ./scripts/build_container.sh
 
-docker stop -t 15 tvstreamer5
-docker rm tvstreamer5
+docker stop -t 15 tvstreammersat5
+docker rm tvstreammersat5
 
 docker run -d \
-  --name tvstreamer5 \
+  --name tvstreammersat5 \
   --restart unless-stopped \
   --init \
   --network host \
-  -v /srv/tvstreamer5:/data \
+  -v /srv/tvstreammersat5:/data \
   -w /data \
   -e GST_DEBUG=1 \
-  tvstreamer5:release2
+  tvstreammersat5:release2
 
 # Verify the new container
-docker ps --filter name=tvstreamer5
-docker logs --tail 100 tvstreamer5
+docker ps --filter name=tvstreammersat5
+docker logs --tail 100 tvstreammersat5
 ```
 
-The bind-mounted `/srv/tvstreamer5` directory is not removed when the container
+The bind-mounted `/srv/tvstreammersat5` directory is not removed when the container
 is recreated, so the configuration, subscriber database and backup files remain
 persistent.
 
@@ -589,36 +590,36 @@ persistent.
 Edit the host copy of the configuration:
 
 ```bash
-sudoedit /srv/tvstreamer5/tvstreamer5-config.json
+sudoedit /srv/tvstreammersat5/tvstreammersat5-config.json
 ```
 
 Then restart the container:
 
 ```bash
-docker restart -t 15 tvstreamer5
-docker logs --tail 100 tvstreamer5
+docker restart -t 15 tvstreammersat5
+docker logs --tail 100 tvstreammersat5
 ```
 
 ### Remove or recreate the container
 
-Removing the container does not remove `/srv/tvstreamer5` because that directory
+Removing the container does not remove `/srv/tvstreammersat5` because that directory
 is a host bind mount.
 
 ```bash
-docker stop -t 15 tvstreamer5
-docker rm tvstreamer5
+docker stop -t 15 tvstreammersat5
+docker rm tvstreammersat5
 ```
 
 Force-remove a stuck container only when a normal stop does not work:
 
 ```bash
-docker rm -f tvstreamer5
+docker rm -f tvstreammersat5
 ```
 
-Remove an old TVStreamer5 image after the container using it has been removed:
+Remove an old TVStreammerSAT5 image after the container using it has been removed:
 
 ```bash
-docker image rm tvstreamer5:release2
+docker image rm tvstreammersat5:release2
 ```
 
 Remove only unused Docker objects:
@@ -638,9 +639,9 @@ Docker volumes.
 If the container immediately exits:
 
 ```bash
-docker ps -a --filter name=tvstreamer5
-docker inspect tvstreamer5 --format 'exit={{.State.ExitCode}} error={{.State.Error}}'
-docker logs --tail 300 tvstreamer5
+docker ps -a --filter name=tvstreammersat5
+docker inspect tvstreammersat5 --format 'exit={{.State.ExitCode}} error={{.State.Error}}'
+docker logs --tail 300 tvstreammersat5
 ```
 
 If port 9000 is already occupied:
@@ -653,20 +654,20 @@ If UDP multicast or SRT traffic is missing, first verify that host networking is
 actually enabled and inspect the host interface directly:
 
 ```bash
-docker inspect tvstreamer5 --format '{{.HostConfig.NetworkMode}}'
+docker inspect tvstreammersat5 --format '{{.HostConfig.NetworkMode}}'
 ip -br addr
 ip route
 sudo tcpdump -ni eth0 udp
 ```
 
-Replace `eth0` with the real IPTV interface. Since TVStreamer5 uses host
+Replace `eth0` with the real IPTV interface. Since TVStreammerSAT5 uses host
 networking, protocol diagnostics are performed on the host network namespace.
 
 If the image needs to be rebuilt without Docker layer cache:
 
 ```bash
-cd /home/monk/TVStreamer5
-docker build --pull --no-cache -t tvstreamer5:release2 .
+cd /home/monk/TVStreammerSAT5
+docker build --pull --no-cache -t tvstreammersat5:release2 .
 ```
 
 If Docker itself is unhealthy:
@@ -707,7 +708,7 @@ sudo tcpdump -ni eth0 udp port 1234
 
 ## Backup failover
 
-Set `backup_input_uri` to enable source failover. When the current input stops producing data, TVStreamer5 can switch to the backup source and later return to the primary source when it recovers.
+Set `backup_input_uri` to enable source failover. When the current input stops producing data, TVStreammerSAT5 can switch to the backup source and later return to the primary source when it recovers.
 
 Useful fields:
 
@@ -725,7 +726,7 @@ The stream tile displays whether the primary or backup source is active.
 Subscriber settings are stored in:
 
 ```text
-tvstreamer5-subscribers.json
+tvstreammersat5-subscribers.json
 ```
 
 When filtering is enabled, HTTP TS, HLS and SRT listener access can be restricted by subscriber IP and stream ID. The web UI can add/remove subscribers, assign streams and reset active sessions.
@@ -764,7 +765,7 @@ Example:
   "audio_pid": 257,
   "service_id": 2,
   "service_name": "Channel 1",
-  "service_provider": "TVStreamer5",
+  "service_provider": "TVStreammerSAT5",
   "transcode_enabled": false,
   "transcode_resolution": "1280x720",
   "transcode_video_bitrate": 3500000,
@@ -781,13 +782,13 @@ Global settings include `http_port`, `login`, `password`, Telegram settings and 
 Service logs:
 
 ```bash
-sudo journalctl -u tvstreamer5 -n 200 --no-pager
+sudo journalctl -u tvstreammersat5 -n 200 --no-pager
 ```
 
 Processes:
 
 ```bash
-ps aux | grep -Ei 'TVStreamer|gst-launch' | grep -v grep
+ps aux | grep -Ei 'TVStreammerSAT5|gst-launch' | grep -v grep
 ```
 
 GStreamer capability check:
@@ -805,7 +806,7 @@ ffprobe -hide_banner -show_programs -show_streams INPUT
 Inspect current HLS segment:
 
 ```bash
-SEG=$(ls -1t /tmp/tvstreamer5-hls/STREAM_ID/segment*.ts | head -1)
+SEG=$(ls -1t /tmp/tvstreammersat5-hls/STREAM_ID/segment*.ts | head -1)
 ffprobe -hide_banner -show_programs -show_streams "$SEG"
 ```
 
@@ -813,15 +814,15 @@ ffprobe -hide_banner -show_programs -show_streams "$SEG"
 
 Dashboard:
 
-![TVStreamer5 dashboard](docs/screenshots/dashboard.png)
+![TVStreammerSAT5 dashboard](docs/screenshots/dashboard.png)
 
 Stream settings:
 
-![TVStreamer5 stream settings](docs/screenshots/stream-settings.png)
+![TVStreammerSAT5 stream settings](docs/screenshots/stream-settings.png)
 
 Network monitoring:
 
-![TVStreamer5 network interface load](docs/screenshots/network.png)
+![TVStreammerSAT5 network interface load](docs/screenshots/network.png)
 
 ## Notes
 
@@ -850,7 +851,7 @@ SRT:     mpegtsmux CBR -> tsparse -> identity CBR pacer -> loopback relay/public
 FIFO:    mpegtsmux CBR -> tsparse -> identity CBR pacer -> filesink/FIFO
 ```
 
-For an SRT Listener with transcoding, the public `srtsink` is still owned by TVStreamer5 so subscriber monitoring continues to use the normal `caller-added`/`caller-removed` callbacks. The external transcoder only sends the already paced CBR MPEG-TS over `127.0.0.1:<relay>`. The in-process relay no longer rebuilds PCR timestamps a second time. Transcoded SRT also uses a 2500 ms SRT latency and disables `GstBaseSink max-bitrate`; the latter is important because a stale/default `target_bitrate` can otherwise throttle a 6+ Mbit/s transcoded stream to only about 2 Mbit/s and create periodic A/V stalls.
+For an SRT Listener with transcoding, the public `srtsink` is still owned by TVStreammerSAT5 so subscriber monitoring continues to use the normal `caller-added`/`caller-removed` callbacks. The external transcoder only sends the already paced CBR MPEG-TS over `127.0.0.1:<relay>`. The in-process relay no longer rebuilds PCR timestamps a second time. Transcoded SRT also uses a 2500 ms SRT latency and disables `GstBaseSink max-bitrate`; the latter is important because a stale/default `target_bitrate` can otherwise throttle a 6+ Mbit/s transcoded stream to only about 2 Mbit/s and create periodic A/V stalls.
 
 Recommended first receiver test for transcoded SRT is 2500-3000 ms latency.
 
@@ -861,14 +862,14 @@ Release 2 инициализирует GStreamer до запуска HTTP-инт
 После пересборки контейнера можно проверить runtime напрямую:
 
 ```bash
-docker exec tvstreamer5 gst-inspect-1.0 uridecodebin
-docker exec tvstreamer5 gst-inspect-1.0 decodebin
-docker exec tvstreamer5 gst-inspect-1.0 x264enc
-docker exec tvstreamer5 gst-inspect-1.0 h264parse
-docker exec tvstreamer5 gst-inspect-1.0 aacparse
-docker exec tvstreamer5 gst-inspect-1.0 mpegtsmux
-docker exec tvstreamer5 gst-inspect-1.0 identity
-docker exec tvstreamer5 gst-inspect-1.0 udpsink
+docker exec tvstreammersat5 gst-inspect-1.0 uridecodebin
+docker exec tvstreammersat5 gst-inspect-1.0 decodebin
+docker exec tvstreammersat5 gst-inspect-1.0 x264enc
+docker exec tvstreammersat5 gst-inspect-1.0 h264parse
+docker exec tvstreammersat5 gst-inspect-1.0 aacparse
+docker exec tvstreammersat5 gst-inspect-1.0 mpegtsmux
+docker exec tvstreammersat5 gst-inspect-1.0 identity
+docker exec tvstreammersat5 gst-inspect-1.0 udpsink
 ```
 
 Для краткой проверки всех обязательных элементов из исходного дерева:
@@ -885,23 +886,23 @@ Release 2 updates live dashboard values without rebuilding every stream card on 
 
 A full stream-card render is now performed only when the stream configuration, stream order or UI language changes. Runtime values such as Online/Offline, backup state, active input, input/output bitrate and status are updated in place.
 
-External `gst-launch-1.0` transcoders must not inherit TVStreamer5 HTTP, metrics or listener sockets. TVStreamer5 marks non-standard file descriptors `FD_CLOEXEC` before starting an external GStreamer process. Verify after starting a transcoded stream:
+External `gst-launch-1.0` transcoders must not inherit TVStreammerSAT5 HTTP, metrics or listener sockets. TVStreammerSAT5 marks non-standard file descriptors `FD_CLOEXEC` before starting an external GStreamer process. Verify after starting a transcoded stream:
 
 ```bash
 ss -lntp | grep -E ':9000|:9100'
 ```
 
-The listening ports should belong to `TVStreamer` only; `gst-launch-1.0` should not appear as an owner of those sockets.
+The listening ports should belong to `TVStreammerSAT5` only; `gst-launch-1.0` should not appear as an owner of those sockets.
 
 ### SRT после транскодирования
 
-В Release 2 внешний GStreamer-транскодер кодирует видео/звук и отдаёт готовый MPEG-TS во внутренний loopback UDP relay. Сам SRT Listener теперь снова принадлежит процессу `TVStreamer`, как и SRT без транскодинга. Поэтому события `caller-added` и `caller-removed` приходят напрямую из `srtsink`, а окно абонентов видит подключение сразу, без опроса `ss`.
+В Release 2 внешний GStreamer-транскодер кодирует видео/звук и отдаёт готовый MPEG-TS во внутренний loopback UDP relay. Сам SRT Listener теперь снова принадлежит процессу `TVStreammerSAT5`, как и SRT без транскодинга. Поэтому события `caller-added` и `caller-removed` приходят напрямую из `srtsink`, а окно абонентов видит подключение сразу, без опроса `ss`.
 
 Смысл полей SRT такой же, как у обычного SRT-потока:
 
-- `Listener`: TVStreamer слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
+- `Listener`: TVStreammerSAT5 слушает `srt://:<port>` на `0.0.0.0` либо на адресе выбранного выходного интерфейса. Поле `Адрес выхода` используется только как адрес, показываемый в ссылке клиенту, и не используется как bind-адрес.
 - `Caller`: `Адрес выхода` является адресом удалённого SRT-сервера, а выбранный выходной интерфейс применяется как локальный bind-адрес.
-- Внешний `gst-launch-1.0` для SRT Listener больше не содержит `srtsink`; он содержит `udpsink host=127.0.0.1 port=<relay>`. SRT-сеть, фильтрация абонентов и активные сессии обслуживаются внутри TVStreamer.
+- Внешний `gst-launch-1.0` для SRT Listener больше не содержит `srtsink`; он содержит `udpsink host=127.0.0.1 port=<relay>`. SRT-сеть, фильтрация абонентов и активные сессии обслуживаются внутри TVStreammerSAT5.
 - Для совместимости с GStreamer 1.20.x на Ubuntu 22.04 внешний `gst-launch-1.0` не использует свойство `auto-reconnect` у `srtsink`, потому что в этой версии элемента такого свойства нет.
 - Если `gst-launch-1.0` завершается сразу из-за ошибки bind/URI/плагина, запуск потока завершается ошибкой вместо ложного статуса `running`.
 
@@ -921,11 +922,11 @@ identity ... datarate=<effective_cbr_bytes_per_second> sync=true
 udpsink host=127.0.0.1 port=<relay>
 ```
 
-А SRT-порт должен принадлежать процессу TVStreamer:
+А SRT-порт должен принадлежать процессу TVStreammerSAT5:
 
 ```bash
 ss -lunp | grep '<SRT_PORT>'
-journalctl -u tvstreamer5 -n 100 --no-pager | grep -Ei 'srt|caller|relay|GStreamer transcoder|error|failed|exit'
+journalctl -u tvstreammersat5 -n 100 --no-pager | grep -Ei 'srt|caller|relay|GStreamer transcoder|error|failed|exit'
 ```
 
 Проверка приёмником GStreamer:
@@ -936,9 +937,9 @@ gst-launch-1.0 -v srtsrc uri="srt://SERVER_IP:SRT_PORT?mode=caller" ! tsparse ! 
 
 ### Active sessions for transcoded SRT
 
-SRT без транскодинга и SRT Listener после транскодинга используют одинаковый механизм активных абонентских сессий: TVStreamer владеет `srtsink` и получает `caller-added`/`caller-removed` callbacks напрямую.
+SRT без транскодинга и SRT Listener после транскодинга используют одинаковый механизм активных абонентских сессий: TVStreammerSAT5 владеет `srtsink` и получает `caller-added`/`caller-removed` callbacks напрямую.
 
-Когда приёмник подключён, его удалённый IP должен совпадать с основным или резервным IP абонента, а сам абонент должен быть привязан к этому потоку. После этого окно «Абоненты» показывает абонента как Online. Если приёмник подключается через NAT, указывайте тот IP, который видит сервер TVStreamer.
+Когда приёмник подключён, его удалённый IP должен совпадать с основным или резервным IP абонента, а сам абонент должен быть привязан к этому потоку. После этого окно «Абоненты» показывает абонента как Online. Если приёмник подключается через NAT, указывайте тот IP, который видит сервер TVStreammerSAT5.
 
 
 ### Единый мониторинг SRT-подключений
@@ -950,12 +951,12 @@ SRT Listener без транскодинга и SRT Listener после тран
 - `caller-removed` — удаление активной SRT-сессии;
 - `caller-rejected` — журналирование отказа.
 
-Отдельный опрос `ss` для транскодированного SRT удалён. Он больше не нужен и мог давать двойной или запаздывающий подсчёт сессий. Внешний `gst-launch-1.0` только передаёт MPEG-TS на `127.0.0.1:<relay>`, а сетевой SRT Listener и мониторинг клиентов находятся внутри TVStreamer.
+Отдельный опрос `ss` для транскодированного SRT удалён. Он больше не нужен и мог давать двойной или запаздывающий подсчёт сессий. Внешний `gst-launch-1.0` только передаёт MPEG-TS на `127.0.0.1:<relay>`, а сетевой SRT Listener и мониторинг клиентов находятся внутри TVStreammerSAT5.
 
 Для проверки подключите SRT caller и смотрите журнал:
 
 ```bash
-journalctl -u tvstreamer5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Transcoded SRT output relay'
+journalctl -u tvstreammersat5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Transcoded SRT output relay'
 ```
 
 При подключении ожидается `SRT caller added ... from <CLIENT_IP>`, а при отключении — `SRT caller removed ...`. Тот же IP используется для статуса Online в таблице абонентов.
@@ -963,120 +964,8 @@ journalctl -u tvstreamer5 -f | grep -Ei 'SRT connection monitoring|SRT caller|Tr
 
 ### SRT transcoding session path verification
 
-For an SRT Listener with transcoding enabled, the external `gst-launch-1.0` process must terminate at an internal loopback `udpsink`; the public `srtsink` is owned by TVStreamer5 so that the normal `caller-added`/`caller-removed` subscriber monitoring callbacks are used. The startup description should therefore contain `srt-listener-relay@127.0.0.1:`. If the UI still shows `srt-listener@srt://...`, an older/partial SRT output module is deployed.
+For an SRT Listener with transcoding enabled, the external `gst-launch-1.0` process must terminate at an internal loopback `udpsink`; the public `srtsink` is owned by TVStreammerSAT5 so that the normal `caller-added`/`caller-removed` subscriber monitoring callbacks are used. The startup description should therefore contain `srt-listener-relay@127.0.0.1:`. If the UI still shows `srt-listener@srt://...`, an older/partial SRT output module is deployed.
 
 The external transcoder command is now logged before process startup, and early `gst-launch-1.0` stderr is appended to the persistent web startup error so an exit code such as 255 is accompanied by the actual GStreamer error text.
 
-### MD5 password storage
-
-The web password is no longer written to `tvstreamer5-config.json` in clear text. TVStreamer5 stores only a lowercase MD5 digest in the `password_md5` field. Existing configurations that still contain a legacy plaintext `password` are migrated automatically on the next successful startup and rewritten without the clear-text field.
-
-HTTP Basic authentication itself is unchanged for clients: the browser/player still sends the normal password, while TVStreamer5 computes its MD5 digest and compares it with the stored digest. Changing the password from the web settings also writes only `password_md5`.
-
-MD5 is provided here for compatibility with the requested configuration format. It is a one-way hash, not encryption, and it is not suitable as a modern password-hardening algorithm against offline attacks. Protect the configuration file and use HTTPS/reverse-proxy TLS for the web interface.
-
-### Satellite DVB-S / DVB-S2 primary input
-
-A stream can use a Linux DVB satellite tuner instead of the normal primary URL. Enable **«Принимать канал со спутника DVB-S / DVB-S2 вместо основного URL»** in the stream editor. The normal primary URL/interface/mode controls are hidden and the satellite tuner panel becomes available.
-
-The panel supports adapter/frontend selection, frequency, symbol rate, DVB-S or DVB-S2, H/V polarization, modulation, FEC, pilot, rolloff, DiSEqC source, DVB-S2 MIS/Stream ID, service/program SID and universal-LNB LOF1/LOF2/switch frequencies. TVStreamer5 uses GStreamer `dvbbasebin` so a configured `satellite_service_id` is passed through `program-numbers` and the selected service is exposed as MPEG-TS to the normal output/remap/transcoding path.
-
-For operator convenience, the **Add channel** form accepts satellite transponder frequency in **MHz** (for example `11531`). TVStreamer5 converts it to the existing internal **kHz** representation (`11531000`) before saving the configuration or passing it to GStreamer, so existing configs and DVB tuning behavior remain compatible. Symbol rate remains in **kBd**. Universal-LNB LOF1/LOF2/switch values remain technical **kHz** values: `9750000`, `10600000`, `11700000`. `DiSEqC source = -1` disables DiSEqC and `Stream ID = -1` disables MIS selection.
-
-Check tuner devices and the GStreamer DVB plugin on Linux:
-
-```bash
-ls -l /dev/dvb/adapter*/frontend*
-gst-inspect-1.0 dvbbasebin
-gst-inspect-1.0 dvbsrc
-./scripts/check_transcoder_plugins.sh
-```
-
-For Docker, the DVB devices must be passed into the container explicitly, for example:
-
-```bash
-docker run --device /dev/dvb/adapter0/frontend0 \
-           --device /dev/dvb/adapter0/demux0 \
-           --device /dev/dvb/adapter0/dvr0 \
-           ...
-```
-
-The satellite source works both for normal MPEG-TS forwarding/remap and for the external GStreamer transcoder. With transcoding enabled, `dvbbasebin` feeds the selected program to `decodebin`, then the existing H.264/AAC and CBR output pipeline is used.
-
-### DVB hardware discovery and transponder service scan
-
-The satellite editor no longer asks for adapter/frontend numbers blindly. TVStreamer5 enumerates `/dev/dvb/adapter*` and each `frontend*` at runtime through `/api/dvb-devices`. The web form uses those results to build **Adapter** and **Frontend** drop-down lists. When the frontend can be opened, the list also shows its kernel-reported name and delivery systems such as DVB-S/DVB-S2.
-
-The CA Provider/Card Manager also inventories serial readers from `/dev/serial/by-id/*` and resolves the current `/dev/ttyUSB*` or `/dev/ttyACM*` target plus udev vendor/model/serial metadata. Providers store the stable by-id path rather than a volatile tty number, so a reader remains associated with the same `ca-card-N` after reboot or USB renumbering.
-
-A new **«Сканировать транспондер»** action tunes the exact DVB-S/S2 parameters currently entered in the form through `dvbbasebin`, reads the resulting MPEG-TS and parses PAT, SDT and PMT tables. The result includes:
-
-- service/program SID;
-- service and provider names;
-- PMT PID;
-- first video and audio PIDs;
-- detected video/audio codec names;
-- FTA/CA indication from SDT/PMT CA descriptors;
-- frontend lock/signal/SNR information when exposed by the driver.
-
-Selecting a discovered service copies its SID into the satellite service selector and also fills the output service name/provider and VPID/APID fields when they were discovered. Scanning is refused while another active TVStreamer stream is already using the same adapter/frontend, because retuning it would interrupt that channel.
-
-The scanner uses the same GStreamer DVB source and the same frequency/symbol-rate/LNB/DiSEqC/MIS properties as normal satellite streaming, so it does not require `dvbv5-scan` or a separate channel database.
-
-Conditional-access note: the Reader/Card Manager discovers and tracks Phoenix-style serial readers, associates them with per-card providers and enforces per-provider session capacity. It does **not** implement ECM/CW extraction, a software descrambler or a CW cache. Encrypted services are shown with the `CA` marker; descrambling still requires an authorized card/CAM integration.
-
-### DVB tile signal meters
-
-For satellite streams the main stream tile now shows two live percentage meters read from the selected Linux DVB frontend: **Signal level** (`FE_READ_SIGNAL_STRENGTH`) and **Signal quality** / SNR (`FE_READ_SNR`). The bars refresh with the normal `/api/state` polling and are colour-coded red / amber / green. A LOCK / NO LOCK indicator is shown beside the signal level. When the stream is stopped or running on a backup source the DVB meters fall back to 0%.
-
-The redundant top **Output** information row was removed from stream tiles; output mode is still visible in the tile badge and URLs remain available through the URL button.
-
-### DVB startup failure hardening
-
-If a DVB frontend cannot start (for example because the selected adapter/frontend is already in use, inaccessible, or cannot lock with the requested parameters), TVStreamer5 now returns the complete GStreamer startup error without disposing `dvbbasebin`/`dvbsrc` while they are still in READY. The failed pipeline is explicitly driven to `GST_STATE_NULL` before the final reference is released. This prevents the GStreamer critical warning and heap-corruption/process-abort path that could otherwise turn a normal DVB startup failure into a web `Failed to fetch` error.
-
-When a satellite stream reports `GstDvbSrc: Failed to start`, check the selected frontend for another owner before changing tuning parameters, for example with `sudo fuser -v /dev/dvb/adapter5/frontend0 /dev/dvb/adapter5/demux0 /dev/dvb/adapter5/dvr0` and `ps -fp <PID>`. An existing Astra/other receiver process using the same hardware must be stopped or a different free frontend selected.
-
-
-### Satellite channel add workflow
-
-Satellite tuner setup and transponder scanning now live in a dedicated **Add channel** modal instead of the normal stream editor. The modal discovers the Linux DVB adapters/frontends, accepts the DVB-S/S2 tuning parameters, scans PAT/SDT/PMT, and presents the discovered services as a searchable multi-select list.
-
-After selecting one or more services, TVStreamer5 can create all corresponding stream tiles in one save operation. Each generated tile inherits the chosen adapter/frontend/transponder/LNB/MIS settings and gets its service SID, name/provider and discovered video/audio PIDs automatically. UDP output allocation can either advance the multicast IPv4 address while keeping one port or keep one address and advance the port. Generated tiles start stopped so the operator can review output/remap/transcode settings before starting them.
-
-The regular stream editor no longer exposes satellite tuning or scanning controls. Editing an existing satellite tile preserves its DVB source configuration while allowing normal output, backup, remap and transcoder settings to be changed.
-
-### Shared DVB frontend fan-out
-
-Satellite channels that use the same Linux DVB `adapter/frontend` and exactly the same transponder tuning parameters now share one physical tuner session. TVStreamer5 starts one `dvbbasebin` per tuned frontend, forwards the complete transport stream through an internal loopback multicast relay, then creates a lightweight per-channel SID selector (`tsdemux program-number -> mpegtsmux`) for each active tile. Each selected service is exposed on its own localhost UDP relay, so the existing passthrough, remap, transcoding and output protocol code can consume it without opening the DVB frontend again.
-
-This allows multiple services discovered on one transponder to run simultaneously from one frontend. Starting another tile on the same frontend and same transponder increments the shared frontend consumer count; stopping a tile removes only its service relay. The physical frontend is released only after the last channel using that transponder stops. Attempting to tune the same frontend to a different transponder while it still has active consumers is rejected with a clear startup error instead of retuning and interrupting the other channels.
-
-Expected diagnostics include:
-
-```text
-Shared DVB frontend started: 5:0 ... relay=udp://@239.255.250.x:45xxx
-Shared DVB frontend reused: 5:0 consumers=2 ...
-Satellite service relay started: stream=... SID=230 ... service=udp://127.0.0.1:47xxx
-```
-
-The stream-tile CBR/VBR badge is positioned beside the delete button so the tile header no longer has the bitrate-mode badge floating in the center.
-
-### Compact satellite channel wizard
-
-The **Add channel** satellite wizard uses a denser four-column layout for the common tuner parameters (adapter, frontend, delivery system, polarization, frequency, symbol rate, modulation and FEC). Less frequently changed Pilot, Rolloff, DiSEqC, MIS, LNB and CA/CI settings are grouped in a collapsible **Additional DVB / LNB / CA settings** section. Signal meters, service search/multi-selection and bulk-output allocation remain visible without requiring a very tall modal.
-
-On narrower screens the wizard automatically collapses to two columns and then one column. The discovered-service list is kept in a bounded scroll area so the scan controls and bulk-create actions stay close together.
-
-## v85: Dynamic Reader/Card Manager
-
-`System -> CA Providers` no longer assumes a fixed number of Phoenix readers or a global eight-channel limit. The UI discovers any number of `/dev/serial/by-id/*` serial readers, resolves their current tty device and udev metadata, and lets each `ca-card-N` provider bind to one stable reader identity. Readers can disappear and return without changing the configured provider association.
-
-Each card/provider owns its own session capacity. `capacity_mode=manual` uses its configured `max_channels`; `capacity_mode=auto` is reserved for a documented card/provider capability interface and currently falls back to that same per-card value if no capability is reported. New providers start with a conservative fallback of 1 rather than a hard-coded 8. The start API rejects a stream when its selected card/provider is disabled, has no reader, the reader is offline, or that provider's effective capacity is already full.
-
-The old `Authorized pre-decoded TS` endpoint is no longer part of the CA Provider UI in v85. Selecting a card/provider does not replace the DVB input transport. This release provides reader discovery, stable identity, hot-plug status and session accounting only; it does not implement ECM/CW extraction, software descrambling or key caching.
-
-
-## v94
-
-FTA DVB-S/S2 direct input now always performs single-service SID filtering/remux in the main pipeline. This prevents full-transponder passthrough on HTTP/UDP/SRT when `remap` is disabled. OpenSSL 3 is a permanent build dependency via `OpenSSL::SSL` and `OpenSSL::Crypto`.
+- Transcoded UDP is routed through the default StableUdpOutput stage via an internal FIFO.

@@ -1,10 +1,8 @@
 #include "StreamManager.h"
 #include "TranscoderModule.h"
-#include "UdpCbrOutput.h"
+#include "StableUdpOutput.h"
 #include "UdpInput.h"
-#include "UdpVbrOutput.h"
 #include "protocols/GstProtocolTypes.h"
-#include "protocols/GstInputProtocols.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
 
@@ -14,11 +12,9 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
-#include <sstream>
 #include <functional>
 #include <thread>
 #include <vector>
-#include <utility>
 
 #include <glib.h>
 #include <gio/gio.h>
@@ -35,59 +31,14 @@ constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
+constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
+constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
-constexpr auto kCaProviderStartSpacing = std::chrono::milliseconds(1500);
-constexpr auto kSatelliteRelayRestartInterval = std::chrono::seconds(12);
-constexpr uint64_t kInputCcRecoveryThreshold = 80;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr const char* kTestPatternUri = "test://bars";
-
-struct MulticastInterfaceSelection {
-    std::string name;
-    std::string address;
-};
-
-MulticastInterfaceSelection selectInternalMulticastInterface(const StreamConfig& cfg) {
-    const auto interfaces = enumerateNetworkInterfaces();
-
-    auto usable = [](const NetworkInterface& iface) {
-        return !iface.name.empty() && !iface.address.empty() && iface.isUp && iface.supportsMulticast;
-    };
-
-    // Prefer an explicitly configured input interface, then the stream/output
-    // interface.  Both may be either an IPv4 address or a Linux interface name.
-    const std::string preferredInput = cfg.inputInterfaceAddressConfigured
-        ? cfg.inputInterfaceAddress : std::string{};
-    for (const auto& preferred : {preferredInput, cfg.interfaceAddress}) {
-        if (preferred.empty() || preferred == "127.0.0.1" || preferred == "lo") continue;
-        for (const auto& iface : interfaces) {
-            if (usable(iface) && (iface.address == preferred || iface.name == preferred)) {
-                return {iface.name, iface.address};
-            }
-        }
-    }
-
-    // Internal DVB multicast must never be pinned to loopback.  utils.cpp
-    // intentionally excludes lo because Linux loopback normally has no
-    // IFF_MULTICAST flag.  Pick the first usable real interface instead.
-    for (const auto& iface : interfaces) {
-        if (usable(iface)) {
-            return {iface.name, iface.address};
-        }
-    }
-    return {};
-}
-
-const CaProviderConfig* findCaProvider(const ConfigManager& manager, const std::string& id) {
-    if (id.empty()) return nullptr;
-    for (const auto& provider : manager.config.caProviders) {
-        if (provider.id == id) return &provider;
-    }
-    return nullptr;
-}
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -204,10 +155,28 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
     }
 }
 
-void setSerializedPropertyIfPresent(GstElement* element, const char* propertyName, const std::string& value) {
-    if (hasProperty(element, propertyName) && !value.empty()) {
-        gst_util_set_object_arg(G_OBJECT(element), propertyName, value.c_str());
+void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
+    (void)userData;
+    if (!queue) {
+        return;
     }
+
+    // queue::running fires once the configured startup threshold is satisfied.
+    // Drop min-threshold-time to zero at that point so the reservoir is a
+    // startup prebuffer only. Leaving min-threshold-time enabled permanently
+    // makes queue re-block every time its level later falls below the threshold,
+    // which matches the observed rare audio stalls after 30-40 seconds.
+    if (g_object_get_data(G_OBJECT(queue), "tvs-audio-reservoir-started")) {
+        return;
+    }
+
+    g_object_set_data(
+        G_OBJECT(queue), "tvs-audio-reservoir-started", GINT_TO_POINTER(1));
+    setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
+
+    std::cerr << "Stable UDP audio reservoir startup complete: "
+              << "startup_reservoir_ms=1500 min_threshold_ms=0 "
+              << "steady_state=clocksync-only" << std::endl;
 }
 
 std::string outputType(const StreamConfig& cfg) {
@@ -218,7 +187,7 @@ std::string outputType(const StreamConfig& cfg) {
         type = "udp-cbr";
     }
 
-    if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" &&
+    if (type != "udp" && type != "udp-vbr" && type != "udp-cbr" && type != "rtp" &&
         type != "srt" && type != "http" && type != "hls" && type != "rtsp" && type != "rtmp" && type != "youtube") {
         type = "udp";
     }
@@ -229,8 +198,20 @@ bool isUdpOutputType(const std::string& type) {
     return type == "udp" || type == "udp-vbr" || type == "udp-cbr";
 }
 
-bool isUdpOutput(const StreamConfig& cfg) {
+bool usesStableUdpShaper(const StreamConfig& cfg) {
     return isUdpOutputType(outputType(cfg));
+}
+
+bool allOutputsUseStableUdp(const StreamConfig& cfg) {
+    const auto outputs = tvs::protocols::outputConfigs(cfg);
+    return !outputs.empty() && std::all_of(outputs.begin(), outputs.end(), [](const StreamConfig& output) {
+        return usesStableUdpShaper(output);
+    });
+}
+
+bool isUdpOutput(const StreamConfig& cfg) {
+    const std::string type = outputType(cfg);
+    return isUdpOutputType(type) || type == "rtp";
 }
 
 bool udpCbrOutputEnabled(const StreamConfig& cfg) {
@@ -413,8 +394,11 @@ StreamConfig transcodeRelayOutputConfig(const StreamConfig& cfg) {
     relay.outputHost = tvs::protocols::transcodedFifoRelayPath(cfg);
     relay.outputPort = 0;
     relay.additionalOutputs.clear();
-    relay.cbr = true;
-    relay.targetBitrate = transcodeMuxBitrateForStats(cfg);
+    // The FIFO is an unpaced hand-off between the external encoder and the
+    // normal StableUdpOutput stage.  StableUdpOutput owns the final CBR/VBR
+    // clock, NULL stuffing, startup reservoir and UDP packetization.
+    relay.cbr = false;
+    relay.targetBitrate = 0;
     return relay;
 }
 
@@ -511,7 +495,7 @@ bool isMpegTsFile(const std::string& input) {
 }
 
 std::string hlsDirectory(const StreamConfig& cfg) {
-    return "/tmp/tvstreamer5-hls/" + cfg.id;
+    return "/tmp/tvstreammersat5-hls/" + cfg.id;
 }
 
 std::string telegramEscape(const std::string& value) {
@@ -807,14 +791,12 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
     (void)cfg;
-    // v97: multifdsink is a network fan-out sink, not a renderer.  In the
-    // DVB single-service remux path mpegtsmux can preserve/derive timestamps
-    // from PCR/PTS that are not aligned to the pipeline clock.  sync=TRUE can
-    // therefore hold every TS buffer indefinitely even though muxing works and
-    // the HTTP request already received 200 OK.  Send buffers as soon as the
-    // mux produces them; pacing belongs to the upstream queue/CBR pacer.
+    // multifdsink must follow the incoming buffer timestamps. With sync disabled
+    // it writes every available MPEG-TS buffer immediately, producing short
+    // network bursts followed by idle gaps. Timestamp-synchronised delivery
+    // smooths HTTP output without modifying the transport stream itself.
     g_object_set(sink,
-        "sync", FALSE,
+        "sync", TRUE,
         "async", FALSE,
         "qos", FALSE,
         nullptr);
@@ -831,6 +813,66 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
         "target-duration", 4,
         "max-files", 8,
         nullptr);
+}
+
+GstElement* createRtpMpegTsSink(const StreamConfig& cfg, const std::string& sinkName) {
+    if (!hasElementFactory("rtpmp2tpay") || !hasElementFactory("udpsink")) {
+        std::cerr << "missing RTP output elements: rtpmp2tpay or udpsink" << std::endl;
+        return nullptr;
+    }
+
+    GstElement* bin = gst_bin_new(sinkName.c_str());
+    GstElement* pay = gst_element_factory_make("rtpmp2tpay", "rtp_mpegts_pay");
+    GstElement* udp = gst_element_factory_make("udpsink", "rtp_udp_sink");
+    if (!bin || !pay || !udp) {
+        if (bin) gst_object_unref(bin);
+        if (pay) gst_object_unref(pay);
+        if (udp) gst_object_unref(udp);
+        return nullptr;
+    }
+
+    gst_bin_add_many(GST_BIN(bin), pay, udp, nullptr);
+    setUIntPropertyIfPresent(pay, "mtu", 1400);
+
+    const std::string host = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+    g_object_set(udp,
+        "host", host.c_str(),
+        "port", static_cast<gint>(cfg.outputPort),
+        "sync", TRUE,
+        "async", FALSE,
+        "qos", FALSE,
+        "auto-multicast", TRUE,
+        "ttl-mc", 32,
+        "buffer-size", 8 * 1024 * 1024,
+        nullptr);
+    setInt64PropertyIfPresent(udp, "max-lateness", -1);
+    if (!cfg.interfaceAddress.empty()) {
+        setStringPropertyIfPresent(udp, "bind-address", cfg.interfaceAddress);
+    }
+
+    if (!gst_element_link(pay, udp)) {
+        gst_object_unref(bin);
+        return nullptr;
+    }
+
+    GstPad* paySink = gst_element_get_static_pad(pay, "sink");
+    if (!paySink) {
+        gst_object_unref(bin);
+        return nullptr;
+    }
+    GstPad* ghostSink = gst_ghost_pad_new("sink", paySink);
+    gst_object_unref(paySink);
+    if (!ghostSink || !gst_element_add_pad(bin, ghostSink)) {
+        if (ghostSink) gst_object_unref(ghostSink);
+        gst_object_unref(bin);
+        return nullptr;
+    }
+
+    std::cerr << "RTP MPEG-TS output: rtp://" << host << ":" << cfg.outputPort
+              << " packetization=7x188 mtu=1400"
+              << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
+              << std::endl;
+    return bin;
 }
 
 void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
@@ -900,7 +942,13 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    if (cbrMuxEnabled(cfg)) {
+    const bool externalUdpShaper = usesStableUdpShaper(cfg);
+    if (externalUdpShaper) {
+        // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
+        // mpegtsmux unpadded so the sender can build either strict CBR or
+        // source-rate-following VBR from one clean SPTS timeline.
+        setUInt64PropertyIfPresent(mux, "bitrate", 0);
+    } else if (cbrMuxEnabled(cfg)) {
         setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
 }
@@ -929,7 +977,7 @@ void sendServiceDescription(GstElement* mux, const StreamConfig& cfg) {
     GstMpegtsDescriptor* descriptor = gst_mpegts_descriptor_from_dvb_service(
         GST_DVB_SERVICE_DIGITAL_TELEVISION,
         cfg.serviceName.empty() ? cfg.name.c_str() : cfg.serviceName.c_str(),
-        cfg.serviceProvider.empty() ? "TVStreamer5" : cfg.serviceProvider.c_str());
+        cfg.serviceProvider.empty() ? "TVStreammerSAT5" : cfg.serviceProvider.c_str());
     if (descriptor) {
         g_ptr_array_add(service->descriptors, descriptor);
     }
@@ -1135,66 +1183,6 @@ bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
            outputConfig.outputPort > 0;
 }
 
-std::string satelliteFrontendKeyForConfig(const StreamConfig& cfg) {
-    return std::to_string(cfg.satelliteAdapter) + ":" + std::to_string(cfg.satelliteFrontend);
-}
-
-bool sameSatelliteTune(const StreamConfig& left, const StreamConfig& right) {
-    return left.satelliteAdapter == right.satelliteAdapter &&
-           left.satelliteFrontend == right.satelliteFrontend &&
-           left.satelliteFrequency == right.satelliteFrequency &&
-           left.satelliteSymbolRate == right.satelliteSymbolRate &&
-           toLower(left.satellitePolarization) == toLower(right.satellitePolarization) &&
-           toLower(left.satelliteDeliverySystem) == toLower(right.satelliteDeliverySystem) &&
-           toLower(left.satelliteModulation) == toLower(right.satelliteModulation) &&
-           toLower(left.satelliteFec) == toLower(right.satelliteFec) &&
-           toLower(left.satellitePilot) == toLower(right.satellitePilot) &&
-           toLower(left.satelliteRolloff) == toLower(right.satelliteRolloff) &&
-           left.satelliteDiseqcSource == right.satelliteDiseqcSource &&
-           left.satelliteStreamId == right.satelliteStreamId &&
-           left.satelliteLnbLof1 == right.satelliteLnbLof1 &&
-           left.satelliteLnbLof2 == right.satelliteLnbLof2 &&
-           left.satelliteLnbSlof == right.satelliteLnbSlof;
-}
-
-std::string satelliteHubMulticastAddress(const StreamConfig& cfg) {
-    const unsigned slot = static_cast<unsigned>((cfg.satelliteAdapter * 16 + cfg.satelliteFrontend) % 250);
-    return "239.255.250." + std::to_string(slot + 1);
-}
-
-uint16_t satelliteHubMulticastPort(const StreamConfig& cfg) {
-    const unsigned slot = static_cast<unsigned>((cfg.satelliteAdapter * 16 + cfg.satelliteFrontend) % 1000);
-    return static_cast<uint16_t>(45000 + slot);
-}
-
-std::string popPipelineError(GstBus* bus, const std::string& fallback) {
-    if (!bus) return fallback;
-    GstMessage* msg = gst_bus_timed_pop_filtered(
-        bus, 1500 * GST_MSECOND,
-        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING));
-    if (!msg) return fallback;
-    std::string result = fallback;
-    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
-        GError* err = nullptr;
-        gchar* dbg = nullptr;
-        gst_message_parse_error(msg, &err, &dbg);
-        if (err && err->message) result = err->message;
-        if (dbg && *dbg) result += std::string(" | ") + dbg;
-        if (err) g_error_free(err);
-        g_free(dbg);
-    }
-    gst_message_unref(msg);
-    return result;
-}
-
-void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SECOND) {
-    if (!pipeline) return;
-    const GstStateChangeReturn result = gst_element_set_state(pipeline, GST_STATE_NULL);
-    if (result == GST_STATE_CHANGE_ASYNC) {
-        gst_element_get_state(pipeline, nullptr, nullptr, timeout);
-    }
-}
-
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
@@ -1206,534 +1194,6 @@ StreamManager::~StreamManager() {
     stopAll();
 }
 
-uint16_t StreamManager::allocateSatelliteServiceRelayPort(const std::string& streamId) {
-    constexpr uint16_t kFirstPort = 47000;
-    constexpr uint16_t kPortCount = 12000;
-    const size_t hash = std::hash<std::string>{}(streamId);
-    std::lock_guard<std::mutex> lock(managerMutex);
-    for (uint16_t offset = 0; offset < kPortCount; ++offset) {
-        const uint16_t port = static_cast<uint16_t>(kFirstPort + ((hash + offset) % kPortCount));
-        if (satelliteServiceRelayPorts.insert(port).second) {
-            return port;
-        }
-    }
-    return 0;
-}
-
-void StreamManager::releaseSatelliteServiceRelayPort(uint16_t port) {
-    if (!port) return;
-    std::lock_guard<std::mutex> lock(managerMutex);
-    satelliteServiceRelayPorts.erase(port);
-}
-
-bool StreamManager::acquireSatelliteTransponder(
-    const StreamConfig& cfg,
-    std::string& frontendKey,
-    std::string& multicastAddress,
-    uint16_t& multicastPort,
-    std::string& error) {
-    frontendKey = satelliteFrontendKeyForConfig(cfg);
-    error.clear();
-
-    std::lock_guard<std::mutex> lock(managerMutex);
-    auto existing = satelliteTransponders.find(frontendKey);
-    if (existing != satelliteTransponders.end()) {
-        if (!sameSatelliteTune(existing->second->tuningConfig, cfg)) {
-            const auto& active = existing->second->tuningConfig;
-            std::ostringstream ss;
-            ss << "DVB adapter " << cfg.satelliteAdapter << " frontend " << cfg.satelliteFrontend
-               << " is already tuned to " << active.satelliteFrequency << " kHz SR "
-               << active.satelliteSymbolRate << " " << active.satellitePolarization
-               << "; stop those channels before tuning another transponder";
-            error = ss.str();
-            return false;
-        }
-        ++existing->second->consumers;
-        multicastAddress = existing->second->multicastAddress;
-        multicastPort = existing->second->multicastPort;
-        std::cerr << "Shared DVB frontend reused: " << frontendKey
-                  << " consumers=" << existing->second->consumers
-                  << " relay=udp://@" << multicastAddress << ":" << multicastPort << std::endl;
-        return true;
-    }
-
-    auto shared = std::make_unique<SatelliteTransponderState>();
-    shared->tuningConfig = cfg;
-    shared->multicastAddress = satelliteHubMulticastAddress(cfg);
-    shared->multicastPort = satelliteHubMulticastPort(cfg);
-    shared->consumers = 1;
-
-    GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(cfg.satelliteAdapter) + "_" + std::to_string(cfg.satelliteFrontend)).c_str());
-    GstElement* source = gst_element_factory_make("dvbsrc", "shared_satellite_source");
-    if (!source) {
-        source = gst_element_factory_make("dvbbasebin", "shared_satellite_source");
-    }
-    GstElement* queue = gst_element_factory_make("queue", "shared_satellite_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "shared_satellite_multicast_sink");
-    if (!pipeline || !source || !queue || !sink ||
-        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
-        if (pipeline) {
-            stopPipelineAndWait(pipeline);
-            gst_object_unref(pipeline);
-        } else {
-            if (source && !GST_OBJECT_PARENT(source)) gst_object_unref(source);
-            if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
-            if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
-        }
-        error = "failed to create shared DVB frontend pipeline";
-        return false;
-    }
-
-    configureQueue(queue, 12000000000ULL);
-    setIntPropertyIfPresent(source, "adapter", cfg.satelliteAdapter);
-    setIntPropertyIfPresent(source, "frontend", cfg.satelliteFrontend);
-    setUIntPropertyIfPresent(source, "frequency", cfg.satelliteFrequency);
-    setUIntPropertyIfPresent(source, "symbol-rate", cfg.satelliteSymbolRate);
-    setStringPropertyIfPresent(source, "polarity", cfg.satellitePolarization);
-    setSerializedPropertyIfPresent(source, "delsys", cfg.satelliteDeliverySystem);
-    setSerializedPropertyIfPresent(source, "modulation", cfg.satelliteModulation);
-    setSerializedPropertyIfPresent(source, "code-rate-hp", cfg.satelliteFec);
-    setSerializedPropertyIfPresent(source, "pilot", cfg.satellitePilot);
-    setSerializedPropertyIfPresent(source, "rolloff", cfg.satelliteRolloff);
-    setIntPropertyIfPresent(source, "diseqc-source", cfg.satelliteDiseqcSource);
-    setIntPropertyIfPresent(source, "stream-id", cfg.satelliteStreamId);
-    setUIntPropertyIfPresent(source, "lnb-lof1", cfg.satelliteLnbLof1);
-    setUIntPropertyIfPresent(source, "lnb-lof2", cfg.satelliteLnbLof2);
-    setUIntPropertyIfPresent(source, "lnb-slof", cfg.satelliteLnbSlof);
-    setUInt64PropertyIfPresent(source, "tuning-timeout", 5000000000ULL); // v98: 5 s on GStreamer 1.20 (nanoseconds)
-    // v90: for the shared transponder hub prefer dvbsrc and request the full
-    // transport stream. dvbbasebin may expose only selected program pads and on
-    // some DVB-S2 services the downstream SID relay never receives TS packets.
-    // PID 8192 means full TS for dvbsrc. If the property is absent this is a no-op.
-    setStringPropertyIfPresent(source, "pids", "8192");
-
-    const auto internalMulticastInterface = selectInternalMulticastInterface(cfg);
-    if (internalMulticastInterface.name.empty()) {
-        stopPipelineAndWait(pipeline);
-        gst_object_unref(pipeline);
-        error = "no active multicast-capable network interface for shared DVB hub";
-        return false;
-    }
-
-    g_object_set(sink,
-        "host", shared->multicastAddress.c_str(),
-        "port", static_cast<gint>(shared->multicastPort),
-        "sync", FALSE,
-        "async", FALSE,
-        nullptr);
-    setStringPropertyIfPresent(sink, "multicast-iface", internalMulticastInterface.name);
-    setBooleanPropertyIfPresent(sink, "auto-multicast", TRUE);
-    setBooleanPropertyIfPresent(sink, "loop", TRUE);
-    setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "ttl-mc", 1);
-    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
-
-    if (!gst_element_link_many(source, queue, sink, nullptr)) {
-        stopPipelineAndWait(pipeline);
-        gst_object_unref(pipeline);
-        error = "failed to link shared DVB frontend pipeline";
-        return false;
-    }
-
-    shared->pipeline = pipeline;
-    shared->bus = gst_element_get_bus(pipeline);
-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateResult == GST_STATE_CHANGE_FAILURE) {
-        error = popPipelineError(shared->bus, "failed to start shared DVB frontend");
-        stopPipelineAndWait(pipeline);
-        if (shared->bus) gst_object_unref(shared->bus);
-        gst_object_unref(pipeline);
-        return false;
-    }
-
-    multicastAddress = shared->multicastAddress;
-    multicastPort = shared->multicastPort;
-    std::cerr << "Shared DVB frontend started: " << frontendKey
-              << " source=" << GST_OBJECT_NAME(source)
-              << " frequency_khz=" << cfg.satelliteFrequency
-              << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
-              << " polarity=" << cfg.satellitePolarization
-              << " relay=udp://@" << multicastAddress << ":" << multicastPort
-              << " iface=" << internalMulticastInterface.name
-              << " localaddr=" << internalMulticastInterface.address << std::endl;
-    satelliteTransponders[frontendKey] = std::move(shared);
-    return true;
-}
-
-void StreamManager::releaseSatelliteTransponder(const std::string& frontendKey) {
-    if (frontendKey.empty()) return;
-    std::unique_ptr<SatelliteTransponderState> released;
-    {
-        std::lock_guard<std::mutex> lock(managerMutex);
-        auto found = satelliteTransponders.find(frontendKey);
-        if (found == satelliteTransponders.end()) return;
-        if (found->second->consumers > 1) {
-            --found->second->consumers;
-            std::cerr << "Shared DVB frontend retained: " << frontendKey
-                      << " consumers=" << found->second->consumers << std::endl;
-            return;
-        }
-        released = std::move(found->second);
-        satelliteTransponders.erase(found);
-    }
-    if (released->pipeline) {
-        stopPipelineAndWait(released->pipeline);
-    }
-    if (released->bus) gst_object_unref(released->bus);
-    if (released->pipeline) gst_object_unref(released->pipeline);
-    std::cerr << "Shared DVB frontend stopped: " << frontendKey << std::endl;
-}
-
-bool StreamManager::startSatelliteServiceRelay(
-    StreamState* state,
-    const std::string& multicastAddress,
-    uint16_t multicastPort,
-    std::string& error) {
-    if (!state) {
-        error = "invalid stream state for satellite service relay";
-        return false;
-    }
-    const bool wholeTransponder = state->config.satelliteServiceId == 0;
-
-    const uint16_t outputPort = allocateSatelliteServiceRelayPort(state->config.id);
-    if (!outputPort) {
-        error = "no free internal UDP port for satellite service relay";
-        return false;
-    }
-
-    auto relay = std::make_unique<SatelliteServiceRelayState>();
-    relay->outputPort = outputPort;
-    if (!wholeTransponder) {
-        relay->context = std::make_unique<RemapContext>();
-        relay->context->config = state->config;
-        relay->context->config.cbr = false;
-        relay->context->config.targetBitrate = 0;
-        relay->context->config.remapEnabled = false;
-    }
-
-    GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
-    GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
-    GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
-    GstElement* parse = gst_element_factory_make("tsparse", "shared_transponder_parse");
-    GstElement* demux = wholeTransponder ? nullptr : gst_element_factory_make("tsdemux", "shared_service_demux");
-    GstElement* mux = wholeTransponder ? nullptr : gst_element_factory_make("mpegtsmux", "shared_service_mux");
-    GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
-    if (!pipeline || !source || !inputQueue || !parse || !outputQueue || !sink ||
-        (!wholeTransponder && (!demux || !mux)) ||
-        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, parse) ||
-        (!wholeTransponder && (!addElementOrFail(pipeline, demux) || !addElementOrFail(pipeline, mux))) ||
-        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
-        if (pipeline) {
-            stopPipelineAndWait(pipeline);
-            gst_object_unref(pipeline);
-        }
-        releaseSatelliteServiceRelayPort(outputPort);
-        error = "failed to create satellite service relay pipeline";
-        return false;
-    }
-
-    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
-    g_object_set(source,
-        "address", multicastAddress.c_str(),
-        "port", static_cast<gint>(multicastPort),
-        "reuse", TRUE,
-        "auto-multicast", TRUE,
-        "buffer-size", 16 * 1024 * 1024,
-        "caps", caps,
-        nullptr);
-    if (caps) gst_caps_unref(caps);
-    const auto internalMulticastInterface = selectInternalMulticastInterface(state->config);
-    if (internalMulticastInterface.name.empty()) {
-        stopPipelineAndWait(pipeline);
-        gst_object_unref(pipeline);
-        releaseSatelliteServiceRelayPort(outputPort);
-        error = "no active multicast-capable network interface for satellite service relay";
-        return false;
-    }
-    setStringPropertyIfPresent(source, "multicast-iface", internalMulticastInterface.name);
-    configureQueue(inputQueue, 12000000000ULL);
-    configureTsPacketAlignment(parse);
-    setBooleanPropertyIfPresent(parse, "set-timestamps", FALSE);
-    if (!wholeTransponder) {
-        setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(state->config.satelliteServiceId));
-        configureTsMux(mux, relay->context->config);
-        sendServiceDescription(mux, relay->context->config);
-    }
-    configureQueue(outputQueue, 8000000000ULL);
-
-    // v92: measure service-relay activity at the last queue before udpsink.
-    // The previous watchdog only trusted the downstream playback pipeline's
-    // input probe.  On the DVB-S2 shared-input path that probe could remain at
-    // zero even while tsdemux had already discovered and linked the service,
-    // causing a healthy FTA relay to be restarted every five seconds.
-    GstPad* relayOutputPad = gst_element_get_static_pad(outputQueue, "src");
-    if (relayOutputPad) {
-        gst_pad_add_probe(
-            relayOutputPad,
-            static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_BUFFER_LIST),
-            +[](GstPad*, GstPadProbeInfo* info, gpointer userData) -> GstPadProbeReturn {
-                auto* relayState = static_cast<SatelliteServiceRelayState*>(userData);
-                if (!relayState) return GST_PAD_PROBE_OK;
-                if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
-                    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
-                    if (buffer) {
-                        relayState->outputBytes.fetch_add(
-                            gst_buffer_get_size(buffer), std::memory_order_relaxed);
-                    }
-                } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
-                    GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
-                    if (list) {
-                        guint n = gst_buffer_list_length(list);
-                        uint64_t bytes = 0;
-                        for (guint i = 0; i < n; ++i) {
-                            GstBuffer* buffer = gst_buffer_list_get(list, i);
-                            if (buffer) bytes += gst_buffer_get_size(buffer);
-                        }
-                        relayState->outputBytes.fetch_add(bytes, std::memory_order_relaxed);
-                    }
-                }
-                return GST_PAD_PROBE_OK;
-            },
-            relay.get(),
-            nullptr);
-        gst_object_unref(relayOutputPad);
-    }
-
-    g_object_set(sink,
-        "host", "127.0.0.1",
-        "port", static_cast<gint>(outputPort),
-        "sync", FALSE,
-        "async", FALSE,
-        nullptr);
-    setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
-
-    const bool linked = wholeTransponder
-        ? gst_element_link_many(source, inputQueue, parse, outputQueue, sink, nullptr)
-        : (gst_element_link_many(source, inputQueue, parse, demux, nullptr) &&
-           gst_element_link_many(mux, outputQueue, sink, nullptr));
-    if (!linked) {
-        stopPipelineAndWait(pipeline);
-        gst_object_unref(pipeline);
-        releaseSatelliteServiceRelayPort(outputPort);
-        error = "failed to link satellite service relay pipeline";
-        return false;
-    }
-
-    if (!wholeTransponder) {
-        relay->context->mux = mux;
-        relay->context->sink = sink;
-        relay->context->flvMux = false;
-        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), relay->context.get());
-    }
-    relay->pipeline = pipeline;
-    relay->bus = gst_element_get_bus(pipeline);
-
-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateResult == GST_STATE_CHANGE_FAILURE) {
-        error = popPipelineError(relay->bus, "failed to start satellite service relay");
-        stopPipelineAndWait(pipeline);
-        if (relay->bus) gst_object_unref(relay->bus);
-        gst_object_unref(pipeline);
-        releaseSatelliteServiceRelayPort(outputPort);
-        return false;
-    }
-
-    state->satelliteServiceRelayUri = "udp://127.0.0.1:" + std::to_string(outputPort);
-    state->satelliteServiceRelay = std::move(relay);
-    std::cerr << "Satellite service relay started: stream=" << state->config.id
-              << " SID=" << state->config.satelliteServiceId
-              << " transponder=udp://@" << multicastAddress << ":" << multicastPort
-              << " service=" << state->satelliteServiceRelayUri << std::endl;
-    return true;
-}
-
-void StreamManager::stopSatelliteServiceRelay(StreamState* state) {
-    if (!state || !state->satelliteServiceRelay) return;
-    auto relay = std::move(state->satelliteServiceRelay);
-    if (relay->pipeline) {
-        stopPipelineAndWait(relay->pipeline);
-    }
-    if (relay->bus) gst_object_unref(relay->bus);
-    if (relay->pipeline) gst_object_unref(relay->pipeline);
-    releaseSatelliteServiceRelayPort(relay->outputPort);
-}
-
-bool StreamManager::prepareSharedSatelliteInput(StreamState* state, std::string& error) {
-    if (!state) {
-        error = "invalid stream state";
-        return false;
-    }
-    state->runtimeConfig = state->config;
-    if (!state->config.satelliteEnabled || state->config.testPattern) {
-        return true;
-    }
-
-    std::string multicastAddress;
-    uint16_t multicastPort = 0;
-    if (!acquireSatelliteTransponder(
-            state->config, state->satelliteFrontendKey, multicastAddress, multicastPort, error)) {
-        return false;
-    }
-
-    // v95: FTA channels must not open the DVB frontend a second time.  The
-    // scanner/shared hub has already proven that adapter/frontend can be tuned
-    // successfully.  Feed the full transponder multicast directly into the
-    // channel's main pipeline and let the v94 single-service tsdemux/remux pick
-    // the configured SID there.  This removes both failure modes seen in v94:
-    //   1) dvbbasebin/dvbsrc "Failed to start" because the frontend is busy;
-    //   2) the old per-service loopback relay watchdog/restart loop.
-    // Scrambled services keep the per-service relay path for now because their
-    // CA backend may need a dedicated service branch later.
-    if (!state->config.satelliteScrambled) {
-        state->sharedSatelliteInput = true;
-        state->lastSatelliteRelayBytesSeen = 0;
-        state->satelliteServiceRelayUri =
-            "udp://@" + multicastAddress + ":" + std::to_string(multicastPort);
-        state->runtimeConfig = state->config;
-        state->runtimeConfig.satelliteEnabled = false;
-        state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
-        state->runtimeConfig.inputMode = "udp";
-        // v96: join the internal multicast on the same real multicast-capable
-        // interface used by the shared DVB hub. Never force 127.0.0.1/lo here:
-        // Linux loopback is not advertised by enumerateNetworkInterfaces() as a
-        // multicast-capable interface, which caused the v95 startup failure.
-        const auto internalMulticastInterface = selectInternalMulticastInterface(state->config);
-        if (internalMulticastInterface.address.empty()) {
-            releaseSatelliteTransponder(state->satelliteFrontendKey);
-            state->satelliteFrontendKey.clear();
-            error = "no active multicast-capable network interface for FTA shared DVB input";
-            return false;
-        }
-        state->runtimeConfig.inputInterfaceAddress = internalMulticastInterface.address;
-        state->runtimeConfig.inputInterfaceAddressConfigured = true;
-        std::cerr << "FTA shared-transponder input attached: stream=" << state->config.id
-                  << " frontend=" << state->satelliteFrontendKey
-                  << " SID=" << state->config.satelliteServiceId
-                  << " source=" << state->satelliteServiceRelayUri
-                  << " iface=" << internalMulticastInterface.name
-                  << " localaddr=" << internalMulticastInterface.address << std::endl;
-        return true;
-    }
-
-    if (!startSatelliteServiceRelay(state, multicastAddress, multicastPort, error)) {
-        releaseSatelliteTransponder(state->satelliteFrontendKey);
-        state->satelliteFrontendKey.clear();
-        return false;
-    }
-
-    state->sharedSatelliteInput = true;
-    state->lastSatelliteRelayBytesSeen = 0;
-    state->runtimeConfig = state->config;
-    state->runtimeConfig.satelliteEnabled = false;
-    state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
-    state->runtimeConfig.inputMode = "udp";
-    state->runtimeConfig.inputInterfaceAddress.clear();
-    state->runtimeConfig.inputInterfaceAddressConfigured = true;
-    std::cerr << "Satellite shared-input attached: stream=" << state->config.id
-              << " frontend=" << state->satelliteFrontendKey
-              << " SID=" << state->config.satelliteServiceId
-              << " source=" << state->satelliteServiceRelayUri << std::endl;
-    return true;
-}
-
-void StreamManager::releaseSharedSatelliteInput(StreamState* state) {
-    if (!state) return;
-    stopSatelliteServiceRelay(state);
-    if (!state->satelliteFrontendKey.empty()) {
-        releaseSatelliteTransponder(state->satelliteFrontendKey);
-    }
-    state->satelliteFrontendKey.clear();
-    state->satelliteServiceRelayUri.clear();
-    state->sharedSatelliteInput = false;
-}
-
-void StreamManager::throttleCaProviderStart(const std::string& providerId) {
-    if (providerId.empty()) {
-        return;
-    }
-
-    std::chrono::milliseconds delay{0};
-    {
-        std::lock_guard<std::mutex> lock(managerMutex);
-        const auto now = std::chrono::steady_clock::now();
-        auto& last = caProviderLastStart[providerId];
-        if (last.time_since_epoch().count() != 0) {
-            const auto nextAllowed = last + kCaProviderStartSpacing;
-            if (now < nextAllowed) {
-                delay = std::chrono::duration_cast<std::chrono::milliseconds>(nextAllowed - now);
-                last = nextAllowed;
-            } else {
-                last = now;
-            }
-        } else {
-            last = now;
-        }
-    }
-
-    if (delay.count() > 0) {
-        std::cerr << "CA provider start throttle: provider=" << providerId
-                  << " delay_ms=" << delay.count() << std::endl;
-        std::this_thread::sleep_for(delay);
-    }
-}
-
-bool StreamManager::restartSharedSatelliteInput(StreamState* state, const std::string& reason, std::string& error) {
-    if (!state || !state->config.satelliteEnabled || state->caProviderTransport) {
-        error = "not a shared DVB satellite input";
-        return false;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (state->lastSatelliteRelayRestart.time_since_epoch().count() != 0 &&
-        now - state->lastSatelliteRelayRestart < kSatelliteRelayRestartInterval) {
-        error = "satellite relay restart throttled";
-        return false;
-    }
-    state->lastSatelliteRelayRestart = now;
-    ++state->satelliteRelayRestartCount;
-
-    std::cerr << "Restarting shared satellite input: stream=" << state->config.id
-              << " SID=" << state->config.satelliteServiceId
-              << " reason=" << reason
-              << " attempt=" << state->satelliteRelayRestartCount << std::endl;
-
-    // v90: do not switch to a second direct DVB pipeline on the same frontend.
-    // For this architecture the reliable path is: dvbsrc full transponder hub
-    // -> per-service relay. If the selected SID still produces no packets after
-    // one relay rebuild, stop recovery attempts and report the real problem
-    // instead of entering a GStreamer teardown/restart crash loop.
-    if (state->satelliteRelayRestartCount > 1) {
-        error = "satellite service relay has no packets for SID " + std::to_string(state->config.satelliteServiceId) +
-                "; rescan transponder or verify service_id/video_pid/audio_pid";
-        state->statusMessage = error;
-        state->satelliteRelayRecoveryDisabled = true;
-        std::cerr << "Satellite relay recovery disabled after repeated no-input: stream="
-                  << state->config.id << " SID=" << state->config.satelliteServiceId << std::endl;
-        return false;
-    }
-
-    releaseSharedSatelliteInput(state);
-    std::string prepareError;
-    if (!prepareSharedSatelliteInput(state, prepareError)) {
-        error = prepareError.empty() ? "failed to prepare shared satellite input" : prepareError;
-        state->statusMessage = "satellite relay recovery failed: " + error;
-        return false;
-    }
-
-    if (!restartPipelineWithInput(state, state->satelliteServiceRelayUri, false)) {
-        error = "failed to restart pipeline after satellite relay recovery";
-        state->statusMessage = "satellite relay recovery failed: " + error;
-        return false;
-    }
-
-    state->inputLossNotified = false;
-    state->primaryRetryPending = false;
-    state->statusMessage = "running after satellite relay recovery";
-    return true;
-}
 
 void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg) {
     if (!sink) {
@@ -1897,7 +1357,7 @@ bool StreamManager::startExternalSrtOutputs(StreamState* state, std::string& err
             }
             if (error.empty()) error = "failed to start transcoded SRT output relay";
             if (output->pipeline) {
-                stopPipelineAndWait(output->pipeline);
+                gst_element_set_state(output->pipeline, GST_STATE_NULL);
                 gst_object_unref(output->pipeline);
                 output->pipeline = nullptr;
             }
@@ -1920,14 +1380,11 @@ void StreamManager::stopExternalSrtOutputs(StreamState* state) {
     }
     for (auto& output : state->externalSrtOutputs) {
         if (!output) continue;
-        if (output->bus) {
-            gst_bus_set_flushing(output->bus, TRUE);
+        if (output->pipeline) {
+            gst_element_set_state(output->pipeline, GST_STATE_NULL);
         }
         if (output->busThread.joinable()) {
             output->busThread.join();
-        }
-        if (output->pipeline) {
-            stopPipelineAndWait(output->pipeline);
         }
         if (output->bus) {
             gst_object_unref(output->bus);
@@ -1946,6 +1403,46 @@ void StreamManager::monitorExternalSrtBus(const std::string& id, size_t outputIn
     (void)outputIndex;
 }
 
+GstElement* StreamManager::createTranscodedUdpRelayPipeline(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "transcoded UDP relay state is null";
+        return nullptr;
+    }
+
+    const std::string fifoPath = tvs::protocols::transcodedFifoRelayPath(state->config);
+    GstElement* pipeline = gst_pipeline_new((state->config.id + "_transcoded_udp_relay").c_str());
+    GstElement* src = gst_element_factory_make("filesrc", "transcoded_udp_fifo_src");
+    GstElement* queue = gst_element_factory_make("queue", "transcoded_udp_fifo_queue");
+    if (!pipeline || !src || !queue ||
+        !addElementOrFail(pipeline, src) || !addElementOrFail(pipeline, queue)) {
+        error = "failed to create transcoded UDP FIFO relay elements";
+        if (pipeline) gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    g_object_set(src, "location", fifoPath.c_str(), nullptr);
+    configureQueue(queue, 10000000000ULL);
+    if (!gst_element_link(src, queue)) {
+        error = "failed to link transcoded UDP FIFO relay source";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    // state->config intentionally keeps transcodeEnabled=true.  The output
+    // branch therefore treats the FIFO content as an already finished SPTS and
+    // sends it directly to StableUdpOutput without another demux/remux pass.
+    if (!buildOutputBranches(state, pipeline, queue)) {
+        error = "failed to build normal UDP output after transcoding";
+        gst_object_unref(pipeline);
+        return nullptr;
+    }
+
+    std::cerr << "Transcoded UDP relay: external GStreamer encoder -> fifo://"
+              << fifoPath
+              << " -> StableUdpOutput (default UDP path)" << std::endl;
+    return pipeline;
+}
+
 bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
     if (error) error->clear();
     {
@@ -1962,79 +1459,146 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     }
 
     auto state = std::make_unique<StreamState>();
-    state->config = streamConfig;
-    state->runtimeConfig = streamConfig;
-    state->primarySatelliteEnabled = streamConfig.satelliteEnabled;
 
-    const CaProviderConfig* caProvider = (streamConfig.satelliteEnabled && streamConfig.satelliteScrambled)
-        ? findCaProvider(configManager, streamConfig.caProviderId)
-        : nullptr;
-    if (caProvider) {
-        // v85+ CA Provider is a dynamic reader/card/session manager. It no longer replaces the
-        // satellite input with a pre-decoded endpoint. The MPEG-TS source remains the configured
-        // DVB frontend; reader/card capability integrations can be attached independently.
-        state->caProviderId = caProvider->id;
-        state->caProviderName = caProvider->name;
-        throttleCaProviderStart(caProvider->id);
+    StreamConfig effectiveConfig = streamConfig;
+    // input_service_id == 0 is true AUTO mode. Do not open/probe the live
+    // input in a second temporary pipeline before the real stream starts.
+    // A preflight PAT probe can consume/exclusively occupy SRT sources and can
+    // disturb UDP startup. The real demux/decode pipeline performs automatic
+    // program selection when SID is zero. A non-zero SID is still selected
+    // explicitly with tsdemux program-number.
+    if (effectiveConfig.inputServiceId == 0) {
+        std::cerr << "Input SID mode: AUTO (single live input, no preflight probe)"
+                  << " uri=" << effectiveConfig.inputUri << std::endl;
     }
-    state->primaryInputUri = streamConfig.satelliteEnabled
-        ? tvs::protocols::inputUriForGstreamer(streamConfig)
-        : streamConfig.inputUri;
-    state->activeInputUri = streamConfig.testPattern
-        ? kTestPatternUri
-        : state->primaryInputUri;
+
+    state->config = effectiveConfig;
+    state->primaryInputUri = effectiveConfig.inputUri;
+    state->activeInputUri = effectiveConfig.testPattern ? kTestPatternUri : effectiveConfig.inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = state->runtimeConfig;
+    state->sourceContext->config = effectiveConfig;
 
-    // v95: every satellite channel acquires the shared tuned transponder first.
-    // FTA then reads that hub multicast directly and performs the v94 SID filter
-    // inside the main output pipeline.  This guarantees that only one GStreamer
-    // DVB source owns /dev/dvb/adapterN/frontendM at a time.
-    const bool useSharedSatelliteInput = streamConfig.satelliteEnabled;
+    if (effectiveConfig.transcodeEnabled && allOutputsUseStableUdp(effectiveConfig) &&
+        GstTranscoderProcess::isAvailable()) {
+        std::string relayError;
+        if (!tvs::protocols::prepareFifoRelay(effectiveConfig, relayError)) {
+            state->statusMessage = "transcoded UDP relay setup failed: " + relayError;
+            if (error) *error = relayError;
+            return false;
+        }
 
-    std::string sharedSatelliteError;
-    if (!state->caProviderTransport && useSharedSatelliteInput &&
-        !prepareSharedSatelliteInput(state.get(), sharedSatelliteError)) {
-        state->statusMessage = "satellite shared input failed: " + sharedSatelliteError;
-        if (error) *error = sharedSatelliteError;
-        return false;
+        auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
+        const StreamConfig relayConfig = transcodeRelayOutputConfig(effectiveConfig);
+        std::string gstError;
+        if (!gstTranscoder->start(relayConfig, gstError)) {
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "gstreamer transcoder relay failed: " + gstError;
+            if (error) *error = gstError.empty() ? "GStreamer transcoder relay failed to start" : gstError;
+            return false;
+        }
+        state->gstTranscoder = std::move(gstTranscoder);
+
+        GstElement* relayPipeline = createTranscodedUdpRelayPipeline(state.get(), relayError);
+        if (!relayPipeline) {
+            state->gstTranscoder->stop();
+            state->gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "transcoded UDP output failed: " + relayError;
+            if (error) *error = relayError.empty() ? "failed to create transcoded UDP output" : relayError;
+            return false;
+        }
+
+        state->pipeline = relayPipeline;
+        state->bus = gst_element_get_bus(relayPipeline);
+        state->running = true;
+        state->active = true;
+        state->statusMessage = "starting transcoded UDP";
+        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(effectiveConfig);
+        state->lastInputActivity = std::chrono::steady_clock::now();
+        state->lastPrimaryRetry = state->lastInputActivity;
+        state->lastBitrateSample = state->lastInputActivity;
+        attachBitrateProbes(state.get());
+
+        const GstStateChangeReturn stateChange = gst_element_set_state(relayPipeline, GST_STATE_PLAYING);
+        if (stateChange == GST_STATE_CHANGE_FAILURE) {
+            state->running = false;
+            state->active = false;
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(relayPipeline);
+            state->pipeline = nullptr;
+            state->gstTranscoder->stop();
+            state->gstTranscoder.reset();
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            state->statusMessage = "transcoded UDP relay playback failed";
+            if (error) *error = "failed to start post-transcode StableUdpOutput pipeline";
+            return false;
+        }
+
+        std::cerr << "Pipeline for stream '" << streamConfig.name
+                  << "': external-transcoder -> fifo -> default-udp"
+                  << " transcode=" << streamConfig.transcodeResolution
+                  << "@" << streamConfig.transcodeVideoBitrate
+                  << " outputs=" << buildPipelineDescription(streamConfig) << std::endl;
+
+        bool duplicateStart = false;
+        {
+            std::lock_guard<std::mutex> lock(managerMutex);
+            if (streams.count(streamConfig.id)) {
+                duplicateStart = true;
+            } else {
+                streams[streamConfig.id] = std::move(state);
+                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+            }
+        }
+        if (duplicateStart) {
+            if (state) {
+                state->running = false;
+                if (state->pipeline) gst_element_set_state(state->pipeline, GST_STATE_NULL);
+                if (state->bus) gst_object_unref(state->bus);
+                if (state->pipeline) gst_object_unref(state->pipeline);
+                if (state->gstTranscoder) state->gstTranscoder->stop();
+            }
+            tvs::protocols::removeFifoRelay(effectiveConfig);
+            if (error) *error = "duplicate stream start detected: " + streamConfig.id;
+            return false;
+        }
+
+        notifyStreamState(
+            streamConfig,
+            "🟢",
+            telegramText(configManager, "Поток запущен", "Stream started"),
+            telegramText(configManager, "Транскодинг -> стандартный UDP", "Transcode -> default UDP") +
+                "\nURL: " + streamConfig.inputUri);
+        return true;
     }
-    if (streamConfig.satelliteEnabled && !streamConfig.satelliteScrambled) {
-        std::cerr << "FTA shared DVB hub selected: stream=" << streamConfig.id
-                  << " adapter=" << streamConfig.satelliteAdapter
-                  << " frontend=" << streamConfig.satelliteFrontend
-                  << " SID=" << streamConfig.satelliteServiceId
-                  << " frequency_khz=" << streamConfig.satelliteFrequency
-                  << " source=" << state->satelliteServiceRelayUri
-                  << std::endl;
-        state->statusMessage = "starting FTA via shared DVB-S/S2 transponder hub";
-    }
 
-    if (streamConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
+    if (effectiveConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
         std::string srtRelayError;
         if (!startExternalSrtOutputs(state.get(), srtRelayError)) {
             std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
                       << ": " << srtRelayError << std::endl;
             state->statusMessage = "transcoded srt output failed: " + srtRelayError;
-            releaseSharedSatelliteInput(state.get());
             if (error) *error = srtRelayError.empty() ? "failed to start transcoded SRT output" : srtRelayError;
             return false;
         }
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
-        if (!gstTranscoder->start(state->runtimeConfig, gstError)) {
+        if (!gstTranscoder->start(effectiveConfig, gstError)) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
             stopExternalSrtOutputs(state.get());
-            releaseSharedSatelliteInput(state.get());
             if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
 
         std::cerr << "Pipeline for stream '" << streamConfig.name
-                  << "': gstreamer-transcoder input=" << state->primaryInputUri
+                  << "': gstreamer-transcoder input=" << streamConfig.inputUri
                   << " transcode=" << streamConfig.transcodeResolution
                   << "@" << streamConfig.transcodeVideoBitrate
                   << " outputs=" << gstTranscoder->description() << std::endl;
@@ -2043,12 +1607,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         state->running = true;
         state->active = true;
         state->statusMessage = "running via gstreamer";
-        state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
-        state->inputBitrate = transcodeInputBitrateForStats(streamConfig);
+        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
+        state->inputBitrate = transcodeInputBitrateForStats(effectiveConfig);
         state->lastInputActivity = std::chrono::steady_clock::now();
         state->lastPrimaryRetry = state->lastInputActivity;
         state->lastBitrateSample = state->lastInputActivity;
-        const std::string notificationInputUri = state->primaryInputUri;
 
         bool duplicateStart = false;
         {
@@ -2066,7 +1629,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 if (state->gstTranscoder) {
                     state->gstTranscoder->stop();
                 }
-                releaseSharedSatelliteInput(state.get());
             }
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
@@ -2075,43 +1637,32 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             streamConfig,
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + notificationInputUri);
+            telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + streamConfig.inputUri);
         return true;
     }
 
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
-        releaseSharedSatelliteInput(state.get());
         if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
     }
 
     std::cerr << "Pipeline for stream '" << streamConfig.name
-              << "': " << buildPipelineDescription(state->runtimeConfig) << std::endl;
+              << "': " << buildPipelineDescription(streamConfig) << std::endl;
 
     state->pipeline = pipeline;
     state->bus = gst_element_get_bus(pipeline);
     state->running = true;
     state->active = true;
     state->statusMessage = "starting";
-    state->outputBitrate = initialConfiguredOutputBitrate(streamConfig);
+    state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
-    state->ccRecoveryBurstCount = 0;
     attachBitrateProbes(state.get());
 
     GstStateChangeReturn stateChange = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateChange == GST_STATE_CHANGE_ASYNC) {
-        const GstStateChangeReturn settled = gst_element_get_state(
-            pipeline, nullptr, nullptr, 1200 * GST_MSECOND);
-        if (settled == GST_STATE_CHANGE_FAILURE) {
-            stateChange = GST_STATE_CHANGE_FAILURE;
-        } else if (settled == GST_STATE_CHANGE_SUCCESS || settled == GST_STATE_CHANGE_NO_PREROLL) {
-            stateChange = settled;
-        }
-    }
     if (stateChange == GST_STATE_CHANGE_FAILURE) {
         std::cerr << "Failed to set pipeline to PLAYING for stream: " << streamConfig.name << std::endl;
         std::string playingError = "failed to set pipeline to PLAYING for stream: " + streamConfig.name;
@@ -2145,30 +1696,16 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             gst_object_unref(state->bus);
             state->bus = nullptr;
         }
-        // A failed source can leave child elements in READY while the parent
-        // pipeline transition to PLAYING has already failed.  Dropping the last
-        // pipeline reference in that state is unsafe for some DVB drivers/plugins
-        // (notably dvbsrc/dvbbasebin) and can lead to use-after-free/heap corruption.
-        // Always drive the whole pipeline back to NULL before releasing it.
-        state->running = false;
-        state->active = false;
-        state->statusMessage = "error: " + playingError;
-
-        stopPipelineAndWait(pipeline);
-
         if (state->gstTranscoder) {
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
         }
-        state->pipeline = nullptr;
         gst_object_unref(pipeline);
-        releaseSharedSatelliteInput(state.get());
         if (error) *error = playingError;
         return false;
     }
 
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
-    const std::string notificationInputUri = state->primaryInputUri;
     bool duplicateStart = false;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
@@ -2182,7 +1719,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     if (duplicateStart) {
         state->running = false;
         if (state->pipeline) {
-            stopPipelineAndWait(state->pipeline);
+            gst_element_set_state(state->pipeline, GST_STATE_NULL);
         }
         if (state->bus) {
             gst_object_unref(state->bus);
@@ -2192,7 +1729,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             gst_object_unref(state->pipeline);
             state->pipeline = nullptr;
         }
-        releaseSharedSatelliteInput(state.get());
         if (error) *error = "duplicate stream start detected: " + streamConfig.id;
         return false;
     }
@@ -2200,7 +1736,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         streamConfig,
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
-        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + notificationInputUri);
+        telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + streamConfig.inputUri);
     return true;
 }
 
@@ -2239,18 +1775,11 @@ bool StreamManager::stopStream(const std::string& id) {
 
     auto& state = *statePtr;
     stopExternalSrtOutputs(&state);
-    // Stop the bus consumer before tearing down the GStreamer task graph.
-    // The old order put the pipeline into NULL while monitorBus() could still
-    // be polling the same bus, which is a plausible trigger for repeated
-    // gst_poll_wait/GST_IS_TASK critical assertions during shutdown.
-    if (state.bus) {
-        gst_bus_set_flushing(state.bus, TRUE);
+    if (state.pipeline) {
+        gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
     if (state.busThread.joinable()) {
         state.busThread.join();
-    }
-    if (state.pipeline) {
-        stopPipelineAndWait(state.pipeline);
     }
     if (state.gstTranscoder) {
         state.gstTranscoder->stop();
@@ -2264,9 +1793,9 @@ bool StreamManager::stopStream(const std::string& id) {
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
-    releaseSharedSatelliteInput(&state);
     state.outputContexts.clear();
     state.sourceContext.reset();
+    tvs::protocols::removeFifoRelay(stoppedConfig);
 
     notifyStreamState(
         stoppedConfig,
@@ -2304,14 +1833,11 @@ void StreamManager::stopAll() {
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
         stopExternalSrtOutputs(&state);
-        if (state.bus) {
-            gst_bus_set_flushing(state.bus, TRUE);
+        if (state.pipeline) {
+            gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
         if (state.busThread.joinable()) {
             state.busThread.join();
-        }
-        if (state.pipeline) {
-            stopPipelineAndWait(state.pipeline);
         }
         if (state.gstTranscoder) {
             state.gstTranscoder->stop();
@@ -2323,9 +1849,9 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
         }
-        releaseSharedSatelliteInput(&state);
         state.outputContexts.clear();
         state.sourceContext.reset();
+        tvs::protocols::removeFifoRelay(state.config);
     }
 }
 
@@ -2371,13 +1897,14 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     std::ostringstream desc;
     desc << "manual-pipeline"
-         << " input=" << (cfg.satelliteEnabled ? tvs::protocols::inputUriForGstreamer(cfg) : cfg.inputUri)
+         << " input=" << cfg.inputUri
          << " input_proto=" << tvs::stream_protocols::inputKindName(tvs::stream_protocols::inputKind(cfg))
          << " output_proto=" << tvs::stream_protocols::outputKindName(tvs::stream_protocols::outputKind(cfg))
          << " input_mode=" << cfg.inputMode
          << " input_iface=" << (inputInterface.empty() ? "auto" : inputInterface)
          << " test_pattern=" << (cfg.testPattern ? "on" : "off")
          << " remap=" << (cfg.remapEnabled ? "on" : "off")
+         << " udp_shaper=" << (usesStableUdpShaper(cfg) ? "stable" : "n/a")
          << " transcode=" << (cfg.transcodeEnabled ? cfg.transcodeResolution + "@" + std::to_string(cfg.transcodeVideoBitrate) : "off")
          << " outputs=";
     const auto outputs = outputConfigs(cfg);
@@ -2391,6 +1918,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
     }
     desc
          << " iface=" << cfg.interfaceAddress
+         << " input_service_id=" << cfg.inputServiceId
          << " service_id=" << cfg.serviceId
          << " vpid=" << cfg.videoPid
          << " apid=" << cfg.audioPid;
@@ -2825,7 +2353,7 @@ void StreamManager::notifyStreamState(
     const std::string& title,
     const std::string& details) {
     const std::string serverName = configManager.config.serverName.empty()
-        ? "TVStreamer5"
+        ? "TVStreammerSAT5"
         : configManager.config.serverName;
     std::ostringstream message;
     const bool english = telegramUsesEnglish(configManager);
@@ -2851,9 +2379,8 @@ bool StreamManager::probeInputAvailable(
     probeState.config = baseConfig;
     probeState.config.inputUri = inputUri;
     probeState.config.testPattern = false;
-    probeState.runtimeConfig = probeState.config;
     probeState.sourceContext = std::make_unique<RemapContext>();
-    probeState.sourceContext->config = probeState.runtimeConfig;
+    probeState.sourceContext->config = probeState.config;
 
     GstElement* pipeline = gst_pipeline_new(nullptr);
     if (!pipeline) {
@@ -2866,7 +2393,7 @@ bool StreamManager::probeInputAvailable(
     if (!source || !sourceTail || !sink ||
         !addElementOrFail(pipeline, sink) ||
         !gst_element_link(sourceTail, sink)) {
-        stopPipelineAndWait(pipeline);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         return false;
     }
@@ -2909,7 +2436,7 @@ bool StreamManager::probeInputAvailable(
     }
 
     available = available && receivedData.load(std::memory_order_relaxed);
-    stopPipelineAndWait(pipeline);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
     if (bus) {
         gst_object_unref(bus);
     }
@@ -2925,34 +2452,13 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
 
-    if (oldBus && GST_IS_BUS(oldBus)) {
-        gst_bus_set_flushing(oldBus, TRUE);
-    }
     if (oldPipeline) {
-        stopPipelineAndWait(oldPipeline);
+        gst_element_set_state(oldPipeline, GST_STATE_NULL);
     }
 
-    state->runtimeConfig = state->config;
-    if (useBackup) {
-        state->runtimeConfig.satelliteEnabled = false;
-        state->runtimeConfig.inputUri = inputUri;
-    } else if (state->sharedSatelliteInput) {
-        state->runtimeConfig.satelliteEnabled = false;
-        state->runtimeConfig.inputUri = state->satelliteServiceRelayUri;
-        state->runtimeConfig.inputMode = "udp";
-        if (state->config.satelliteEnabled && !state->config.satelliteScrambled &&
-            state->satelliteServiceRelay == nullptr) {
-            state->runtimeConfig.inputInterfaceAddress = "127.0.0.1";
-        } else {
-            state->runtimeConfig.inputInterfaceAddress.clear();
-        }
-        state->runtimeConfig.inputInterfaceAddressConfigured = true;
-    } else {
-        state->runtimeConfig.inputUri = inputUri;
-        state->runtimeConfig.satelliteEnabled = state->primarySatelliteEnabled;
-    }
+    state->config.inputUri = inputUri;
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = state->runtimeConfig;
+    state->sourceContext->config = state->config;
     state->outputContexts.clear();
 
     GstElement* newPipeline = createPipeline(state);
@@ -2973,7 +2479,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->backupAttempted = useBackup;
     state->primaryRetryPending = !useBackup;
     state->inputLossNotified = false;
-    state->activeInputUri = useBackup ? inputUri : state->primaryInputUri;
+    state->activeInputUri = inputUri;
     state->active = true;
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
@@ -3002,7 +2508,6 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
-    state->ccRecoveryBurstCount = 0;
     attachBitrateProbes(state);
 
     GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
@@ -3019,6 +2524,126 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     }
     return ret != GST_STATE_CHANGE_FAILURE;
 }
+
+
+bool StreamManager::restartTranscodedInput(
+    StreamState* state,
+    const std::string& inputUri,
+    bool useBackup) {
+    if (!state || !state->gstTranscoder || inputUri.empty()) {
+        return false;
+    }
+
+    const bool stableUdpRelay = allOutputsUseStableUdp(state->config);
+    StreamConfig nextConfig = state->config;
+    nextConfig.inputUri = inputUri;
+    nextConfig.testPattern = false;
+
+    std::cerr << "Transcoded input switch: from=" << state->activeInputUri
+              << " to=" << inputUri
+              << " backup=" << (useBackup ? "yes" : "no")
+              << " mode=" << (stableUdpRelay ? "fifo-stable-udp" : "direct-output")
+              << std::endl;
+
+    state->gstTranscoder->stop();
+
+    if (stableUdpRelay) {
+        if (state->pipeline) {
+            gst_element_set_state(state->pipeline, GST_STATE_NULL);
+        }
+        if (state->bus) {
+            gst_object_unref(state->bus);
+            state->bus = nullptr;
+        }
+        if (state->pipeline) {
+            gst_object_unref(state->pipeline);
+            state->pipeline = nullptr;
+        }
+    }
+
+    state->config = nextConfig;
+
+    std::string gstError;
+    const StreamConfig transcoderConfig =
+        stableUdpRelay ? transcodeRelayOutputConfig(nextConfig) : nextConfig;
+
+    if (!state->gstTranscoder->start(transcoderConfig, gstError)) {
+        state->statusMessage = "error: transcoded input restart failed: " + gstError;
+        state->active = false;
+        std::cerr << state->statusMessage << std::endl;
+        return false;
+    }
+
+    if (stableUdpRelay) {
+        std::string relayError;
+        GstElement* relayPipeline = createTranscodedUdpRelayPipeline(state, relayError);
+        if (!relayPipeline) {
+            state->gstTranscoder->stop();
+            state->statusMessage = "error: transcoded UDP relay restart failed: " + relayError;
+            state->active = false;
+            return false;
+        }
+
+        state->pipeline = relayPipeline;
+        state->bus = gst_element_get_bus(relayPipeline);
+        attachBitrateProbes(state);
+
+        if (gst_element_set_state(relayPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            state->gstTranscoder->stop();
+            if (state->bus) {
+                gst_object_unref(state->bus);
+                state->bus = nullptr;
+            }
+            gst_object_unref(relayPipeline);
+            state->pipeline = nullptr;
+            state->statusMessage = "error: transcoded UDP relay playback restart failed";
+            state->active = false;
+            return false;
+        }
+    }
+
+    state->usingBackup = useBackup;
+    state->backupAttempted = useBackup;
+    state->primaryRetryPending = !useBackup;
+    state->inputLossNotified = false;
+    state->activeInputUri = inputUri;
+    state->active = true;
+    state->statusMessage = useBackup ? "running on backup" : "running on primary";
+
+    state->inputBytes = 0;
+    state->outputBytes = 0;
+    state->inputCcErrors = 0;
+    state->inputCcErrorsDelta = 0;
+    state->outputCcErrors = 0;
+    state->outputCcErrorsDelta = 0;
+    state->inputBitrate = 0;
+    state->outputBitrate = initialConfiguredOutputBitrate(state->config);
+    state->lastInputBytesSample = 0;
+    state->lastOutputBytesSample = 0;
+    state->lastInputCcErrorsSample = 0;
+    state->lastOutputCcErrorsSample = 0;
+    state->lastInputBytesSeen = 0;
+    state->lastInputActivity = std::chrono::steady_clock::now();
+    state->lastPrimaryRetry = state->lastInputActivity;
+    state->lastBitrateSample = state->lastInputActivity;
+
+    std::cerr << "Transcoded input switch complete: active="
+              << state->activeInputUri
+              << " using_backup=" << (state->usingBackup ? "yes" : "no")
+              << std::endl;
+    return true;
+}
+
+bool StreamManager::restartActiveInput(
+    StreamState* state,
+    const std::string& inputUri,
+    bool useBackup) {
+    if (state && state->gstTranscoder) {
+        return restartTranscodedInput(state, inputUri, useBackup);
+    }
+    return restartPipelineWithInput(state, inputUri, useBackup);
+}
+
 
 GstElement* StreamManager::createPipeline(StreamState* state) {
     if (!state) {
@@ -3062,15 +2687,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     if (!state) {
         return nullptr;
     }
-    const StreamConfig& cfg = state->runtimeConfig;
+    const StreamConfig& cfg = state->config;
     const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
     const std::string inputLower = toLower(input);
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
 
     auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
-        if (state->caProviderTransport && maxSizeTime < 8000000000ULL) {
-            maxSizeTime = 8000000000ULL;
-        }
         GstElement* queue = gst_element_factory_make("queue", name);
         if (!addElementOrFail(pipeline, queue)) {
             return nullptr;
@@ -3081,65 +2703,6 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
     if (tvs::stream_protocols::isTestPatternInput(inputProtocol)) {
         return createTestPatternChain(cfg, pipeline, terminalElement);
-    }
-
-    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Satellite) {
-        if (!hasElementFactory("dvbbasebin")) {
-            std::cerr << missingElementStatus("dvbbasebin")
-                      << " (install gstreamer1.0-plugins-bad)" << std::endl;
-            return nullptr;
-        }
-        if (cfg.satelliteFrequency == 0 || cfg.satelliteSymbolRate == 0) {
-            std::cerr << "satellite input requires frequency and symbol rate" << std::endl;
-            return nullptr;
-        }
-
-        GstElement* src = gst_element_factory_make("dvbbasebin", "satellite_input_src");
-        GstElement* queue = addQueue("input_queue", 8000000000ULL);
-        if (!src || !queue || !addElementOrFail(pipeline, src)) {
-            return nullptr;
-        }
-
-        setIntPropertyIfPresent(src, "adapter", cfg.satelliteAdapter);
-        setIntPropertyIfPresent(src, "frontend", cfg.satelliteFrontend);
-        setUIntPropertyIfPresent(src, "frequency", cfg.satelliteFrequency);
-        setUIntPropertyIfPresent(src, "symbol-rate", cfg.satelliteSymbolRate);
-        setStringPropertyIfPresent(src, "polarity", cfg.satellitePolarization);
-        setSerializedPropertyIfPresent(src, "delsys", cfg.satelliteDeliverySystem);
-        setSerializedPropertyIfPresent(src, "modulation", cfg.satelliteModulation);
-        setSerializedPropertyIfPresent(src, "code-rate-hp", cfg.satelliteFec);
-        setSerializedPropertyIfPresent(src, "pilot", cfg.satellitePilot);
-        setSerializedPropertyIfPresent(src, "rolloff", cfg.satelliteRolloff);
-        setIntPropertyIfPresent(src, "diseqc-source", cfg.satelliteDiseqcSource);
-        setIntPropertyIfPresent(src, "stream-id", cfg.satelliteStreamId);
-        setUIntPropertyIfPresent(src, "lnb-lof1", cfg.satelliteLnbLof1);
-        setUIntPropertyIfPresent(src, "lnb-lof2", cfg.satelliteLnbLof2);
-        setUIntPropertyIfPresent(src, "lnb-slof", cfg.satelliteLnbSlof);
-        setUInt64PropertyIfPresent(src, "tuning-timeout", 5000000000ULL); // v98: 5 s on GStreamer 1.20 (nanoseconds)
-        if (cfg.satelliteServiceId > 0) {
-            setStringPropertyIfPresent(src, "program-numbers", std::to_string(cfg.satelliteServiceId));
-        }
-
-        if (!gst_element_link(src, queue)) {
-            std::cerr << "failed to link DVB-S/S2 source to input queue" << std::endl;
-            return nullptr;
-        }
-
-        std::cerr << "Satellite input: adapter=" << cfg.satelliteAdapter
-                  << " frontend=" << cfg.satelliteFrontend
-                  << " frequency_khz=" << cfg.satelliteFrequency
-                  << " symbol_rate_kbd=" << cfg.satelliteSymbolRate
-                  << " polarity=" << cfg.satellitePolarization
-                  << " delsys=" << cfg.satelliteDeliverySystem
-                  << " modulation=" << cfg.satelliteModulation
-                  << " fec=" << cfg.satelliteFec
-                  << " diseqc=" << cfg.satelliteDiseqcSource
-                  << " stream_id=" << cfg.satelliteStreamId
-                  << " service_id=" << cfg.satelliteServiceId
-                  << std::endl;
-
-        terminalElement = queue;
-        return src;
     }
 
     if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtmp) {
@@ -3581,27 +3144,16 @@ bool StreamManager::buildOutputBranch(
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
-
-    // v94: a direct FTA DVB-S/S2 source can still expose the complete
-    // transponder transport stream even when dvbbasebin program-numbers is
-    // configured.  Passing that TS straight to HTTP/UDP makes VLC see every
-    // service on the transponder and may leave only PSI/audio traffic for the
-    // selected channel.  For FTA satellite services always perform a local
-    // single-service demux/remux in the main pipeline.  This does not use the
-    // old loopback UDP service relay.
-    const bool forceFtaSatelliteServiceRemux =
-        state && state->config.satelliteEnabled &&
-        !state->config.satelliteScrambled &&
-        state->config.satelliteServiceId > 0 &&
-        !transcodedInput;
-    const bool needsRemux = (outputConfig.remapEnabled || forceFtaSatelliteServiceRemux) && !transcodedInput;
+    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) && !transcodedInput;
+    const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
     if (needsRemux) {
-        if (forceFtaSatelliteServiceRemux) {
-            std::cerr << "FTA single-service remux: stream=" << state->config.id
-                      << " SID=" << state->config.satelliteServiceId
-                      << " video_pid=" << state->config.videoPid
-                      << " audio_pid=" << state->config.audioPid
-                      << " branch=" << branchIndex << std::endl;
+        if (stableUdpRemux) {
+            std::cerr << "Unified UDP: rebuilding passthrough TS as a clean single-program transport"
+                      << " mode=" << (udpCbrOutputEnabled(outputConfig) ? "CBR" : "VBR")
+                      << " input_service_id=" << outputConfig.inputServiceId
+                      << " service_id=" << outputConfig.serviceId
+                      << " video_pid=" << outputConfig.videoPid
+                      << " audio_pid=" << outputConfig.audioPid << std::endl;
         }
         return buildRemapPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
@@ -3690,22 +3242,28 @@ bool StreamManager::buildRemapPipeline(
     configureOutputQueue(outputQueue, cfg);
     configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
-    sendServiceDescription(mux, cfg);
 
-    // v94: explicitly select the scanned DVB service in tsdemux.
-    // program-numbers on dvbbasebin is not sufficient on every driver/plugin
-    // combination; some frontends still expose the whole transport stream.
-    // The output branch therefore filters by the actual scanned satellite SID
-    // before linking elementary video/audio streams into the new mpegtsmux.
-    if (state->config.satelliteEnabled && state->config.satelliteServiceId > 0) {
-        setIntPropertyIfPresent(
-            demux,
-            "program-number",
-            static_cast<gint>(state->config.satelliteServiceId));
-        std::cerr << "FTA/DVB service filter configured: SID="
-                  << state->config.satelliteServiceId
-                  << " branch=" << branchIndex << std::endl;
+    if (usesStableUdpShaper(cfg)) {
+        if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
+            std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
+            return false;
+        }
+        const uint32_t inputServiceId = cfg.inputServiceId;
+        if (inputServiceId > 0) {
+            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
+        }
+        std::cerr << "Unified UDP mux: bitrate=0 mode="
+                  << (udpCbrOutputEnabled(cfg) ? "CBR" : "VBR")
+                  << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
+                  << " input_sid=" << inputServiceId
+                  << " output_sid=" << cfg.serviceId
+                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1500 : 0)
+                  << " audio_reservoir_mode=" << (udpCbrOutputEnabled(cfg) ? "startup-only" : "off")
+                  << " audio_pacer=" << (udpCbrOutputEnabled(cfg) ? "clocksync" : "off")
+                  << " alignment=" << kTsPacketsPerUdpBuffer
+                  << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
+    sendServiceDescription(mux, cfg);
 
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
@@ -3721,37 +3279,51 @@ bool StreamManager::buildRemapPipeline(
     context->mux = mux;
     context->sink = sink;
     context->config = cfg;
+
+    const bool stableUdpRemap = usesStableUdpShaper(cfg) && cfg.remapEnabled;
+    if (stableUdpRemap) {
+        // Configure the complete output program map before any elementary data is
+        // linked into mpegtsmux. This avoids live prog-map replacement and makes
+        // UDP remapping deterministic: input SID only selects tsdemux, while
+        // serviceId is the new output program number.
+        if (cfg.serviceId == 0 || cfg.videoPid == 0 || cfg.audioPid == 0) {
+            std::cerr << "UDP remap requires non-zero output SID, V-PID and A-PID" << std::endl;
+            return false;
+        }
+
+        const std::string videoPadName = "sink_" + std::to_string(cfg.videoPid);
+        const std::string audioPadName = "sink_" + std::to_string(cfg.audioPid);
+        GstPad* videoPad = gst_element_request_pad_simple(mux, videoPadName.c_str());
+        GstPad* audioPad = gst_element_request_pad_simple(mux, audioPadName.c_str());
+        if (!videoPad || !audioPad) {
+            if (videoPad) gst_object_unref(videoPad);
+            if (audioPad) gst_object_unref(audioPad);
+            std::cerr << "UDP remap failed to reserve output PID pads: video="
+                      << cfg.videoPid << " audio=" << cfg.audioPid << std::endl;
+            return false;
+        }
+        context->preallocatedVideoMuxPad = videoPad;
+        context->preallocatedAudioMuxPad = audioPad;
+
+        GstStructure* programMap = gst_structure_new_empty("program_map");
+        gst_structure_set(programMap,
+            videoPadName.c_str(), G_TYPE_INT, static_cast<gint>(cfg.serviceId),
+            audioPadName.c_str(), G_TYPE_INT, static_cast<gint>(cfg.serviceId),
+            nullptr);
+        g_object_set(mux, "prog-map", programMap, nullptr);
+        gst_structure_free(programMap);
+
+        context->programMapApplied = true;
+        context->videoPadName = videoPadName;
+        context->audioPadName = audioPadName;
+        std::cerr << "UDP remap program map: input_sid="
+                  << cfg.inputServiceId
+                  << " output_sid=" << cfg.serviceId
+                  << " video=" << videoPadName
+                  << " audio=" << audioPadName << std::endl;
+    }
+
     RemapContext* contextPtr = context.get();
-
-    // v97 diagnostics: prove that mpegtsmux produces TS and that the HTTP sink
-    // receives it.  Only the first buffer is logged to keep journal noise low.
-    if (GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src")) {
-        gst_pad_add_probe(
-            muxSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
-            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
-                auto* probeCtx = static_cast<RemapContext*>(userData);
-                bool expected = false;
-                if (probeCtx && probeCtx->muxActivityLogged.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA flow: MUX first MPEG-TS buffer" << std::endl;
-                }
-                return GST_PAD_PROBE_OK;
-            }, contextPtr, nullptr);
-        gst_object_unref(muxSrcPad);
-    }
-    if (GstPad* sinkPad = gst_element_get_static_pad(sink, "sink")) {
-        gst_pad_add_probe(
-            sinkPad, GST_PAD_PROBE_TYPE_BUFFER,
-            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
-                auto* probeCtx = static_cast<RemapContext*>(userData);
-                bool expected = false;
-                if (probeCtx && probeCtx->httpActivityLogged.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA flow: HTTP/OUTPUT first MPEG-TS buffer" << std::endl;
-                }
-                return GST_PAD_PROBE_OK;
-            }, contextPtr, nullptr);
-        gst_object_unref(sinkPad);
-    }
-
     state->outputContexts.push_back(std::move(context));
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
     return true;
@@ -3825,12 +3397,21 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         return nullptr;
     }
     if (isUdpOutputType(type)) {
+        // UDP-CBR and UDP-VBR share one stable MPEG-TS reservoir/shaper. CBR
+        // uses Target bitrate with NULL padding; VBR follows the measured source
+        // rate with the same startup reservoir, packetization and periodic PCR.
         std::string error;
-        GstElement* sink = udpCbrOutputEnabled(cfg)
-            ? UdpCbrOutput::createSink(pipeline, cfg, sinkName, error)
-            : UdpVbrOutput::createSink(pipeline, cfg, sinkName, error);
+        GstElement* sink = StableUdpOutput::createSink(pipeline, cfg, sinkName, error);
         if (!sink) {
             std::cerr << error << std::endl;
+        }
+        return sink;
+    }
+    if (type == "rtp") {
+        GstElement* sink = createRtpMpegTsSink(cfg, sinkName);
+        if (!sink || !addElementOrFail(pipeline, sink)) {
+            if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+            return nullptr;
         }
         return sink;
     }
@@ -3884,11 +3465,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     bool isVideo = capsString.find("video/") != std::string::npos;
     bool isPrivateTs = capsString.find("private") != std::string::npos || capsString.find("subpicture") != std::string::npos;
 
-    std::cerr << "tsdemux pad detected: caps=" << capsString
-              << " audio=" << (isAudio ? "yes" : "no")
-              << " video=" << (isVideo ? "yes" : "no")
-              << " private=" << (isPrivateTs ? "yes" : "no") << std::endl;
-
     if ((!isAudio && !isVideo) || isPrivateTs) {
         if (caps) gst_caps_unref(caps);
         drainDynamicPad(ctx->mux, pad);
@@ -3900,28 +3476,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
-    // v99: probe the selected tsdemux pad itself. A pad-added signal only proves
-    // that PMT/caps were discovered; this probe proves that elementary buffers
-    // actually leave tsdemux for the selected service.
-    gst_pad_add_probe(
-        pad, GST_PAD_PROBE_TYPE_BUFFER,
-        +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
-            auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
-            if (pair && pair->first) {
-                auto& flag = pair->second
-                    ? pair->first->demuxAudioActivityLogged
-                    : pair->first->demuxVideoActivityLogged;
-                bool expected = false;
-                if (flag.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA flow: DEMUX " << (pair->second ? "AUDIO" : "VIDEO")
-                              << " first buffer" << std::endl;
-                }
-            }
-            return GST_PAD_PROBE_OK;
-        },
-        new std::pair<RemapContext*, bool>(ctx, isAudio),
-        +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
-
     std::string parserFactory = parserForCaps(caps, capsString);
     if (caps) {
         gst_caps_unref(caps);
@@ -3931,11 +3485,30 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
-    if (!queue || !parser) {
-        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;
+    const bool stableUdpAudioReservoir =
+        isAudio && !ctx->flvMux &&
+        usesStableUdpShaper(ctx->config) &&
+        udpCbrOutputEnabled(ctx->config);
+
+    GstElement* audioReservoirQueue = stableUdpAudioReservoir
+        ? gst_element_factory_make("queue", nullptr)
+        : nullptr;
+    GstElement* audioClockSync = stableUdpAudioReservoir
+        ? gst_element_factory_make("clocksync", nullptr)
+        : nullptr;
+
+    if (!queue || !parser ||
+        (stableUdpAudioReservoir && (!audioReservoirQueue || !audioClockSync))) {
+        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString;
+        if (stableUdpAudioReservoir && !audioClockSync) {
+            std::cerr << " (clocksync unavailable for Stable UDP audio reservoir)";
+        }
+        std::cerr << std::endl;
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
         if (capsfilter) gst_object_unref(capsfilter);
+        if (audioReservoirQueue) gst_object_unref(audioReservoirQueue);
+        if (audioClockSync) gst_object_unref(audioClockSync);
         drainDynamicPad(ctx->mux, pad);
         return;
     }
@@ -3948,48 +3521,66 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     if (!gst_bin_add(GST_BIN(pipeline), queue) ||
         !gst_bin_add(GST_BIN(pipeline), parser) ||
-        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter))) {
+        (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter)) ||
+        (audioReservoirQueue && !gst_bin_add(GST_BIN(pipeline), audioReservoirQueue)) ||
+        (audioClockSync && !gst_bin_add(GST_BIN(pipeline), audioClockSync))) {
         if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
         if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
         if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
+        if (audioReservoirQueue && !GST_OBJECT_PARENT(audioReservoirQueue)) gst_object_unref(audioReservoirQueue);
+        if (audioClockSync && !GST_OBJECT_PARENT(audioClockSync)) gst_object_unref(audioClockSync);
         gst_object_unref(pipeline);
         return;
     }
 
     configureQueue(queue);
 
-    // v99: observe the queue output independently of the parser.
-    if (GstPad* queueSrcPad = gst_element_get_static_pad(queue, "src")) {
-        gst_pad_add_probe(
-            queueSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
-            +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
-                auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
-                if (pair && pair->first) {
-                    auto& flag = pair->second
-                        ? pair->first->queueAudioActivityLogged
-                        : pair->first->queueVideoActivityLogged;
-                    bool expected = false;
-                    if (flag.compare_exchange_strong(expected, true)) {
-                        std::cerr << "FTA flow: " << (pair->second ? "AUDIO" : "VIDEO")
-                                  << " QUEUE first buffer" << std::endl;
-                    }
-                }
-                return GST_PAD_PROBE_OK;
-            },
-            new std::pair<RemapContext*, bool>(ctx, isAudio),
-            +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
-        gst_object_unref(queueSrcPad);
-    }
+    if (stableUdpAudioReservoir) {
+        // Compressed AAC is not decoded or modified. Build a 1500 ms startup
+        // reserve, then release parsed AAC buffers according to their original
+        // timestamps. The queue threshold is disabled after the initial fill so
+        // it cannot periodically re-buffer and create later audio stalls.
+        configureQueue(audioReservoirQueue, kStableUdpAudioReservoirMax);
+        setUInt64PropertyIfPresent(
+            audioReservoirQueue, "min-threshold-time", kStableUdpAudioReservoir);
+        setIntPropertyIfPresent(audioReservoirQueue, "leaky", 0);
+        g_signal_connect(
+            audioReservoirQueue,
+            "running",
+            G_CALLBACK(onStableUdpAudioReservoirRunning),
+            nullptr);
 
+        setBooleanPropertyIfPresent(audioClockSync, "sync", TRUE);
+        setBooleanPropertyIfPresent(audioClockSync, "sync-to-first", TRUE);
+    }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", 1, nullptr);
     }
-    // Link the complete dynamic branch first, then activate it against the
-    // live parent. v99 verifies every state transition instead of assuming it succeeded.
+    gst_element_sync_state_with_parent(queue);
+    gst_element_sync_state_with_parent(parser);
+    if (capsfilter) {
+        gst_element_sync_state_with_parent(capsfilter);
+    }
+    if (audioReservoirQueue) {
+        gst_element_sync_state_with_parent(audioReservoirQueue);
+    }
+    if (audioClockSync) {
+        gst_element_sync_state_with_parent(audioClockSync);
+    }
+
     const bool parserLinked = capsfilter
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
         : gst_element_link(queue, parser);
     if (!parserLinked) {
+        gst_object_unref(pipeline);
+        drainDynamicPad(ctx->mux, pad);
+        return;
+    }
+
+    GstElement* parserTail = capsfilter ? capsfilter : parser;
+    if (stableUdpAudioReservoir &&
+        !gst_element_link_many(parserTail, audioReservoirQueue, audioClockSync, nullptr)) {
+        std::cerr << "Stable UDP audio reservoir link failed" << std::endl;
         gst_object_unref(pipeline);
         drainDynamicPad(ctx->mux, pad);
         return;
@@ -4014,11 +3605,22 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         requestedPid = pidFromDemuxPadName(pad);
     }
 
-    GstElement* muxSourceElement = capsfilter ? capsfilter : parser;
+    GstElement* muxSourceElement =
+        stableUdpAudioReservoir ? audioClockSync : parserTail;
     GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
-    GstPad* muxSinkPad = ctx->flvMux
-        ? requestFlvMuxSinkPad(ctx->mux, isVideo)
-        : requestMuxSinkPad(ctx->mux, requestedPid);
+    GstPad* muxSinkPad = nullptr;
+    const bool stableUdpPreMapped = !ctx->flvMux && usesStableUdpShaper(ctx->config) &&
+                                    ctx->config.remapEnabled && ctx->programMapApplied;
+    if (stableUdpPreMapped) {
+        GstPad* reservedPad = isVideo ? ctx->preallocatedVideoMuxPad : ctx->preallocatedAudioMuxPad;
+        if (reservedPad) {
+            muxSinkPad = GST_PAD(gst_object_ref(reservedPad));
+        }
+    } else {
+        muxSinkPad = ctx->flvMux
+            ? requestFlvMuxSinkPad(ctx->mux, isVideo)
+            : requestMuxSinkPad(ctx->mux, requestedPid);
+    }
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
         if (muxSinkPad) gst_object_unref(muxSinkPad);
@@ -4026,66 +3628,15 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         return;
     }
 
-    // Log the first elementary buffer that reaches the parser output.
-    gst_pad_add_probe(
-        parserSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
-        +[](GstPad*, GstPadProbeInfo*, gpointer userData) -> GstPadProbeReturn {
-            auto* pair = static_cast<std::pair<RemapContext*, bool>*>(userData);
-            if (pair && pair->first) {
-                auto& flag = pair->second ? pair->first->audioActivityLogged : pair->first->videoActivityLogged;
-                bool expected = false;
-                if (flag.compare_exchange_strong(expected, true)) {
-                    std::cerr << "FTA flow: " << (pair->second ? "AUDIO" : "VIDEO")
-                              << " PARSER first buffer" << std::endl;
-                }
-            }
-            return GST_PAD_PROBE_OK;
-        },
-        new std::pair<RemapContext*, bool>(ctx, isAudio),
-        +[](gpointer data) { delete static_cast<std::pair<RemapContext*, bool>*>(data); });
-
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
-        // v99: activate each dynamic element explicitly and verify the result.
-        // If sync-with-parent fails while the live pipeline is transitioning,
-        // fall back to an explicit PLAYING state request instead of silently
-        // leaving a NULL/READY queue or parser attached to a live tsdemux pad.
-        const gboolean queueSynced = gst_element_sync_state_with_parent(queue);
-        const gboolean parserSynced = gst_element_sync_state_with_parent(parser);
-        gboolean capsSynced = TRUE;
-        if (capsfilter) {
-            capsSynced = gst_element_sync_state_with_parent(capsfilter);
-        }
-
-        GstState parentCurrent = GST_STATE_NULL;
-        GstState parentPending = GST_STATE_VOID_PENDING;
-        gst_element_get_state(pipeline, &parentCurrent, &parentPending, 0);
-
-        auto ensurePlaying = [](GstElement* element, gboolean synced) {
-            if (!element || synced) {
-                return GST_STATE_CHANGE_SUCCESS;
-            }
-            return gst_element_set_state(element, GST_STATE_PLAYING);
-        };
-        const GstStateChangeReturn queueFallback = ensurePlaying(queue, queueSynced);
-        const GstStateChangeReturn parserFallback = ensurePlaying(parser, parserSynced);
-        const GstStateChangeReturn capsFallback = capsfilter
-            ? ensurePlaying(capsfilter, capsSynced)
-            : GST_STATE_CHANGE_SUCCESS;
-
-        std::cerr << "FTA dynamic branch state: " << (isAudio ? "audio" : "video")
-                  << " parent=" << gst_element_state_get_name(parentCurrent)
-                  << " pending=" << gst_element_state_get_name(parentPending)
-                  << " queue_sync=" << (queueSynced ? "ok" : "failed")
-                  << " parser_sync=" << (parserSynced ? "ok" : "failed")
-                  << " caps_sync=" << (capsSynced ? "ok" : "failed")
-                  << " queue_fallback=" << static_cast<int>(queueFallback)
-                  << " parser_fallback=" << static_cast<int>(parserFallback)
-                  << " caps_fallback=" << static_cast<int>(capsFallback)
-                  << std::endl;
-
         std::cerr << "remap linked " << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
-                  << " pid=" << requestedPid << std::endl;
+                  << " pid=" << requestedPid
+                  << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
+                  << (stableUdpAudioReservoir
+                      ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=clocksync(sync-to-first)"
+                      : "")
+                  << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
             ctx->videoLinked = true;
@@ -4445,22 +3996,53 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
 }
 
 void StreamManager::monitorBus(const std::string& id) {
-    StreamState* state = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(managerMutex);
-        auto found = streams.find(id);
-        if (found == streams.end()) {
-            return;
-        }
-        state = found->second.get();
+    auto found = streams.find(id);
+    if (found == streams.end()) {
+        return;
     }
+
+    StreamState* state = found->second.get();
     GstBus* bus = state->bus;
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
+
         while (state->running.load()) {
-            auto now = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+
             if (!state->gstTranscoder->isRunning()) {
+                if (!state->usingBackup && !state->config.backupInputUri.empty()) {
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "Основной поток пропал", "Primary stream lost"),
+                        telegramText(configManager, "Нет медиаданных 5 секунд", "No media data for 5 seconds") +
+                            "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
+                            "\nBackup: " + state->config.backupInputUri);
+
+                    if (restartTranscodedInput(state, state->config.backupInputUri, true)) {
+                        notifyStreamState(
+                            state->config,
+                            "🟠",
+                            telegramText(configManager, "Работаю с резервного источника", "Running from backup source"),
+                            telegramText(configManager, "Активный источник: резерв", "Active source: backup") +
+                                "\nURL: " + state->activeInputUri);
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+
+                if (state->usingBackup &&
+                    state->config.backupFileLoop &&
+                    isBackupFileInput(state->config, state->activeInputUri)) {
+                    const std::string loopFile = state->activeInputUri;
+                    if (restartTranscodedInput(state, loopFile, true)) {
+                        state->statusMessage = "running on backup file loop";
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
                 notifyStreamState(
@@ -4471,22 +4053,48 @@ void StreamManager::monitorBus(const std::string& id) {
                 return;
             }
 
-            auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSyntheticSample).count();
+            if (state->usingBackup &&
+                now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+                state->lastPrimaryRetry = now;
+                const std::string primaryUri = state->primaryInputUri;
+                if (!primaryUri.empty() &&
+                    probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                    notifyStreamState(
+                        state->config,
+                        "🟢",
+                        telegramText(configManager, "Основной поток снова доступен", "Primary stream is available again"),
+                        telegramText(configManager, "Переключаюсь на основной источник", "Switching to primary source") +
+                            "\nURL: " + primaryUri);
+                    if (restartTranscodedInput(state, primaryUri, false)) {
+                        lastSyntheticSample = std::chrono::steady_clock::now();
+                        continue;
+                    }
+                }
+            }
+
+            const auto elapsedMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - lastSyntheticSample).count();
             if (elapsedMs >= 1000) {
                 const double seconds = static_cast<double>(elapsedMs) / 1000.0;
                 const uint64_t inputEstimate = transcodeInputBitrateForStats(state->config);
                 const uint64_t outputEstimate = transcodeMuxBitrateForStats(state->config);
                 state->inputBitrate = inputEstimate;
                 state->outputBitrate = outputEstimate;
-                state->inputBytes.fetch_add(static_cast<uint64_t>((inputEstimate * seconds) / 8.0), std::memory_order_relaxed);
-                state->outputBytes.fetch_add(static_cast<uint64_t>((outputEstimate * seconds) / 8.0), std::memory_order_relaxed);
-                state->lastInputActivity = now;
+                state->inputBytes.fetch_add(
+                    static_cast<uint64_t>((inputEstimate * seconds) / 8.0),
+                    std::memory_order_relaxed);
+                state->outputBytes.fetch_add(
+                    static_cast<uint64_t>((outputEstimate * seconds) / 8.0),
+                    std::memory_order_relaxed);
                 state->lastBitrateSample = now;
-                state->statusMessage = "running via gstreamer";
+                state->statusMessage = state->usingBackup
+                    ? "running on backup via gstreamer"
+                    : "running via gstreamer";
                 lastSyntheticSample = now;
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         return;
     }
@@ -4499,6 +4107,28 @@ void StreamManager::monitorBus(const std::string& id) {
         const auto now = std::chrono::steady_clock::now();
         if (state->gstTranscoder) {
             if (!state->gstTranscoder->isRunning()) {
+                if (!state->usingBackup &&
+                    !state->config.backupInputUri.empty() &&
+                    restartTranscodedInput(state, state->config.backupInputUri, true)) {
+                    bus = state->bus;
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        telegramText(configManager, "Работаю с резервного источника", "Running from backup source"),
+                        telegramText(configManager, "Активный источник: резерв", "Active source: backup") +
+                            "\nURL: " + state->activeInputUri);
+                    continue;
+                }
+
+                if (state->usingBackup &&
+                    state->config.backupFileLoop &&
+                    isBackupFileInput(state->config, state->activeInputUri) &&
+                    restartTranscodedInput(state, state->activeInputUri, true)) {
+                    bus = state->bus;
+                    state->statusMessage = "running on backup file loop";
+                    continue;
+                }
+
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
                 notifyStreamState(
@@ -4508,28 +4138,10 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
                 return;
             }
-            // The external transcoder owns the original input socket. Treat a live process as
-            // input activity; its dedicated monitor loop updates the synthetic input counters.
-            state->lastInputActivity = now;
+            // A live gst-launch process is not proof of media activity.
+            // SRT/UDP may remain connected with zero media. The external
+            // watchdog is the real 5-second no-buffer detector.
         }
-        // v92: shared DVB-S2 liveness is based on bytes emitted by the
-        // per-service relay itself.  Seeing tsdemux pads means the service was
-        // found, and bytes on this probe mean the selected SID is actively
-        // being remuxed toward the loopback UDP source.  Do not restart that
-        // healthy relay just because the generic downstream input probe did
-        // not advance.
-        if (state->sharedSatelliteInput && state->satelliteServiceRelay) {
-            const uint64_t relayBytes = state->satelliteServiceRelay->outputBytes.load(std::memory_order_relaxed);
-            if (relayBytes != state->lastSatelliteRelayBytesSeen) {
-                state->lastSatelliteRelayBytesSeen = relayBytes;
-                state->lastInputActivity = now;
-                if (state->inputLossNotified && !state->usingBackup) {
-                    state->inputLossNotified = false;
-                    state->statusMessage = "running (DVB-S2 service relay active)";
-                }
-            }
-        }
-
         const uint64_t currentInputBytes = state->inputBytes.load();
         if (currentInputBytes != state->lastInputBytesSeen) {
             state->lastInputBytesSeen = currentInputBytes;
@@ -4557,36 +4169,6 @@ void StreamManager::monitorBus(const std::string& id) {
 
         if (!state->config.testPattern) {
             const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
-            const bool sharedSatellitePrimary = state->config.satelliteEnabled && state->sharedSatelliteInput &&
-                state->satelliteServiceRelay != nullptr && !state->usingBackup;
-            const bool excessiveInputCcErrors = state->inputCcErrorsDelta.load(std::memory_order_relaxed) >= kInputCcRecoveryThreshold;
-            if (sharedSatellitePrimary && !state->satelliteRelayRecoveryDisabled &&
-                state->config.backupInputUri.empty() &&
-                (inputTimedOut || excessiveInputCcErrors) &&
-                now - state->lastSatelliteRelayRestart >= kSatelliteRelayRestartInterval) {
-                std::string recoveryError;
-                const std::string reason = inputTimedOut ? "input timeout" : "continuity errors";
-                if (restartSharedSatelliteInput(state, reason, recoveryError)) {
-                    bus = state->bus;
-                    state->active = true;
-                    state->inputLossNotified = false;
-                    notifyStreamState(
-                        state->config,
-                        "🟢",
-                        telegramText(configManager, "Спутниковый relay восстановлен", "Satellite relay recovered"),
-                        telegramText(configManager, "Перезапущен внутренний DVB service relay", "Internal DVB service relay restarted") +
-                            "\n" + telegramText(configManager, "Причина", "Reason") + ": " + reason);
-                    continue;
-                } else if (!state->inputLossNotified) {
-                    state->inputLossNotified = true;
-                    state->statusMessage = "satellite relay recovery failed: " + recoveryError;
-                    notifyStreamState(
-                        state->config,
-                        "🟡",
-                        telegramText(configManager, "Не удалось восстановить спутниковый relay", "Satellite relay recovery failed"),
-                        telegramText(configManager, "Причина", "Reason") + ": " + recoveryError);
-                }
-            }
             if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
                 notifyStreamState(
                     state->config,
@@ -4595,7 +4177,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Нет входных данных 5 секунд", "No input data for 5 seconds") +
                         "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
                         "\nBackup: " + state->config.backupInputUri);
-                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                if (restartActiveInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                     notifyStreamState(
@@ -4620,31 +4202,14 @@ void StreamManager::monitorBus(const std::string& id) {
                     // Probe the primary input with an independent temporary pipeline.
                     // The active backup-file pipeline keeps playing uninterrupted while
                     // availability is checked. Switch only after real media data arrives.
-                    StreamConfig primaryProbeConfig = state->config;
-                    std::string primaryProbeUri = primaryUri;
-                    if (state->sharedSatelliteInput) {
-                        primaryProbeConfig.satelliteEnabled = false;
-                        primaryProbeConfig.inputUri = state->satelliteServiceRelayUri;
-                        primaryProbeConfig.inputMode = "udp";
-                        if (state->config.satelliteEnabled && !state->config.satelliteScrambled &&
-                            state->satelliteServiceRelay == nullptr) {
-                            primaryProbeConfig.inputInterfaceAddress = "127.0.0.1";
-                        } else {
-                            primaryProbeConfig.inputInterfaceAddress.clear();
-                        }
-                        primaryProbeConfig.inputInterfaceAddressConfigured = true;
-                        primaryProbeUri = state->satelliteServiceRelayUri;
-                    } else {
-                        primaryProbeConfig.satelliteEnabled = state->primarySatelliteEnabled;
-                    }
-                    if (probeInputAvailable(primaryProbeConfig, primaryProbeUri, kInputFailoverDelay)) {
+                    if (probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
                         notifyStreamState(
                             state->config,
                             "🟢",
                             telegramText(configManager, "Основной поток снова доступен", "Primary stream is available again"),
                             telegramText(configManager, "Переключаюсь с файла подмены на основной источник", "Switching from the replacement file to the primary source") +
                                 "\nURL: " + primaryUri);
-                        if (restartPipelineWithInput(state, primaryUri, false)) {
+                        if (restartActiveInput(state, primaryUri, false)) {
                             bus = state->bus;
                             state->inputLossNotified = false;
                         }
@@ -4657,39 +4222,13 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Основной пока недоступен", "Primary is still unavailable"),
                     telegramText(configManager, "Возвращаюсь на резервный источник", "Returning to backup source") +
                         "\nBackup: " + state->config.backupInputUri);
-                if (restartPipelineWithInput(state, state->config.backupInputUri, true)) {
+                if (restartActiveInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
                     state->inputLossNotified = false;
-                }
-            } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() &&
-                       state->caProviderTransport && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
-                state->lastPrimaryRetry = now;
-                state->statusMessage = "reconnecting authorized TS provider";
-                if (restartPipelineWithInput(state, state->primaryInputUri, false)) {
-                    bus = state->bus;
-                    state->active = true;
-                    state->inputLossNotified = false;
-                    state->statusMessage = "running via authorized TS provider";
-                    notifyStreamState(
-                        state->config,
-                        "🟢",
-                        telegramText(configManager, "CA Provider переподключён", "CA Provider reconnected"),
-                        telegramText(configManager, "Авторизованный TS endpoint снова активен", "Authorized TS endpoint is active again") +
-                            "\nURL: " + state->primaryInputUri);
-                } else if (!state->inputLossNotified) {
-                    state->inputLossNotified = true;
-                    notifyStreamState(
-                        state->config,
-                        "🟡",
-                        telegramText(configManager, "CA Provider недоступен", "CA Provider unavailable"),
-                        telegramText(configManager, "Повтор подключения через 10 секунд", "Retrying in 10 seconds") +
-                            "\nURL: " + state->primaryInputUri);
                 }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
-                state->statusMessage = state->config.satelliteEnabled && !state->config.satelliteScrambled
-                    ? "no input signal (FTA; CA not involved; relay recovery attempted)"
-                    : "no input signal";
+                state->statusMessage = "no input signal";
                 notifyStreamState(
                     state->config,
                     "🔴",
@@ -4697,14 +4236,6 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
                         "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
                         "\nURL: " + state->activeInputUri);
-            }
-        }
-
-        if (!bus || !GST_IS_BUS(bus)) {
-            bus = state->bus;
-            if (!bus || !GST_IS_BUS(bus)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
             }
         }
 
@@ -4726,24 +4257,6 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: " + message;
                 state->active = false;
-                if (state->caProviderTransport) {
-                    notifyStreamState(
-                        state->config,
-                        "🟡",
-                        telegramText(configManager, "Ошибка CA Provider transport", "CA Provider transport error"),
-                        telegramText(configManager, "Пробую восстановить authorized TS endpoint", "Trying to restore authorized TS endpoint") +
-                            "\n" + telegramText(configManager, "Причина", "Reason") + ": " + message);
-                    gst_message_unref(msg);
-                    if (restartPipelineWithInput(state, state->primaryInputUri, false)) {
-                        bus = state->bus;
-                        state->active = true;
-                        state->inputLossNotified = false;
-                        state->statusMessage = "running via authorized TS provider";
-                        continue;
-                    }
-                    state->statusMessage = "authorized TS provider reconnect failed";
-                    return;
-                }
                 notifyStreamState(
                     state->config,
                     "🔴",
@@ -4762,7 +4275,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     // drained, which leaves the output running with a black frame.
                     const std::string loopFile = state->activeInputUri;
                     gst_message_unref(msg);
-                    if (restartPipelineWithInput(state, loopFile, true)) {
+                    if (restartActiveInput(state, loopFile, true)) {
                         bus = state->bus;
                         state->statusMessage = "running on backup file loop";
                         state->active = true;

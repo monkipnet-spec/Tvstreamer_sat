@@ -3,8 +3,8 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
-tvstreamer5-config.json
-tvstreamer5-subscribers.json
+tvstreammersat5-config.json
+tvstreammersat5-subscribers.json
 backup-files/
 .vscode/
 *.log

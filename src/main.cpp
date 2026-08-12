@@ -52,7 +52,7 @@ int main() {
             streamManager.startStream(stream);
         }
     }
-    std::cout << "TVStreamer5 running on port " << configManager.config.httpPort << std::endl;
+    std::cout << "TVStreammerSAT5 running on port " << configManager.config.httpPort << std::endl;
     std::cerr << "Calling ioc.run()" << std::endl;
 
     ioc.run();

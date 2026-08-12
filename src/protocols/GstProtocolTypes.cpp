@@ -113,8 +113,8 @@ std::string srtOutputMode(const StreamConfig& cfg) {
 }
 
 std::string hlsDirectory(const StreamConfig& cfg) {
-    std::filesystem::create_directories("/tmp/tvstreamer5-hls/" + cfg.id);
-    return "/tmp/tvstreamer5-hls/" + cfg.id;
+    std::filesystem::create_directories("/tmp/tvstreammersat5-hls/" + cfg.id);
+    return "/tmp/tvstreammersat5-hls/" + cfg.id;
 }
 
 std::string rtmpOutputLocation(const StreamConfig& cfg) {
@@ -170,7 +170,7 @@ std::string transcodedFifoRelayPath(const StreamConfig& cfg) {
             safe.push_back('_');
         }
     }
-    return "/tmp/tvstreamer5-relay/" + safe + ".ts";
+    return "/tmp/tvstreammersat5-relay/" + safe + ".ts";
 }
 
 bool prepareFifoRelay(const StreamConfig& cfg, std::string& error) {

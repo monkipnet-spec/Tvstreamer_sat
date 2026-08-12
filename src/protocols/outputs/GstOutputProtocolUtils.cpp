@@ -110,6 +110,28 @@ void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, con
     });
 }
 
+void appendPostMuxAvReservoir(
+    std::vector<std::string>& args,
+    const std::string& name,
+    uint64_t delayNs,
+    uint64_t queueMaxNs) {
+    // Buffer the already-remapped MPEG-TS as one A/V unit.  This deliberately
+    // sits AFTER mpegtsmux/request-pad remapping and AFTER the CBR pacer, so it
+    // cannot change service_id/video_pid/audio_pid assignment.  clocksync adds
+    // a fixed startup delay without queue min-threshold-time, avoiding periodic
+    // rebuffer pauses later in the stream.
+    addQueue(args, name + "_queue", queueMaxNs, false);
+    args.push_back("!");
+    args.insert(args.end(), {
+        "clocksync",
+        "name=" + name + "_pacer",
+        "sync=true",
+        "sync-to-first=false",
+        "ts-offset=" + std::to_string(delayNs),
+        "!"
+    });
+}
+
 void appendOutputQueue(std::vector<std::string>& args, const std::string& name, bool leakyDownstream) {
     addQueue(args, name, leakyDownstream ? 2000000000ULL : 5000000000ULL, leakyDownstream);
     args.push_back("!");

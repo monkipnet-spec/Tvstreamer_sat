@@ -59,9 +59,9 @@ RUN set -eux; \
     elif gst-inspect-1.0 avenc_aac >/dev/null 2>&1; then :; \
     else echo "No supported AAC encoder was found in the runtime image" >&2; exit 1; fi
 
-COPY --from=build /src/build/TVStreamer /app/TVStreamer
+COPY --from=build /src/build/TVStreammerSAT5 /app/TVStreammerSAT5
 
 WORKDIR /data
 EXPOSE 9000/tcp
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/app/TVStreamer"]
+ENTRYPOINT ["/app/TVStreammerSAT5"]

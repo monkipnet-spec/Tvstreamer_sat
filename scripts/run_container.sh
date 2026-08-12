@@ -7,12 +7,12 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-tvstreamer5:release2}"
-CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/tvstreamer5-config.json}"
+IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:release2}"
+CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/tvstreammersat5-config.json}"
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "Config file not found: ${CONFIG_FILE}" >&2
-    echo "Create it first or set CONFIG_FILE=/absolute/path/to/tvstreamer5-config.json" >&2
+    echo "Create it first or set CONFIG_FILE=/absolute/path/to/tvstreammersat5-config.json" >&2
     exit 1
 fi
 
@@ -23,10 +23,10 @@ DATA_DIR="$(dirname "${CONFIG_FILE}")"
 CONFIG_BASENAME="$(basename "${CONFIG_FILE}")"
 
 VOLUME_ARGS=(-v "${DATA_DIR}:/data")
-if [[ "${CONFIG_BASENAME}" != "tvstreamer5-config.json" ]]; then
+if [[ "${CONFIG_BASENAME}" != "tvstreammersat5-config.json" ]]; then
     # Keep the whole data directory mounted so subscriber/backup files persist,
     # while exposing a custom config filename under the canonical app name.
-    VOLUME_ARGS+=(-v "${CONFIG_FILE}:/data/tvstreamer5-config.json")
+    VOLUME_ARGS+=(-v "${CONFIG_FILE}:/data/tvstreammersat5-config.json")
 fi
 
 RUN_ARGS=(

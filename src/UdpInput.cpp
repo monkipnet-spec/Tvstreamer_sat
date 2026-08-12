@@ -199,14 +199,11 @@ std::string effectiveInputInterfaceAddress(
     return (multicastInput || wildcardUriHost) ? config.interfaceAddress : "";
 }
 
-void configureQueue(GstElement* queue, const StreamConfig& config) {
-    const guint64 queueTime = !config.caProviderId.empty()
-        ? static_cast<guint64>(8 * GST_SECOND)
-        : static_cast<guint64>(3 * GST_SECOND);
+void configureQueue(GstElement* queue) {
     g_object_set(queue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
-        "max-size-time", queueTime,
+        "max-size-time", static_cast<guint64>(3 * GST_SECOND),
         nullptr);
 }
 
@@ -238,7 +235,7 @@ GstElement* build(
         error = "failed to create UDP input elements";
         return nullptr;
     }
-    configureQueue(queue, config);
+    configureQueue(queue);
 
     int port = 0;
     try {

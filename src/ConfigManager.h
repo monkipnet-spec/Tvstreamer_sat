@@ -16,25 +16,6 @@ struct StreamOutputConfig {
     static StreamOutputConfig fromJson(const Json::Value& root);
 };
 
-struct CaProviderConfig {
-    std::string id;
-    std::string name;
-    // Stable Linux serial-reader identity. Prefer /dev/serial/by-id/* over ttyUSB/ttyACM numbers.
-    std::string readerById;
-    // Capacity belongs to the selected card/provider and is never a global TVStreamer constant.
-    // "manual" uses maxChannels. "auto" uses a capability reported by an authorized card
-    // interface when available and otherwise falls back to maxChannels.
-    std::string capacityMode = "manual";
-    int maxChannels = 1;
-    bool enabled = true;
-    // Legacy fields are retained only so old v82-v84 configuration files can be loaded safely.
-    std::string backendType = "reader";
-    std::string endpoint;
-
-    Json::Value toJson() const;
-    static CaProviderConfig fromJson(const Json::Value& root);
-};
-
 struct StreamConfig {
     std::string id;
     std::string name;
@@ -50,27 +31,6 @@ struct StreamConfig {
     std::string inputInterfaceAddress;
     bool inputInterfaceAddressConfigured = false;
     std::string inputMode = "auto";
-    bool satelliteEnabled = false;
-    int satelliteAdapter = 0;
-    int satelliteFrontend = 0;
-    uint32_t satelliteFrequency = 0;
-    uint32_t satelliteSymbolRate = 27500;
-    std::string satellitePolarization = "H";
-    std::string satelliteDeliverySystem = "dvb-s2";
-    std::string satelliteModulation = "auto";
-    std::string satelliteFec = "auto";
-    std::string satellitePilot = "auto";
-    std::string satelliteRolloff = "auto";
-    int satelliteDiseqcSource = -1;
-    int satelliteStreamId = -1;
-    uint32_t satelliteServiceId = 1;
-    // True when PAT/PMT/SDT scan reported conditional-access descriptors for this service.
-    // FTA services bypass CA reader/session checks entirely.
-    bool satelliteScrambled = false;
-    uint32_t satelliteLnbLof1 = 9750000;
-    uint32_t satelliteLnbLof2 = 10600000;
-    uint32_t satelliteLnbSlof = 11700000;
-    std::string caProviderId;
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;
@@ -83,6 +43,7 @@ struct StreamConfig {
     uint64_t transcodeAudioBitrate = 192000;
     uint32_t audioPid = 0;
     uint32_t videoPid = 0;
+    uint32_t inputServiceId = 0;
     uint32_t serviceId = 1;
     std::string serviceName;
     std::string serviceProvider;
@@ -95,12 +56,11 @@ struct StreamConfig {
 struct AppConfig {
     std::string login = "admin";
     std::string password = "admin";
-    std::string serverName = "TVStreamer5";
+    std::string serverName = "TVStreammerSAT5";
     int httpPort = 9000;
     std::string language = "en";
     std::string telegramToken;
     std::string telegramChatId;
-    std::vector<CaProviderConfig> caProviders;
     std::vector<StreamConfig> streams;
 
     Json::Value toJson() const;

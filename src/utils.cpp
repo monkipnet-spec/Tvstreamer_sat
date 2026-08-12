@@ -6,9 +6,6 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <glib.h>
-#include <algorithm>
-#include <cctype>
 
 std::string toLower(const std::string& value) {
     std::string lower = value;
@@ -29,52 +26,6 @@ std::string gstQuote(const std::string& value) {
     }
     result += "'";
     return result;
-}
-
-
-namespace {
-
-bool isHexDigest(const std::string& value) {
-    return value.size() == 32 && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-        return std::isxdigit(ch) != 0;
-    });
-}
-
-bool constantTimeStringEquals(const std::string& left, const std::string& right) {
-    if (left.size() != right.size()) return false;
-    unsigned char diff = 0;
-    for (size_t i = 0; i < left.size(); ++i) {
-        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
-    }
-    return diff == 0;
-}
-
-} // namespace
-
-std::string md5Hex(const std::string& value) {
-    gchar* checksum = g_compute_checksum_for_string(G_CHECKSUM_MD5, value.c_str(), static_cast<gssize>(value.size()));
-    if (!checksum) return {};
-    std::string result(checksum);
-    g_free(checksum);
-    return toLower(result);
-}
-
-std::string normalizeMd5Password(const std::string& value) {
-    std::string normalized = value;
-    if (normalized.rfind("md5:", 0) == 0) {
-        std::string digest = toLower(normalized.substr(4));
-        if (isHexDigest(digest)) return "md5:" + digest;
-    }
-    if (isHexDigest(normalized)) {
-        return "md5:" + toLower(normalized);
-    }
-    return "md5:" + md5Hex(normalized);
-}
-
-bool verifyMd5Password(const std::string& candidate, const std::string& storedValue) {
-    const std::string normalized = normalizeMd5Password(storedValue);
-    if (normalized.rfind("md5:", 0) != 0) return false;
-    return constantTimeStringEquals(md5Hex(candidate), normalized.substr(4));
 }
 
 std::string normalizeIpAddress(const std::string& value) {

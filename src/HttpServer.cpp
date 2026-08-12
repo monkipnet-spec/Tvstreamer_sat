@@ -1,8 +1,5 @@
 #include "HttpServer.h"
 
-#include "CaProviderManager.h"
-#include "DvbManager.h"
-
 #include "utils.h"
 #include "TranscoderModule.h"
 #include "protocols/GstProtocolTypes.h"
@@ -16,8 +13,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include <cstdio>
-#include <filesystem>
 #include <cstdint>
 #include <cctype>
 #include <cstring>
@@ -31,6 +26,9 @@
 #include <unistd.h>
 
 namespace {
+
+constexpr const char* kProgramRelease = "Release 2";
+constexpr const char* kProgramVersion = "v115";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -182,7 +180,7 @@ std::string normalizedOutputType(const StreamConfig& cfg) {
     if (type == "udp") {
         return cfg.cbr ? "udp-cbr" : "udp-vbr";
     }
-    if (type != "udp-vbr" && type != "udp-cbr" &&
+    if (type != "udp-vbr" && type != "udp-cbr" && type != "rtp" &&
         type != "srt" && type != "http" && type != "hls" &&
         type != "rtsp" && type != "rtmp" && type != "youtube") {
         return "udp-vbr";
@@ -242,23 +240,6 @@ std::map<std::string, StreamConfig> streamConfigById(const std::vector<StreamCon
     return result;
 }
 
-std::string primaryInputDisplay(const StreamConfig& cfg) {
-    if (!cfg.satelliteEnabled) {
-        return cfg.inputUri;
-    }
-    std::ostringstream ss;
-    ss << (cfg.satelliteDeliverySystem == "dvb-s" ? "DVB-S" : "DVB-S2")
-       << " adapter=" << cfg.satelliteAdapter
-       << " frontend=" << cfg.satelliteFrontend
-       << " " << (static_cast<double>(cfg.satelliteFrequency) / 1000.0) << "MHz"
-       << " SR=" << cfg.satelliteSymbolRate << "kBd"
-       << " " << cfg.satellitePolarization;
-    if (cfg.satelliteServiceId > 0) {
-        ss << " SID=" << cfg.satelliteServiceId;
-    }
-    return ss.str();
-}
-
 bool sameStreamConfig(const StreamConfig& left, const StreamConfig& right) {
     return left.toJson() == right.toJson();
 }
@@ -271,7 +252,7 @@ std::vector<std::string> currentProcessArgs() {
         args.push_back(arg);
     }
     if (args.empty()) {
-        args.push_back("TVStreamer");
+        args.push_back("TVStreammerSAT5");
     }
     return args;
 }
@@ -302,6 +283,9 @@ void closeInheritedFileDescriptors() {
 
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = normalizedOutputType(cfg);
+    if (type == "rtp") {
+        return "rtp://" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
+    }
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         const bool listener = toLower(cfg.outputMode) != "caller";
@@ -395,7 +379,7 @@ void HttpServer::handleSession(tcp::socket socket) {
         http::read(socket, buffer, parser);
         http::request<http::string_body> req = parser.release();
         http::response<http::string_body> res{http::status::ok, req.version()};
-        res.set(http::field::server, "TVStreamer5");
+        res.set(http::field::server, "TVStreammerSAT5");
         res.set(http::field::content_type, "text/html; charset=UTF-8");
         res.set(http::field::cache_control, "no-store");
         res.set(http::field::pragma, "no-cache");
@@ -431,12 +415,6 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
-            } else if (target == "/api/dvb-devices") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = listDvbDevices();
-            } else if (target == "/api/serial-readers") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = listSerialReaders();
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
               res.body() = systemMetrics();
@@ -462,8 +440,9 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/start-stream") {
+                handleStartStream(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = handleStartStream(req.body());
+                res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/stop-stream") {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
@@ -490,9 +469,6 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
-            } else if (target == "/api/scan-satellite") {
-              res.set(http::field::content_type, "application/json");
-              res.body() = handleScanSatellite(req.body());
             } else {
                 res.result(http::status::not_found);
                 res.body() = "Not Found";
@@ -536,7 +512,7 @@ bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const
     const std::string login = decoded.substr(0, separator);
     const std::string password = decoded.substr(separator + 1);
     return constantTimeEquals(login, configManager.config.login) &&
-           verifyMd5Password(password, configManager.config.password);
+           constantTimeEquals(password, configManager.config.password);
 }
 
 bool HttpServer::isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const {
@@ -572,7 +548,7 @@ bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::str
 
 void HttpServer::writeUnauthorized(http::response<http::string_body>& res) const {
     res.result(http::status::unauthorized);
-    res.set(http::field::www_authenticate, "Basic realm=\"TVStreamer5\"");
+    res.set(http::field::www_authenticate, "Basic realm=\"TVStreammerSAT5\"");
     res.set(http::field::content_type, "text/plain; charset=UTF-8");
     res.body() = "Unauthorized";
 }
@@ -675,55 +651,6 @@ std::string HttpServer::listInterfaces() {
     return Json::writeString(writer, root);
 }
 
-std::string HttpServer::listDvbDevices() {
-    Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, tvs::dvb::enumerateDevices());
-}
-
-std::string HttpServer::listSerialReaders() {
-    Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, ca_provider::enumerateSerialReadersJson());
-}
-
-std::string HttpServer::handleScanSatellite(const std::string& body) {
-    Json::Value response;
-    Json::CharReaderBuilder readerBuilder;
-    Json::Value request;
-    std::string errors;
-    std::istringstream input(body);
-    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
-        response["result"] = "error";
-        response["error"] = "invalid satellite scan request: " + errors;
-    } else {
-        StreamConfig scanConfig = StreamConfig::fromJson(request);
-        scanConfig.satelliteEnabled = true;
-
-        // Tuning a frontend for a scan would retune a running channel that uses
-        // the same hardware. Refuse it instead of interrupting an active stream.
-        const auto snapshot = streamManager.snapshot();
-        bool busy = false;
-        std::string busyStream;
-        for (const auto& [id, state] : snapshot) {
-            if (!state || !state->active.load() || !state->config.satelliteEnabled) continue;
-            if (state->config.satelliteAdapter == scanConfig.satelliteAdapter &&
-                state->config.satelliteFrontend == scanConfig.satelliteFrontend) {
-                busy = true;
-                busyStream = id;
-                break;
-            }
-        }
-        if (busy) {
-            response["result"] = "error";
-            response["error"] = "DVB frontend is in use by active stream: " + busyStream;
-            response["busy_stream_id"] = busyStream;
-        } else {
-            response = tvs::dvb::scanTransponder(scanConfig, 7000);
-        }
-    }
-    Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, response);
-}
-
   std::string HttpServer::systemMetrics() {
     uint64_t cpuTotal = 0;
     uint64_t cpuIdle = 0;
@@ -820,6 +747,8 @@ std::string HttpServer::currentState() {
     root["language"] = configManager.config.language;
     root["telegram_token"] = configManager.config.telegramToken;
     root["telegram_chat_id"] = configManager.config.telegramChatId;
+    root["program_release"] = kProgramRelease;
+    root["program_version"] = kProgramVersion;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
@@ -836,61 +765,6 @@ std::string HttpServer::currentState() {
     for (const auto& element : transcoderCapabilities.missingElements) missing.append(element);
     transcoder["missing_elements"] = missing;
     root["transcoder"] = transcoder;
-    auto snap = streamManager.snapshot();
-    const Json::Value serialReaders = ca_provider::enumerateSerialReadersJson();
-    root["serial_reader_count"] = Json::UInt(serialReaders.size());
-    Json::Value caProviders(Json::arrayValue);
-    for (const auto& provider : configManager.config.caProviders) {
-      Json::Value item = provider.toJson();
-      unsigned assignedChannels = 0;
-      unsigned activeChannels = 0;
-      for (const auto& stream : configManager.config.streams) {
-        if (stream.caProviderId != provider.id) continue;
-        ++assignedChannels;
-        auto found = snap.find(stream.id);
-        if (found != snap.end() && found->second && found->second->active.load() && !found->second->usingBackup) {
-          ++activeChannels;
-        }
-      }
-
-      // v85 keeps capacity per provider/card. Auto mode is ready for a documented card capability
-      // interface; until such an interface reports a value, maxChannels is the explicit fallback.
-      const int effectiveMaxChannels = ca_provider::effectiveMaxChannels(provider);
-      const Json::Value* reader = ca_provider::findSerialReaderById(serialReaders, provider.readerById);
-      const bool readerOnline = reader != nullptr;
-
-      item["assigned_channels"] = assignedChannels;
-      item["active_channels"] = activeChannels;
-      item["effective_max_channels"] = effectiveMaxChannels;
-      item["available_channels"] = effectiveMaxChannels > static_cast<int>(activeChannels)
-        ? effectiveMaxChannels - static_cast<int>(activeChannels) : 0;
-      item["capacity_ok"] = activeChannels <= static_cast<unsigned>(effectiveMaxChannels);
-      item["capacity_source"] = provider.capacityMode == "auto" ? "auto-fallback" : "manual";
-      item["auto_capacity_available"] = false;
-      item["reader_online"] = readerOnline;
-      const Json::Value backendStatus = ca_provider::backendStatusJson(provider, serialReaders);
-      item["card_status"] = backendStatus.get("status", "UNKNOWN");
-      item["card_metadata_available"] = false;
-      if (reader) {
-        item["reader_device"] = reader->get("device", "");
-        item["reader_tty"] = reader->get("tty", "");
-        item["reader_vendor"] = reader->get("vendor", "");
-        item["reader_model"] = reader->get("model", "");
-        item["reader_serial"] = reader->get("serial", "");
-        item["reader_usb_path"] = reader->get("usb_path", "");
-      } else {
-        item["reader_device"] = "";
-        item["reader_tty"] = "";
-        item["reader_vendor"] = "";
-        item["reader_model"] = "";
-        item["reader_serial"] = "";
-        item["reader_usb_path"] = "";
-      }
-      item["manager_status"] = backendStatus.get("message", "");
-      item["backend_status"] = backendStatus;
-      caProviders.append(item);
-    }
-    root["ca_providers"] = caProviders;
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       Json::Value item = subscriber.toJson();
@@ -901,6 +775,7 @@ std::string HttpServer::currentState() {
     }
     root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
+    auto snap = streamManager.snapshot();
     for (const auto& cfg : configManager.config.streams) {
         Json::Value item = cfg.toJson();
         if (snap.count(cfg.id)) {
@@ -910,12 +785,12 @@ std::string HttpServer::currentState() {
             item["using_backup"] = streamState->usingBackup;
             item["active_input_uri"] = cfg.testPattern
                 ? "test://bars"
-                : (streamState->activeInputUri.empty() ? primaryInputDisplay(cfg) : streamState->activeInputUri);
+                : (streamState->activeInputUri.empty() ? cfg.inputUri : streamState->activeInputUri);
             item["active_input_label"] = cfg.testPattern
                 ? "Тест"
                 : (streamState->usingBackup
                     ? (toLower(cfg.backupInputType) == "file" ? "Файл замены" : "Резерв")
-                    : (cfg.satelliteEnabled ? "Спутник" : "Основной"));
+                    : "Основной");
             item["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
             item["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
             item["input_cc_errors"] = Json::UInt64(streamState->inputCcErrorsDelta.load());
@@ -928,8 +803,8 @@ std::string HttpServer::currentState() {
             item["active"] = false;
             item["status"] = "stopped";
             item["using_backup"] = false;
-            item["active_input_uri"] = cfg.testPattern ? "test://bars" : primaryInputDisplay(cfg);
-            item["active_input_label"] = cfg.testPattern ? "Тест" : (cfg.satelliteEnabled ? "Спутник" : "Основной");
+            item["active_input_uri"] = cfg.testPattern ? "test://bars" : cfg.inputUri;
+            item["active_input_label"] = cfg.testPattern ? "Тест" : "Основной";
             item["bitrate_in_kbps"] = Json::UInt64(0);
             item["bitrate_out_kbps"] = Json::UInt64(0);
             item["input_cc_errors"] = Json::UInt64(0);
@@ -939,28 +814,6 @@ std::string HttpServer::currentState() {
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
-        if (cfg.satelliteEnabled) {
-            bool dvbActive = false;
-            auto activeIt = snap.find(cfg.id);
-            if (activeIt != snap.end() && activeIt->second) {
-                dvbActive = activeIt->second->active.load() && !activeIt->second->usingBackup;
-            }
-
-            Json::Value frontend;
-            if (dvbActive) {
-                frontend = tvs::dvb::frontendStatus(cfg.satelliteAdapter, cfg.satelliteFrontend);
-            }
-            const uint64_t signalRaw = frontend.get("signal_strength_raw", Json::UInt(0)).asUInt64();
-            const uint64_t snrRaw = frontend.get("snr_raw", Json::UInt(0)).asUInt64();
-            const auto percentFromRaw = [](uint64_t value) -> unsigned {
-                if (value >= 65535ULL) return 100U;
-                return static_cast<unsigned>((value * 100ULL + 32767ULL) / 65535ULL);
-            };
-            item["dvb_signal_percent"] = percentFromRaw(signalRaw);
-            item["dvb_quality_percent"] = percentFromRaw(snrRaw);
-            item["dvb_has_lock"] = dvbActive && frontend.get("has_lock", false).asBool();
-        }
-
         Json::Value links(Json::arrayValue);
         for (const auto& output : streamOutputs(cfg)) {
             Json::Value link;
@@ -994,7 +847,7 @@ bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target
 
     const std::string header =
         "HTTP/1.1 200 OK\r\n"
-        "Server: TVStreamer5\r\n"
+        "Server: TVStreammerSAT5\r\n"
         "Content-Type: video/MP2T\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
@@ -1022,7 +875,7 @@ bool HttpServer::serveHlsFile(const tcp::socket& socket, const std::string& targ
     }
 
     const std::filesystem::path filePath =
-        std::filesystem::path("/tmp/tvstreamer5-hls") / id / fileName;
+        std::filesystem::path("/tmp/tvstreammersat5-hls") / id / fileName;
     if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
         res.result(http::status::not_found);
         res.set(http::field::content_type, "text/plain");
@@ -1194,10 +1047,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("login") || root.get("login", "").asString().empty()) {
         nextConfig.login = configManager.config.login;
     }
-    const bool passwordProvided =
-        (root.isMember("password") && !root.get("password", "").asString().empty()) ||
-        (root.isMember("password_md5") && !root.get("password_md5", "").asString().empty());
-    if (!passwordProvided) {
+    if (!root.isMember("password") || root.get("password", "").asString().empty()) {
         nextConfig.password = configManager.config.password;
     }
     if (!root.isMember("server_name") || root.get("server_name", "").asString().empty()) {
@@ -1208,9 +1058,6 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     }
     if (!root.isMember("language")) {
         nextConfig.language = configManager.config.language;
-    }
-    if (!root.isMember("ca_providers")) {
-        nextConfig.caProviders = previousConfig.caProviders;
     }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
@@ -1360,146 +1207,21 @@ std::string HttpServer::handleDeleteBackupFile(const std::string& body) {
     return Json::writeString(writer, response);
 }
 
-std::string HttpServer::handleStartStream(const std::string& body) {
-    Json::Value response;
+void HttpServer::handleStartStream(const std::string& body) {
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
-        const std::string message = "Invalid start-stream payload: " + errs;
-        std::cerr << message << std::endl;
-        response["result"] = "error";
-        response["error"] = message;
-        Json::StreamWriterBuilder writer;
-        return Json::writeString(writer, response);
+        std::cerr << "Invalid start-stream payload: " << errs << std::endl;
+        return;
     }
-
     auto cfg = StreamConfig::fromJson(root);
-    const bool caRequired = cfg.satelliteEnabled && cfg.satelliteScrambled;
-    const CaProviderConfig* selectedCaProvider = nullptr;
-    if (caRequired && !cfg.caProviderId.empty()) {
-        for (const auto& provider : configManager.config.caProviders) {
-            if (provider.id == cfg.caProviderId) {
-                selectedCaProvider = &provider;
-                break;
-            }
-        }
-        if (!selectedCaProvider) {
-            response["result"] = "error";
-            response["stream_id"] = cfg.id;
-            response["error"] = "CA provider '" + cfg.caProviderId + "' not found";
-            Json::StreamWriterBuilder writer;
-            return Json::writeString(writer, response);
-        }
-        if (!selectedCaProvider->enabled) {
-            response["result"] = "error";
-            response["stream_id"] = cfg.id;
-            response["error"] = "CA provider '" + selectedCaProvider->name + "' is disabled";
-            Json::StreamWriterBuilder writer;
-            return Json::writeString(writer, response);
-        }
-        if (cfg.satelliteEnabled) {
-            if (!ca_provider::isReaderBackend(*selectedCaProvider)) {
-                response["result"] = "error";
-                response["stream_id"] = cfg.id;
-                response["error"] =
-                    "CA provider '" + selectedCaProvider->name +
-                    "' uses backend '" + selectedCaProvider->backendType +
-                    "'. v91 newcamd-status is monitoring-only and cannot be used as a channel descrambler.";
-                Json::StreamWriterBuilder writer;
-                return Json::writeString(writer, response);
-            }
-            if (selectedCaProvider->readerById.empty()) {
-                response["result"] = "error";
-                response["stream_id"] = cfg.id;
-                response["error"] =
-                    "CA provider '" + selectedCaProvider->name +
-                    "' has no serial reader assigned. Open System -> CA Providers and select a /dev/serial/by-id reader.";
-                Json::StreamWriterBuilder writer;
-                return Json::writeString(writer, response);
-            }
-            const Json::Value readers = ca_provider::enumerateSerialReadersJson();
-            if (!ca_provider::findSerialReaderById(readers, selectedCaProvider->readerById)) {
-                response["result"] = "error";
-                response["stream_id"] = cfg.id;
-                response["error"] =
-                    "CA provider '" + selectedCaProvider->name +
-                    "' reader is offline: " + selectedCaProvider->readerById;
-                Json::StreamWriterBuilder writer;
-                return Json::writeString(writer, response);
-            }
-        }
-        unsigned activeOnProvider = 0;
-        const auto managed = streamManager.snapshot();
-        for (const auto& stream : configManager.config.streams) {
-            if (stream.id == cfg.id || stream.caProviderId != cfg.caProviderId) continue;
-            auto active = managed.find(stream.id);
-            if (active != managed.end() && active->second && active->second->active.load() && !active->second->usingBackup) {
-                ++activeOnProvider;
-            }
-        }
-        const int effectiveMaxChannels = ca_provider::effectiveMaxChannels(*selectedCaProvider);
-        if (activeOnProvider >= static_cast<unsigned>(effectiveMaxChannels)) {
-            response["result"] = "error";
-            response["stream_id"] = cfg.id;
-            response["error"] = "CA provider '" + selectedCaProvider->name + "' reached its session limit " +
-                std::to_string(activeOnProvider) + "/" + std::to_string(effectiveMaxChannels);
-            Json::StreamWriterBuilder writer;
-            return Json::writeString(writer, response);
-        }
-    }
-
-    if (caRequired && cfg.caProviderId.empty()) {
-        response["result"] = "error";
-        response["stream_id"] = cfg.id;
-        response["error"] = "Scrambled satellite service requires a CA card/provider. FTA services do not require CA.";
-        Json::StreamWriterBuilder writer;
-        return Json::writeString(writer, response);
-    }
-    if (!caRequired) {
-        // A stale CA assignment must never block an unencrypted service.
-        cfg.caProviderId.clear();
-    }
-
-    std::string startError;
-    bool started = streamManager.startStream(cfg, &startError);
-
-    if (!started &&
+    if (!streamManager.startStream(cfg) &&
         !streamManager.isStreamActive(cfg.id) &&
         streamManager.snapshot().count(cfg.id) > 0) {
-        std::string restartError;
-        started = streamManager.restartStream(cfg, &restartError);
-        if (!started && !restartError.empty()) {
-            startError = restartError;
-        }
+        streamManager.restartStream(cfg);
     }
-
-    if (started) {
-        response["result"] = "ok";
-        response["stream_id"] = cfg.id;
-        if (cfg.satelliteEnabled && !cfg.satelliteScrambled) {
-            response["ca_mode"] = "fta-bypass";
-            response["ca_required"] = false;
-        }
-        if (cfg.satelliteEnabled && cfg.satelliteScrambled && selectedCaProvider) {
-            response["ca_provider_id"] = selectedCaProvider->id;
-            response["ca_provider_name"] = selectedCaProvider->name;
-            response["ca_reader_by_id"] = selectedCaProvider->readerById;
-            response["ca_mode"] = "reader-card-manager";
-            response["ca_capacity_mode"] = selectedCaProvider->capacityMode;
-            response["ca_effective_max_channels"] = ca_provider::effectiveMaxChannels(*selectedCaProvider);
-        }
-    } else {
-        response["result"] = "error";
-        response["stream_id"] = cfg.id;
-        response["error"] = startError.empty()
-            ? ("Failed to start stream: " + (cfg.name.empty() ? cfg.id : cfg.name))
-            : startError;
-    }
-
-    Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, response);
 }
 
 void HttpServer::handleStopStream(const std::string& body) {
@@ -1519,7 +1241,7 @@ void HttpServer::handleRestartProgram() {
     const auto args = currentProcessArgs();
     std::thread([this, args]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        std::cerr << "Restarting TVStreamer5 process" << std::endl;
+        std::cerr << "Restarting TVStreammerSAT5 process" << std::endl;
         streamManager.stopAll();
         closeInheritedFileDescriptors();
         execCurrentProcess(args);
@@ -1618,7 +1340,7 @@ std::string HttpServer::renderIndexPage() {
 <meta charset="UTF-8">
 <meta http-equiv="X-UA-Compatible" content="IE=edge">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TVStreamer5</title>
+<title>TVStreammerSAT5</title>
 <style>
 html{font-size:14px}
 body{font-family:Arial,Helvetica,sans-serif;background:#0f1218;color:#EEE;margin:0;padding:0;min-height:100vh}
@@ -1662,35 +1384,24 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:240px;height:240px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px;overflow:hidden}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;min-height:130px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
-.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-right:82px}
+.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px}
 .tile .delete-button{position:absolute;top:8px;right:8px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
 .tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
 .tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff}
-.tile .badge{position:absolute;right:30px;top:8px;left:auto;transform:none;padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .badge{position:absolute;left:50%;top:10px;transform:translateX(-50%);padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
-.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6;min-height:0;overflow:hidden}
+.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
-.tile .dvb-meters{display:grid;gap:5px;margin:1px 0 2px;padding:6px 7px;border:1px solid rgba(255,255,255,.07);border-radius:9px;background:rgba(255,255,255,.025)}
-.tile .dvb-meter-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#d8deea;font-size:10px}
-.tile .dvb-meter-head strong{font-size:10px;color:#fff;font-weight:600}
-.tile .dvb-meter-value{font-variant-numeric:tabular-nums;color:#fff}
-.tile .dvb-meter-track{height:7px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.09);box-shadow:inset 0 0 0 1px rgba(255,255,255,.04)}
-.tile .dvb-meter-fill{height:100%;width:0;border-radius:999px;transition:width .35s ease,background-color .35s ease}
-.tile .dvb-meter-fill.bad{background:#ff5f5f}
-.tile .dvb-meter-fill.warn{background:#ffbd4a}
-.tile .dvb-meter-fill.good{background:#17c261}
-.tile .dvb-lock{font-size:9px;color:#ffb3b3}
-.tile .dvb-lock.locked{color:#b6f7c2}
-.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:auto}
+.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
@@ -1706,47 +1417,9 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .modal.quality-open,.modal.stream-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal.active{display:flex}
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
-.modal-content.error-modal{width:min(760px,100%);border-color:rgba(255,95,95,.32)}
-.error-modal-head{display:flex;align-items:center;gap:10px;margin-bottom:10px;color:#ffb8b8}
-.error-modal-icon{display:grid;place-items:center;flex:0 0 32px;width:32px;height:32px;border-radius:50%;background:rgba(255,95,95,.16);font-weight:800}
-.error-modal-message{padding:10px 12px;border-radius:10px;background:rgba(255,95,95,.08);border:1px solid rgba(255,95,95,.18);color:#ffd1d1;white-space:pre-wrap;overflow-wrap:anywhere}
-.error-modal-details{margin-top:10px;padding:10px 12px;border-radius:10px;background:#0b1018;border:1px solid rgba(255,255,255,.08);color:#b8c2d4;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
 .modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
 .modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
 .modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
-.modal-content.satellite-modal{width:min(980px,100%);max-height:calc(100% - 12px);margin:0 auto;padding:14px 16px}
-.modal-content.satellite-modal h2{margin-bottom:9px}
-.sat-setup-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px 9px}
-.sat-setup-grid .form-row{gap:4px;min-width:0}
-.sat-setup-grid .form-row input,.sat-setup-grid .form-row select{box-sizing:border-box;width:100%;max-width:none;padding:6px 8px}
-.sat-section{grid-column:1/-1;padding:8px 10px;border:1px solid rgba(255,255,255,.07);border-radius:11px;background:rgba(255,255,255,.02)}
-.sat-section-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:7px;color:#dce5f3;font-size:.78rem;font-weight:700}
-.sat-advanced{grid-column:1/-1;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.018);padding:0 9px}
-.sat-advanced summary{cursor:pointer;padding:7px 0;color:#b9c6d8;font-size:.76rem;font-weight:700;user-select:none}
-.sat-advanced[open] summary{margin-bottom:6px;border-bottom:1px solid rgba(255,255,255,.06)}
-.sat-advanced-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px 9px;padding-bottom:9px}
-.sat-advanced-grid .form-row{gap:4px;min-width:0}
-.sat-advanced-grid .form-row input,.sat-advanced-grid .form-row select{box-sizing:border-box;width:100%;max-width:none;padding:6px 8px}
-.sat-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.sat-toolbar .button-primary{padding:7px 11px}
-.sat-scan-status{display:flex;align-items:center;gap:6px;flex:1;min-width:220px;color:#cbd4e4;font-size:.76rem}
-.sat-signal-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:7px}
-.sat-signal-box{padding:6px 8px;border:1px solid rgba(255,255,255,.08);border-radius:9px;background:rgba(255,255,255,.025)}
-.sat-signal-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:4px;font-size:.73rem;color:#dbe3ef}
-.sat-result-tools{display:grid;grid-template-columns:minmax(180px,1fr) auto;align-items:center;gap:7px;margin:6px 0}
-.sat-result-tools input[type="search"]{min-width:0;max-width:none}
-.sat-channel-list{display:grid;gap:5px;max-height:250px;overflow:auto;padding-right:2px}
-.sat-channel-row{display:grid;grid-template-columns:auto minmax(180px,1.5fr) minmax(70px,.55fr) minmax(80px,.7fr) minmax(110px,.9fr);gap:8px;align-items:center;padding:8px 9px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.025);font-size:.8rem}
-.sat-channel-row:hover{border-color:rgba(31,139,255,.3);background:rgba(31,139,255,.05)}
-.sat-channel-row.hidden{display:none}
-.sat-channel-name{min-width:0}
-.sat-channel-name strong{display:block;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sat-channel-name small{display:block;color:#8f9aab;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sat-channel-meta{color:#c9d2e2;white-space:nowrap}
-.sat-ca{display:inline-block;padding:2px 6px;border-radius:999px;font-size:.7rem;background:rgba(23,194,97,.14);color:#b6f7c2}
-.sat-ca.scrambled{background:rgba(255,189,74,.14);color:#ffe0a3}
-@media(max-width:900px){.sat-setup-grid,.sat-advanced-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-result-tools{grid-template-columns:1fr auto}}
-@media(max-width:700px){.sat-setup-grid,.sat-advanced-grid,.sat-signal-grid{grid-template-columns:1fr}.sat-result-tools{grid-template-columns:1fr}.sat-channel-row{grid-template-columns:auto minmax(0,1fr);}.sat-channel-meta{grid-column:2}.sat-channel-codecs{grid-column:2}}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -1833,6 +1506,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .about-donate{align-items:start}
 .about-donate-content{display:grid;grid-template-columns:148px minmax(0,1fr);gap:12px;align-items:center}
 .about-qr{width:148px;height:148px;display:block;background:#fff;border-radius:8px;padding:8px;box-sizing:border-box}
+.about-donate-wallet{display:flex;flex-direction:column;gap:6px;min-width:0}
+.about-donate-wallet-label{font-size:.82rem;font-weight:700;color:#9aa3b1}
 .about-donate-address{font-family:monospace;font-size:.82rem;line-height:1.45}
 @media (max-width:560px){.about-donate-content{grid-template-columns:1fr}.about-qr{width:132px;height:132px}}
 .network-table{width:100%;border-collapse:collapse;color:#d7deec;font-size:.85rem}
@@ -1887,14 +1562,12 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <div class="system-menu-list">
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
-<button class="system-menu-item" onclick="openCaProvidersModal();closeSystemMenu()">CA Providers</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
 </details>
 <button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
 <button class="button-secondary" onclick="openSubscribersModal()" data-i18n="subscribers">Subscribers</button>
-<button class="button-secondary" onclick="openSatelliteChannelModal()" data-i18n="addChannel">+ Add channel</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
 </div>
 </header>
@@ -1906,26 +1579,26 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <script>
 const translations = {
   en: {
-    subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream', addChannel:'+ Add channel',
-    interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status', signalLevel:'Signal level', signalQuality:'Signal quality', lock:'LOCK', noLock:'NO LOCK',
+    subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream',
+    interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
-    restartProgram:'Restart', restartConfirm:'Restart TVStreamer5 now?', restarting:'Restarting...',
+    restartProgram:'Restart', restartConfirm:'Restart TVStreammerSAT5 now?', restarting:'Restarting...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
-    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
+    about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', donateWallet:'Telegram Wallet', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
   ru: {
-    subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток', addChannel:'+ Добавить канал',
-    interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус', signalLevel:'Уровень сигнала', signalQuality:'Качество сигнала', lock:'LOCK', noLock:'НЕТ LOCK',
+    subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток',
+    interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
-    restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreamer5 сейчас?', restarting:'Перезапуск...',
+    restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreammerSAT5 сейчас?', restarting:'Перезапуск...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
-    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
+    about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', donateWallet:'Telegram-кошелёк', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
 function normalizeLanguage(value) {
   return value === 'ru' ? 'ru' : 'en';
 }
-let language = normalizeLanguage(localStorage.getItem('tvstreamer-language') || 'en');
+let language = normalizeLanguage(localStorage.getItem('tvstreammersat5-language') || 'en');
 const donateAddress = 'UQD1uQn5WxhzKLXjL0KOVuJDcRU65pYzgt6pm_gzJM-vT-cN';
 const donateQrPath = 'M4 4h7v1H4zM12 4h1v1H12zM14 4h3v1H14zM25 4h3v1H25zM30 4h7v1H30zM4 5h1v1H4zM10 5h1v1H10zM13 5h1v1H13zM15 5h1v1H15zM17 5h2v1H17zM20 5h3v1H20zM26 5h1v1H26zM28 5h1v1H28zM30 5h1v1H30zM36 5h1v1H36zM4 6h1v1H4zM6 6h3v1H6zM10 6h1v1H10zM12 6h3v1H12zM16 6h1v1H16zM18 6h2v1H18zM22 6h1v1H22zM25 6h2v1H25zM28 6h1v1H28zM30 6h1v1H30zM32 6h3v1H32zM36 6h1v1H36zM4 7h1v1H4zM6 7h3v1H6zM10 7h1v1H10zM14 7h1v1H14zM16 7h1v1H16zM18 7h1v1H18zM20 7h1v1H20zM22 7h1v1H22zM24 7h2v1H24zM27 7h2v1H27zM30 7h1v1H30zM32 7h3v1H32zM36 7h1v1H36zM4 8h1v1H4zM6 8h3v1H6zM10 8h1v1H10zM14 8h11v1H14zM26 8h2v1H26zM30 8h1v1H30zM32 8h3v1H32zM36 8h1v1H36zM4 9h1v1H4zM10 9h1v1H10zM12 9h1v1H12zM15 9h1v1H15zM20 9h1v1H20zM22 9h1v1H22zM24 9h1v1H24zM26 9h1v1H26zM30 9h1v1H30zM36 9h1v1H36zM4 10h7v1H4zM12 10h1v1H12zM14 10h1v1H14zM16 10h1v1H16zM18 10h1v1H18zM20 10h1v1H20zM22 10h1v1H22zM24 10h1v1H24zM26 10h1v1H26zM28 10h1v1H28zM30 10h7v1H30zM13 11h1v1H13zM16 11h1v1H16zM22 11h1v1H22zM27 11h2v1H27zM4 12h1v1H4zM6 12h1v1H6zM10 12h2v1H10zM14 12h2v1H14zM17 12h1v1H17zM19 12h1v1H19zM21 12h1v1H21zM23 12h1v1H23zM25 12h1v1H25zM27 12h2v1H27zM31 12h1v1H31zM34 12h1v1H34zM36 12h1v1H36zM4 13h2v1H4zM9 13h1v1H9zM11 13h3v1H11zM16 13h1v1H16zM18 13h2v1H18zM24 13h3v1H24zM28 13h3v1H28zM35 13h2v1H35zM5 14h2v1H5zM10 14h1v1H10zM15 14h1v1H15zM17 14h7v1H17zM25 14h1v1H25zM27 14h2v1H27zM30 14h2v1H30zM34 14h1v1H34zM36 14h1v1H36zM6 15h3v1H6zM11 15h1v1H11zM16 15h1v1H16zM18 15h3v1H18zM22 15h3v1H22zM26 15h2v1H26zM29 15h5v1H29zM35 15h2v1H35zM6 16h1v1H6zM8 16h1v1H8zM10 16h1v1H10zM17 16h6v1H17zM24 16h1v1H24zM30 16h2v1H30zM33 16h2v1H33zM36 16h1v1H36zM4 17h3v1H4zM8 17h2v1H8zM13 17h1v1H13zM15 17h1v1H15zM18 17h1v1H18zM20 17h3v1H20zM24 17h2v1H24zM27 17h5v1H27zM33 17h1v1H33zM35 17h1v1H35zM4 18h2v1H4zM8 18h3v1H8zM12 18h2v1H12zM15 18h2v1H15zM18 18h1v1H18zM20 18h1v1H20zM22 18h1v1H22zM24 18h4v1H24zM30 18h1v1H30zM33 18h2v1H33zM36 18h1v1H36zM5 19h1v1H5zM8 19h2v1H8zM11 19h1v1H11zM13 19h1v1H13zM18 19h3v1H18zM23 19h2v1H23zM28 19h2v1H28zM31 19h2v1H31zM35 19h1v1H35zM6 20h1v1H6zM9 20h2v1H9zM13 20h1v1H13zM15 20h3v1H15zM21 20h1v1H21zM24 20h1v1H24zM30 20h2v1H30zM36 20h1v1H36zM4 21h1v1H4zM7 21h3v1H7zM14 21h1v1H14zM16 21h2v1H16zM19 21h1v1H19zM21 21h1v1H21zM24 21h1v1H24zM27 21h3v1H27zM31 21h1v1H31zM33 21h1v1H33zM36 21h1v1H36zM8 22h1v1H8zM10 22h1v1H10zM13 22h1v1H13zM15 22h1v1H15zM17 22h1v1H17zM19 22h1v1H19zM23 22h1v1H23zM26 22h4v1H26zM32 22h3v1H32zM36 22h1v1H36zM6 23h1v1H6zM8 23h2v1H8zM14 23h2v1H14zM18 23h1v1H18zM20 23h2v1H20zM23 23h1v1H23zM26 23h1v1H26zM30 23h1v1H30zM36 23h1v1H36zM5 24h2v1H5zM8 24h1v1H8zM10 24h2v1H10zM13 24h2v1H13zM16 24h2v1H16zM19 24h1v1H19zM21 24h1v1H21zM25 24h1v1H25zM28 24h1v1H28zM30 24h1v1H30zM32 24h1v1H32zM35 24h1v1H35zM5 25h2v1H5zM8 25h1v1H8zM17 25h2v1H17zM25 25h1v1H25zM27 25h1v1H27zM31 25h1v1H31zM33 25h1v1H33zM35 25h1v1H35zM4 26h2v1H4zM9 26h2v1H9zM12 26h1v1H12zM14 26h1v1H14zM16 26h1v1H16zM18 26h2v1H18zM21 26h1v1H21zM23 26h1v1H23zM26 26h2v1H26zM30 26h1v1H30zM32 26h2v1H32zM36 26h1v1H36zM7 27h1v1H7zM11 27h1v1H11zM13 27h1v1H13zM15 27h2v1H15zM18 27h1v1H18zM28 27h6v1H28zM4 28h4v1H4zM10 28h2v1H10zM13 28h1v1H13zM17 28h3v1H17zM23 28h3v1H23zM28 28h5v1H28zM35 28h2v1H35zM12 29h3v1H12zM18 29h1v1H18zM20 29h1v1H20zM24 29h2v1H24zM28 29h1v1H28zM32 29h1v1H32zM35 29h2v1H35zM4 30h7v1H4zM12 30h1v1H12zM14 30h1v1H14zM16 30h2v1H16zM19 30h6v1H19zM28 30h1v1H28zM30 30h1v1H30zM32 30h1v1H32zM34 30h1v1H34zM36 30h1v1H36zM4 31h1v1H4zM10 31h1v1H10zM16 31h4v1H16zM22 31h1v1H22zM27 31h2v1H27zM32 31h2v1H32zM35 31h1v1H35zM4 32h1v1H4zM6 32h3v1H6zM10 32h1v1H10zM13 32h2v1H13zM16 32h1v1H16zM19 32h14v1H19zM35 32h1v1H35zM4 33h1v1H4zM6 33h3v1H6zM10 33h1v1H10zM15 33h1v1H15zM18 33h1v1H18zM20 33h1v1H20zM22 33h1v1H22zM24 33h2v1H24zM29 33h1v1H29zM31 33h1v1H31zM35 33h2v1H35zM4 34h1v1H4zM6 34h3v1H6zM10 34h1v1H10zM12 34h1v1H12zM15 34h3v1H15zM20 34h1v1H20zM22 34h1v1H22zM24 34h2v1H24zM27 34h1v1H27zM32 34h5v1H32zM4 35h1v1H4zM10 35h1v1H10zM13 35h1v1H13zM16 35h1v1H16zM19 35h2v1H19zM22 35h3v1H22zM30 35h2v1H30zM33 35h1v1H33zM4 36h7v1H4zM12 36h2v1H12zM15 36h1v1H15zM17 36h2v1H17zM21 36h1v1H21zM26 36h1v1H26zM28 36h2v1H28zM32 36h2v1H32zM36 36h1v1H36z';
 function t(key, values={}) {
@@ -1940,7 +1613,7 @@ function applyLanguage() {
 }
 function toggleLanguage() {
   language = language === 'en' ? 'ru' : 'en';
-  localStorage.setItem('tvstreamer-language', language);
+  localStorage.setItem('tvstreammersat5-language', language);
   applyLanguage();
   render(true);
   saveLanguagePreference();
@@ -1960,7 +1633,6 @@ let metricsFetchPromise = null;
 let lastTileStructureSignature = '';
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
-let satelliteScanServices = [];
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -1973,7 +1645,6 @@ function saveLanguagePreference(sourceState=state) {
       telegram_chat_id: sourceState.telegram_chat_id,
       http_port: sourceState.http_port,
       language,
-      ca_providers: sourceState.ca_providers || [],
       streams: sourceState.streams
     })
   }).catch(()=>{});
@@ -1986,16 +1657,12 @@ function fetchState() {
       return response.json();
     })
     .then(data => {
-      const cachedInterfaces = state.interfaces;
-      const cachedDvbDevices = state.dvb_devices;
-      const storedLanguage = localStorage.getItem('tvstreamer-language');
+      const storedLanguage = localStorage.getItem('tvstreammersat5-language');
       const serverLanguage = normalizeLanguage(data.language);
       language = normalizeLanguage(storedLanguage || language);
-      localStorage.setItem('tvstreamer-language', language);
+      localStorage.setItem('tvstreammersat5-language', language);
       data.language = language;
       state = data;
-      if (cachedInterfaces) state.interfaces = cachedInterfaces;
-      if (cachedDvbDevices) state.dvb_devices = cachedDvbDevices;
       applyLanguage();
       render(false);
       refreshSubscriberSessions();
@@ -2003,7 +1670,7 @@ function fetchState() {
       return data;
     })
     .catch(error => {
-      console.warn('TVStreamer5 state refresh failed:', error);
+      console.warn('TVStreammerSAT5 state refresh failed:', error);
       return null;
     })
     .finally(() => { stateFetchPromise = null; });
@@ -2037,7 +1704,7 @@ function fetchSystemMetrics() {
       return metrics;
     })
     .catch(error => {
-      console.warn('TVStreamer5 metrics refresh failed:', error);
+      console.warn('TVStreammerSAT5 metrics refresh failed:', error);
       return null;
     })
     .finally(() => { metricsFetchPromise = null; });
@@ -2063,7 +1730,7 @@ function downloadVlcPlaylist() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'tvstreamer5-playlist.m3u';
+  link.download = 'tvstreammersat5-playlist.m3u';
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -2130,100 +1797,15 @@ function streamBitrateMode(stream) {
   if (type === 'udp-vbr') return 'VBR';
   return stream.cbr ? 'CBR' : 'VBR';
 }
-function satelliteFrequencyKhzToMhz(value) {
-  const khz = Number(value || 0);
-  if (!Number.isFinite(khz) || khz <= 0) return 0;
-  return khz / 1000;
-}
-function satelliteFrequencyMhzToKhz(value) {
-  const mhz = Number(value || 0);
-  if (!Number.isFinite(mhz) || mhz <= 0) return 0;
-  return Math.round(mhz * 1000);
-}
-function formatSatelliteFrequencyMhz(value) {
-  const mhz = satelliteFrequencyKhzToMhz(value);
-  if (!mhz) return '—';
-  return Number.isInteger(mhz) ? String(mhz) : mhz.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
-}
-function satelliteInputSummary(stream) {
-  const system = stream.satellite_delivery_system === 'dvb-s' ? 'DVB-S' : 'DVB-S2';
-  const freq = formatSatelliteFrequencyMhz(stream.satellite_frequency);
-  const sr = Number(stream.satellite_symbol_rate || 0);
-  const pol = String(stream.satellite_polarization || 'H').toUpperCase();
-  const sid = Number(stream.satellite_service_id || 0);
-  return `${system} · ${freq} MHz · SR ${sr || '—'} kBd · ${pol}${sid ? ` · SID ${sid}` : ''}`;
-}
-function primaryInputSummary(stream) {
-  return stream.satellite_enabled ? satelliteInputSummary(stream) : (stream.input_uri || '—');
-}
-function caProviderTileSummary(stream) {
-  if (!stream?.satellite_enabled) return '';
-  if (stream.satellite_scrambled === false) return 'FTA';
-  const provider = (state.ca_providers || []).find(item => String(item.id || '') === String(stream.ca_provider_id || ''));
-  if (provider) {
-    const max = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
-    const reader = provider.reader_online ? 'ONLINE' : (provider.reader_by_id ? 'OFFLINE' : 'NO READER');
-    return `${provider.name || provider.id} ${reader} ${Number(provider.active_channels || 0)}/${max}`;
-  }
-  return stream.ca_provider_id ? `${stream.ca_provider_id} (не найден)` : 'без CA';
-}
-function satelliteTilePrimarySummary(stream) {
-  const system = stream.satellite_delivery_system === 'dvb-s' ? 'DVB-S' : 'DVB-S2';
-  const freq = formatSatelliteFrequencyMhz(stream.satellite_frequency);
-  const sr = Number(stream.satellite_symbol_rate || 0);
-  const pol = String(stream.satellite_polarization || 'H').toUpperCase();
-  const caText = stream.satellite_scrambled === false ? 'FTA' : `CA ${caProviderTileSummary(stream)}`;
-  return `${system} · ${freq} MHz · ${pol}${sr ? ` · ${sr}k` : ''} · ${caText}`;
-}
-function satelliteTileActiveInputSummary(stream) {
-  const source = stream.active_input_label || t('primary');
-  if (stream.using_backup) return `${source} · ${stream.active_input_uri || stream.backup_input_uri || '—'}`;
-  const signal = clampPercent(stream.dvb_signal_percent);
-  const quality = clampPercent(stream.dvb_quality_percent);
-  return `${source} · S ${signal}% · Q ${quality}% · ${stream.dvb_has_lock ? t('lock') : t('noLock')}`;
-}
-function clampPercent(value) {
-  const number = Number(value || 0);
-  return Math.max(0, Math.min(100, Number.isFinite(number) ? number : 0));
-}
-function dvbMeterClass(value) {
-  const percent = clampPercent(value);
-  if (percent >= 65) return 'good';
-  if (percent >= 35) return 'warn';
-  return 'bad';
-}
-function updateDvbMeter(tile, rolePrefix, value) {
-  const percent = clampPercent(value);
-  const fill = tile.querySelector(`[data-role="${rolePrefix}-fill"]`);
-  const label = tile.querySelector(`[data-role="${rolePrefix}-value"]`);
-  if (fill) {
-    fill.style.width = `${percent}%`;
-    fill.className = `dvb-meter-fill ${dvbMeterClass(percent)}`;
-  }
-  if (label) label.textContent = `${percent}%`;
-}
 function streamTileStructureSignature(stream) {
   return {
     id: stream.id,
     name: stream.name,
     input_uri: stream.input_uri,
-    satellite_enabled: stream.satellite_enabled,
-    satellite_adapter: stream.satellite_adapter,
-    satellite_frontend: stream.satellite_frontend,
-    satellite_frequency: stream.satellite_frequency,
-    satellite_symbol_rate: stream.satellite_symbol_rate,
-    satellite_polarization: stream.satellite_polarization,
-    satellite_delivery_system: stream.satellite_delivery_system,
-    satellite_modulation: stream.satellite_modulation,
-    satellite_fec: stream.satellite_fec,
-    satellite_diseqc_source: stream.satellite_diseqc_source,
-    satellite_stream_id: stream.satellite_stream_id,
-    satellite_service_id: stream.satellite_service_id,
-    satellite_scrambled: stream.satellite_scrambled,
-    ca_provider_id: stream.ca_provider_id,
     backup_input_uri: stream.backup_input_uri,
     backup_input_type: stream.backup_input_type,
     backup_file_loop: stream.backup_file_loop,
+    input_service_id: stream.input_service_id,
     service_id: stream.service_id,
     cbr: stream.cbr,
     outputs: outputConfigsForStream(stream),
@@ -2248,13 +1830,7 @@ function updateStreamTile(tile, stream) {
 
   const activeInput = tile.querySelector('[data-role="active-input"]');
   if (activeInput) {
-    activeInput.textContent = stream.satellite_enabled
-      ? satelliteTileActiveInputSummary(stream)
-      : `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`;
-  }
-  const primarySummary = tile.querySelector('[data-role="primary-summary"]');
-  if (primarySummary) {
-    primarySummary.textContent = stream.satellite_enabled ? satelliteTilePrimarySummary(stream) : primaryInputSummary(stream);
+    activeInput.textContent = `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}`;
   }
 
   const bitrateIn = tile.querySelector('[data-role="bitrate-in"]');
@@ -2265,7 +1841,6 @@ function updateStreamTile(tile, stream) {
 
   const status = tile.querySelector('[data-role="stream-status"]');
   if (status) status.textContent = stream.status || '';
-
 
   const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
   if (toggleButton) {
@@ -2305,7 +1880,7 @@ function render(force=false) {
     const links = streamLinks(stream);
     const primaryLink = links[0]?.url || stream.vlc_link || `${stream.output_host || ''}:${stream.output_port || ''}`;
     const tile = document.createElement('div');
-    tile.className = 'tile' + (stream.satellite_enabled ? ' satellite' : '') + (stream.active ? ' active' : '');
+    tile.className = 'tile' + (stream.active ? ' active' : '');
     tile.dataset.streamId = String(stream.id);
     tile.innerHTML = `
       <div class="top">
@@ -2317,8 +1892,9 @@ function render(force=false) {
       </div>
       <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
       <div class="info">
-        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.satellite_enabled ? satelliteTileActiveInputSummary(stream) : `${stream.active_input_label || t('primary')} · ${stream.active_input_uri || primaryInputSummary(stream)}`}</span></div>
-        <div class="info-row"><strong>${t('primary')}</strong><span data-role="primary-summary">${stream.satellite_enabled ? satelliteTilePrimarySummary(stream) : primaryInputSummary(stream)}</span></div>
+        <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
+        <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
+        <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
@@ -2337,78 +1913,13 @@ function render(force=false) {
   lastTileStructureSignature = signature;
   updateLiveTiles();
 }
-function openStreamError(title, message, details='') {
-  subscribersModalOpen = false;
-  const content = document.getElementById('modalContent');
-  content.className = 'modal-content error-modal';
-  content.innerHTML = modalCloseButton() + `
-    <div class="error-modal-head"><span class="error-modal-icon">!</span><h2 style="margin:0">${escapeHtmlValue(title || 'Ошибка')}</h2></div>
-    <div class="error-modal-message">${escapeHtmlValue(message || 'Неизвестная ошибка')}</div>
-    ${details ? `<div class="error-modal-details">${escapeHtmlValue(details)}</div>` : ''}
-    <div class="modal-actions"><button class="button-primary" onclick="closeModal()">${t('close')}</button></div>`;
-  document.getElementById('modal').classList.remove('quality-open', 'stream-open');
-  document.getElementById('modal').classList.add('active');
-}
-async function checkStreamStartError(id, name) {
-  try {
-    const response = await fetch('/api/state', {cache:'no-store'});
-    const latest = await response.json();
-    const current = (latest.streams || []).find(stream => String(stream.id) === String(id));
-    if (!current) return;
-    const status = String(current.status || '').trim();
-    const lowered = status.toLowerCase();
-    const looksLikeError = lowered.startsWith('error:') ||
-      lowered.includes('failed') ||
-      lowered.includes('no input signal');
-    if (!current.active && looksLikeError) {
-      openStreamError('Ошибка запуска потока', `${name || id}: ${status}`);
-    }
-  } catch (_) {
-    // The primary start request already reports transport/JSON failures. A
-    // follow-up status check is best-effort and must not replace that error.
-  }
-}
 function toggleStream(id, active) {
   const url = active ? '/api/stop-stream' : '/api/start-stream';
-  const stream = state.streams.find(s=>s.id===id);
-  const body = active ? {id} : stream;
+  const body = active ? {id} : state.streams.find(s=>s.id===id);
   fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(async response=>{
-      let data = {};
-      const text = await response.text();
-      try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {result:'error', error:text || `HTTP ${response.status}`}; }
-      if (!response.ok || data.result === 'error') {
-        const message = data.error || `HTTP ${response.status} ${response.statusText}`;
-        openStreamError(
-          active ? 'Ошибка остановки потока' : 'Ошибка запуска потока',
-          `${stream?.name || id}: ${message}`,
-          data.details || ''
-        );
-        throw new Error(message);
-      }
-      if (!active && Array.isArray(data.warnings) && data.warnings.length) {
-        openStreamError('Предупреждение запуска', `${stream?.name || id}: поток запущен с предупреждением`, data.warnings.join('\n'));
-      }
-      if (!active) {
-        // Some source errors arrive asynchronously after PLAYING was accepted.
-        // Re-check the live stream status so Start-button failures are visible
-        // instead of being left only in the tile/journal.
-        setTimeout(() => checkStreamStartError(id, stream?.name || id), 2500);
-        setTimeout(() => checkStreamStartError(id, stream?.name || id), 5500);
-      }
-      return data;
-    })
-    .catch(error=>{
-      if (!document.getElementById('modal')?.classList.contains('active')) {
-        openStreamError(
-          active ? 'Ошибка остановки потока' : 'Ошибка запуска потока',
-          `${stream?.name || id}: ${error.message || error}`
-        );
-      }
-    })
-    .finally(()=>{
-      setTimeout(fetchState,300);
-      setTimeout(fetchState,1200);
+    .then(()=>{
+      setTimeout(fetchState,500);
+      setTimeout(fetchState,1500);
     });
 }
 function deleteStream(id) {
@@ -2603,7 +2114,7 @@ function exportSubscribers() {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'tvstreamer5-subscribers.txt';
+  link.download = 'tvstreammersat5-subscribers.txt';
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -2618,8 +2129,8 @@ function openAboutModal() {
   openModal(`
     <h2>${t('about')}</h2>
     <div class="about-list">
-      <div class="about-row"><strong>${t('product')}</strong><span>TVStreamer5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>v99</span></div>
+      <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 2'} / ${state.program_version||'v115'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2628,7 +2139,10 @@ function openAboutModal() {
           <rect width="41" height="41" fill="#fff"></rect>
           <path d="${donateQrPath}" fill="#111"></path>
         </svg>
-        <span class="about-donate-address">${donateAddress}</span>
+        <div class="about-donate-wallet">
+          <span class="about-donate-wallet-label">${t('donateWallet')}</span>
+          <span class="about-donate-address">${donateAddress}</span>
+        </div>
       </div></div>
     </div>
     <div class="modal-actions">
@@ -2641,7 +2155,7 @@ function openLoginModal() {
     <h2>${t('userTitle')}</h2>
     <div class="form-grid full">
       <div class="form-row"><label>Login</label><input id="login" value="${state.login||''}" /></div>
-      <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /><small>В конфигурации сохраняется только MD5-хэш пароля.</small></div>
+      <div class="form-row"><label>Новый пароль</label><input id="password" type="password" placeholder="Оставьте пустым, чтобы не менять" /></div>
       <div class="form-row"><label>Имя сервера</label><input id="serverName" value="${state.server_name||''}" /></div>
       <div class="form-row"><label>Порт web-интерфейса</label><input id="httpPort" type="number" min="1" max="65535" value="${state.http_port||9000}" /></div>
     </div>
@@ -2664,262 +2178,19 @@ function openTelegramModal() {
     </div>
   `);
 }
-let serialReadersCache = [];
-function nextCaProviderId() {
-  const used = new Set((state.ca_providers || []).map(provider => String(provider.id || '')));
-  document.querySelectorAll?.('.ca-provider-row [data-ca-field="id"]').forEach(input => used.add(String(input.value || '')));
-  let index = 1;
-  while (used.has(`ca-card-${index}`)) index += 1;
-  return `ca-card-${index}`;
-}
-function serialReaderLabel(reader={}) {
-  const serial = String(reader.serial || '').trim();
-  const model = String(reader.model || '').trim();
-  const device = String(reader.device || reader.tty || '').trim();
-  return [model || 'Serial reader', serial ? `#${serial}` : '', device ? `(${device})` : ''].filter(Boolean).join(' ');
-}
-function readerOptions(selected='') {
-  const selectedValue = String(selected || '');
-  const options = [`<option value="" ${selectedValue?'':'selected'}>— Reader не выбран —</option>`];
-  (serialReadersCache || []).forEach(reader => {
-    const value = String(reader.by_id || '');
-    if (!value) return;
-    options.push(`<option value="${escapeHtmlValue(value)}" ${value===selectedValue?'selected':''}>${escapeHtmlValue(serialReaderLabel(reader))}</option>`);
-  });
-  if (selectedValue && !(serialReadersCache || []).some(reader => String(reader.by_id || '') === selectedValue)) {
-    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (OFFLINE / сейчас не найден)</option>`);
-  }
-  return options.join('');
-}
-function updateCaReaderSelects() {
-  document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]').forEach(select => {
-    const previous = select.value || select.dataset.savedValue || '';
-    select.innerHTML = readerOptions(previous);
-    select.value = previous;
-  });
-}
-function caProviderRowHtml(provider={}) {
-  const id = String(provider.id || nextCaProviderId());
-  const assigned = Number(provider.assigned_channels || (state.streams || []).filter(stream => stream.ca_provider_id === id).length || 0);
-  const active = Number(provider.active_channels || 0);
-  const effectiveMax = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
-  const configuredMax = Math.max(1, Number(provider.max_channels || effectiveMax || 1));
-  const capacityMode = String(provider.capacity_mode || 'manual').toLowerCase() === 'auto' ? 'auto' : 'manual';
-  const backendType = String(provider.backend_type || 'reader') === 'newcamd-status' ? 'newcamd-status' : 'reader';
-  const endpoint = String(provider.endpoint || '');
-  const readerById = String(provider.reader_by_id || '');
-  const online = provider.reader_online === true || (readerById && serialReadersCache.some(reader => String(reader.by_id || '') === readerById));
-  const backendStatus = provider.backend_status || {};
-  const networkOnline = backendStatus.online === true;
-  const statusText = backendType === 'newcamd-status'
-    ? (networkOnline ? 'TCP ONLINE' : (endpoint ? 'TCP OFFLINE' : 'ENDPOINT NOT CONFIGURED'))
-    : (!readerById ? 'Reader не назначен' : (online ? 'READER ONLINE' : 'READER OFFLINE'));
-  const readerDetails = online
-    ? [provider.reader_model, provider.reader_serial ? `#${provider.reader_serial}` : '', provider.reader_device].filter(Boolean).join(' ')
-    : readerById;
-  const backendDetails = backendType === 'newcamd-status'
-    ? [endpoint, backendStatus.message || provider.manager_status || 'status-only backend'].filter(Boolean).join(' · ')
-    : readerDetails;
-  const capacitySource = capacityMode === 'auto'
-    ? (provider.auto_capacity_available ? 'Auto: получено от карты/официального интерфейса' : `Auto: capability пока не сообщён, используется fallback ${configuredMax}`)
-    : `Manual: ${configuredMax}`;
-  return `<div class="ca-provider-row" data-provider-id="${escapeHtmlValue(id)}" style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:10px">
-    <div class="form-grid">
-      <div class="form-row"><label>ID карты/provider</label><input data-ca-field="id" value="${escapeHtmlValue(id)}" /><small>Стабильный ID TVStreamer, например ca-card-1.</small></div>
-      <div class="form-row"><label>Название</label><input data-ca-field="name" value="${escapeHtmlValue(provider.name || '')}" placeholder="Карта 1 / CA monitor" /></div>
-      <div class="form-row"><label>Backend</label><select data-ca-field="backend_type" onchange="updateCaBackendFields(this.closest('.ca-provider-row'))"><option value="reader" ${backendType==='reader'?'selected':''}>Phoenix / serial reader</option><option value="newcamd-status" ${backendType==='newcamd-status'?'selected':''}>Newcamd Status (TCP only)</option></select><small>Newcamd Status проверяет только доступность TCP endpoint и не обрабатывает ECM/CW/EMM.</small></div>
-      <div class="form-row"><label>Состояние</label><div class="checkbox-inline"><input data-ca-field="enabled" type="checkbox" ${provider.enabled===false?'':'checked'} /><span>Provider включён</span></div><small>${escapeHtmlValue(statusText)}${backendDetails ? ` · ${escapeHtmlValue(backendDetails)}` : ''}</small></div>
-      <div class="form-row full ca-backend-reader" style="${backendType==='reader'?'':'display:none'}"><label>Физический Phoenix / serial reader</label><select data-ca-field="reader_by_id" data-saved-value="${escapeHtmlValue(readerById)}">${readerOptions(readerById)}</select><small>Хранится стабильный /dev/serial/by-id/*.</small></div>
-      <div class="form-row full ca-backend-newcamd" style="${backendType==='newcamd-status'?'':'display:none'}"><label>Newcamd TCP endpoint</label><input data-ca-field="endpoint" value="${escapeHtmlValue(endpoint)}" placeholder="192.168.1.10:10000" /><small>Только host:port для health-check. Логин, DES key, ECM/CW и EMM этим backend не используются.</small></div>
-      <div class="form-row"><label>Лимит каналов</label><select data-ca-field="capacity_mode"><option value="manual" ${capacityMode==='manual'?'selected':''}>Manual</option><option value="auto" ${capacityMode==='auto'?'selected':''}>Auto + fallback</option></select><small>${escapeHtmlValue(capacitySource)}</small></div>
-      <div class="form-row"><label>Manual / fallback max channels</label><input data-ca-field="max_channels" type="number" min="1" max="1024" value="${configuredMax}" /></div>
-      <div class="form-row"><label>Сессии</label><div class="sat-signal-box"><strong>${active}/${effectiveMax} active</strong><div style="margin-top:3px;color:#aeb8ca">${assigned} assigned · ${Math.max(0,effectiveMax-active)} available</div></div></div>
-    </div>
-    <div style="display:flex;justify-content:flex-end;margin-top:8px"><button class="button-secondary" type="button" onclick="removeCaProviderRow(this)">Удалить</button></div>
-  </div>`;
-}
-function updateCaBackendFields(row) {
-  if (!row) return;
-  const type = row.querySelector('[data-ca-field="backend_type"]')?.value || 'reader';
-  const reader = row.querySelector('.ca-backend-reader');
-  const network = row.querySelector('.ca-backend-newcamd');
-  if (reader) reader.style.display = type === 'reader' ? '' : 'none';
-  if (network) network.style.display = type === 'newcamd-status' ? '' : 'none';
-}
-function serialReaderTableHtml(readers=[]) {
-  if (!Array.isArray(readers) || !readers.length) {
-    return '<div style="color:#aeb8ca;padding:10px 0">Устройства /dev/serial/by-id/* не обнаружены.</div>';
-  }
-  const used = new Set([...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].map(select => String(select.value || select.dataset.savedValue || '')));
-  return `<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">
-    <thead><tr style="text-align:left;color:#aeb8ca"><th style="padding:7px;border-bottom:1px solid #344155">By-ID</th><th style="padding:7px;border-bottom:1px solid #344155">Device</th><th style="padding:7px;border-bottom:1px solid #344155">Производитель</th><th style="padding:7px;border-bottom:1px solid #344155">Модель</th><th style="padding:7px;border-bottom:1px solid #344155">Serial</th><th style="padding:7px;border-bottom:1px solid #344155"></th></tr></thead>
-    <tbody>${readers.map(reader => { const byId=String(reader.by_id||''); const linked=used.has(byId); return `<tr><td style="padding:7px;border-bottom:1px solid #253044"><code title="${escapeHtmlValue(byId)}">${escapeHtmlValue(reader.by_id_name || byId)}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><strong>${escapeHtmlValue(reader.device || reader.tty || '')}</strong></td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.vendor || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044">${escapeHtmlValue(reader.model || '—')}</td><td style="padding:7px;border-bottom:1px solid #253044"><code>${escapeHtmlValue(reader.serial || '—')}</code></td><td style="padding:7px;border-bottom:1px solid #253044"><button class="button-secondary" type="button" ${linked?'disabled':''} onclick="addCaProviderForReader(decodeURIComponent('${encodeURIComponent(byId)}'))">${linked?'Добавлен':'Создать Card'}</button></td></tr>`; }).join('')}</tbody>
-  </table></div>`;
-}
-async function refreshSerialReaders() {
-  const target = document.getElementById('serialReadersTable');
-  const status = document.getElementById('serialReadersStatus');
-  if (!target) return;
-  if (status) status.textContent = 'Поиск serial-reader устройств…';
-  try {
-    const response = await fetch('/api/serial-readers', {cache:'no-store'});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const readers = await response.json();
-    serialReadersCache = Array.isArray(readers) ? readers : [];
-    updateCaReaderSelects();
-    target.innerHTML = serialReaderTableHtml(serialReadersCache);
-    if (status) status.textContent = `Обнаружено: ${serialReadersCache.length}`;
-  } catch (error) {
-    serialReadersCache = [];
-    updateCaReaderSelects();
-    target.innerHTML = '<div style="color:#ff8f8f;padding:10px 0">Не удалось получить список serial-reader устройств.</div>';
-    if (status) status.textContent = error.message || String(error);
-  }
-}
-function addCaProviderForReader(byId) {
-  const reader = (serialReadersCache || []).find(item => String(item.by_id || '') === String(byId || ''));
-  if (!reader) return;
-  const already = [...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].some(select => String(select.value || '') === String(byId));
-  if (already) return;
-  document.getElementById('caProvidersEmpty')?.remove();
-  const rows = document.getElementById('caProviderRows');
-  if (!rows) return;
-  const wrapper = document.createElement('div');
-  const nextId = nextCaProviderId();
-  const number = nextId.replace('ca-card-','');
-  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${number}`,reader_by_id:byId,capacity_mode:'manual',max_channels:1,enabled:true,reader_online:true,reader_device:reader.device,reader_model:reader.model,reader_serial:reader.serial});
-  rows.appendChild(wrapper.firstElementChild);
-  updateCaReaderSelects();
-  const table = document.getElementById('serialReadersTable');
-  if (table) table.innerHTML = serialReaderTableHtml(serialReadersCache);
-}
-function addAllDetectedReaders() {
-  (serialReadersCache || []).forEach(reader => addCaProviderForReader(reader.by_id));
-}
-function openCaProvidersModal() {
-  const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
-  openModal(`
-    <h2>CA Providers / Cards</h2>
-    <div class="sat-signal-box" style="margin-bottom:12px"><strong>Модульные CA Provider backends</strong><div style="margin-top:4px;color:#aeb8ca">Количество Phoenix-reader устройств не фиксировано. Каждая карта/provider привязывается к стабильному /dev/serial/by-id/* и имеет собственный лимит одновременно активных каналов.</div><small>Режим Auto готов принимать лимит от документированного интерфейса карты/провайдера; пока capability не сообщён, используется индивидуальный fallback. TVStreamer не считает 8 глобальной константой.</small></div>
-    <div style="border:1px solid #344155;border-radius:10px;padding:12px;margin-bottom:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><div><strong>Обнаруженные Phoenix / serial readers</strong><div id="serialReadersStatus" style="font-size:12px;color:#aeb8ca;margin-top:3px">Поиск…</div></div><div style="display:flex;gap:8px"><button class="button-secondary" type="button" onclick="refreshSerialReaders()">Обновить</button><button class="button-secondary" type="button" onclick="addAllDetectedReaders()">Добавить новые как Cards</button></div></div>
-      <div id="serialReadersTable" style="margin-top:8px"><div style="color:#aeb8ca;padding:10px 0">Загрузка…</div></div>
-      <small style="display:block;margin-top:8px">By-ID остаётся стабильным даже если после reboot устройство сменит ttyUSB0 на ttyUSB2. Vendor/model/serial относятся к reader. Данные самой карты могут появиться здесь только через документированный card capability/status interface.</small>
-    </div>
-    <div id="caProviderRows">${providers.map(caProviderRowHtml).join('') || '<div id="caProvidersEmpty" style="color:#aeb8ca;margin:10px 0">Карты/providers пока не настроены.</div>'}</div>
-    <button class="button-secondary" type="button" onclick="addCaProviderRow()">+ Добавить Card вручную</button>
-    <div id="caProviderSaveStatus" style="margin-top:10px;color:#ffb36b"></div>
-    <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">Отмена</button><button class="button-primary" onclick="saveCaProviders()">Сохранить</button></div>
-  `);
-  refreshSerialReaders();
-}
-function addCaProviderRow() {
-  document.getElementById('caProvidersEmpty')?.remove();
-  const rows = document.getElementById('caProviderRows');
-  if (!rows) return;
-  const wrapper = document.createElement('div');
-  const nextId = nextCaProviderId();
-  const number = nextId.replace('ca-card-','');
-  const already = new Set([...document.querySelectorAll('.ca-provider-row [data-ca-field="reader_by_id"]')].map(select => String(select.value || '')));
-  const reader = (serialReadersCache || []).find(item => !already.has(String(item.by_id || '')));
-  wrapper.innerHTML = caProviderRowHtml({id:nextId,name:`Карта ${number}`,reader_by_id:reader?.by_id || '',capacity_mode:'manual',max_channels:1,enabled:true,reader_online:!!reader,reader_device:reader?.device,reader_model:reader?.model,reader_serial:reader?.serial});
-  rows.appendChild(wrapper.firstElementChild);
-  updateCaReaderSelects();
-}
-function removeCaProviderRow(button) {
-  const row = button?.closest('.ca-provider-row');
-  if (!row) return;
-  const id = row.querySelector('[data-ca-field="id"]')?.value || row.dataset.providerId || '';
-  const assigned = (state.streams || []).filter(stream => stream.ca_provider_id === id).length;
-  if (assigned > 0) {
-    const status = document.getElementById('caProviderSaveStatus');
-    if (status) status.textContent = `Provider ${id} назначен ${assigned} каналам. Сначала переключите эти каналы на другую карту или «Без CA».`;
-    return;
-  }
-  row.remove();
-  const table = document.getElementById('serialReadersTable');
-  if (table) table.innerHTML = serialReaderTableHtml(serialReadersCache);
-}
-function collectCaProviders() {
-  const providers = [];
-  const ids = new Set();
-  const readers = new Set();
-  for (const row of document.querySelectorAll('.ca-provider-row')) {
-    const id = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
-    const name = String(row.querySelector('[data-ca-field="name"]')?.value || '').trim();
-    const backendType = row.querySelector('[data-ca-field="backend_type"]')?.value === 'newcamd-status' ? 'newcamd-status' : 'reader';
-    const readerById = String(row.querySelector('[data-ca-field="reader_by_id"]')?.value || '').trim();
-    const endpoint = String(row.querySelector('[data-ca-field="endpoint"]')?.value || '').trim();
-    const capacityMode = row.querySelector('[data-ca-field="capacity_mode"]')?.value === 'auto' ? 'auto' : 'manual';
-    if (!id) throw new Error('У каждой карты/CA Provider должен быть ID.');
-    if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`Недопустимый ID provider: ${id}`);
-    if (ids.has(id)) throw new Error(`Повторяющийся ID provider: ${id}`);
-    if (backendType === 'reader' && readerById && readers.has(readerById)) throw new Error(`Reader ${readerById} уже назначен другой карте.`);
-    if (backendType === 'newcamd-status' && endpoint && !/^([^\s:]+|\[[^\]]+\]):\d{1,5}$/.test(endpoint)) throw new Error(`Newcamd Status endpoint должен быть host:port: ${endpoint}`);
-    ids.add(id);
-    if (backendType === 'reader' && readerById) readers.add(readerById);
-    providers.push({
-      id,
-      name: name || id,
-      reader_by_id: backendType === 'reader' ? readerById : '',
-      capacity_mode: capacityMode,
-      max_channels: Math.min(1024, Math.max(1, Number(row.querySelector('[data-ca-field="max_channels"]')?.value || 1))),
-      enabled: row.querySelector('[data-ca-field="enabled"]')?.checked !== false,
-      backend_type: backendType,
-      endpoint: backendType === 'newcamd-status' ? endpoint : ''
-    });
-  }
-  return providers;
-}
-function saveCaProviders() {
-  const status = document.getElementById('caProviderSaveStatus');
-  let providers;
-  try { providers = collectCaProviders(); }
-  catch (error) { if (status) status.textContent = error.message || String(error); return; }
-
-  const renameMap = new Map();
-  for (const row of document.querySelectorAll('.ca-provider-row')) {
-    const originalId = String(row.dataset.providerId || '').trim();
-    const nextId = String(row.querySelector('[data-ca-field="id"]')?.value || '').trim();
-    if (originalId && nextId && originalId !== nextId) renameMap.set(originalId, nextId);
-  }
-  const updatedStreams = (state.streams || []).map(stream => {
-    const nextProviderId = renameMap.get(String(stream.ca_provider_id || ''));
-    return nextProviderId ? {...stream, ca_provider_id: nextProviderId} : {...stream};
-  });
-  const validIds = new Set(providers.map(provider => provider.id));
-  const missing = updatedStreams.filter(stream => stream.ca_provider_id && !validIds.has(stream.ca_provider_id));
-  if (missing.length) {
-    if (status) status.textContent = `Нельзя удалить provider: ${missing.length} канал(ов) всё ещё ссылаются на удалённый ID.`;
-    return;
-  }
-  const payload = {
-    login: state.login,
-    server_name: state.server_name,
-    telegram_token: state.telegram_token,
-    telegram_chat_id: state.telegram_chat_id,
-    http_port: state.http_port,
-    language,
-    ca_providers: providers,
-    streams: updatedStreams
-  };
-  fetch('/api/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(response=>{ if(!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })
-    .then(()=>{ state.ca_providers = providers; state.streams = updatedStreams; closeModal(); fetchState(); })
-    .catch(error=>{ if(status) status.textContent = `Ошибка сохранения: ${error.message || error}`; });
-}
 function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', satellite_enabled:false, satellite_adapter:0, satellite_frontend:0, satellite_frequency:0, satellite_symbol_rate:27500, satellite_polarization:'H', satellite_delivery_system:'dvb-s2', satellite_modulation:'auto', satellite_fec:'auto', satellite_pilot:'auto', satellite_rolloff:'auto', satellite_diseqc_source:-1, satellite_stream_id:-1, satellite_service_id:1, satellite_scrambled:false, satellite_lnb_lof1:9750000, satellite_lnb_lof2:10600000, satellite_lnb_slof:11700000, ca_provider_id:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
-    audio_pid:0, video_pid:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
+    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    audio_pid:0, video_pid:0, input_service_id:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
 function outputTypeOptions(selected) {
   const options = [
     ['udp-vbr', 'UDP MPEG-TS VBR'],
     ['udp-cbr', 'UDP MPEG-TS CBR'],
+    ['rtp', 'RTP MPEG-TS'],
     ['srt', 'SRT'],
     ['http', 'HTTP TS'],
     ['hls', 'HLS'],
@@ -3105,425 +2376,6 @@ function uploadBackupReplacementFile(streamId, input) {
     if (status) status.textContent = 'Ошибка загрузки файла';
   });
 }
-function escapeHtmlValue(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-function dvbAdapters() {
-  return Array.isArray(state.dvb_devices?.adapters) ? state.dvb_devices.adapters : [];
-}
-function satelliteAdapterOptions(selected) {
-  const selectedNumber = Number(selected || 0);
-  const adapters = dvbAdapters();
-  if (!adapters.length) {
-    return `<option value="${selectedNumber}" selected>Adapter ${selectedNumber} (не найден в /dev/dvb)</option>`;
-  }
-  let found = false;
-  const options = adapters.map(adapter => {
-    const number = Number(adapter.adapter || 0);
-    if (number === selectedNumber) found = true;
-    const frontends = Array.isArray(adapter.frontends) ? adapter.frontends.length : 0;
-    return `<option value="${number}" ${number===selectedNumber?'selected':''}>Adapter ${number} · ${frontends} frontend</option>`;
-  });
-  if (!found) options.unshift(`<option value="${selectedNumber}" selected>Adapter ${selectedNumber} (сохранён, сейчас не найден)</option>`);
-  return options.join('');
-}
-function satelliteFrontendOptions(adapterNumber, selected) {
-  const selectedNumber = Number(selected || 0);
-  const adapter = dvbAdapters().find(item => Number(item.adapter) === Number(adapterNumber));
-  const frontends = Array.isArray(adapter?.frontends) ? adapter.frontends : [];
-  if (!frontends.length) {
-    return `<option value="${selectedNumber}" selected>Frontend ${selectedNumber} (не найден)</option>`;
-  }
-  let found = false;
-  const options = frontends.map(frontend => {
-    const number = Number(frontend.frontend || 0);
-    if (number === selectedNumber) found = true;
-    const systems = Array.isArray(frontend.delivery_systems) && frontend.delivery_systems.length
-      ? ` · ${frontend.delivery_systems.join('/')}` : '';
-    const name = frontend.name ? ` · ${frontend.name}` : '';
-    return `<option value="${number}" ${number===selectedNumber?'selected':''}>Frontend ${number}${escapeHtmlValue(name)}${escapeHtmlValue(systems)}</option>`;
-  });
-  if (!found) options.unshift(`<option value="${selectedNumber}" selected>Frontend ${selectedNumber} (сохранён, сейчас не найден)</option>`);
-  return options.join('');
-}
-function caProviderOptions(selected) {
-  const selectedValue = String(selected || '');
-  const providers = Array.isArray(state.ca_providers) ? state.ca_providers : [];
-  const options = [`<option value="" ${selectedValue?'':'selected'}>Без CA карты/provider</option>`];
-  providers.forEach(provider => {
-    const id = String(provider.id || '');
-    if (!id) return;
-    const name = provider.name || id;
-    const active = Number(provider.active_channels || 0);
-    const max = Math.max(1, Number(provider.effective_max_channels || provider.max_channels || 1));
-    const disabled = provider.enabled === false;
-    const readerOnline = provider.reader_online === true;
-    const readerSerial = String(provider.reader_serial || '').trim();
-    const readerState = provider.reader_by_id ? (readerOnline ? ` · reader ${readerSerial ? '#'+readerSerial : 'ONLINE'}` : ' · reader OFFLINE') : ' · reader не назначен';
-    const status = disabled ? ' · отключена' : ` · ${active}/${max} active`;
-    options.push(`<option value="${escapeHtmlValue(id)}" ${id===selectedValue?'selected':''} ${disabled?'disabled':''}>${escapeHtmlValue(name)}${escapeHtmlValue(readerState)}${escapeHtmlValue(status)}</option>`);
-  });
-  if (selectedValue && !providers.some(provider => String(provider.id || '') === selectedValue)) {
-    options.push(`<option value="${escapeHtmlValue(selectedValue)}" selected>${escapeHtmlValue(selectedValue)} (карта/provider не найден)</option>`);
-  }
-  return options.join('');
-}
-function updateChannelSatelliteFrontendOptions() {
-  const adapter = document.getElementById('channelSatelliteAdapter');
-  const frontend = document.getElementById('channelSatelliteFrontend');
-  if (!adapter || !frontend) return;
-  const previous = Number(frontend.value || 0);
-  frontend.innerHTML = satelliteFrontendOptions(Number(adapter.value || 0), previous);
-  if (![...frontend.options].some(option => Number(option.value) === previous)) frontend.selectedIndex = 0;
-}
-function satelliteChannelScanPayload() {
-  return {
-    id: 'satellite-channel-scan',
-    name: 'Satellite channel scan',
-    satellite_enabled: true,
-    satellite_adapter: Number(document.getElementById('channelSatelliteAdapter')?.value || 0),
-    satellite_frontend: Number(document.getElementById('channelSatelliteFrontend')?.value || 0),
-    // UI uses MHz for convenience; the existing config/GStreamer contract remains kHz.
-    satellite_frequency: satelliteFrequencyMhzToKhz(document.getElementById('channelSatelliteFrequency')?.value),
-    satellite_symbol_rate: Number(document.getElementById('channelSatelliteSymbolRate')?.value || 0),
-    satellite_polarization: document.getElementById('channelSatellitePolarization')?.value || 'H',
-    satellite_delivery_system: document.getElementById('channelSatelliteDeliverySystem')?.value || 'dvb-s2',
-    satellite_modulation: document.getElementById('channelSatelliteModulation')?.value || 'auto',
-    satellite_fec: document.getElementById('channelSatelliteFec')?.value || 'auto',
-    satellite_pilot: document.getElementById('channelSatellitePilot')?.value || 'auto',
-    satellite_rolloff: document.getElementById('channelSatelliteRolloff')?.value || 'auto',
-    satellite_diseqc_source: Number(document.getElementById('channelSatelliteDiseqcSource')?.value ?? -1),
-    satellite_stream_id: Number(document.getElementById('channelSatelliteStreamId')?.value ?? -1),
-    satellite_service_id: 0,
-    satellite_lnb_lof1: Number(document.getElementById('channelSatelliteLnbLof1')?.value || 9750000),
-    satellite_lnb_lof2: Number(document.getElementById('channelSatelliteLnbLof2')?.value || 10600000),
-    satellite_lnb_slof: Number(document.getElementById('channelSatelliteLnbSlof')?.value || 11700000)
-  };
-}
-function satellitePercent(raw) {
-  const value = Number(raw || 0);
-  if (!Number.isFinite(value) || value <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round(value * 100 / 65535)));
-}
-function setSatelliteScanMeter(role, percent) {
-  const value = clampPercent(percent);
-  const label = document.querySelector(`[data-role="sat-scan-${role}-value"]`);
-  const fill = document.querySelector(`[data-role="sat-scan-${role}-fill"]`);
-  if (label) label.textContent = `${value}%`;
-  if (fill) {
-    fill.style.width = `${value}%`;
-    fill.className = `dvb-meter-fill ${dvbMeterClass(value)}`;
-  }
-}
-function renderSatelliteChannelResults() {
-  const list = document.getElementById('satelliteChannelResults');
-  if (!list) return;
-  if (!satelliteScanServices.length) {
-    list.innerHTML = '<div class="backup-library-empty">После сканирования найденные сервисы появятся здесь.</div>';
-    updateSatelliteSelectionCount();
-    return;
-  }
-  list.innerHTML = satelliteScanServices.map((service, index) => {
-    const sid = Number(service.service_id || 0);
-    const name = service.name || `Service ${sid}`;
-    const provider = service.provider || '';
-    const scrambled = !!service.scrambled;
-    const video = Number(service.video_pid || 0);
-    const audio = Number(service.audio_pid || 0);
-    const codecs = [service.video_codec, service.audio_codec].filter(Boolean).join(' / ') || '—';
-    const search = `${name} ${provider} ${sid} ${video} ${audio}`.toLowerCase();
-    return `<label class="sat-channel-row" data-sat-search="${escapeHtmlValue(search)}">
-      <input class="sat-channel-choice" type="checkbox" value="${sid}" data-service-index="${index}" onchange="updateSatelliteSelectionCount()" />
-      <span class="sat-channel-name"><strong>${escapeHtmlValue(name)}</strong><small>${escapeHtmlValue(provider || 'Провайдер не указан')}</small></span>
-      <span class="sat-channel-meta">SID ${sid}</span>
-      <span><span class="sat-ca${scrambled?' scrambled':''}">${scrambled?'CA':'FTA'}</span></span>
-      <span class="sat-channel-meta sat-channel-codecs">V:${video || '—'} · A:${audio || '—'} · ${escapeHtmlValue(codecs)}</span>
-    </label>`;
-  }).join('');
-  filterSatelliteChannelResults();
-  updateSatelliteSelectionCount();
-}
-function filterSatelliteChannelResults() {
-  const query = String(document.getElementById('satelliteChannelSearch')?.value || '').trim().toLowerCase();
-  document.querySelectorAll('.sat-channel-row').forEach(row => {
-    row.classList.toggle('hidden', !!query && !String(row.dataset.satSearch || '').includes(query));
-  });
-}
-function toggleAllSatelliteChannels(checked) {
-  document.querySelectorAll('.sat-channel-row:not(.hidden) .sat-channel-choice').forEach(input => { input.checked = !!checked; });
-  updateSatelliteSelectionCount();
-}
-function updateSatelliteSelectionCount() {
-  const count = document.querySelectorAll('.sat-channel-choice:checked').length;
-  const label = document.getElementById('satelliteSelectionCount');
-  const button = document.getElementById('satelliteCreateChannelsButton');
-  if (label) label.textContent = `Выбрано: ${count}`;
-  if (button) {
-    button.disabled = count === 0;
-    button.textContent = count ? `Создать плитки (${count})` : 'Создать плитки';
-  }
-}
-function scanSatelliteChannels() {
-  const button = document.getElementById('satelliteScanButton');
-  const status = document.getElementById('satelliteScanStatus');
-  const payload = satelliteChannelScanPayload();
-  if (payload.satellite_frequency <= 0 || payload.satellite_symbol_rate <= 0) {
-    if (status) status.textContent = 'Укажите частоту и Symbol Rate.';
-    return;
-  }
-  if (button) button.disabled = true;
-  if (status) status.textContent = 'Настройка frontend и сканирование PAT / SDT / PMT…';
-  satelliteScanServices = [];
-  renderSatelliteChannelResults();
-  setSatelliteScanMeter('signal', 0);
-  setSatelliteScanMeter('quality', 0);
-  fetch('/api/scan-satellite', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(payload)
-  }).then(async response => {
-    const text = await response.text();
-    let result = {};
-    try { result = text ? JSON.parse(text) : {}; } catch (_) { throw new Error(text || `HTTP ${response.status}`); }
-    if (!response.ok || result.result !== 'ok') throw new Error(result.error || `HTTP ${response.status}`);
-    satelliteScanServices = Array.isArray(result.services) ? result.services : [];
-    renderSatelliteChannelResults();
-    const frontend = result.frontend_status || {};
-    const signal = satellitePercent(frontend.signal_strength_raw);
-    const quality = satellitePercent(frontend.snr_raw);
-    setSatelliteScanMeter('signal', signal);
-    setSatelliteScanMeter('quality', quality);
-    if (status) status.textContent = `${result.lock ? 'LOCK' : 'без LOCK'} · найдено сервисов: ${satelliteScanServices.length}`;
-  }).catch(error => {
-    if (status) status.textContent = `Ошибка сканирования: ${error.message || error}`;
-    satelliteScanServices = [];
-    renderSatelliteChannelResults();
-  }).finally(() => { if (button) button.disabled = false; });
-}
-function incrementIpv4Address(address, offset) {
-  const parts = String(address || '').trim().split('.').map(Number);
-  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return '';
-  let value = (((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3]) + Number(offset || 0);
-  if (value < 0 || value > 0xffffffff) return '';
-  const p4 = value % 256; value = Math.floor(value / 256);
-  const p3 = value % 256; value = Math.floor(value / 256);
-  const p2 = value % 256; value = Math.floor(value / 256);
-  const p1 = value % 256;
-  return `${p1}.${p2}.${p3}.${p4}`;
-}
-function satelliteChannelAlreadyExists(scan, serviceId) {
-  return (state.streams || []).some(stream =>
-    stream.satellite_enabled === true &&
-    Number(stream.satellite_adapter) === Number(scan.satellite_adapter) &&
-    Number(stream.satellite_frontend) === Number(scan.satellite_frontend) &&
-    Number(stream.satellite_frequency) === Number(scan.satellite_frequency) &&
-    Number(stream.satellite_symbol_rate) === Number(scan.satellite_symbol_rate) &&
-    String(stream.satellite_polarization || '').toUpperCase() === String(scan.satellite_polarization || '').toUpperCase() &&
-    Number(stream.satellite_stream_id ?? -1) === Number(scan.satellite_stream_id ?? -1) &&
-    Number(stream.satellite_service_id) === Number(serviceId));
-}
-function createSelectedSatelliteChannels() {
-  const selected = [...document.querySelectorAll('.sat-channel-choice:checked')]
-    .map(input => satelliteScanServices[Number(input.dataset.serviceIndex)])
-    .filter(Boolean);
-  const status = document.getElementById('satelliteCreateStatus');
-  if (!selected.length) {
-    if (status) status.textContent = 'Выберите хотя бы один канал.';
-    return;
-  }
-  const scan = satelliteChannelScanPayload();
-  const baseHost = String(document.getElementById('satelliteOutputHost')?.value || '239.100.1.1').trim();
-  const basePort = Number(document.getElementById('satelliteOutputPort')?.value || 1234);
-  const allocation = document.getElementById('satelliteOutputAllocation')?.value || 'increment-ip';
-  const outputType = document.getElementById('satelliteOutputType')?.value || 'udp-cbr';
-  const outputInterface = document.getElementById('satelliteOutputInterface')?.value || '';
-  const targetBitrate = Math.max(1, Number(document.getElementById('satelliteOutputBitrate')?.value || 12000)) * 1000;
-  const caProviderId = document.getElementById('satelliteCaProvider')?.value || '';
-  if (basePort <= 0 || basePort > 65535) {
-    if (status) status.textContent = 'Укажите корректный порт 1…65535.';
-    return;
-  }
-  if (allocation === 'increment-ip' && !incrementIpv4Address(baseHost, 0)) {
-    if (status) status.textContent = 'Для автоматического изменения IP укажите IPv4 адрес, например 239.100.1.1.';
-    return;
-  }
-
-  const created = [];
-  let skipped = 0;
-  const stamp = Date.now();
-  selected.forEach((service, index) => {
-    const sid = Number(service.service_id || 0);
-    if (!sid || satelliteChannelAlreadyExists(scan, sid)) { skipped += 1; return; }
-    const host = allocation === 'increment-ip' ? incrementIpv4Address(baseHost, created.length) : baseHost;
-    const port = allocation === 'increment-port' ? basePort + created.length : basePort;
-    if (!host || port > 65535) { skipped += 1; return; }
-    const serviceName = service.name && !String(service.name).startsWith('Service ')
-      ? String(service.name)
-      : `SID ${sid}`;
-    created.push({
-      id: `sat-${scan.satellite_adapter}-${scan.satellite_frequency}-${sid}-${stamp + index}`,
-      name: serviceName,
-      input_uri: '',
-      input_interface_address: '',
-      input_mode: 'auto',
-      satellite_enabled: true,
-      satellite_adapter: scan.satellite_adapter,
-      satellite_frontend: scan.satellite_frontend,
-      satellite_frequency: scan.satellite_frequency,
-      satellite_symbol_rate: scan.satellite_symbol_rate,
-      satellite_polarization: scan.satellite_polarization,
-      satellite_delivery_system: scan.satellite_delivery_system,
-      satellite_modulation: scan.satellite_modulation,
-      satellite_fec: scan.satellite_fec,
-      satellite_pilot: scan.satellite_pilot,
-      satellite_rolloff: scan.satellite_rolloff,
-      satellite_diseqc_source: scan.satellite_diseqc_source,
-      satellite_stream_id: scan.satellite_stream_id,
-      satellite_service_id: sid,
-      satellite_scrambled: !!service.scrambled,
-      satellite_lnb_lof1: scan.satellite_lnb_lof1,
-      satellite_lnb_lof2: scan.satellite_lnb_lof2,
-      satellite_lnb_slof: scan.satellite_lnb_slof,
-      ca_provider_id: service.scrambled ? caProviderId : '',
-      backup_input_uri: '',
-      backup_input_type: 'url',
-      backup_file_loop: false,
-      output_type: outputType,
-      output_mode: 'listener',
-      output_host: host,
-      output_port: port,
-      additional_outputs: [],
-      interface_address: outputInterface,
-      test_pattern: false,
-      auto_start: false,
-      remap_enabled: false,
-      cbr: outputType === 'udp-cbr',
-      target_bitrate: targetBitrate,
-      transcode_enabled: false,
-      transcode_resolution: '1920x1080',
-      transcode_video_bitrate: 6000000,
-      transcode_audio_codec: 'aac',
-      transcode_audio_bitrate: 192000,
-      audio_pid: Number(service.audio_pid || 0),
-      video_pid: Number(service.video_pid || 0),
-      service_id: sid,
-      service_name: serviceName,
-      service_provider: String(service.provider || '')
-    });
-  });
-  if (!created.length) {
-    if (status) status.textContent = skipped ? 'Все выбранные каналы уже существуют или не удалось выделить выходные адреса.' : 'Не удалось создать каналы.';
-    return;
-  }
-
-  const nextStreams = [...(state.streams || []), ...created];
-  const savePayload = {
-    login: state.login,
-    server_name: state.server_name,
-    telegram_token: state.telegram_token,
-    telegram_chat_id: state.telegram_chat_id,
-    http_port: state.http_port,
-    language,
-    ca_providers: state.ca_providers || [],
-    streams: nextStreams
-  };
-  const button = document.getElementById('satelliteCreateChannelsButton');
-  if (button) button.disabled = true;
-  if (status) status.textContent = `Создание плиток: ${created.length}…`;
-  fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
-    .then(response => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      state.streams = nextStreams;
-      closeModal();
-      fetchState();
-    })
-    .catch(error => {
-      if (status) status.textContent = `Ошибка сохранения: ${error.message || error}`;
-      if (button) button.disabled = false;
-    });
-}
-function openSatelliteChannelModal() {
-  const renderSatelliteModal = () => {
-    const devices = state.dvb_devices || {adapters:[], serial_readers:[]};
-    const adapters = Array.isArray(devices.adapters) ? devices.adapters : [];
-    const firstAdapter = Number(adapters[0]?.adapter || 0);
-    const outputInterfaces = (state.interfaces || []).map(i=>`<option value="${i.address}">${i.name} (${i.address})</option>`).join('');
-    satelliteScanServices = [];
-    openModal(`
-      <h2>Добавить канал со спутника</h2>
-      <div class="sat-setup-grid">
-        <div class="form-row"><label>Adapter</label><select id="channelSatelliteAdapter" onchange="updateChannelSatelliteFrontendOptions()">${satelliteAdapterOptions(firstAdapter)}</select></div>
-        <div class="form-row"><label>Frontend</label><select id="channelSatelliteFrontend">${satelliteFrontendOptions(firstAdapter, 0)}</select></div>
-        <div class="form-row"><label>Система</label><select id="channelSatelliteDeliverySystem"><option value="dvb-s2">DVB-S2</option><option value="dvb-s">DVB-S</option></select></div>
-        <div class="form-row"><label>Поляризация</label><select id="channelSatellitePolarization"><option value="H">Horizontal (H)</option><option value="V">Vertical (V)</option></select></div>
-
-        <div class="form-row"><label>Частота, MHz</label><input id="channelSatelliteFrequency" type="number" min="1" max="30000" step="0.001" placeholder="11531" inputmode="decimal" /></div>
-        <div class="form-row"><label>Symbol rate, kBd</label><input id="channelSatelliteSymbolRate" type="number" min="1" step="1" value="22000" /></div>
-        <div class="form-row"><label>Модуляция</label><select id="channelSatelliteModulation"><option value="auto">Auto</option><option value="qpsk">QPSK</option><option value="8psk">8PSK</option><option value="16apsk">16APSK</option><option value="32apsk">32APSK</option></select></div>
-        <div class="form-row"><label>FEC</label><select id="channelSatelliteFec"><option value="auto">Auto</option>${['1/2','2/3','3/4','4/5','5/6','6/7','7/8','8/9','3/5','9/10','2/5'].map(v=>`<option value="${v}">${v}</option>`).join('')}</select></div>
-
-        <details class="sat-advanced">
-          <summary>Дополнительные настройки DVB / LNB / CA</summary>
-          <div class="sat-advanced-grid">
-            <div class="form-row"><label>Pilot</label><select id="channelSatellitePilot"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select></div>
-            <div class="form-row"><label>Rolloff</label><select id="channelSatelliteRolloff"><option value="auto">Auto</option><option value="35">0.35</option><option value="25">0.25</option><option value="20">0.20</option></select></div>
-            <div class="form-row"><label>DiSEqC source</label><input id="channelSatelliteDiseqcSource" type="number" min="-1" max="7" value="-1" /></div>
-            <div class="form-row"><label>Stream ID / MIS</label><input id="channelSatelliteStreamId" type="number" min="-1" max="255" value="-1" /></div>
-            <div class="form-row"><label>LNB LOF1, kHz</label><input id="channelSatelliteLnbLof1" type="number" value="9750000" /></div>
-            <div class="form-row"><label>LNB LOF2, kHz</label><input id="channelSatelliteLnbLof2" type="number" value="10600000" /></div>
-            <div class="form-row"><label>LNB switch, kHz</label><input id="channelSatelliteLnbSlof" type="number" value="11700000" /></div>
-            <div class="form-row"><label>CA карта</label><select id="satelliteCaProvider">${caProviderOptions('')}</select><small>Выберите Card/provider, связанный со стабильным Phoenix reader. Лимит активных каналов задаётся отдельно для каждой карты.</small></div>
-          </div>
-        </details>
-
-        <div class="sat-section">
-          <div class="sat-toolbar"><button class="button-primary" id="satelliteScanButton" type="button" onclick="scanSatelliteChannels()">Сканировать транспондер</button><span class="sat-scan-status" id="satelliteScanStatus">Настройте транспондер и запустите поиск каналов.</span></div>
-          <div class="sat-signal-grid">
-            <div class="sat-signal-box"><div class="sat-signal-head"><strong>Уровень сигнала</strong><span data-role="sat-scan-signal-value">0%</span></div><div class="dvb-meter-track"><div data-role="sat-scan-signal-fill" class="dvb-meter-fill bad" style="width:0%"></div></div></div>
-            <div class="sat-signal-box"><div class="sat-signal-head"><strong>Качество сигнала</strong><span data-role="sat-scan-quality-value">0%</span></div><div class="dvb-meter-track"><div data-role="sat-scan-quality-fill" class="dvb-meter-fill bad" style="width:0%"></div></div></div>
-          </div>
-        </div>
-
-        <div class="sat-section">
-          <div class="sat-section-title"><span>Найденные каналы</span><span id="satelliteSelectionCount">Выбрано: 0</span></div>
-          <div class="sat-result-tools"><input id="satelliteChannelSearch" type="search" placeholder="Поиск: имя, провайдер, SID, PID" oninput="filterSatelliteChannelResults()" /><label class="checkbox-inline"><input type="checkbox" onchange="toggleAllSatelliteChannels(this.checked)" /><span>Выбрать видимые</span></label></div>
-          <div class="sat-channel-list" id="satelliteChannelResults"><div class="backup-library-empty">После сканирования найденные сервисы появятся здесь.</div></div>
-        </div>
-
-        <div class="sat-section">
-          <div class="sat-section-title"><span>Выход для создаваемых плиток</span><small>Каждый выбранный SID создаёт отдельную остановленную плитку.</small></div>
-          <div class="sat-setup-grid">
-            <div class="form-row"><label>Тип</label><select id="satelliteOutputType"><option value="udp-cbr">UDP MPEG-TS CBR</option><option value="udp-vbr">UDP MPEG-TS VBR</option></select></div>
-            <div class="form-row"><label>Интерфейс</label><select id="satelliteOutputInterface"><option value="">Auto / все интерфейсы</option>${outputInterfaces}</select></div>
-            <div class="form-row"><label>Начальный IP</label><input id="satelliteOutputHost" value="239.100.1.1" placeholder="239.100.1.1" /></div>
-            <div class="form-row"><label>Порт</label><input id="satelliteOutputPort" type="number" min="1" max="65535" value="1234" /></div>
-            <div class="form-row"><label>Распределение</label><select id="satelliteOutputAllocation"><option value="increment-ip">Следующий multicast IP</option><option value="increment-port">Следующий порт</option></select></div>
-            <div class="form-row"><label>CBR / target, кбит/с</label><input id="satelliteOutputBitrate" type="number" min="1" value="12000" /></div>
-          </div>
-        </div>
-      </div>
-      <div class="modal-actions">
-        <span id="satelliteCreateStatus" style="margin-right:auto;color:#aeb8ca"></span>
-        <button class="button-secondary" onclick="closeModal()">Отмена</button>
-        <button class="button-primary" id="satelliteCreateChannelsButton" onclick="createSelectedSatelliteChannels()" disabled>Создать плитки</button>
-      </div>
-    `);
-    const modalContent = document.getElementById('modalContent');
-    modalContent.classList.add('stream-modal','satellite-modal');
-    updateHeaderHeight();
-    document.getElementById('modal').classList.add('stream-open');
-  };
-  const loaders = [];
-  if (!state.interfaces || !state.interfaces.length) loaders.push(loadInterfaces());
-  if (!state.dvb_devices) loaders.push(loadDvbDevices());
-  if (loaders.length) Promise.all(loaders).then(renderSatelliteModal);
-  else renderSatelliteModal();
-}
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
@@ -3540,26 +2392,26 @@ function openStreamForm(stream) {
     const transcoderStatus = transcoderAvailable
       ? `Доступно: H.264 ${transcoderInfo.video_encoder || 'encoder'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
       : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
-    const satelliteSummary = stream.satellite_enabled ? satelliteInputSummary(stream) : '';
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
-        ${stream.satellite_enabled ? `<div class="form-row full"><label>Источник основного потока</label><div class="sat-signal-box"><strong>Спутниковый канал · ${stream.satellite_scrambled === false ? 'FTA' : 'CA'}</strong><div style="margin-top:4px;color:#aeb8ca">${escapeHtmlValue(satelliteSummary)}</div><small>DVB-настройки и сканирование перенесены в отдельное меню «Добавить канал».</small></div></div>${stream.satellite_scrambled === false ? `<div class="form-row full"><label>CA карта</label><div class="sat-signal-box"><strong>Не требуется</strong><small>Сканирование PMT/SDT определило этот сервис как FTA. CA reader и его лимит при запуске не используются.</small></div></div>` : `<div class="form-row full"><label>CA карта</label><select id="streamCaProvider">${caProviderOptions(stream.ca_provider_id || '')}</select><small>Для зашифрованного сервиса выберите Card/provider.</small></div>`}` : `<div class="form-row full" id="streamPrimaryUrlSettings"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>`}
+        <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
         <div class="form-row full"><label>Интерфейс вывода</label><select class="compact" id="streamInterface" onchange="syncOutputHostWithInterface()"><option value="">Auto / все интерфейсы</option>${outputOptions}</select></div>
         <div class="form-row full"><label>Выходные форматы</label><div id="streamOutputs" class="output-list">${renderOutputRows(outputs, links)}</div><button class="button-secondary" type="button" onclick="addStreamOutput()">+ Добавить формат</button></div>
-        <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamAudioPid" type="number" value="${stream.audio_pid||257}" placeholder="257" /><input class="compact" id="streamVideoPid" type="number" value="${stream.video_pid||258}" placeholder="258" /></div></div>
-        <div class="form-row"><label>SID</label><input class="compact" id="streamServiceId" type="number" value="${stream.service_id||1}" placeholder="1" /></div>
+        <div class="form-row full"><label>V-PID / A-PID</label><div class="row-inline compact-row"><input class="compact" id="streamVideoPid" type="number" min="16" max="8190" value="${stream.video_pid||258}" placeholder="V-PID 258" /><input class="compact" id="streamAudioPid" type="number" min="16" max="8190" value="${stream.audio_pid||257}" placeholder="A-PID 257" /></div></div>
+        <div class="form-row"><label>SID входа</label><input class="compact" id="streamInputServiceId" type="number" min="0" max="65535" value="${stream.input_service_id ?? 0}" placeholder="0 = Auto" /><small>0 = автоопределение SID из PAT; значение 1–65535 = выбрать конкретный входной канал.</small></div>
+        <div class="form-row"><label>SID выхода</label><input class="compact" id="streamServiceId" type="number" min="1" max="65535" value="${stream.service_id||1}" placeholder="1" /></div>
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
-        <div class="form-row full"><label>Target bitrate (кбит/с)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
+        <div class="form-row full"><label>Target bitrate (кбит/с, для CBR)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
         <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${(stream.transcode_enabled && transcoderAvailable) ? 'checked' : ''} ${transcoderAvailable ? '' : 'disabled'} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR, устранить черезстрочность и перекодировать звук</span></div><small style="color:${transcoderAvailable ? '#7ee2a8' : '#ff9f9f'}">${transcoderStatus}</small></div>
         <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><div class="row-inline compact-row" style="margin-top:8px"><select id="streamTranscodeAudioCodec" onchange="updateTranscodeAudioControls()"><option value="copy" ${stream.transcode_audio_codec==='copy'?'selected':''}>Проброс оригинальной дорожки</option><option value="aac" ${(stream.transcode_audio_codec||'aac')==='aac'?'selected':''} ${transcoderInfo.aac_encoder?'':'disabled'}>AAC-LC${transcoderInfo.aac_encoder?'':' (недоступен)'}</option><option value="mp3" ${stream.transcode_audio_codec==='mp3'?'selected':''} ${transcoderInfo.mp3_encoder?'':'disabled'}>MP3${transcoderInfo.mp3_encoder?'':' (недоступен)'}</option></select><select id="streamTranscodeAudioBitrate" ${stream.transcode_audio_codec==='copy'?'disabled':''}><option value="96000" ${(stream.transcode_audio_bitrate||192000)===96000?'selected':''}>96 кбит/с</option><option value="128000" ${(stream.transcode_audio_bitrate||192000)===128000?'selected':''}>128 кбит/с</option><option value="160000" ${(stream.transcode_audio_bitrate||192000)===160000?'selected':''}>160 кбит/с</option><option value="192000" ${(stream.transcode_audio_bitrate||192000)===192000?'selected':''}>192 кбит/с</option><option value="256000" ${(stream.transcode_audio_bitrate||192000)===256000?'selected':''}>256 кбит/с</option><option value="320000" ${(stream.transcode_audio_bitrate||192000)===320000?'selected':''}>320 кбит/с</option></select><span>аудио</span></div><small>Видео всегда преобразуется в прогрессивный режим 25p. По умолчанию: Full HD — 6000 кбит/с, звук AAC 192 кбит/с. В режиме проброса исходная аудиодорожка не перекодируется.</small></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} /><span>CBR</span></div></div>
-        <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div></div>
+        <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div><small>Для MPEG-TS: SID входа 0 = автоопределение программы из PAT; ненулевой SID выбирает конкретный входной канал. SID выхода всегда задаётся отдельно и используется для Remap в PAT/PMT/SDT. V-PID и A-PID задают выходные PID.</small></div>
       </div>
       <div class="modal-actions">
         <button class="button-secondary" onclick="closeModal()">Отмена</button>
@@ -3576,10 +2428,8 @@ function openStreamForm(stream) {
     updateOutputHints();
   };
 
-  const loaders = [];
-  if (!state.interfaces || !state.interfaces.length) loaders.push(loadInterfaces());
-  if (loaders.length) {
-    Promise.all(loaders).then(renderStreamForm);
+  if (!state.interfaces || !state.interfaces.length) {
+    loadInterfaces().then(renderStreamForm);
   } else {
     renderStreamForm();
   }
@@ -3593,6 +2443,7 @@ function updateTranscodeControls() {
     enabled.disabled = true;
   }
   if (controls) controls.style.display = available && enabled && enabled.checked ? 'block' : 'none';
+  updateOutputHints();
 }
 function updateTranscodeAudioControls() {
   const codec = document.getElementById('streamTranscodeAudioCodec');
@@ -3627,6 +2478,11 @@ function updateOutputHints() {
       port.disabled = false;
       port.placeholder = String(state.http_port || 9000);
       host.placeholder = 'IP интерфейса или DNS';
+    } else if (type === 'rtp') {
+      hostLabel.textContent = 'RTP IP / мультикаст';
+      portLabel.textContent = 'RTP порт';
+      port.disabled = false;
+      host.placeholder = '239.0.0.1';
     } else if (type === 'srt') {
       hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
       portLabel.textContent = 'SRT порт';
@@ -3693,7 +2549,6 @@ function saveSettings() {
     telegram_chat_id: document.getElementById('telegramChatId')?.value || state.telegram_chat_id,
     http_port: httpPort,
     language,
-    ca_providers: state.ca_providers || [],
     streams: state.streams
   };
   const password = document.getElementById('password')?.value;
@@ -3717,12 +2572,10 @@ function saveStream(id) {
   const selectedCbr = selectedOutputType === 'udp-cbr'
     ? true
     : (selectedOutputType === 'udp-vbr' ? false : document.getElementById('streamCbr').checked);
-  const previous = (state.streams || []).find(stream => stream.id === id) || {};
-  const satelliteEnabled = previous.satellite_enabled === true;
   const payload = {
     id: id,
     name: document.getElementById('streamName').value,
-    input_uri: document.getElementById('streamInput')?.value ?? previous.input_uri ?? '',
+    input_uri: document.getElementById('streamInput').value,
     output_type: selectedOutputType,
     output_mode: primaryOutput.output_mode,
     output_host: primaryOutput.output_host,
@@ -3732,27 +2585,8 @@ function saveStream(id) {
     backup_input_type: document.getElementById('streamBackupInputType').value,
     backup_file_loop: document.getElementById('streamBackupInputType').value === 'file' && document.getElementById('streamBackupFileLoop').checked,
     interface_address: document.getElementById('streamInterface').value,
-    input_interface_address: document.getElementById('streamInputInterface')?.value ?? previous.input_interface_address ?? '',
-    input_mode: document.getElementById('streamInputMode')?.value ?? previous.input_mode ?? 'auto',
-    satellite_enabled: satelliteEnabled,
-    satellite_adapter: Number(previous.satellite_adapter || 0),
-    satellite_frontend: Number(previous.satellite_frontend || 0),
-    satellite_frequency: Number(previous.satellite_frequency || 0),
-    satellite_symbol_rate: Number(previous.satellite_symbol_rate || 27500),
-    satellite_polarization: previous.satellite_polarization || 'H',
-    satellite_delivery_system: previous.satellite_delivery_system || 'dvb-s2',
-    satellite_modulation: previous.satellite_modulation || 'auto',
-    satellite_fec: previous.satellite_fec || 'auto',
-    satellite_pilot: previous.satellite_pilot || 'auto',
-    satellite_rolloff: previous.satellite_rolloff || 'auto',
-    satellite_diseqc_source: Number(previous.satellite_diseqc_source ?? -1),
-    satellite_stream_id: Number(previous.satellite_stream_id ?? -1),
-    satellite_service_id: Number(previous.satellite_service_id || 0),
-    satellite_scrambled: previous.satellite_scrambled === true,
-    satellite_lnb_lof1: Number(previous.satellite_lnb_lof1 || 9750000),
-    satellite_lnb_lof2: Number(previous.satellite_lnb_lof2 || 10600000),
-    satellite_lnb_slof: Number(previous.satellite_lnb_slof || 11700000),
-    ca_provider_id: satelliteEnabled && previous.satellite_scrambled === true ? (document.getElementById('streamCaProvider')?.value || previous.ca_provider_id || '') : '',
+    input_interface_address: document.getElementById('streamInputInterface').value,
+    input_mode: document.getElementById('streamInputMode').value,
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,
@@ -3765,6 +2599,7 @@ function saveStream(id) {
     transcode_audio_bitrate: Number(document.getElementById('streamTranscodeAudioBitrate').value),
     audio_pid: Number(document.getElementById('streamAudioPid').value),
     video_pid: Number(document.getElementById('streamVideoPid').value),
+    input_service_id: Number(document.getElementById('streamInputServiceId').value),
     service_id: Number(document.getElementById('streamServiceId').value),
     service_name: document.getElementById('streamServiceName').value,
     service_provider: document.getElementById('streamProvider').value
@@ -3782,7 +2617,6 @@ function saveStream(id) {
     telegram_chat_id: state.telegram_chat_id,
     http_port: state.http_port,
     language,
-    ca_providers: state.ca_providers || [],
     streams: state.streams
   };
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
@@ -3856,7 +2690,7 @@ const qualityRefreshOptions = [
   {label:'30 сек', ms:30000}
 ];
 function storedQualityRefreshMs() {
-  const stored = localStorage.getItem('tvstreamer-quality-refresh-ms');
+  const stored = localStorage.getItem('tvstreammersat5-quality-refresh-ms');
   const value = stored === null ? 2000 : Number(stored);
   return qualityRefreshOptions.some(option => option.ms === value) ? value : 2000;
 }
@@ -3874,7 +2708,7 @@ function restartQualityAutoRefresh() {
 }
 function setQualityAutoRefresh(ms) {
   qualityChart.refreshMs = qualityRefreshOptions.some(option => option.ms === ms) ? ms : 0;
-  localStorage.setItem('tvstreamer-quality-refresh-ms', String(qualityChart.refreshMs));
+  localStorage.setItem('tvstreammersat5-quality-refresh-ms', String(qualityChart.refreshMs));
   restartQualityAutoRefresh();
 }
 function qualityColor(level) {
@@ -3974,7 +2808,7 @@ function drawQualityChart(data) {
   const stream = (state.streams || []).find(item => item.id === qualityChart.streamId) || {};
   const streamName = stream.name || data.id || 'Поток';
   const streamLinkText = (stream.vlc_links && stream.vlc_links[0]?.url) || stream.vlc_link || stream.input_uri || '';
-  const title = `${state.server_name || 'TVStreamer5'}: Поток: ${streamName}${streamLinkText ? ` (${streamLinkText})` : ''}`;
+  const title = `${state.server_name || 'TVStreammerSAT5'}: Поток: ${streamName}${streamLinkText ? ` (${streamLinkText})` : ''}`;
   const edgeTime = ts => {
     const date = new Date(ts * 1000);
     const day = String(date.getDate()).padStart(2, '0');
@@ -4218,16 +3052,9 @@ function loadInterfaces() {
     .then(data=>{ state.interfaces=data; return data; })
     .catch(() => { state.interfaces=[]; return []; });
 }
-function loadDvbDevices() {
-  return fetch('/api/dvb-devices', {cache:'no-store'})
-    .then(r=>r.json())
-    .then(data=>{ state.dvb_devices=data || {adapters:[], serial_readers:[]}; return state.dvb_devices; })
-    .catch(() => { state.dvb_devices={adapters:[], serial_readers:[]}; return state.dvb_devices; });
-}
 window.onload = () => {
   applyLanguage();
   loadInterfaces();
-  loadDvbDevices();
   statePollLoop();
   metricsPollLoop();
 };

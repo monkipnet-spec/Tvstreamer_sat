@@ -8,6 +8,7 @@ bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     appendMpegTsMux(args, cfg);
     appendTsSmoother(args, "transcode_srt_ts_smoother", 500000);
     appendCbrPacer(args, cfg, "transcode_srt_cbr_pacer");
+    appendPostMuxAvReservoir(args, "transcode_srt_av_reservoir");
     appendOutputQueueWithTime(args, "transcode_srt_output_queue", 5000000000ULL, false);
 
     const std::string mode = srtOutputMode(cfg);

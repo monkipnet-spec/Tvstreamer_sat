@@ -690,7 +690,7 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
     context->bin = bin;
     context->mux = mux;
     context->config = config;
-    g_object_set_data_full(G_OBJECT(bin), "tvstreamer-transcode-context", context,
+    g_object_set_data_full(G_OBJECT(bin), "tvstreammersat5-transcode-context", context,
         [](gpointer p) { delete static_cast<TranscodeContext*>(p); });
     g_signal_connect(parsebin, "pad-added", G_CALLBACK(onDemuxPadAdded), context);
     return bin;

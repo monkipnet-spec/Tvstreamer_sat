@@ -7,5 +7,5 @@ backup-files/
 *.zip
 *.patch
 *.apk
-tvstreamer5-config.json
-tvstreamer5-subscribers.json
+tvstreammersat5-config.json
+tvstreammersat5-subscribers.json

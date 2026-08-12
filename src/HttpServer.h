@@ -51,9 +51,6 @@ private:
     bool bindHttpPorts(const std::set<int>& ports);
     void refreshHttpPorts();
     std::string listInterfaces();
-    std::string listDvbDevices();
-    std::string listSerialReaders();
-    std::string handleScanSatellite(const std::string& body);
     std::string systemMetrics();
     std::string currentState();
     std::string qualityHistory(const std::string& target);
@@ -63,7 +60,7 @@ private:
     std::string listBackupFiles();
     std::string handleUploadBackupFile(const std::string& target, const std::string& body);
     std::string handleDeleteBackupFile(const std::string& body);
-    std::string handleStartStream(const std::string& body);
+    void handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
     void handleRestartProgram();
     void handleDeleteStream(const std::string& body);

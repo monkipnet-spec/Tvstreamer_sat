@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TVStreamer5 Release 2 GStreamer capability check.
+# TVStreammerSAT5 Release 2 GStreamer capability check.
 # Core transcoder elements are mandatory. Input/output protocol elements are
 # reported separately because a deployment may intentionally use only a subset.
 
@@ -67,7 +67,6 @@ if ((${#missing[@]} > 0)); then
 fi
 
 input_elements=(
-  "satellite DVB-S/S2:dvbbasebin"
   "http/https:souphttpsrc"
   "hls:souphttpsrc hlsdemux"
   "udp:udpsrc"
@@ -112,7 +111,7 @@ print_group() {
   done
 }
 
-echo "TVStreamer5 Release 2 GStreamer core is available."
+echo "TVStreammerSAT5 Release 2 GStreamer core is available."
 echo "  gst-launch: $(command -v gst-launch-1.0)"
 echo "  Video encoder: x264enc"
 echo "  AAC encoder: ${aac_encoder}"
