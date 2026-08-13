@@ -47,6 +47,7 @@ struct StreamConfig {
     uint32_t serviceId = 1;
     std::string serviceName;
     std::string serviceProvider;
+    std::string conditionalAccessReader;
     std::vector<StreamOutputConfig> additionalOutputs;
 
     Json::Value toJson() const;

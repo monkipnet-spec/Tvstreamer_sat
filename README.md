@@ -1,6 +1,6 @@
-# TVStreammerSAT5 — Release 8
+# TVStreammerSAT5 — Release 9
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 8 / v122.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 9 / v123.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -12,6 +12,15 @@ While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and qualit
 
 Satellite streams are stored as `dvb://satellite?...` inputs. Each scan result now includes the PMT/PCR and every elementary PID of the selected service. Release 7 stores that PID list in the channel URI and configures `dvbsrc` to capture the complete service directly, avoiding the `tsparse program_%u` request-pad path that could forward only PSI/SI on some GStreamer builds. The normal WISI-compatible 5-second UDP reservoir remains unchanged.
 
+
+
+### Phoenix reader/card inventory (v123)
+
+Release 9 adds automatic Phoenix/SmartMouse-style USB serial reader discovery without changing the working DVB/FTA or WISI UDP pipeline. The inventory prefers stable `/dev/serial/by-id/*` paths and falls back to `/dev/ttyUSB*` / `/dev/ttyACM*`, then numbers the detected readers as **Phoenix 1**, **Phoenix 2**, and so on. FTDI, PL2303, CP210x, CH341 and common usbserial/smart-card identities are recognised as candidates.
+
+When the **Add channel** window is opened (or **Refresh** is pressed), a free Phoenix candidate is probed for an ISO 7816 ATR without sending application APDUs. If an ATR is received, the UI shows **CARD** and a best-effort card-system/provider label when recognizable from ATR historical data; otherwise it explicitly shows that the provider could not be determined. If no ATR is returned, the reader is shown as **Phoenix N — NO CARD**. Busy readers are not reset/probed and are shown as **BUSY**; permission failures are shown separately.
+
+The selected reader is stored in `conditional_access_reader` for scrambled DVB tiles. FTA tiles do not depend on this field. This release is an inventory/status and reader-assignment feature only: it does not add ECM/CW extraction, sharing, caching, or software descrambling. The existing five-second WISI startup reservoir, PCR restamping/20 ms periodic PCR and 7x188 UDP packetisation remain unchanged.
 
 ### Stable UDP DVB passthrough fix (v122)
 
@@ -319,7 +328,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 8
+Description=TVStreammerSAT5 Release 9
 After=network-online.target
 Wants=network-online.target
 

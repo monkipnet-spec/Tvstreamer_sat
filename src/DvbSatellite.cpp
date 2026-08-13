@@ -1,4 +1,5 @@
 #include "DvbSatellite.h"
+#include "PhoenixManager.h"
 
 #include <gst/app/gstappsink.h>
 #include <glib.h>
@@ -905,6 +906,8 @@ Json::Value adapters() {
     }
     root["adapters"] = list;
     root["available"] = !list.empty();
+    root["phoenix_readers"] = PhoenixManager::readers();
+    root["phoenix_count"] = Json::UInt(root["phoenix_readers"].size());
     GstElementFactory* dvbFactory = gst_element_factory_find("dvbsrc");
     root["dvbsrc_available"] = dvbFactory != nullptr;
     if (dvbFactory) gst_object_unref(dvbFactory);

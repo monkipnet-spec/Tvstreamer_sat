@@ -29,8 +29,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 8";
-constexpr const char* kProgramVersion = "v122";
+constexpr const char* kProgramRelease = "Release 9";
+constexpr const char* kProgramVersion = "v123";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -922,6 +922,7 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
     int basePort = std::clamp(request.get("base_port", 5000).asInt(), 1, 65535);
     const std::string interfaceAddress = request.get("interface_address", "").asString();
     const bool autoStart = request.get("auto_start", false).asBool();
+    const std::string conditionalAccessReader = request.get("conditional_access_reader", "").asString();
     const uint64_t targetBitrate = std::clamp<uint64_t>(
         request.get("target_bitrate_kbps", Json::UInt64(12000)).asUInt64(), 500, 100000) * 1000ULL;
 
@@ -993,6 +994,7 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
         config.serviceId = sid;
         config.serviceName = config.name;
         config.serviceProvider = item.get("provider", "").asString();
+        config.conditionalAccessReader = item.get("scrambled", false).asBool() ? conditionalAccessReader : "";
         config.videoPid = 0;
         config.audioPid = 0;
 
@@ -1722,7 +1724,9 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-signal-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) auto;gap:10px;align-items:center;margin-bottom:14px;padding:12px;background:rgba(31,139,255,.08);border:1px solid rgba(57,189,248,.18);border-radius:14px}
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
 .sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
-@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
+.phoenix-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
+.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
+@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
 </style>
@@ -1829,6 +1833,8 @@ let satelliteSignalTimer = null;
 let satelliteSignalPending = false;
 let satelliteScanning = false;
 let satelliteServices = [];
+let phoenixReaders = [];
+let phoenixReadersLoaded = false;
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -2356,7 +2362,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 8'} / ${state.program_version||'v122'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 9'} / ${state.program_version||'v123'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2406,6 +2412,74 @@ function openTelegramModal() {
 }
 function satEscape(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+function phoenixStatusInfo(reader) {
+  const status = String(reader?.status || 'unknown');
+  if (status === 'card') {
+    if (reader.provider_name) return {cls:'card', text:String(reader.provider_name)};
+    if (reader.card_system) return {cls:'card', text:`КАРТА · ${reader.card_system}`};
+    return {cls:'card', text:'КАРТА · провайдер не определён'};
+  }
+  if (status === 'no_card') return {cls:'no-card', text:'НЕТ КАРТЫ'};
+  if (status === 'busy') return {cls:'busy', text:'ЗАНЯТ'};
+  if (status === 'permission') return {cls:'warn', text:'НЕТ ДОСТУПА'};
+  return {cls:'warn', text:'НЕ ОПРЕДЕЛЁН'};
+}
+function phoenixReaderOptions(selected='') {
+  const current = String(selected || '');
+  const options = [`<option value="" ${current?'':'selected'}>Авто / не привязывать</option>`];
+  phoenixReaders.forEach(reader => {
+    const path = String(reader.stable_device || reader.device || '');
+    const status = phoenixStatusInfo(reader);
+    const suffix = status.text ? ` · ${status.text}` : '';
+    options.push(`<option value="${satEscape(path)}" ${path===current?'selected':''}>Phoenix ${Number(reader.index||0)} · ${satEscape(path)}${satEscape(suffix)}</option>`);
+  });
+  if (current && !phoenixReaders.some(reader => String(reader.stable_device || reader.device || '') === current)) {
+    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} · сейчас не найден</option>`);
+  }
+  return options.join('');
+}
+function renderPhoenixReaders() {
+  const list = document.getElementById('satPhoenixReaders');
+  const select = document.getElementById('satPhoenixReaderSelect');
+  if (list) {
+    list.innerHTML = phoenixReaders.length ? phoenixReaders.map(reader => {
+      const stateInfo = phoenixStatusInfo(reader);
+      const path = String(reader.stable_device || reader.device || '');
+      const hw = [reader.manufacturer, reader.product].filter(Boolean).join(' ') || reader.driver || '';
+      const atr = reader.atr ? ` · ATR ${reader.atr}` : '';
+      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}`;
+      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${Number(reader.index||0)}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}</span><span class="phoenix-state ${stateInfo.cls}">${satEscape(stateInfo.text)}</span></div>`;
+    }).join('') : '<div class="phoenix-empty">Phoenix/SmartMouse USB readers не обнаружены.</div>';
+  }
+  if (select) {
+    const previous = select.value;
+    select.innerHTML = phoenixReaderOptions(previous);
+    if (!previous) {
+      const card = phoenixReaders.find(reader => reader.status === 'card');
+      if (card) select.value = String(card.stable_device || card.device || '');
+    }
+  }
+}
+async function loadPhoenixReaders() {
+  try {
+    const response = await fetch('/api/dvb-adapters', {cache:'no-store'});
+    const data = await response.json();
+    phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
+    phoenixReadersLoaded = true;
+    return data;
+  } catch (_) {
+    phoenixReaders = [];
+    phoenixReadersLoaded = true;
+    return {adapters:[], phoenix_readers:[]};
+  }
+}
+async function refreshPhoenixReaders() {
+  const button = document.getElementById('satPhoenixRefresh');
+  if (button) button.disabled = true;
+  await loadPhoenixReaders();
+  renderPhoenixReaders();
+  if (button) button.disabled = false;
 }
 function satelliteTunePayload() {
   const adapter = Number(document.getElementById('satAdapter')?.value || 0);
@@ -2477,6 +2551,9 @@ async function loadSatelliteAdapters() {
   try {
     const response = await fetch('/api/dvb-adapters');
     const data = await response.json();
+    phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
+    phoenixReadersLoaded = true;
+    renderPhoenixReaders();
     const adapters = Array.isArray(data.adapters) ? data.adapters : [];
     if (!data.dvbsrc_available) {
       if (info) info.textContent = 'GStreamer dvbsrc не найден. Установите gstreamer1.0-plugins-bad.';
@@ -2573,6 +2650,7 @@ async function saveSelectedSatelliteChannels() {
     base_port:Number(document.getElementById('satBasePort')?.value || 5000),
     target_bitrate_kbps:Number(document.getElementById('satTargetBitrate')?.value || 12000),
     interface_address:document.getElementById('satOutputInterface')?.value || '',
+    conditional_access_reader:document.getElementById('satPhoenixReaderSelect')?.value || '',
     auto_start:document.getElementById('satAutoStart')?.checked === true
   };
   try {
@@ -2613,6 +2691,11 @@ function openAddChannelModal() {
       <div class="sat-field"><label>ISI / Stream ID</label><input id="satStreamId" type="number" min="-1" max="255" value="-1" onchange="updateSatelliteSignal()" /></div>
     </div>
     <div id="satDeviceInfo" class="sat-scan-status" style="margin-top:8px">Поиск DVB frontend...</div>
+    <div class="phoenix-panel">
+      <div class="phoenix-head"><strong>Phoenix / карты условного доступа</strong><button id="satPhoenixRefresh" class="button-secondary" type="button" onclick="refreshPhoenixReaders()">Обновить</button></div>
+      <div id="satPhoenixReaders" class="phoenix-list"><div class="phoenix-empty">Поиск подключённых Phoenix...</div></div>
+      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Авто / не привязывать</option></select></div><small>Программа нумерует найденные Phoenix автоматически. Проверка карты выполняется только при открытии окна или по кнопке «Обновить» и не используется для FTA.</small></div>
+    </div>
     <div class="sat-actions">
       <button id="satScanButton" class="button-primary" onclick="startSatelliteScan()">Сканировать каналы</button>
       <span id="satScanStatus" class="sat-scan-status">Найдено: <span id="satFoundCount">0</span></span>
@@ -2642,7 +2725,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', conditional_access_reader:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, input_service_id:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -2849,6 +2932,7 @@ function openStreamForm(stream) {
     const transcoderInfo = state.transcoder || {};
     const transcoderAvailable = transcoderInfo.available === true;
     const transcoderMissing = Array.isArray(transcoderInfo.missing_elements) ? transcoderInfo.missing_elements.join(', ') : '';
+    const phoenixOptions = phoenixReaderOptions(stream.conditional_access_reader || '');
     const transcoderStatus = transcoderAvailable
       ? `Доступно: H.264 ${transcoderInfo.video_encoder || 'encoder'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
       : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
@@ -2857,6 +2941,7 @@ function openStreamForm(stream) {
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
+        <div class="form-row full" id="streamPhoenixRow" style="display:${String(stream.input_uri||'').startsWith('dvb://')?'':'none'}"><label>Phoenix / карта (для кодированного DVB-канала)</label><select id="streamConditionalAccessReader">${phoenixOptions}</select><small>Выбор сохраняет привязку канала к найденному Phoenix. FTA-поток от этого параметра не зависит.</small></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -2888,11 +2973,11 @@ function openStreamForm(stream) {
     updateOutputHints();
   };
 
-  if (!state.interfaces || !state.interfaces.length) {
-    loadInterfaces().then(renderStreamForm);
-  } else {
-    renderStreamForm();
-  }
+  const formLoaders = [];
+  if (!state.interfaces || !state.interfaces.length) formLoaders.push(loadInterfaces());
+  if (String(stream.input_uri || '').startsWith('dvb://') && !phoenixReadersLoaded) formLoaders.push(loadPhoenixReaders());
+  if (formLoaders.length) Promise.all(formLoaders).then(renderStreamForm);
+  else renderStreamForm();
 }
 function updateTranscodeControls() {
   const enabled = document.getElementById('streamTranscodeEnabled');
@@ -3062,7 +3147,8 @@ function saveStream(id) {
     input_service_id: Number(document.getElementById('streamInputServiceId').value),
     service_id: Number(document.getElementById('streamServiceId').value),
     service_name: document.getElementById('streamServiceName').value,
-    service_provider: document.getElementById('streamProvider').value
+    service_provider: document.getElementById('streamProvider').value,
+    conditional_access_reader: document.getElementById('streamConditionalAccessReader')?.value || ''
   };
   const existingIndex = state.streams.findIndex(s=>s.id===id);
   if (existingIndex >= 0) {

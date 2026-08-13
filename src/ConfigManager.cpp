@@ -77,6 +77,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
         : config.serviceId;
     config.serviceName = root.get("service_name", "").asString();
     config.serviceProvider = root.get("service_provider", "").asString();
+    config.conditionalAccessReader = root.get("conditional_access_reader", "").asString();
     if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {
         const auto primary = StreamOutputConfig::fromJson(root["outputs"][0]);
         config.outputType = primary.outputType;
@@ -127,6 +128,7 @@ Json::Value StreamConfig::toJson() const {
     root["service_id"] = serviceId;
     root["service_name"] = serviceName;
     root["service_provider"] = serviceProvider;
+    root["conditional_access_reader"] = conditionalAccessReader;
     Json::Value extraOutputs(Json::arrayValue);
     for (const auto& output : additionalOutputs) {
         extraOutputs.append(output.toJson());
