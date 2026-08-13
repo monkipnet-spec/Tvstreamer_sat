@@ -1,8 +1,15 @@
-# TVStreammerSAT5 — Release 14
+# TVStreammerSAT5 — Release 15
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 14 / v128.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 15 / v129.**
 
 
+
+
+### Retry inactive/error streams cleanly (v129)
+
+Release 15 fixes a runtime-state bug visible as `stream is already active: <id>` after a tile had already fallen to **OFFLINE** because of a GStreamer/DVB error. A terminal ERROR/EOS now marks both `active=false` and `running=false`. When **Старт** is pressed for an inactive stream that still has a stale runtime object, TVStreammerSAT5 performs a complete silent cleanup first (joins the old bus thread, drives the pipeline to NULL, releases the per-service DVB relay and its port, decrements the shared-DVB frontend consumer count, releases any CA slot, then creates a fresh pipeline). Truly active streams are still protected from duplicate starts. This cleanup does not emit a false “stopped manually” Telegram notification.
+
+The shared DVB frontend introduced in v128 is preserved: restarting one failed service does not retune or stop other services using the same adapter/frontend/transponder. The five-second WISI startup reservoir and StableUdpOutput implementation are unchanged.
 
 ### Shared DVB frontend fan-out without remux (v128)
 
@@ -392,7 +399,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 14
+Description=TVStreammerSAT5 Release 15
 After=network-online.target
 Wants=network-online.target
 

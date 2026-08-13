@@ -2398,13 +2398,37 @@ GstElement* StreamManager::createTranscodedUdpRelayPipeline(StreamState* state, 
 
 bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
     if (error) error->clear();
+
+    // A stream can remain in the runtime table after its bus thread reports a
+    // terminal ERROR/EOS: the UI correctly shows it as OFFLINE, but a later
+    // Start used to fail with "stream is already active" simply because the
+    // stale StreamState object still existed.  Clean an inactive state before
+    // building the replacement pipeline. cleanupStreamState() performs the complete
+    // teardown (bus-thread join, pipeline NULL/unref, shared-DVB consumer
+    // release, service-relay port release and CA slot release), which is
+    // especially important for shared DVB frontends.
+    bool staleInactiveStream = false;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
-        if (streams.count(streamConfig.id)) {
-            if (error) *error = "stream is already active: " + streamConfig.id;
+        auto existing = streams.find(streamConfig.id);
+        if (existing != streams.end()) {
+            if (existing->second && existing->second->active.load()) {
+                if (error) *error = "stream is already active: " + streamConfig.id;
+                return false;
+            }
+            staleInactiveStream = true;
+        }
+    }
+    if (staleInactiveStream) {
+        std::cerr << "Cleaning inactive stream state before restart: " << streamConfig.id << std::endl;
+        if (!cleanupStreamState(streamConfig.id, false)) {
+            if (error) *error = "failed to clean inactive stream state: " + streamConfig.id;
             return false;
         }
+    }
 
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
         if (!gstreamerInitialized) {
             gst_init(nullptr, nullptr);
             gstreamerInitialized = true;
@@ -2730,7 +2754,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     return true;
 }
 
-bool StreamManager::stopStream(const std::string& id) {
+bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualStop) {
     std::unique_ptr<StreamState> statePtr;
     StreamConfig stoppedConfig;
     {
@@ -2745,7 +2769,7 @@ bool StreamManager::stopStream(const std::string& id) {
         stoppedConfig = statePtr->config;
         statePtr->running = false;
         statePtr->active = false;
-        statePtr->statusMessage = "stopped";
+        statePtr->statusMessage = notifyManualStop ? "stopped" : "cleaning inactive state";
 
         for (auto it = httpClients.begin(); it != httpClients.end();) {
             if (it->second.streamId == id) {
@@ -2780,6 +2804,7 @@ bool StreamManager::stopStream(const std::string& id) {
         state.bus = nullptr;
     }
     if (state.pipeline) {
+        gst_element_get_state(state.pipeline, nullptr, nullptr, GST_SECOND);
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
@@ -2789,12 +2814,20 @@ bool StreamManager::stopStream(const std::string& id) {
     tvs::protocols::removeFifoRelay(stoppedConfig);
     CardManager::instance().releaseService(id);
 
-    notifyStreamState(
-        stoppedConfig,
-        "⚪",
-        telegramText(configManager, "Поток остановлен", "Stream stopped"),
-        telegramText(configManager, "Остановлен вручную", "Stopped manually"));
+    if (notifyManualStop) {
+        notifyStreamState(
+            stoppedConfig,
+            "⚪",
+            telegramText(configManager, "Поток остановлен", "Stream stopped"),
+            telegramText(configManager, "Остановлен вручную", "Stopped manually"));
+    } else {
+        std::cerr << "Inactive stream state cleaned: " << id << std::endl;
+    }
     return true;
+}
+
+bool StreamManager::stopStream(const std::string& id) {
+    return cleanupStreamState(id, true);
 }
 
 bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string* error) {
@@ -5268,6 +5301,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
+                state->running = false;
                 notifyStreamState(
                     state->config,
                     "🔴",
@@ -5354,6 +5388,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: gstreamer transcoder exited";
                 state->active = false;
+                state->running = false;
                 notifyStreamState(
                     state->config,
                     "🔴",
@@ -5510,6 +5545,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
                 state->statusMessage = "error: " + message;
                 state->active = false;
+                state->running = false;
                 notifyStreamState(
                     state->config,
                     "🔴",
@@ -5537,6 +5573,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     std::cerr << "Failed to restart backup file loop for stream: " << id << std::endl;
                     state->statusMessage = "error: backup file loop restart failed";
                     state->active = false;
+                    state->running = false;
                     notifyStreamState(
                         state->config,
                         "🔴",
@@ -5547,6 +5584,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
                 state->statusMessage = "ended";
                 state->active = false;
+                state->running = false;
                 notifyStreamState(
                     state->config,
                     "⚫",

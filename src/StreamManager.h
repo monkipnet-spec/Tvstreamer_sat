@@ -183,6 +183,7 @@ private:
     void releaseSharedDvbFrontend(StreamState* state);
     bool startDvbServiceRelay(StreamState* state, std::string& error);
     void stopDvbServiceRelay(StreamState* state);
+    bool cleanupStreamState(const std::string& id, bool notifyManualStop);
     uint16_t allocateDvbServiceRelayPort(const std::string& streamId);
     void releaseDvbServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
