@@ -84,6 +84,7 @@ struct StreamState {
     std::string sharedDvbMulticastAddress;
     uint16_t sharedDvbMulticastPort = 0;
     std::string sharedDvbServiceRelayUri;
+    bool dvbTsRemapApplied = false;
     std::unique_ptr<DvbServiceRelayState> dvbServiceRelay;
     // Runtime PAT result used only when input_service_id=0 (Auto).
     // The configured value remains 0; effective selection is kept in state->config.

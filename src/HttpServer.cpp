@@ -31,8 +31,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 15";
-constexpr const char* kProgramVersion = "v129";
+constexpr const char* kProgramRelease = "Release 17";
+constexpr const char* kProgramVersion = "v131";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -1663,12 +1663,12 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:10px 10px 10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:6px;height:318px;min-height:318px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:8px 10px 8px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:4px;height:286px;min-height:286px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
-.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-right:64px}
+.tile .top{display:flex;align-items:flex-start;justify-content:space-between;gap:4px;padding-right:64px;min-height:27px}
 .tile .tile-actions{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:5px;z-index:2}
 .tile .delete-button{position:static;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
 .tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
@@ -1679,7 +1679,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .dvb-meter{position:relative;height:13px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.07);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
 .tile .dvb-meter-fill{position:absolute;left:0;top:0;bottom:0;width:0%;border-radius:inherit;transition:width .25s ease,background .25s ease;opacity:.9}
 .tile .dvb-meter-label{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;height:100%;font-size:8px;font-weight:800;line-height:13px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.9);letter-spacing:.02em;white-space:nowrap}
-.tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .status-line{display:flex;align-items:center;gap:5px;min-width:0;margin-top:2px;line-height:12px}.tile .status-pill{flex:0 0 auto;padding:1px 5px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:9px;text-transform:uppercase;letter-spacing:.06em}.tile .runtime-status{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9ca8bb;font-size:9px}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
 .tile .decode-pill{display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;line-height:12px;letter-spacing:.05em;white-space:nowrap}
@@ -1687,13 +1687,13 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .decode-pill.scrambled{background:rgba(255,95,95,.18);color:#ffc2c2;box-shadow:inset 0 0 0 1px rgba(255,95,95,.3)}
 .tile .decode-pill.waiting{background:rgba(255,184,77,.16);color:#ffe0a3;box-shadow:inset 0 0 0 1px rgba(255,184,77,.24)}
 .tile .decode-pill.offline{background:rgba(255,255,255,.07);color:#aeb7c8;box-shadow:inset 0 0 0 1px rgba(255,255,255,.1)}
-.tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6}
+.tile .info{display:grid;grid-template-columns:1fr;gap:4px;font-size:11px;color:#b3b8c6}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .tile .info-row.placeholder{visibility:hidden}
-.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:auto}
-.tile .controls button{padding:7px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
+.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:1px}
+.tile .controls button{padding:6px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
 .tile .controls .start-button{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.26)}
@@ -2070,6 +2070,15 @@ function closeModal() {
   stopSatelliteSignalPolling();
   document.getElementById('modal').classList.remove('active', 'quality-open', 'stream-open', 'satellite-open');
 }
+function escapeHtmlValue(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    '"':'&quot;',
+    "'":'&#39;'
+  })[ch]);
+}
 function normalizedOutputType(stream) {
   const raw = String(stream.output_type || 'udp').toLowerCase();
   if (raw === 'udp') return stream.cbr ? 'udp-cbr' : 'udp-vbr';
@@ -2170,6 +2179,12 @@ function updateStreamTile(tile, stream) {
     statusPill.className = `status-pill ${stream.active ? 'active' : 'stopped'}`;
     statusPill.textContent = stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline';
   }
+  const runtimeStatus = tile.querySelector('[data-role="runtime-status"]');
+  if (runtimeStatus) {
+    const value = String(stream.status || '').trim();
+    runtimeStatus.textContent = value;
+    runtimeStatus.title = value;
+  }
 
   if (stream.dvb_input) {
     const available = !!stream.dvb_signal_available;
@@ -2188,9 +2203,6 @@ function updateStreamTile(tile, stream) {
 
   const bitrateOut = tile.querySelector('[data-role="bitrate-out"]');
   if (bitrateOut) bitrateOut.textContent = stream.bitrate_out_kbps ? `${stream.bitrate_out_kbps} kbps` : '—';
-
-  const status = tile.querySelector('[data-role="stream-status"]');
-  if (status) status.textContent = stream.status || '';
 
   const caStatus = tile.querySelector('[data-role="ca-status"]');
   if (caStatus) caStatus.textContent = caStreamStatusText(stream);
@@ -2246,8 +2258,11 @@ function render(force=false) {
     tile.innerHTML = `
       <div class="top">
         <div>
-          <div class="title">${stream.name || stream.id}</div>
-          <div data-role="status-pill" class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
+          <div class="title">${escapeHtmlValue(stream.name || stream.id)}</div>
+          <div class="status-line">
+            <div data-role="status-pill" class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
+            <span data-role="runtime-status" class="runtime-status" title="${escapeHtmlValue(stream.status || '')}">${escapeHtmlValue(stream.status || '')}</span>
+          </div>
         </div>
       </div>
       <div class="tile-actions">
@@ -2269,7 +2284,6 @@ function render(force=false) {
         <div class="info-row placeholder"><strong>Декодирование</strong><span>—</span></div>`}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${escapeHtmlValue(stream.status || '')}</span></div>
       </div>
       <div class="controls">
         <button data-role="stream-toggle" class="${stream.active ? 'stop-button' : 'start-button'}">${stream.active ? t('stop') : t('start')}</button>
@@ -2506,7 +2520,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 15'} / ${state.program_version||'v129'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 17'} / ${state.program_version||'v131'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

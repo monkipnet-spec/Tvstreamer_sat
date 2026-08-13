@@ -1,13 +1,18 @@
-# TVStreammerSAT5 — Release 16
+# TVStreammerSAT5 — Release 17
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 16 / v130.**
+### Compact tiles + DVB remap without demux/remux (v131)
+
+Release 17 compacts every stream tile to the same 286 px height. The separate `Статус` row is removed: the runtime state now appears on the same line as the `ONLINE/OFFLINE` badge, and the four control buttons sit immediately below `Bitrate Out`. FTA/IP placeholder rows are retained invisibly so all tiles remain equal height.
+
+For a selected DVB service, explicit SID/V-PID/A-PID remapping no longer sends the already working SPTS through `tsdemux -> parser -> mpegtsmux`. The shared-DVB service relay discovers the real video/audio PIDs from the PMT, rewrites only the TS packet PID headers plus PAT/PMT/SDT references, recomputes PSI CRCs, and leaves PES payload/timestamps/private streams untouched. The resulting SPTS therefore continues directly into the existing StableUdpOutput/WISI five-second reservoir. Expected diagnostics include `DVB TS remap: ... mode=packet-pid-rewrite-no-demux-no-remux` followed by `DVB remap passthrough: ... demux=off remux=off`.
+
+The WISI startup reservoir, periodic PCR restamping, 7x188 UDP packetization, shared DVB frontend fan-out, Phoenix/CardManager and decode telemetry are otherwise unchanged.
+
+
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 17 / v131.**
 
 
 
-
-### Compact tile status/layout (v130)
-
-Release 16 moves the runtime stream state onto the same compact line as the ONLINE/OFFLINE pill, removes the separate **Статус** information row, places the control buttons immediately after **Bitrate Out**, and reduces the fixed tile height while preserving equal heights for DVB/FTA/CA/general stream tiles. This is a web-interface-only layout change; DVB, shared-front-end, CA/CardManager and the WISI five-second UDP reservoir are unchanged.
 
 ### Retry inactive/error streams cleanly (v129)
 
@@ -403,7 +408,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 16
+Description=TVStreammerSAT5 Release 17
 After=network-online.target
 Wants=network-online.target
 
@@ -1104,3 +1109,10 @@ For an SRT Listener with transcoding enabled, the external `gst-launch-1.0` proc
 The external transcoder command is now logged before process startup, and early `gst-launch-1.0` stderr is appended to the persistent web startup error so an exit code such as 255 is accompanied by the actual GStreamer error text.
 
 - Transcoded UDP is routed through the default StableUdpOutput stage via an internal FIFO.
+
+
+## Release 17 / v131 — dashboard tile render hotfix
+
+- Fixed a v130 browser-side regression where stream tiles disappeared from the dashboard because `render()` called an undefined `escapeHtmlValue()` helper while building the new compact status line.
+- Added the missing HTML escaping helper and use it for the runtime status and stream title so text cannot break tile markup.
+- This release changes only dashboard rendering/version metadata. DVB shared-frontends, SPTS filtering, packet-level DVB remap and the five-second WISI UDP reservoir/shaper are unchanged from v130.

@@ -158,6 +158,9 @@ void freeSrtAccessContext(gpointer data) {
 // This avoids another tsdemux/mpegtsmux cycle, which previously broke valid
 // FTA/private streams, while producing a standards-compliant single-program TS.
 struct DvbSingleProgramPsiContext {
+    // serviceId is the service selected on the input transponder.  When
+    // remapEnabled is true the output can advertise a different SID/PIDs,
+    // while the elementary payload itself is kept byte-for-byte.
     uint16_t serviceId = 0;
     uint16_t pmtPid = 0x1FFF;
     uint16_t transportStreamId = 1;
@@ -166,6 +169,13 @@ struct DvbSingleProgramPsiContext {
     uint8_t sdtVersion = 0;
     std::string serviceName;
     std::string serviceProvider;
+    bool remapEnabled = false;
+    uint16_t outputServiceId = 0;
+    uint16_t requestedVideoPid = 0;
+    uint16_t requestedAudioPid = 0;
+    uint16_t inputVideoPid = 0;
+    uint16_t inputAudioPid = 0;
+    bool remapAnnounced = false;
     // When the physical DVB frontend is shared, every service sees the full
     // transponder. Compact the buffer to the PID set discovered by the channel
     // scan instead of remuxing with tsdemux/mpegtsmux. This preserves the
@@ -333,6 +343,124 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
     }
 }
 
+
+uint16_t advertisedDvbServiceId(const DvbSingleProgramPsiContext& ctx) {
+    return ctx.remapEnabled && ctx.outputServiceId > 0 ? ctx.outputServiceId : ctx.serviceId;
+}
+
+bool isDvbVideoStreamType(uint8_t streamType) {
+    switch (streamType) {
+        case 0x01: // MPEG-1 video
+        case 0x02: // MPEG-2 video
+        case 0x10: // MPEG-4 Visual
+        case 0x1B: // H.264/AVC
+        case 0x24: // H.265/HEVC
+        case 0x42: // AVS video
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool isDvbAudioStreamType(uint8_t streamType) {
+    switch (streamType) {
+        case 0x03: // MPEG-1 audio
+        case 0x04: // MPEG-2 audio
+        case 0x0F: // AAC ADTS
+        case 0x11: // AAC LATM
+        case 0x81: // AC-3 (common private registration)
+        case 0x87: // E-AC-3 (common private registration)
+            return true;
+        default:
+            return false;
+    }
+}
+
+void rewriteDvbRemapPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
+    if (!packet || !ctx || !ctx->remapEnabled || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid != ctx->pmtPid) return;
+
+    size_t available = 0;
+    uint8_t* section = const_cast<uint8_t*>(tsSectionStart(packet, available));
+    if (!section || available < 16 || section[0] != 0x02) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > available) return;
+
+    const uint16_t inputProgram = static_cast<uint16_t>((section[3] << 8) | section[4]);
+    if (inputProgram != ctx->serviceId && inputProgram != advertisedDvbServiceId(*ctx)) return;
+
+    const size_t end = total - 4; // CRC excluded
+    const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
+    if (12 + programInfoLength > end) return;
+
+    // Discover the first video and audio ES exactly as the previous tsdemux
+    // remap path did.  Other ES/CA/teletext/subtitle PIDs remain untouched.
+    size_t pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const uint8_t streamType = section[pos];
+        const uint16_t esPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) return;
+        if (ctx->inputVideoPid == 0 && isDvbVideoStreamType(streamType)) ctx->inputVideoPid = esPid;
+        if (ctx->inputAudioPid == 0 && isDvbAudioStreamType(streamType)) ctx->inputAudioPid = esPid;
+        pos += 5 + esInfoLength;
+    }
+
+    const uint16_t outputSid = advertisedDvbServiceId(*ctx);
+    section[3] = static_cast<uint8_t>(outputSid >> 8);
+    section[4] = static_cast<uint8_t>(outputSid & 0xFF);
+
+    uint16_t pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);
+    if (ctx->inputVideoPid && pcrPid == ctx->inputVideoPid && ctx->requestedVideoPid) pcrPid = ctx->requestedVideoPid;
+    if (ctx->inputAudioPid && pcrPid == ctx->inputAudioPid && ctx->requestedAudioPid) pcrPid = ctx->requestedAudioPid;
+    section[8] = static_cast<uint8_t>(0xE0 | ((pcrPid >> 8) & 0x1F));
+    section[9] = static_cast<uint8_t>(pcrPid & 0xFF);
+
+    pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const uint8_t streamType = section[pos];
+        uint16_t esPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) return;
+        if (ctx->inputVideoPid && esPid == ctx->inputVideoPid && isDvbVideoStreamType(streamType) && ctx->requestedVideoPid) {
+            esPid = ctx->requestedVideoPid;
+        } else if (ctx->inputAudioPid && esPid == ctx->inputAudioPid && isDvbAudioStreamType(streamType) && ctx->requestedAudioPid) {
+            esPid = ctx->requestedAudioPid;
+        }
+        section[pos + 1] = static_cast<uint8_t>(0xE0 | ((esPid >> 8) & 0x1F));
+        section[pos + 2] = static_cast<uint8_t>(esPid & 0xFF);
+        pos += 5 + esInfoLength;
+    }
+
+    const uint32_t crc = mpeg2SectionCrc32(section, total - 4);
+    section[total - 4] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+    section[total - 3] = static_cast<uint8_t>((crc >> 16) & 0xFF);
+    section[total - 2] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    section[total - 1] = static_cast<uint8_t>(crc & 0xFF);
+
+    if (!ctx->remapAnnounced && ctx->inputVideoPid && ctx->inputAudioPid) {
+        std::cerr << "DVB TS remap: SID=" << ctx->serviceId << "->" << outputSid
+                  << " video=" << ctx->inputVideoPid << "->" << ctx->requestedVideoPid
+                  << " audio=" << ctx->inputAudioPid << "->" << ctx->requestedAudioPid
+                  << " mode=packet-pid-rewrite-no-demux-no-remux" << std::endl;
+        ctx->remapAnnounced = true;
+    }
+}
+
+void rewriteDvbRemapPacketPid(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
+    if (!packet || !ctx.remapEnabled || packet[0] != 0x47) return;
+    uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    uint16_t mapped = pid;
+    if (ctx.inputVideoPid && pid == ctx.inputVideoPid && ctx.requestedVideoPid) mapped = ctx.requestedVideoPid;
+    if (ctx.inputAudioPid && pid == ctx.inputAudioPid && ctx.requestedAudioPid) mapped = ctx.requestedAudioPid;
+    if (mapped != pid) {
+        packet[1] = static_cast<uint8_t>((packet[1] & 0xE0) | ((mapped >> 8) & 0x1F));
+        packet[2] = static_cast<uint8_t>(mapped & 0xFF);
+    }
+}
+
 void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
     if (!packet || ctx.pmtPid == 0 || ctx.pmtPid >= 0x1FFF) return;
     const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
@@ -353,8 +481,9 @@ void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     section[5] = static_cast<uint8_t>(0xC1 | ((ctx.patVersion & 0x1F) << 1));
     section[6] = 0x00; // section_number
     section[7] = 0x00; // last_section_number
-    section[8] = static_cast<uint8_t>(ctx.serviceId >> 8);
-    section[9] = static_cast<uint8_t>(ctx.serviceId & 0xFF);
+    const uint16_t advertisedSid = advertisedDvbServiceId(ctx);
+    section[8] = static_cast<uint8_t>(advertisedSid >> 8);
+    section[9] = static_cast<uint8_t>(advertisedSid & 0xFF);
     section[10] = static_cast<uint8_t>(0xE0 | ((ctx.pmtPid >> 8) & 0x1F));
     section[11] = static_cast<uint8_t>(ctx.pmtPid & 0xFF);
     const uint32_t crc = mpeg2SectionCrc32(section, 12);
@@ -384,7 +513,7 @@ void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     packet[4] = 0x00;
 
     const std::string nameText = ctx.serviceName.empty()
-        ? ("Service " + std::to_string(ctx.serviceId))
+        ? ("Service " + std::to_string(advertisedDvbServiceId(ctx)))
         : ctx.serviceName;
     auto provider = dvbUtf8ServiceText(ctx.serviceProvider, 48);
     auto name = dvbUtf8ServiceText(nameText, 80);
@@ -411,8 +540,9 @@ void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     section[10] = 0xFF;
 
     size_t pos = 11;
-    section[pos++] = static_cast<uint8_t>(ctx.serviceId >> 8);
-    section[pos++] = static_cast<uint8_t>(ctx.serviceId & 0xFF);
+    const uint16_t advertisedSid = advertisedDvbServiceId(ctx);
+    section[pos++] = static_cast<uint8_t>(advertisedSid >> 8);
+    section[pos++] = static_cast<uint8_t>(advertisedSid & 0xFF);
     section[pos++] = 0xFC; // EIT flags off
     const uint16_t loopLength = static_cast<uint16_t>(descriptorTotalLength);
     section[pos++] = static_cast<uint8_t>(0x80 | ((loopLength >> 8) & 0x0F)); // running_status=4
@@ -470,6 +600,12 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
         const bool keepPacket = !ctx->filterPids || (pid < ctx->allowedPids.size() && ctx->allowedPids[pid]);
         if (!keepPacket) continue;
 
+        // For DVB remap, rewrite only TS headers + PMT/PAT/SDT.  PES payload,
+        // timestamps, codec private data and CA packets stay untouched.
+        if (ctx->remapEnabled && pid == ctx->pmtPid) {
+            rewriteDvbRemapPmt(packet, ctx);
+        }
+
         if (pid == 0x0000) {
             if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
                 writeSingleProgramPat(packet, *ctx);
@@ -488,6 +624,10 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
             // SDT is also copied from the full transponder by Linux DVB demux.
             // Replace it so VLC advertises only the selected service.
             writeSingleProgramSdt(packet, *ctx);
+        }
+
+        if (pid != 0x0000 && pid != 0x0011 && pid != ctx->pmtPid) {
+            rewriteDvbRemapPacketPid(packet, *ctx);
         }
 
         if (writeOffset != offset) {
@@ -1971,6 +2111,17 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         return false;
     }
 
+    if (state->config.remapEnabled) {
+        const uint32_t vpid = state->config.videoPid;
+        const uint32_t apid = state->config.audioPid;
+        const uint32_t sid = state->config.serviceId;
+        if (sid == 0 || sid > 0xFFFF || vpid < 0x20 || vpid >= 0x1FFF ||
+            apid < 0x20 || apid >= 0x1FFF || vpid == apid) {
+            error = "DVB remap requires valid non-zero output SID and distinct V-PID/A-PID (32..8190)";
+            return false;
+        }
+    }
+
     const uint16_t outputPort = allocateDvbServiceRelayPort(state->config.id);
     if (!outputPort) {
         error = "no free internal UDP port for DVB service relay";
@@ -2037,6 +2188,10 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
             psiContext->serviceName = state->config.serviceName;
             psiContext->serviceProvider = state->config.serviceProvider;
+            psiContext->remapEnabled = state->config.remapEnabled;
+            psiContext->outputServiceId = static_cast<uint16_t>((state->config.serviceId ? state->config.serviceId : state->config.inputServiceId) & 0xFFFFU);
+            psiContext->requestedVideoPid = static_cast<uint16_t>(state->config.videoPid & 0x1FFFU);
+            psiContext->requestedAudioPid = static_cast<uint16_t>(state->config.audioPid & 0x1FFFU);
             configureServicePidFilter(*psiContext, params.pids);
             if (!psiContext->filterPids) {
                 std::cerr << "Shared DVB service relay warning: stream=" << state->config.id
@@ -2067,6 +2222,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     state->sharedDvbServiceRelayUri = "udp://127.0.0.1:" + std::to_string(outputPort);
+    state->dvbTsRemapApplied = state->config.remapEnabled && state->config.inputServiceId > 0;
     state->dvbServiceRelay = std::move(relay);
     std::cerr << "DVB service relay started: stream=" << state->config.id
               << " SID=" << state->config.inputServiceId
@@ -2088,6 +2244,7 @@ void StreamManager::stopDvbServiceRelay(StreamState* state) {
     if (relay->pipeline) gst_object_unref(relay->pipeline);
     releaseDvbServiceRelayPort(relay->outputPort);
     state->sharedDvbServiceRelayUri.clear();
+    state->dvbTsRemapApplied = false;
 }
 
 bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error) {
@@ -4356,7 +4513,15 @@ bool StreamManager::buildOutputBranch(
     // or a generic multi-program input.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
-    const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
+    const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
+    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied) || stableUdpRemux) && !transcodedInput;
+    if (remapAlreadyApplied && outputConfig.remapEnabled) {
+        std::cerr << "DVB remap passthrough: packet-level PID/SID rewrite already applied"
+                  << " service_id=" << outputConfig.serviceId
+                  << " video_pid=" << outputConfig.videoPid
+                  << " audio_pid=" << outputConfig.audioPid
+                  << " demux=off remux=off" << std::endl;
+    }
     if (needsRemux) {
         if (stableUdpRemux) {
             std::cerr << "Unified UDP: rebuilding passthrough TS as a clean single-program transport"
