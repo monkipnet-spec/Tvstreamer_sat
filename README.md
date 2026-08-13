@@ -1,6 +1,16 @@
-# TVStreammerSAT5 — Release 9
+# TVStreammerSAT5 — Release 10
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 9 / v123.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 10 / v124.**
+
+### DVB single-program PSI cleanup (v124)
+
+Release 10 fixes the case where VLC received the selected service media PIDs but still displayed every program from the satellite transponder. Linux `dvbsrc` PID filtering can preserve the original transponder PAT/SDT even after unrelated PES/PCR PIDs are removed. v124 keeps the selected PMT/PCR/video/audio/teletext/subtitle packets byte-for-byte and rewrites only PAT PID 0 so it advertises exactly one selected SID and its original PMT PID. Until the selected PMT is known the original all-program PAT is suppressed, preventing players from caching unrelated services. The five-second WISI startup reservoir, PCR restamping, 20 ms periodic PCR generation and 7x188 (1316-byte) UDP packetisation are unchanged.
+
+Expected log line after the selected PMT has been identified:
+
+```text
+DVB SPTS PSI filter: SID=<sid> PMT_PID=<pid> PAT=single-program media=passthrough SDT=preserved
+```
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -328,7 +338,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 9
+Description=TVStreammerSAT5 Release 10
 After=network-online.target
 Wants=network-online.target
 

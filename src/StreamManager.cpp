@@ -115,6 +115,175 @@ void freeSrtAccessContext(gpointer data) {
     delete static_cast<SrtAccessContext*>(data);
 }
 
+// DVB-S/S2 service PID filtering in dvbsrc removes the PES/PCR packets of
+// unrelated services, but Linux DVB demux still returns the original PAT/SDT
+// tables from the complete transponder.  Players such as VLC therefore see
+// every service advertised by the original PAT even though only one service's
+// media PIDs are present.  Keep the selected media packets byte-for-byte and
+// rewrite only PID 0 (PAT) to advertise one selected SID -> PMT mapping.
+// This avoids another tsdemux/mpegtsmux cycle, which previously broke valid
+// FTA/private streams, while producing a standards-compliant single-program TS.
+struct DvbSingleProgramPsiContext {
+    uint16_t serviceId = 0;
+    uint16_t pmtPid = 0x1FFF;
+    uint16_t transportStreamId = 1;
+    uint8_t patVersion = 0;
+    bool announced = false;
+};
+
+uint32_t mpeg2SectionCrc32(const uint8_t* data, size_t size) {
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= static_cast<uint32_t>(data[i]) << 24;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80000000U)
+                ? (crc << 1) ^ 0x04C11DB7U
+                : (crc << 1);
+        }
+    }
+    return crc;
+}
+
+size_t tsPayloadOffset(const uint8_t* packet) {
+    if (!packet || packet[0] != 0x47) return kTsPacketSize;
+    const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
+    if (adaptationControl == 0 || adaptationControl == 2) return kTsPacketSize;
+    size_t offset = 4;
+    if (adaptationControl == 3) {
+        const size_t adaptationLength = packet[4];
+        offset += 1 + adaptationLength;
+    }
+    return offset < kTsPacketSize ? offset : kTsPacketSize;
+}
+
+const uint8_t* tsSectionStart(const uint8_t* packet, size_t& available) {
+    available = 0;
+    if (!packet || (packet[1] & 0x40) == 0) return nullptr; // payload_unit_start_indicator
+    const size_t payload = tsPayloadOffset(packet);
+    if (payload >= kTsPacketSize) return nullptr;
+    const size_t pointer = packet[payload];
+    const size_t start = payload + 1 + pointer;
+    if (start >= kTsPacketSize) return nullptr;
+    available = kTsPacketSize - start;
+    return packet + start;
+}
+
+void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
+    if (!packet || !ctx || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    size_t available = 0;
+    const uint8_t* section = tsSectionStart(packet, available);
+    if (!section || available < 8) return;
+
+    if (pid == 0x0000 && section[0] == 0x00) {
+        const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength < 9 || total > available) return;
+        ctx->transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
+        ctx->patVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
+        const size_t entriesEnd = total >= 4 ? total - 4 : 0;
+        for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+            if (program == ctx->serviceId && mappedPid > 0 && mappedPid < 0x1FFF) {
+                ctx->pmtPid = mappedPid;
+                return;
+            }
+        }
+    }
+
+    // Fallback: identify the PMT directly. dvbsrc's selected PID set contains
+    // only the chosen service PMT, so this also works if a very large PAT spans
+    // more than one TS packet and the selected entry is not in the first packet.
+    if (pid != 0x0000 && section[0] == 0x02 && available >= 8) {
+        const uint16_t program = static_cast<uint16_t>((section[3] << 8) | section[4]);
+        if (program == ctx->serviceId) ctx->pmtPid = pid;
+    }
+}
+
+void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
+    if (!packet || ctx.pmtPid == 0 || ctx.pmtPid >= 0x1FFF) return;
+    const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
+    std::memset(packet, 0xFF, kTsPacketSize);
+    packet[0] = 0x47;
+    packet[1] = 0x40; // PUSI + PID 0
+    packet[2] = 0x00;
+    packet[3] = static_cast<uint8_t>(0x10 | continuity); // payload only
+    packet[4] = 0x00; // pointer_field
+
+    uint8_t* section = packet + 5;
+    constexpr uint16_t sectionLength = 13; // through CRC32
+    section[0] = 0x00; // PAT
+    section[1] = static_cast<uint8_t>(0xB0 | ((sectionLength >> 8) & 0x0F));
+    section[2] = static_cast<uint8_t>(sectionLength & 0xFF);
+    section[3] = static_cast<uint8_t>(ctx.transportStreamId >> 8);
+    section[4] = static_cast<uint8_t>(ctx.transportStreamId & 0xFF);
+    section[5] = static_cast<uint8_t>(0xC1 | ((ctx.patVersion & 0x1F) << 1));
+    section[6] = 0x00; // section_number
+    section[7] = 0x00; // last_section_number
+    section[8] = static_cast<uint8_t>(ctx.serviceId >> 8);
+    section[9] = static_cast<uint8_t>(ctx.serviceId & 0xFF);
+    section[10] = static_cast<uint8_t>(0xE0 | ((ctx.pmtPid >> 8) & 0x1F));
+    section[11] = static_cast<uint8_t>(ctx.pmtPid & 0xFF);
+    const uint32_t crc = mpeg2SectionCrc32(section, 12);
+    section[12] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+    section[13] = static_cast<uint8_t>((crc >> 16) & 0xFF);
+    section[14] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    section[15] = static_cast<uint8_t>(crc & 0xFF);
+}
+
+void suppressPatPacketUntilPmtKnown(uint8_t* packet) {
+    if (!packet) return;
+    const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
+    std::memset(packet, 0xFF, kTsPacketSize);
+    packet[0] = 0x47;
+    packet[1] = 0x1F;
+    packet[2] = 0xFF;
+    packet[3] = static_cast<uint8_t>(0x10 | continuity);
+}
+
+GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<DvbSingleProgramPsiContext*>(userData);
+    if (!ctx || ctx->serviceId == 0 || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstBuffer* original = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!original) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = gst_buffer_make_writable(original);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (buffer != original) GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
+
+    for (size_t offset = 0; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
+        uint8_t* packet = map.data + offset;
+        if (packet[0] != 0x47) continue;
+        discoverSelectedPmtFromPacket(packet, ctx);
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        if (pid == 0x0000) {
+            if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
+                writeSingleProgramPat(packet, *ctx);
+                if (!ctx->announced) {
+                    std::cerr << "DVB SPTS PSI filter: SID=" << ctx->serviceId
+                              << " PMT_PID=" << ctx->pmtPid
+                              << " PAT=single-program media=passthrough SDT=preserved"
+                              << std::endl;
+                    ctx->announced = true;
+                }
+            } else {
+                // Never leak the original all-program PAT while waiting to learn
+                // the selected PMT PID. This keeps VLC from caching every service.
+                suppressPatPacketUntilPmtKnown(packet);
+            }
+        }
+    }
+
+    gst_buffer_unmap(buffer, &map);
+    return GST_PAD_PROBE_OK;
+}
+
 bool hasProperty(GstElement* element, const char* propertyName) {
     return element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), propertyName) != nullptr;
 }
@@ -2766,6 +2935,25 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         if (!gst_element_link_many(src, parse, queue, nullptr)) {
             std::cerr << "DVB input pipeline link failed: dvbsrc -> tsparse -> queue" << std::endl;
             return nullptr;
+        }
+
+        // v124: dvbsrc PID filtering still carries the transponder's original
+        // PAT. Rewrite only that PSI table to one selected SID while leaving
+        // PMT/PCR/PES/teletext/subtitle packets untouched. Without this, VLC
+        // lists every transponder program although their media PIDs are absent.
+        if (cfg.inputServiceId > 0 && params.pids != "8192") {
+            GstPad* psiPad = gst_element_get_static_pad(parse, "src");
+            if (psiPad) {
+                auto* psiContext = new DvbSingleProgramPsiContext();
+                psiContext->serviceId = static_cast<uint16_t>(cfg.inputServiceId & 0xFFFFU);
+                gst_pad_add_probe(
+                    psiPad,
+                    GST_PAD_PROBE_TYPE_BUFFER,
+                    dvbSingleProgramPsiProbe,
+                    psiContext,
+                    [](gpointer data) { delete static_cast<DvbSingleProgramPsiContext*>(data); });
+                gst_object_unref(psiPad);
+            }
         }
 
         std::cerr << "DVB-S/S2 input: adapter=" << params.adapter

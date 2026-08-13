@@ -29,8 +29,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 9";
-constexpr const char* kProgramVersion = "v123";
+constexpr const char* kProgramRelease = "Release 10";
+constexpr const char* kProgramVersion = "v124";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -2362,7 +2362,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 9'} / ${state.program_version||'v123'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 10'} / ${state.program_version||'v124'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
