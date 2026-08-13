@@ -1,6 +1,17 @@
-# TVStreammerSAT5 — Release 12
+# TVStreammerSAT5 — Release 13
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 12 / v126.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 13 / v127.**
+
+
+### SPTS metadata, decode truth, equal tiles and DVB adapter selector (v127)
+
+v127 completes the single-program DVB cleanup by rewriting **both PAT and SDT** for the selected SID. The selected PMT/PCR/PES/teletext/subtitle packets remain byte-for-byte passthrough, while PID `0x0011` is replaced with a one-service SDT generated from the selected channel name/provider. VLC therefore no longer reconstructs the unused transponder service list from the original SDT. The expected log now contains `PAT=single-program SDT=single-service media=passthrough`.
+
+The per-tile CA decode indicator is also made stricter. It learns the selected elementary-stream PIDs from PMT (with configured VPID/APID as fallback), counts scrambling only on those media PIDs, and requires a real clear PES boundary before showing **ДЕКОД: ОК**. Clear ECM/EMM/private sections can no longer create a false green decode state. If output exists but no selected video/audio/subtitle PES is confirmed, the tile shows **ДЕКОД: НЕТ МЕДИА**.
+
+All dashboard tiles now reserve the same DVB-meter and CA/decode row height, including FTA and non-DVB streams, and use a fixed common tile height. The Add Channel DVB dialog now provides discovered **Adapter** and **Frontend** values as drop-down lists populated from `/api/dvb-adapters`.
+
+The `StableUdpOutput` WISI five-second startup reservoir, PCR restamping, 20 ms periodic PCR and 7x188/1316-byte UDP packetisation are unchanged.
 
 
 ### Phoenix card-presence / 6 MHz ATR fix (v126)
@@ -358,7 +369,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 12
+Description=TVStreammerSAT5 Release 13
 After=network-online.target
 Wants=network-online.target
 

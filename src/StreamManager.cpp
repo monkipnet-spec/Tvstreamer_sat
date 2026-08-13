@@ -151,15 +151,20 @@ void freeSrtAccessContext(gpointer data) {
 // unrelated services, but Linux DVB demux still returns the original PAT/SDT
 // tables from the complete transponder.  Players such as VLC therefore see
 // every service advertised by the original PAT even though only one service's
-// media PIDs are present.  Keep the selected media packets byte-for-byte and
-// rewrite only PID 0 (PAT) to advertise one selected SID -> PMT mapping.
-// This avoids another tsdemux/mpegtsmux cycle, which previously broke valid
-// FTA/private streams, while producing a standards-compliant single-program TS.
+// media PIDs are present. Keep the selected media packets byte-for-byte and
+// rewrite PAT plus SDT so both program mapping and service metadata advertise
+// only the selected SID. This avoids another tsdemux/mpegtsmux cycle, which
+// previously broke valid FTA/private streams, while producing a real SPTS.
 struct DvbSingleProgramPsiContext {
     uint16_t serviceId = 0;
     uint16_t pmtPid = 0x1FFF;
     uint16_t transportStreamId = 1;
+    uint16_t originalNetworkId = 1;
     uint8_t patVersion = 0;
+    uint8_t sdtVersion = 0;
+    std::string serviceName;
+    std::string serviceProvider;
+    bool scrambledService = false;
     bool announced = false;
 };
 
@@ -224,6 +229,12 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
         }
     }
 
+    if (pid == 0x0011 && (section[0] == 0x42 || section[0] == 0x46) && available >= 11) {
+        ctx->transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
+        ctx->sdtVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
+        ctx->originalNetworkId = static_cast<uint16_t>((section[8] << 8) | section[9]);
+    }
+
     // Fallback: identify the PMT directly. dvbsrc's selected PID set contains
     // only the chosen service PMT, so this also works if a very large PAT spans
     // more than one TS packet and the selected entry is not in the first packet.
@@ -274,6 +285,84 @@ void suppressPatPacketUntilPmtKnown(uint8_t* packet) {
     packet[3] = static_cast<uint8_t>(0x10 | continuity);
 }
 
+std::vector<uint8_t> dvbServiceText(const std::string& value, std::size_t maxBytes) {
+    if (value.empty() || maxBytes == 0) return {};
+    const bool needsUtf8Marker = std::any_of(value.begin(), value.end(), [](unsigned char ch) {
+        return ch >= 0x80;
+    });
+    const std::size_t payloadLimit = maxBytes > (needsUtf8Marker ? 1U : 0U)
+        ? maxBytes - (needsUtf8Marker ? 1U : 0U)
+        : 0U;
+    std::size_t cut = std::min<std::size_t>(value.size(), payloadLimit);
+    // If the byte immediately after the cut is a UTF-8 continuation byte, move
+    // the cut back to the beginning of that code point.
+    while (cut > 0 && cut < value.size() &&
+           (static_cast<unsigned char>(value[cut]) & 0xC0U) == 0x80U) {
+        --cut;
+    }
+    std::string trimmed = value.substr(0, cut);
+    std::vector<uint8_t> result;
+    result.reserve(trimmed.size() + (needsUtf8Marker ? 1U : 0U));
+    if (needsUtf8Marker) result.push_back(0x15); // DVB UTF-8 selector.
+    result.insert(result.end(), trimmed.begin(), trimmed.end());
+    return result;
+}
+
+void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
+    if (!packet || ctx.serviceId == 0) return;
+    const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
+    std::memset(packet, 0xFF, kTsPacketSize);
+    packet[0] = 0x47;
+    packet[1] = 0x40; // PUSI + PID 0x0011 high bits.
+    packet[2] = 0x11;
+    packet[3] = static_cast<uint8_t>(0x10 | continuity);
+    packet[4] = 0x00; // pointer_field
+
+    const std::string fallbackName = "Service " + std::to_string(ctx.serviceId);
+    const auto provider = dvbServiceText(
+        ctx.serviceProvider.empty() ? "TVStreammerSAT5" : ctx.serviceProvider, 48);
+    const auto name = dvbServiceText(
+        ctx.serviceName.empty() ? fallbackName : ctx.serviceName, 88);
+    const std::size_t descriptorPayloadLength = 1 + 1 + provider.size() + 1 + name.size();
+    const std::size_t descriptorLength = 2 + descriptorPayloadLength;
+    const std::size_t sectionLength = 8 + 5 + descriptorLength + 4;
+    if (sectionLength > 0x0FFF || 3 + sectionLength > kTsPacketSize - 5) return;
+
+    uint8_t* section = packet + 5;
+    section[0] = 0x42; // SDT actual transport stream.
+    section[1] = static_cast<uint8_t>(0xF0 | ((sectionLength >> 8) & 0x0F));
+    section[2] = static_cast<uint8_t>(sectionLength & 0xFF);
+    section[3] = static_cast<uint8_t>(ctx.transportStreamId >> 8);
+    section[4] = static_cast<uint8_t>(ctx.transportStreamId & 0xFF);
+    section[5] = static_cast<uint8_t>(0xC1 | ((ctx.sdtVersion & 0x1F) << 1));
+    section[6] = 0x00;
+    section[7] = 0x00;
+    section[8] = static_cast<uint8_t>(ctx.originalNetworkId >> 8);
+    section[9] = static_cast<uint8_t>(ctx.originalNetworkId & 0xFF);
+    section[10] = 0xFF;
+
+    std::size_t pos = 11;
+    section[pos++] = static_cast<uint8_t>(ctx.serviceId >> 8);
+    section[pos++] = static_cast<uint8_t>(ctx.serviceId & 0xFF);
+    section[pos++] = 0xFC; // reserved + EIT flags off.
+    section[pos++] = static_cast<uint8_t>(0x80 | (ctx.scrambledService ? 0x10 : 0x00) |
+                                          ((descriptorLength >> 8) & 0x0F));
+    section[pos++] = static_cast<uint8_t>(descriptorLength & 0xFF);
+    section[pos++] = 0x48; // DVB service descriptor.
+    section[pos++] = static_cast<uint8_t>(descriptorPayloadLength);
+    section[pos++] = 0x01; // digital television service.
+    section[pos++] = static_cast<uint8_t>(provider.size());
+    for (uint8_t ch : provider) section[pos++] = ch;
+    section[pos++] = static_cast<uint8_t>(name.size());
+    for (uint8_t ch : name) section[pos++] = ch;
+
+    const uint32_t crc = mpeg2SectionCrc32(section, pos);
+    section[pos++] = static_cast<uint8_t>((crc >> 24) & 0xFF);
+    section[pos++] = static_cast<uint8_t>((crc >> 16) & 0xFF);
+    section[pos++] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+    section[pos++] = static_cast<uint8_t>(crc & 0xFF);
+}
+
 GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
     auto* ctx = static_cast<DvbSingleProgramPsiContext*>(userData);
     if (!ctx || ctx->serviceId == 0 || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
@@ -300,7 +389,7 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
                 if (!ctx->announced) {
                     std::cerr << "DVB SPTS PSI filter: SID=" << ctx->serviceId
                               << " PMT_PID=" << ctx->pmtPid
-                              << " PAT=single-program media=passthrough SDT=preserved"
+                              << " PAT=single-program SDT=single-service media=passthrough"
                               << std::endl;
                     ctx->announced = true;
                 }
@@ -309,6 +398,11 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
                 // the selected PMT PID. This keeps VLC from caching every service.
                 suppressPatPacketUntilPmtKnown(packet);
             }
+        } else if (pid == 0x0011) {
+            // PID 0x11 from the tuner contains the original full-transponder SDT.
+            // Replace every packet on that PID, including continuation packets,
+            // so VLC cannot rebuild or cache service names for unrelated SIDs.
+            writeSingleProgramSdt(packet, *ctx);
         }
     }
 
@@ -870,17 +964,87 @@ uint64_t countContinuityErrors(
 struct TransportScramblingCount {
     uint64_t payloadPackets = 0;
     uint64_t scrambledPackets = 0;
+    uint64_t mediaPackets = 0;
+    uint64_t scrambledMediaPackets = 0;
+    uint64_t clearPesStarts = 0;
 };
+
+void parseOutputPmtMediaPids(const std::vector<uint8_t>& section, StreamState* state) {
+    if (!state || section.size() < 16 || section[0] != 0x02) return;
+    const std::size_t sectionLength = static_cast<std::size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const std::size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > section.size()) return;
+    const uint16_t sid = static_cast<uint16_t>((section[3] << 8) | section[4]);
+    if (state->config.inputServiceId > 0 && sid != (state->config.inputServiceId & 0xFFFFU)) return;
+
+    const std::size_t end = total - 4; // CRC excluded.
+    const std::size_t programInfoLength = static_cast<std::size_t>(((section[10] & 0x0F) << 8) | section[11]);
+    if (12 + programInfoLength > end) return;
+    std::size_t pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const uint16_t pid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const std::size_t esInfoLength = static_cast<std::size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) break;
+        if (pid > 0 && pid < 0x1FFF) state->outputMediaPidKnown[pid] = true;
+        pos += 5 + esInfoLength;
+    }
+}
+
+void learnOutputMediaPidsFromPmt(const guint8* packet, StreamState* state) {
+    if (!packet || !state || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    const std::size_t payload = tsPayloadOffset(packet);
+    if (payload >= kTsPacketSize) return;
+
+    const bool pusi = (packet[1] & 0x40) != 0;
+    if (pusi) {
+        const std::size_t pointer = packet[payload];
+        const std::size_t start = payload + 1 + pointer;
+        if (start >= kTsPacketSize || packet[start] != 0x02) return;
+        state->outputPmtAssemblyPid = pid;
+        state->outputPmtSectionAssembly.assign(packet + start, packet + kTsPacketSize);
+        state->outputPmtSectionExpected = 0;
+    } else if (pid == state->outputPmtAssemblyPid && !state->outputPmtSectionAssembly.empty()) {
+        state->outputPmtSectionAssembly.insert(
+            state->outputPmtSectionAssembly.end(), packet + payload, packet + kTsPacketSize);
+    } else {
+        return;
+    }
+
+    auto& section = state->outputPmtSectionAssembly;
+    if (section.size() >= 3 && state->outputPmtSectionExpected == 0) {
+        const std::size_t sectionLength = static_cast<std::size_t>(((section[1] & 0x0F) << 8) | section[2]);
+        const std::size_t expected = 3 + sectionLength;
+        if (section[0] != 0x02 || expected < 16 || expected > 4096) {
+            section.clear();
+            state->outputPmtAssemblyPid = 0x1FFF;
+            return;
+        }
+        state->outputPmtSectionExpected = expected;
+    }
+    if (state->outputPmtSectionExpected > 0 && section.size() >= state->outputPmtSectionExpected) {
+        section.resize(state->outputPmtSectionExpected);
+        parseOutputPmtMediaPids(section, state);
+        section.clear();
+        state->outputPmtAssemblyPid = 0x1FFF;
+        state->outputPmtSectionExpected = 0;
+    }
+}
 
 TransportScramblingCount countTransportScrambling(
     const guint8* data,
     std::size_t size,
-    std::vector<uint8_t>& remainder,
-    std::mutex& mutex) {
+    StreamState* state) {
     TransportScramblingCount count;
-    if (!data || size == 0) return count;
+    if (!data || size == 0 || !state) return count;
 
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
+    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF)
+        state->outputMediaPidKnown[state->config.videoPid] = true;
+    if (state->config.audioPid > 0 && state->config.audioPid < 0x1FFF)
+        state->outputMediaPidKnown[state->config.audioPid] = true;
+
+    auto& remainder = state->outputScramblingRemainder;
     std::vector<uint8_t> bytes;
     bytes.reserve(remainder.size() + size);
     bytes.insert(bytes.end(), remainder.begin(), remainder.end());
@@ -900,17 +1064,35 @@ TransportScramblingCount countTransportScrambling(
         if (packet[0] != 0x47) break;
         if ((packet[1] & 0x80) != 0) continue;
 
-        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
-        // Fixed PSI/SI and null packets cannot tell us whether the selected
-        // service media is clear, so exclude them from the decode indicator.
-        if (pid < 0x20 || pid == 0x1fff) continue;
+        learnOutputMediaPidsFromPmt(packet, state);
 
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
         const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
-        if (adaptationControl != 1 && adaptationControl != 3) continue;
+        const std::size_t payload = tsPayloadOffset(packet);
+        if ((adaptationControl != 1 && adaptationControl != 3) || payload >= kTsPacketSize) continue;
 
-        ++count.payloadPackets;
+        // Keep the broad counters for diagnostics, but do not use them to say
+        // that a CA service is decoded. Clear ECM/EMM packets are not media.
+        if (pid >= 0x20 && pid != 0x1FFF) {
+            ++count.payloadPackets;
+            const guint8 scramblingControl = static_cast<guint8>((packet[3] >> 6) & 0x03);
+            if (scramblingControl != 0) ++count.scrambledPackets;
+        }
+
+        if (pid >= state->outputMediaPidKnown.size() || !state->outputMediaPidKnown[pid]) continue;
+        ++count.mediaPackets;
         const guint8 scramblingControl = static_cast<guint8>((packet[3] >> 6) & 0x03);
-        if (scramblingControl != 0) ++count.scrambledPackets;
+        if (scramblingControl != 0) {
+            ++count.scrambledMediaPackets;
+            continue;
+        }
+
+        // A clear scrambling bit alone is insufficient: require a real PES
+        // boundary on the selected elementary streams before declaring decode OK.
+        if ((packet[1] & 0x40) != 0 && payload + 4 <= kTsPacketSize &&
+            packet[payload] == 0x00 && packet[payload + 1] == 0x00 && packet[payload + 2] == 0x01) {
+            ++count.clearPesStarts;
+        }
     }
 
     if (offset < bytes.size()) {
@@ -926,15 +1108,18 @@ void updateOutputScramblingStats(StreamState* state, GstBuffer* buffer) {
     if (!state || !buffer) return;
     GstMapInfo map {};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
-    const auto count = countTransportScrambling(
-        map.data, map.size, state->outputScramblingRemainder, state->outputScramblingMutex);
+    const auto count = countTransportScrambling(map.data, map.size, state);
     gst_buffer_unmap(buffer, &map);
-    if (count.payloadPackets) {
+    if (count.payloadPackets)
         state->outputTsPayloadPackets.fetch_add(count.payloadPackets, std::memory_order_relaxed);
-    }
-    if (count.scrambledPackets) {
+    if (count.scrambledPackets)
         state->outputTsScrambledPackets.fetch_add(count.scrambledPackets, std::memory_order_relaxed);
-    }
+    if (count.mediaPackets)
+        state->outputTsMediaPackets.fetch_add(count.mediaPackets, std::memory_order_relaxed);
+    if (count.scrambledMediaPackets)
+        state->outputTsScrambledMediaPackets.fetch_add(count.scrambledMediaPackets, std::memory_order_relaxed);
+    if (count.clearPesStarts)
+        state->outputTsClearPesStarts.fetch_add(count.clearPesStarts, std::memory_order_relaxed);
 }
 
 void updateOutputScramblingStats(StreamState* state, GstBufferList* list) {
@@ -2781,8 +2966,17 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->outputTsScrambledPackets = 0;
     state->outputTsPayloadPacketsDelta = 0;
     state->outputTsScrambledPacketsDelta = 0;
+    state->outputTsMediaPackets = 0;
+    state->outputTsScrambledMediaPackets = 0;
+    state->outputTsClearPesStarts = 0;
+    state->outputTsMediaPacketsDelta = 0;
+    state->outputTsScrambledMediaPacketsDelta = 0;
+    state->outputTsClearPesStartsDelta = 0;
     state->lastOutputTsPayloadPacketsSample = 0;
     state->lastOutputTsScrambledPacketsSample = 0;
+    state->lastOutputTsMediaPacketsSample = 0;
+    state->lastOutputTsScrambledMediaPacketsSample = 0;
+    state->lastOutputTsClearPesStartsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
@@ -2803,6 +2997,10 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     {
         std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
         state->outputScramblingRemainder.clear();
+        state->outputMediaPidKnown.fill(false);
+        state->outputPmtAssemblyPid = 0x1FFF;
+        state->outputPmtSectionAssembly.clear();
+        state->outputPmtSectionExpected = 0;
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
@@ -2919,8 +3117,17 @@ bool StreamManager::restartTranscodedInput(
     state->outputTsScrambledPackets = 0;
     state->outputTsPayloadPacketsDelta = 0;
     state->outputTsScrambledPacketsDelta = 0;
+    state->outputTsMediaPackets = 0;
+    state->outputTsScrambledMediaPackets = 0;
+    state->outputTsClearPesStarts = 0;
+    state->outputTsMediaPacketsDelta = 0;
+    state->outputTsScrambledMediaPacketsDelta = 0;
+    state->outputTsClearPesStartsDelta = 0;
     state->lastOutputTsPayloadPacketsSample = 0;
     state->lastOutputTsScrambledPacketsSample = 0;
+    state->lastOutputTsMediaPacketsSample = 0;
+    state->lastOutputTsScrambledMediaPacketsSample = 0;
+    state->lastOutputTsClearPesStartsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
@@ -2934,6 +3141,10 @@ bool StreamManager::restartTranscodedInput(
     {
         std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
         state->outputScramblingRemainder.clear();
+        state->outputMediaPidKnown.fill(false);
+        state->outputPmtAssemblyPid = 0x1FFF;
+        state->outputPmtSectionAssembly.clear();
+        state->outputPmtSectionExpected = 0;
     }
 
     std::cerr << "Transcoded input switch complete: active="
@@ -3077,15 +3288,18 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
-        // v124: dvbsrc PID filtering still carries the transponder's original
-        // PAT. Rewrite only that PSI table to one selected SID while leaving
-        // PMT/PCR/PES/teletext/subtitle packets untouched. Without this, VLC
-        // lists every transponder program although their media PIDs are absent.
+        // v127: dvbsrc PID filtering still carries the transponder's original
+        // PAT and SDT. Rewrite both tables to one selected SID while leaving
+        // PMT/PCR/PES/teletext/subtitle packets untouched. This removes the
+        // unrelated service list that VLC can otherwise reconstruct from SDT.
         if (cfg.inputServiceId > 0 && params.pids != "8192") {
             GstPad* psiPad = gst_element_get_static_pad(parse, "src");
             if (psiPad) {
                 auto* psiContext = new DvbSingleProgramPsiContext();
                 psiContext->serviceId = static_cast<uint16_t>(cfg.inputServiceId & 0xFFFFU);
+                psiContext->serviceName = cfg.serviceName.empty() ? cfg.name : cfg.serviceName;
+                psiContext->serviceProvider = cfg.serviceProvider;
+                psiContext->scrambledService = !cfg.conditionalAccessReader.empty();
                 gst_pad_add_probe(
                     psiPad,
                     GST_PAD_PROBE_TYPE_BUFFER,
@@ -4387,12 +4601,18 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     uint64_t currentOutputCcErrors = state->outputCcErrors.load();
     uint64_t currentOutputTsPayloadPackets = state->outputTsPayloadPackets.load();
     uint64_t currentOutputTsScrambledPackets = state->outputTsScrambledPackets.load();
+    uint64_t currentOutputTsMediaPackets = state->outputTsMediaPackets.load();
+    uint64_t currentOutputTsScrambledMediaPackets = state->outputTsScrambledMediaPackets.load();
+    uint64_t currentOutputTsClearPesStarts = state->outputTsClearPesStarts.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
     uint64_t inputCcDelta = currentInputCcErrors - state->lastInputCcErrorsSample;
     uint64_t outputCcDelta = currentOutputCcErrors - state->lastOutputCcErrorsSample;
     uint64_t outputTsPayloadDelta = currentOutputTsPayloadPackets - state->lastOutputTsPayloadPacketsSample;
     uint64_t outputTsScrambledDelta = currentOutputTsScrambledPackets - state->lastOutputTsScrambledPacketsSample;
+    uint64_t outputTsMediaDelta = currentOutputTsMediaPackets - state->lastOutputTsMediaPacketsSample;
+    uint64_t outputTsScrambledMediaDelta = currentOutputTsScrambledMediaPackets - state->lastOutputTsScrambledMediaPacketsSample;
+    uint64_t outputTsClearPesStartsDelta = currentOutputTsClearPesStarts - state->lastOutputTsClearPesStartsSample;
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
@@ -4404,6 +4624,9 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     state->outputCcErrorsDelta = outputCcDelta;
     state->outputTsPayloadPacketsDelta = outputTsPayloadDelta;
     state->outputTsScrambledPacketsDelta = outputTsScrambledDelta;
+    state->outputTsMediaPacketsDelta = outputTsMediaDelta;
+    state->outputTsScrambledMediaPacketsDelta = outputTsScrambledMediaDelta;
+    state->outputTsClearPesStartsDelta = outputTsClearPesStartsDelta;
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
@@ -4411,6 +4634,9 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     state->lastOutputCcErrorsSample = currentOutputCcErrors;
     state->lastOutputTsPayloadPacketsSample = currentOutputTsPayloadPackets;
     state->lastOutputTsScrambledPacketsSample = currentOutputTsScrambledPackets;
+    state->lastOutputTsMediaPacketsSample = currentOutputTsMediaPackets;
+    state->lastOutputTsScrambledMediaPacketsSample = currentOutputTsScrambledMediaPackets;
+    state->lastOutputTsClearPesStartsSample = currentOutputTsClearPesStarts;
     state->lastBitrateSample = now;
 }
 GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {

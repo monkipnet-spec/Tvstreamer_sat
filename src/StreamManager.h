@@ -76,6 +76,15 @@ struct StreamState {
     std::atomic<uint64_t> outputTsScrambledPackets{0};
     std::atomic<uint64_t> outputTsPayloadPacketsDelta{0};
     std::atomic<uint64_t> outputTsScrambledPacketsDelta{0};
+    // Decode truth is based only on elementary-stream PIDs learned from the
+    // selected PMT. ECM/EMM/other clear private sections must never make an
+    // encrypted service look decoded.
+    std::atomic<uint64_t> outputTsMediaPackets{0};
+    std::atomic<uint64_t> outputTsScrambledMediaPackets{0};
+    std::atomic<uint64_t> outputTsClearPesStarts{0};
+    std::atomic<uint64_t> outputTsMediaPacketsDelta{0};
+    std::atomic<uint64_t> outputTsScrambledMediaPacketsDelta{0};
+    std::atomic<uint64_t> outputTsClearPesStartsDelta{0};
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
@@ -83,6 +92,9 @@ struct StreamState {
     uint64_t lastOutputCcErrorsSample = 0;
     uint64_t lastOutputTsPayloadPacketsSample = 0;
     uint64_t lastOutputTsScrambledPacketsSample = 0;
+    uint64_t lastOutputTsMediaPacketsSample = 0;
+    uint64_t lastOutputTsScrambledMediaPacketsSample = 0;
+    uint64_t lastOutputTsClearPesStartsSample = 0;
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
@@ -96,6 +108,10 @@ struct StreamState {
     std::mutex outputContinuityMutex;
     std::vector<uint8_t> outputScramblingRemainder;
     std::mutex outputScramblingMutex;
+    std::array<bool, 8192> outputMediaPidKnown {};
+    uint16_t outputPmtAssemblyPid = 0x1FFF;
+    std::vector<uint8_t> outputPmtSectionAssembly;
+    std::size_t outputPmtSectionExpected = 0;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;
