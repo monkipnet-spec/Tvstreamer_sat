@@ -1,6 +1,15 @@
-# TVStreammerSAT5 — Release 10
+# TVStreammerSAT5 — Release 11
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 10 / v124.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 11 / v125.**
+
+
+### Internal Multi-Service CardManager (v125)
+
+Release 11 adds a closed in-process Conditional-Access control plane for Phoenix/SmartMouse readers. Each encrypted DVB stream can reserve one service slot on its configured reader; a reader is limited to 10 simultaneous reservations by default. Reader identity is normalised to stable `/dev/serial/by-id/*` paths so `/dev/ttyUSB0` / `/dev/ttyUSB1` renumbering after reboot cannot swap card profiles. The current deployment profiles recognise FTDI serial `A104JCGD` as `Voprosy_otvety` (`CAID 0652`, provider `0406BE`) and `AD023J2Q` as `Pervy1` (`CAID 0652`, provider `0400DC`). Unknown readers remain usable as generic Phoenix entries.
+
+`/api/ca-manager` reports reader hardware state, immutable serial, profile, slot usage and per-service telemetry. Active DVB tiles show the local CA reservation state. The manager contains no Newcamd/CCcam server, no network key API and no key export/logging path. v125 is the multi-service control plane and reservation layer; it does not claim a native card descrambling backend. A reader already opened by another process is reported as an external owner and is never reset by the CardManager inventory path.
+
+The DVB SPTS path from v124 is unchanged. The WISI-specific five-second startup reservoir, 20 ms periodic PCR generation, PCR restamping and 7x188/1316-byte UDP packetisation are unchanged.
 
 ### DVB single-program PSI cleanup (v124)
 
@@ -338,7 +347,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 10
+Description=TVStreammerSAT5 Release 11
 After=network-online.target
 Wants=network-online.target
 

@@ -334,7 +334,7 @@ std::vector<ReaderEntry> enumerateDevicePaths() {
 
 } // namespace
 
-Json::Value readers() {
+Json::Value readers(bool probeCardEnabled) {
     Json::Value result(Json::arrayValue);
     const auto paths = enumerateDevicePaths();
     unsigned index = 0;
@@ -360,16 +360,28 @@ Json::Value readers() {
         item["serial"] = parentAttribute(sysDevice, "serial");
         item["phoenix_candidate"] = true;
 
-        const ProbeResult probe = probeCard(entry.stableDevice.empty() ? entry.device : entry.stableDevice);
-        item["status"] = probe.status;
-        if (probe.status == "card") item["card_present"] = true;
-        else if (probe.status == "no_card") item["card_present"] = false;
-        else item["card_present"] = Json::Value(Json::nullValue);
-        item["atr"] = hexBytes(probe.atr);
-        item["historical_text"] = printableHistorical(probe.atr);
-        item["card_system"] = probe.cardSystem;
-        item["provider_name"] = probe.provider;
-        item["detail"] = probe.detail;
+        const std::string probeDevice = entry.stableDevice.empty() ? entry.device : entry.stableDevice;
+        if (probeCardEnabled) {
+            const ProbeResult probe = probeCard(probeDevice);
+            item["status"] = probe.status;
+            if (probe.status == "card") item["card_present"] = true;
+            else if (probe.status == "no_card") item["card_present"] = false;
+            else item["card_present"] = Json::Value(Json::nullValue);
+            item["atr"] = hexBytes(probe.atr);
+            item["historical_text"] = printableHistorical(probe.atr);
+            item["card_system"] = probe.cardSystem;
+            item["provider_name"] = probe.provider;
+            item["detail"] = probe.detail;
+        } else {
+            const bool busy = usedByAnotherProcess(canonicalDevice(probeDevice));
+            item["status"] = busy ? "busy" : "detected";
+            item["card_present"] = Json::Value(Json::nullValue);
+            item["atr"] = "";
+            item["historical_text"] = "";
+            item["card_system"] = "";
+            item["provider_name"] = "";
+            item["detail"] = busy ? "device is already open by another process" : "reader detected; ATR probe not requested";
+        }
         result.append(item);
     }
     return result;

@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "TranscoderModule.h"
 #include "DvbSatellite.h"
+#include "CardManager.h"
 #include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
@@ -29,8 +30,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 10";
-constexpr const char* kProgramVersion = "v124";
+constexpr const char* kProgramRelease = "Release 11";
+constexpr const char* kProgramVersion = "v125";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -429,6 +430,9 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/dvb-adapters") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = dvbAdapters();
+            } else if (target == "/api/ca-manager") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = caManagerStatus();
             } else if (target.rfind("/api/quality-history", 0) == 0) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = qualityHistory(target);
@@ -445,9 +449,8 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
             } else if (target == "/api/start-stream") {
-                handleStartStream(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = "{\"result\": \"ok\"}";
+                res.body() = handleStartStream(req.body());
             } else if (target == "/api/stop-stream") {
                 handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
@@ -765,6 +768,7 @@ std::string HttpServer::currentState() {
     root["program_version"] = kProgramVersion;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
+    root["ca_manager"] = CardManager::instance().snapshot();
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
     static const auto transcoderCapabilities = TranscoderModule::inspectCapabilities();
     Json::Value transcoder;
@@ -857,6 +861,8 @@ std::string HttpServer::currentState() {
             }
         }
 
+        item["ca"] = CardManager::instance().streamState(cfg.id);
+
         Json::Value links(Json::arrayValue);
         for (const auto& output : streamOutputs(cfg)) {
             Json::Value link;
@@ -880,6 +886,11 @@ std::string HttpServer::currentState() {
 std::string HttpServer::dvbAdapters() {
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, DvbSatellite::adapters());
+}
+
+std::string HttpServer::caManagerStatus() {
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, CardManager::instance().snapshot());
 }
 
 std::string HttpServer::handleDvbTune(const std::string& body, bool scan) {
@@ -1386,21 +1397,41 @@ std::string HttpServer::handleDeleteBackupFile(const std::string& body) {
     return Json::writeString(writer, response);
 }
 
-void HttpServer::handleStartStream(const std::string& body) {
+std::string HttpServer::handleStartStream(const std::string& body) {
+    Json::Value response;
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
-        std::cerr << "Invalid start-stream payload: " << errs << std::endl;
-        return;
+        const std::string message = "Invalid start-stream payload: " + errs;
+        std::cerr << message << std::endl;
+        response["result"] = "error";
+        response["error"] = message;
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
     }
-    auto cfg = StreamConfig::fromJson(root);
-    if (!streamManager.startStream(cfg) &&
-        !streamManager.isStreamActive(cfg.id) &&
-        streamManager.snapshot().count(cfg.id) > 0) {
-        streamManager.restartStream(cfg);
+
+    const auto cfg = StreamConfig::fromJson(root);
+    std::string startError;
+    bool started = streamManager.startStream(cfg, &startError);
+    if (!started && streamManager.isStreamActive(cfg.id)) started = true;
+
+    response["stream_id"] = cfg.id;
+    if (started) {
+        response["result"] = "ok";
+        if (!cfg.conditionalAccessReader.empty()) {
+            response["ca"] = CardManager::instance().streamState(cfg.id);
+        }
+    } else {
+        response["result"] = "error";
+        response["error"] = startError.empty()
+            ? ("Failed to start stream: " + (cfg.name.empty() ? cfg.id : cfg.name))
+            : startError;
     }
+
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 void HttpServer::handleStopStream(const std::string& body) {
@@ -1725,7 +1756,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
 .sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
 .phoenix-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
-.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
+.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
 @media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
@@ -1835,6 +1866,7 @@ let satelliteScanning = false;
 let satelliteServices = [];
 let phoenixReaders = [];
 let phoenixReadersLoaded = false;
+let caManagerState = {readers:[]};
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -2068,6 +2100,9 @@ function updateStreamTile(tile, stream) {
   const status = tile.querySelector('[data-role="stream-status"]');
   if (status) status.textContent = stream.status || '';
 
+  const caStatus = tile.querySelector('[data-role="ca-status"]');
+  if (caStatus) caStatus.textContent = caStreamStatusText(stream);
+
   const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
   if (toggleButton) {
     toggleButton.className = stream.active ? 'stop-button' : 'start-button';
@@ -2129,6 +2164,7 @@ function render(force=false) {
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
+        ${stream.conditional_access_reader ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>` : ''}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${stream.status || ''}</span></div>
@@ -2149,10 +2185,16 @@ function toggleStream(id, active) {
   const url = active ? '/api/stop-stream' : '/api/start-stream';
   const body = active ? {id} : state.streams.find(s=>s.id===id);
   fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(()=>{
+    .then(async response=>{
+      let data = {};
+      try { data = await response.json(); } catch (_) {}
+      if (!active && data.result === 'error') {
+        window.alert(data.error || 'Не удалось запустить поток');
+      }
       setTimeout(fetchState,500);
       setTimeout(fetchState,1500);
-    });
+    })
+    .catch(error=>window.alert(error?.message || 'Ошибка управления потоком'));
 }
 function deleteStream(id) {
   const stream = state.streams.find(s=>s.id===id);
@@ -2362,7 +2404,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 10'} / ${state.program_version||'v124'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 11'} / ${state.program_version||'v125'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2413,6 +2455,43 @@ function openTelegramModal() {
 function satEscape(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 }
+function caManagerReader(path) {
+  const wanted = String(path || '');
+  return (caManagerState?.readers || []).find(reader => {
+    const key = String(reader.key || '');
+    const stable = String(reader.stable_device || '');
+    const device = String(reader.device || '');
+    return wanted && (wanted === key || wanted === stable || wanted === device);
+  }) || null;
+}
+function caReaderSummary(path) {
+  const reader = caManagerReader(path);
+  if (!reader) return '';
+  const identity = [reader.display_name, reader.caid ? `CAID ${reader.caid}` : '', reader.provider ? `PROVID ${reader.provider}` : ''].filter(Boolean).join(' · ');
+  const slots = `${Number(reader.services_used||0)}/${Number(reader.max_services||10)}`;
+  return `${identity}${identity?' · ':''}слоты ${slots}`;
+}
+function caStreamStatusText(stream) {
+  const ca = stream?.ca || {};
+  if (!stream?.conditional_access_reader) return 'FTA / не привязан';
+  if (!ca.managed) {
+    const profile = caReaderSummary(stream.conditional_access_reader);
+    return profile || 'Phoenix настроен · слот свободен';
+  }
+  const reader = ca.reader_display_name || ca.reader_serial || 'Phoenix';
+  const profile = [ca.caid ? `CAID ${ca.caid}` : '', ca.provider ? `PROVID ${ca.provider}` : ''].filter(Boolean).join(' · ');
+  const stateText = ca.external_owner ? 'внешний владелец' : (ca.active ? 'слот активен' : 'слот зарезервирован');
+  return `${reader}${profile?` · ${profile}`:''} · ${stateText}`;
+}
+async function loadCaManager() {
+  try {
+    const response = await fetch('/api/ca-manager', {cache:'no-store'});
+    caManagerState = await response.json();
+  } catch (_) {
+    caManagerState = {readers:[]};
+  }
+  return caManagerState;
+}
 function phoenixStatusInfo(reader) {
   const status = String(reader?.status || 'unknown');
   if (status === 'card') {
@@ -2422,6 +2501,7 @@ function phoenixStatusInfo(reader) {
   }
   if (status === 'no_card') return {cls:'no-card', text:'НЕТ КАРТЫ'};
   if (status === 'busy') return {cls:'busy', text:'ЗАНЯТ'};
+  if (status === 'detected') return {cls:'detected', text:'ОБНАРУЖЕН'};
   if (status === 'permission') return {cls:'warn', text:'НЕТ ДОСТУПА'};
   return {cls:'warn', text:'НЕ ОПРЕДЕЛЁН'};
 }
@@ -2431,7 +2511,8 @@ function phoenixReaderOptions(selected='') {
   phoenixReaders.forEach(reader => {
     const path = String(reader.stable_device || reader.device || '');
     const status = phoenixStatusInfo(reader);
-    const suffix = status.text ? ` · ${status.text}` : '';
+    const caSummary = caReaderSummary(path);
+    const suffix = [status.text, caSummary].filter(Boolean).map(text=>` · ${text}`).join('');
     options.push(`<option value="${satEscape(path)}" ${path===current?'selected':''}>Phoenix ${Number(reader.index||0)} · ${satEscape(path)}${satEscape(suffix)}</option>`);
   });
   if (current && !phoenixReaders.some(reader => String(reader.stable_device || reader.device || '') === current)) {
@@ -2448,8 +2529,12 @@ function renderPhoenixReaders() {
       const path = String(reader.stable_device || reader.device || '');
       const hw = [reader.manufacturer, reader.product].filter(Boolean).join(' ') || reader.driver || '';
       const atr = reader.atr ? ` · ATR ${reader.atr}` : '';
-      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}`;
-      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${Number(reader.index||0)}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}</span><span class="phoenix-state ${stateInfo.cls}">${satEscape(stateInfo.text)}</span></div>`;
+      const managed = caManagerReader(path);
+      const caSummary = caReaderSummary(path);
+      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}${caSummary?` · ${caSummary}`:''}`;
+      const stateText = managed ? `${stateInfo.text} · ${Number(managed.services_used||0)}/${Number(managed.max_services||10)}` : stateInfo.text;
+      const secondary = caSummary ? ` · ${caSummary}` : '';
+      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${Number(reader.index||0)}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${stateInfo.cls}">${satEscape(stateText)}</span></div>`;
     }).join('') : '<div class="phoenix-empty">Phoenix/SmartMouse USB readers не обнаружены.</div>';
   }
   if (select) {
@@ -2467,6 +2552,7 @@ async function loadPhoenixReaders() {
     const data = await response.json();
     phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
     phoenixReadersLoaded = true;
+    await loadCaManager();
     return data;
   } catch (_) {
     phoenixReaders = [];
@@ -2553,6 +2639,7 @@ async function loadSatelliteAdapters() {
     const data = await response.json();
     phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
     phoenixReadersLoaded = true;
+    await loadCaManager();
     renderPhoenixReaders();
     const adapters = Array.isArray(data.adapters) ? data.adapters : [];
     if (!data.dvbsrc_available) {
@@ -2694,7 +2781,7 @@ function openAddChannelModal() {
     <div class="phoenix-panel">
       <div class="phoenix-head"><strong>Phoenix / карты условного доступа</strong><button id="satPhoenixRefresh" class="button-secondary" type="button" onclick="refreshPhoenixReaders()">Обновить</button></div>
       <div id="satPhoenixReaders" class="phoenix-list"><div class="phoenix-empty">Поиск подключённых Phoenix...</div></div>
-      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Авто / не привязывать</option></select></div><small>Программа нумерует найденные Phoenix автоматически. Проверка карты выполняется только при открытии окна или по кнопке «Обновить» и не используется для FTA.</small></div>
+      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Авто / не привязывать</option></select></div><small>CardManager резервирует до 10 локальных сервисных слотов на reader и использует стабильный /dev/serial/by-id. Сетевой CA-server и экспорт ключевого материала отсутствуют. FTA слот не занимает.</small></div>
     </div>
     <div class="sat-actions">
       <button id="satScanButton" class="button-primary" onclick="startSatelliteScan()">Сканировать каналы</button>

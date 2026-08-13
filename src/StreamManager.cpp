@@ -3,6 +3,7 @@
 #include "StableUdpOutput.h"
 #include "UdpInput.h"
 #include "DvbSatellite.h"
+#include "CardManager.h"
 #include "protocols/GstProtocolTypes.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
@@ -39,6 +40,37 @@ constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr const char* kTestPatternUri = "test://bars";
+
+class CardReservationGuard {
+public:
+    CardReservationGuard(const StreamConfig& config, std::string* error)
+        : streamId_(config.id), managed_(!config.conditionalAccessReader.empty()) {
+        if (!managed_) {
+            reserved_ = true;
+            return;
+        }
+        reserved_ = CardManager::instance().reserveService(config, error);
+    }
+
+    ~CardReservationGuard() {
+        if (managed_ && reserved_ && !committed_) {
+            CardManager::instance().releaseService(streamId_);
+        }
+    }
+
+    bool ok() const { return reserved_; }
+
+    void commit() {
+        if (managed_ && reserved_) CardManager::instance().activateService(streamId_);
+        committed_ = true;
+    }
+
+private:
+    std::string streamId_;
+    bool managed_ = false;
+    bool reserved_ = false;
+    bool committed_ = false;
+};
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -1627,6 +1659,12 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         }
     }
 
+    CardReservationGuard cardReservation(streamConfig, error);
+    if (!cardReservation.ok()) {
+        if (error && error->empty()) *error = "failed to reserve conditional-access service slot";
+        return false;
+    }
+
     auto state = std::make_unique<StreamState>();
 
     StreamConfig effectiveConfig = streamConfig;
@@ -1742,6 +1780,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             telegramText(configManager, "Поток запущен", "Stream started"),
             telegramText(configManager, "Транскодинг -> стандартный UDP", "Transcode -> default UDP") +
                 "\nURL: " + streamConfig.inputUri);
+        cardReservation.commit();
         return true;
     }
 
@@ -1807,6 +1846,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             "🟢",
             telegramText(configManager, "Поток запущен", "Stream started"),
             telegramText(configManager, "GStreamer-транскодер", "GStreamer transcoder") + "\nURL: " + streamConfig.inputUri);
+        cardReservation.commit();
         return true;
     }
 
@@ -1906,6 +1946,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         "🟢",
         telegramText(configManager, "Поток запущен", "Stream started"),
         telegramText(configManager, "Источник: основной", "Source: primary") + "\nURL: " + streamConfig.inputUri);
+    cardReservation.commit();
     return true;
 }
 
@@ -1965,6 +2006,7 @@ bool StreamManager::stopStream(const std::string& id) {
     state.outputContexts.clear();
     state.sourceContext.reset();
     tvs::protocols::removeFifoRelay(stoppedConfig);
+    CardManager::instance().releaseService(id);
 
     notifyStreamState(
         stoppedConfig,
@@ -1998,6 +2040,7 @@ void StreamManager::stopAll() {
         }
         streams.clear();
     }
+    CardManager::instance().releaseAll();
 
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;

@@ -55,6 +55,7 @@ private:
     std::string currentState();
     std::string qualityHistory(const std::string& target);
     std::string dvbAdapters();
+    std::string caManagerStatus();
     std::string handleDvbTune(const std::string& body, bool scan);
     std::string handleDvbAddChannels(const std::string& body);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
@@ -63,7 +64,7 @@ private:
     std::string listBackupFiles();
     std::string handleUploadBackupFile(const std::string& target, const std::string& body);
     std::string handleDeleteBackupFile(const std::string& body);
-    void handleStartStream(const std::string& body);
+    std::string handleStartStream(const std::string& body);
     void handleStopStream(const std::string& body);
     void handleRestartProgram();
     void handleDeleteStream(const std::string& body);
