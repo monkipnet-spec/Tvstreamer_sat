@@ -137,6 +137,28 @@ Json::Value StreamConfig::toJson() const {
     return root;
 }
 
+CaReaderConfig CaReaderConfig::fromJson(const Json::Value& root) {
+    CaReaderConfig config;
+    config.readerKey = root.get("reader_key", "").asString();
+    config.serial = root.get("serial", "").asString();
+    config.maxServices = std::clamp(root.get("max_services", 10).asUInt(), 1u, 64u);
+    config.autoActivate = root.get("auto_activate", true).asBool();
+    config.autoReactivate = root.get("auto_reactivate", true).asBool();
+    config.retrySeconds = std::clamp(root.get("retry_seconds", 5).asUInt(), 2u, 300u);
+    return config;
+}
+
+Json::Value CaReaderConfig::toJson() const {
+    Json::Value root;
+    root["reader_key"] = readerKey;
+    root["serial"] = serial;
+    root["max_services"] = std::clamp(maxServices, 1u, 64u);
+    root["auto_activate"] = autoActivate;
+    root["auto_reactivate"] = autoReactivate;
+    root["retry_seconds"] = std::clamp(retrySeconds, 2u, 300u);
+    return root;
+}
+
 Json::Value AppConfig::toJson() const {
     Json::Value root;
     root["login"] = login;
@@ -146,6 +168,9 @@ Json::Value AppConfig::toJson() const {
     root["language"] = language;
     root["telegram_token"] = telegramToken;
     root["telegram_chat_id"] = telegramChatId;
+    Json::Value caReadersJson(Json::arrayValue);
+    for (const auto& reader : caReaders) caReadersJson.append(reader.toJson());
+    root["ca_readers"] = caReadersJson;
     Json::Value list(Json::arrayValue);
     for (const auto& stream : streams) {
         list.append(stream.toJson());
@@ -166,6 +191,9 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
+    if (root.isMember("ca_readers") && root["ca_readers"].isArray()) {
+        for (const auto& item : root["ca_readers"]) config.caReaders.push_back(CaReaderConfig::fromJson(item));
+    }
     if (root.isMember("streams") && root["streams"].isArray()) {
         for (const auto& item : root["streams"]) {
             config.streams.push_back(StreamConfig::fromJson(item));

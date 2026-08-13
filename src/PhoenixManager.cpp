@@ -400,7 +400,9 @@ std::vector<ReaderEntry> enumerateDevicePaths() {
 
 } // namespace
 
-Json::Value readers(bool probeCardEnabled) {
+namespace {
+
+Json::Value enumerateReadersJson(bool probeCardEnabled, const std::string* onlyKey) {
     Json::Value result(Json::arrayValue);
     const auto paths = enumerateDevicePaths();
     unsigned index = 0;
@@ -412,22 +414,29 @@ Json::Value readers(bool probeCardEnabled) {
         const std::string product = parentAttribute(sysDevice, "product");
         if (!ttyLooksLikeReader(ttyName, driver, manufacturer, product)) continue;
 
+        ++index;
+        const std::string serial = parentAttribute(sysDevice, "serial");
+        const std::string stable = entry.stableDevice.empty() ? entry.device : entry.stableDevice;
+        if (onlyKey && !onlyKey->empty() && *onlyKey != stable && *onlyKey != entry.device &&
+            *onlyKey != serial && *onlyKey != ttyName) {
+            continue;
+        }
+
         Json::Value item;
-        item["index"] = ++index;
+        item["index"] = index;
         item["name"] = "Phoenix " + std::to_string(index);
         item["device"] = entry.device;
-        item["stable_device"] = entry.stableDevice.empty() ? entry.device : entry.stableDevice;
+        item["stable_device"] = stable;
         item["tty"] = ttyName;
         item["driver"] = driver;
         item["manufacturer"] = manufacturer;
         item["product"] = product;
         item["vendor_id"] = parentAttribute(sysDevice, "idVendor");
         item["product_id"] = parentAttribute(sysDevice, "idProduct");
-        const std::string serial = parentAttribute(sysDevice, "serial");
         item["serial"] = serial;
         item["phoenix_candidate"] = true;
 
-        const std::string probeDevice = entry.stableDevice.empty() ? entry.device : entry.stableDevice;
+        const std::string probeDevice = stable;
         if (probeCardEnabled) {
             const ProbeResult probe = probeCard(probeDevice, serial);
             item["status"] = probe.status;
@@ -450,8 +459,21 @@ Json::Value readers(bool probeCardEnabled) {
             item["detail"] = busy ? "device is already open by another process" : "reader detected; ATR probe not requested";
         }
         result.append(item);
+        if (onlyKey) break;
     }
     return result;
+}
+
+} // namespace
+
+Json::Value readers(bool probeCardEnabled) {
+    return enumerateReadersJson(probeCardEnabled, nullptr);
+}
+
+Json::Value reader(const std::string& key, bool probeCardEnabled) {
+    Json::Value list = enumerateReadersJson(probeCardEnabled, &key);
+    if (!list.isArray() || list.empty()) return Json::Value(Json::nullValue);
+    return list[0];
 }
 
 } // namespace PhoenixManager

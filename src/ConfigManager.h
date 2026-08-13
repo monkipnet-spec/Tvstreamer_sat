@@ -54,6 +54,19 @@ struct StreamConfig {
     static StreamConfig fromJson(const Json::Value& root);
 };
 
+
+struct CaReaderConfig {
+    std::string readerKey;
+    std::string serial;
+    unsigned maxServices = 10;
+    bool autoActivate = true;
+    bool autoReactivate = true;
+    unsigned retrySeconds = 5;
+
+    Json::Value toJson() const;
+    static CaReaderConfig fromJson(const Json::Value& root);
+};
+
 struct AppConfig {
     std::string login = "admin";
     std::string password = "admin";
@@ -63,6 +76,7 @@ struct AppConfig {
     std::string telegramToken;
     std::string telegramChatId;
     std::vector<StreamConfig> streams;
+    std::vector<CaReaderConfig> caReaders;
 
     Json::Value toJson() const;
     static AppConfig fromJson(const Json::Value& root);

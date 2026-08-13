@@ -1,4 +1,21 @@
-# TVStreammerSAT5 — Release 18
+# TVStreammerSAT5 — Release 20
+
+### Manual CA binding + DVB EMM intake telemetry (v134)
+
+Release 20 disables cross-card AUTO routing. Encrypted channels must be bound to a specific Phoenix reader because different physical cards can carry different operator/provider entitlements. The per-reader service limit, reader auto-activation and reader auto-reactivation settings remain available. Legacy streams configured with `conditional_access_reader=auto` are rejected with a clear message until a specific reader is selected.
+
+Satellite PSI scanning now reports CA signalling separately: ECM PIDs from PMT CA descriptors and EMM PIDs from CAT CA descriptors. The service PID filter continues to include both sets, so operator EMM packets are received from the satellite together with the selected encrypted service. This is reception/telemetry only: the current native CardManager does not implement the card-system-specific command path that applies EMM entitlements to the smart card and it does not implement ECM/CW descrambling. Therefore `Pervy1` shown on a tile means the stream is assigned to that reader, not that the transport has been decrypted.
+
+
+### Phoenix card lifecycle + per-card service limits (v133)
+
+Release 19 adds persistent per-reader Conditional Access policy without exposing any network CA or key interface. Each Phoenix reader now has an operator-configurable service limit from 1 to 64 (default 10), automatic initial activation, automatic reactivation after reader/card/USB errors, a configurable retry interval, and a manual **Reactivate** action. Settings are stored in the main `tvstreammersat5-config.json` under `ca_readers` and are matched by stable `/dev/serial/by-id` path and USB serial.
+
+For scrambled DVB services the **Auto** reader mode is now a real CardManager route rather than a UI shortcut to the first detected card. Auto mode selects a usable reader with a free slot and balances by the configured `used/max` ratio. For example, with `Pervy1 max=3` and `Voprosy_otvety max=10`, the first three automatic services can fill `Pervy1` and subsequent services spill to the second reader according to availability/load. Manual per-channel reader binding remains available when operator entitlements differ between cards. Existing streams already saved with an explicit reader stay explicit until changed to **Auto** in the stream editor.
+
+The CardManager lifecycle monitor is deliberately conservative: it never opens or resets a reader that is owned by another process. While OSCam or another process has the device open the reader is reported as `EXTERNAL_OWNER`; once the port becomes free, auto-activation can perform the local ATR/card-presence probe. Successful probe state is `READY`; missing card, permission errors, disconnected USB and failed probes can be retried automatically according to the per-reader policy. This lifecycle/slot manager still does **not** implement a native ECM/CW descrambling backend and does not export key material.
+
+The Add Channel Phoenix panel now shows the activation state, `used/max` slots, maximum channel count, Auto activation, Auto reactivation, retry seconds, and a per-reader Reactivate button. FTA services do not consume a card slot. The DVB/SPTS, packet remap, shared-frontend and five-second WISI reservoir paths are unchanged by this release.
 
 ### Dashboard density + outgoing-interface selector recovery (v132)
 
@@ -8,7 +25,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 18 / v132.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 20 / v134.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -405,7 +422,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 18
+Description=TVStreammerSAT5 Release 20
 After=network-online.target
 Wants=network-online.target
 

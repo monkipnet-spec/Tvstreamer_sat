@@ -3,6 +3,7 @@
 #include <gst/gst.h>
 
 #include "ConfigManager.h"
+#include "CardManager.h"
 #include "TelegramNotifier.h"
 #include "StreamManager.h"
 #include "HttpServer.h"
@@ -33,6 +34,8 @@ int main() {
 
     std::cerr << "Config loaded: http_port=" << configManager.config.httpPort
               << " login=" << configManager.config.login << std::endl;
+
+    CardManager::instance().configure(configManager.config.caReaders);
 
     TelegramNotifier notifier(configManager);
     StreamManager streamManager(configManager, notifier);

@@ -33,7 +33,9 @@ struct DvbService {
     bool scrambled = false;
     bool pmtParsed = false;
     std::vector<uint16_t> streamPids;
-    std::vector<uint16_t> caPids;
+    std::vector<uint16_t> caPids;      // compatibility: ECM + EMM
+    std::vector<uint16_t> ecmPids;
+    std::vector<uint16_t> emmPids;
     std::string name;
     std::string provider;
 };
@@ -328,6 +330,8 @@ public:
             }
             if (item.scrambled) {
                 for (uint16_t caPid : catCaPids) {
+                    if (std::find(item.emmPids.begin(), item.emmPids.end(), caPid) == item.emmPids.end())
+                        item.emmPids.push_back(caPid);
                     if (std::find(item.caPids.begin(), item.caPids.end(), caPid) == item.caPids.end())
                         item.caPids.push_back(caPid);
                 }
@@ -524,7 +528,12 @@ private:
         const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
         size_t pos = 12;
         if (pos + programInfoLength > end) return;
-        if (collectCaDescriptors(section + pos, programInfoLength, &service.caPids)) service.scrambled = true;
+        std::vector<uint16_t> programCaPids;
+        if (collectCaDescriptors(section + pos, programInfoLength, &programCaPids)) service.scrambled = true;
+        for (uint16_t caPid : programCaPids) {
+            if (std::find(service.ecmPids.begin(), service.ecmPids.end(), caPid) == service.ecmPids.end()) service.ecmPids.push_back(caPid);
+            if (std::find(service.caPids.begin(), service.caPids.end(), caPid) == service.caPids.end()) service.caPids.push_back(caPid);
+        }
         pos += programInfoLength;
 
         std::vector<uint16_t> streamPids;
@@ -533,7 +542,12 @@ private:
             const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
             pos += 5;
             if (pos + esInfoLength > end) break;
-            if (collectCaDescriptors(section + pos, esInfoLength, &service.caPids)) service.scrambled = true;
+            std::vector<uint16_t> esCaPids;
+            if (collectCaDescriptors(section + pos, esInfoLength, &esCaPids)) service.scrambled = true;
+            for (uint16_t caPid : esCaPids) {
+                if (std::find(service.ecmPids.begin(), service.ecmPids.end(), caPid) == service.ecmPids.end()) service.ecmPids.push_back(caPid);
+                if (std::find(service.caPids.begin(), service.caPids.end(), caPid) == service.caPids.end()) service.caPids.push_back(caPid);
+            }
             if (elementaryPid != 0x1FFF &&
                 std::find(streamPids.begin(), streamPids.end(), elementaryPid) == streamPids.end()) {
                 streamPids.push_back(elementaryPid);
@@ -768,6 +782,13 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
             Json::Value caPids(Json::arrayValue);
             for (uint16_t pid : service.caPids) caPids.append(pid);
             item["ca_pids"] = caPids;
+            Json::Value ecmPids(Json::arrayValue);
+            for (uint16_t pid : service.ecmPids) ecmPids.append(pid);
+            item["ecm_pids"] = ecmPids;
+            Json::Value emmPids(Json::arrayValue);
+            for (uint16_t pid : service.emmPids) emmPids.append(pid);
+            item["emm_pids"] = emmPids;
+            item["emm_receive_enabled"] = service.scrambled && !service.emmPids.empty();
             const std::string pids = servicePidsString(service);
             item["service_pids"] = pids;
             DvbSatelliteParams serviceParams = params;
@@ -906,7 +927,7 @@ Json::Value adapters() {
     }
     root["adapters"] = list;
     root["available"] = !list.empty();
-    root["phoenix_readers"] = PhoenixManager::readers();
+    root["phoenix_readers"] = PhoenixManager::readers(false);
     root["phoenix_count"] = Json::UInt(root["phoenix_readers"].size());
     GstElementFactory* dvbFactory = gst_element_factory_find("dvbsrc");
     root["dvbsrc_available"] = dvbFactory != nullptr;

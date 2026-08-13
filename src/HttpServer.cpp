@@ -31,8 +31,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 18";
-constexpr const char* kProgramVersion = "v132";
+constexpr const char* kProgramRelease = "Release 20";
+constexpr const char* kProgramVersion = "v134";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -478,6 +478,12 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/ca-reader-settings") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleCaReaderSettings(req.body());
+            } else if (target == "/api/ca-reader-reactivate") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleCaReaderReactivate(req.body());
             } else if (target == "/api/dvb-signal") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleDvbTune(req.body(), false);
@@ -970,6 +976,70 @@ std::string HttpServer::caManagerStatus() {
     return Json::writeString(writer, CardManager::instance().snapshot());
 }
 
+std::string HttpServer::handleCaReaderSettings(const std::string& body) {
+    Json::Value response;
+    Json::Value request;
+    Json::CharReaderBuilder readerBuilder;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["result"] = "error";
+        response["error"] = "invalid CA reader settings: " + errors;
+    } else {
+        CaReaderConfig updated;
+        updated.readerKey = request.get("reader_key", "").asString();
+        updated.serial = request.get("serial", "").asString();
+        updated.maxServices = std::clamp(request.get("max_services", 10).asUInt(), 1u,
+                                         CardManager::kMaxConfigurableServices);
+        updated.autoActivate = request.get("auto_activate", true).asBool();
+        updated.autoReactivate = request.get("auto_reactivate", true).asBool();
+        updated.retrySeconds = std::clamp(request.get("retry_seconds", 5).asUInt(), 2u, 300u);
+        if (updated.readerKey.empty() && updated.serial.empty()) {
+            response["result"] = "error";
+            response["error"] = "reader_key or serial is required";
+        } else {
+            bool replaced = false;
+            for (auto& existing : configManager.config.caReaders) {
+                if ((!updated.readerKey.empty() && existing.readerKey == updated.readerKey) ||
+                    (!updated.serial.empty() && !existing.serial.empty() && existing.serial == updated.serial)) {
+                    existing = updated;
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) configManager.config.caReaders.push_back(updated);
+            if (!configManager.save()) {
+                response["result"] = "error";
+                response["error"] = "failed to save CA reader settings";
+            } else {
+                CardManager::instance().configure(configManager.config.caReaders);
+                response = CardManager::instance().snapshot();
+                response["result"] = "ok";
+            }
+        }
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
+}
+
+std::string HttpServer::handleCaReaderReactivate(const std::string& body) {
+    Json::Value response;
+    Json::Value request;
+    Json::CharReaderBuilder readerBuilder;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["result"] = "error";
+        response["error"] = "invalid CA reader reactivation request: " + errors;
+    } else {
+        const std::string readerKey = request.get("reader_key", "").asString();
+        response = CardManager::instance().reactivateReader(readerKey);
+        response["ca_manager"] = CardManager::instance().snapshot();
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
+}
+
 std::string HttpServer::handleDvbTune(const std::string& body, bool scan) {
     Json::Value response;
     Json::CharReaderBuilder readerBuilder;
@@ -1011,6 +1081,15 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
     const std::string interfaceAddress = request.get("interface_address", "").asString();
     const bool autoStart = request.get("auto_start", false).asBool();
     const std::string conditionalAccessReader = request.get("conditional_access_reader", "").asString();
+    bool hasScrambledSelection = false;
+    for (const auto& selected : request["channels"]) {
+        if (selected.get("scrambled", false).asBool()) { hasScrambledSelection = true; break; }
+    }
+    if (hasScrambledSelection && (conditionalAccessReader.empty() || conditionalAccessReader == "auto")) {
+        response["error"] = "Для кодированных каналов выберите конкретную Phoenix-карту; автоматическое распределение между картами отключено";
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
     const uint64_t targetBitrate = std::clamp<uint64_t>(
         request.get("target_bitrate_kbps", Json::UInt64(12000)).asUInt64(), 500, 100000) * 1000ULL;
 
@@ -1082,7 +1161,9 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
         config.serviceId = sid;
         config.serviceName = config.name;
         config.serviceProvider = item.get("provider", "").asString();
-        config.conditionalAccessReader = item.get("scrambled", false).asBool() ? conditionalAccessReader : "";
+        config.conditionalAccessReader = item.get("scrambled", false).asBool()
+            ? conditionalAccessReader
+            : "";
         config.videoPid = 0;
         config.audioPid = 0;
 
@@ -1326,6 +1407,9 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("language")) {
         nextConfig.language = configManager.config.language;
     }
+    if (!root.isMember("ca_readers")) {
+        nextConfig.caReaders = configManager.config.caReaders;
+    }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
     std::vector<StreamConfig> streamsToRestart;
@@ -1344,6 +1428,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
 
     configManager.config = nextConfig;
     configManager.save();
+    CardManager::instance().configure(configManager.config.caReaders);
     refreshHttpPorts();
 
     for (const auto& id : streamsToStop) {
@@ -1841,8 +1926,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
 .sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
 .phoenix-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
-.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
-@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
+.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.phoenix-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.phoenix-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls input[type=checkbox]{margin:0}.phoenix-controls button{padding:4px 8px;font-size:.68rem}.phoenix-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
+@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-controls{gap:7px}.phoenix-activation-detail{flex-basis:100%}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
 </style>
@@ -2531,7 +2616,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 18'} / ${state.program_version||'v132'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 20'} / ${state.program_version||'v134'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2608,7 +2693,8 @@ function caStreamStatusText(stream) {
   const reader = ca.reader_display_name || ca.reader_serial || 'Phoenix';
   const profile = [ca.caid ? `CAID ${ca.caid}` : '', ca.provider ? `PROVID ${ca.provider}` : ''].filter(Boolean).join(' · ');
   const stateText = ca.external_owner ? 'внешний владелец' : (ca.active ? 'слот активен' : 'слот зарезервирован');
-  return `${reader}${profile?` · ${profile}`:''} · ${stateText}`;
+  const route = stream.conditional_access_reader === 'auto' ? `НУЖНО ВЫБРАТЬ КАРТУ` : reader;
+  return `${route}${profile?` · ${profile}`:''} · ${stateText}`;
 }
 async function loadCaManager() {
   try {
@@ -2634,9 +2720,69 @@ function phoenixStatusInfo(reader) {
   if (status === 'permission') return {cls:'warn', text:'НЕТ ДОСТУПА'};
   return {cls:'warn', text:'НЕ ОПРЕДЕЛЁН'};
 }
+function caActivationInfo(reader) {
+  const status = String(reader?.activation_status || 'UNKNOWN');
+  if (status === 'READY') return {cls:'card', text:'АКТИВНА'};
+  if (status === 'CARD_UNREADABLE') return {cls:'card', text:'КАРТА · ATR НЕ ПРОЧИТАН'};
+  if (status === 'PROBING') return {cls:'detected', text:'АКТИВАЦИЯ…'};
+  if (status === 'EXTERNAL_OWNER') return {cls:'busy', text:'ВНЕШНИЙ ВЛАДЕЛЕЦ'};
+  if (status === 'NO_CARD') return {cls:'no-card', text:'НЕТ КАРТЫ'};
+  if (status === 'UNAVAILABLE') return {cls:'warn', text:'РИДЕР НЕДОСТУПЕН'};
+  if (status === 'PERMISSION') return {cls:'warn', text:'НЕТ ДОСТУПА'};
+  if (status === 'PROBE_FAILED') return {cls:'warn', text:'ОШИБКА АКТИВАЦИИ'};
+  if (status === 'DETECTED') return {cls:'detected', text:'ОЖИДАЕТ АКТИВАЦИИ'};
+  return {cls:'detected', text:'НЕ АКТИВИРОВАНА'};
+}
+async function saveCaReaderSettings(index) {
+  const reader = phoenixReaders.find(item => Number(item.index||0) === Number(index));
+  if (!reader) return;
+  const path = String(reader.stable_device || reader.device || '');
+  const maxInput = document.getElementById(`phoenixMax-${index}`);
+  const activateInput = document.getElementById(`phoenixAutoActivate-${index}`);
+  const reactivateInput = document.getElementById(`phoenixAutoReactivate-${index}`);
+  const retryInput = document.getElementById(`phoenixRetry-${index}`);
+  const payload = {
+    reader_key: path,
+    serial: String(reader.serial || ''),
+    max_services: Math.max(1, Math.min(64, Number(maxInput?.value || 10))),
+    auto_activate: !!activateInput?.checked,
+    auto_reactivate: !!reactivateInput?.checked,
+    retry_seconds: Math.max(2, Math.min(300, Number(retryInput?.value || 5)))
+  };
+  try {
+    const response = await fetch('/api/ca-reader-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const data = await response.json();
+    if (!response.ok || data.result === 'error') throw new Error(data.error || `HTTP ${response.status}`);
+    caManagerState = data;
+    renderPhoenixReaders();
+  } catch (error) {
+    alert(error.message || 'Не удалось сохранить настройки карты');
+  }
+}
+async function reactivatePhoenixReader(index) {
+  const reader = phoenixReaders.find(item => Number(item.index||0) === Number(index));
+  if (!reader) return;
+  const path = String(reader.stable_device || reader.device || '');
+  const button = document.getElementById(`phoenixReactivate-${index}`);
+  if (button) { button.disabled = true; button.textContent = 'Активация…'; }
+  try {
+    const response = await fetch('/api/ca-reader-reactivate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reader_key:path})});
+    const data = await response.json();
+    if (data.ca_manager) caManagerState = data.ca_manager;
+    await loadPhoenixReaders();
+    renderPhoenixReaders();
+  } catch (error) {
+    alert(error.message || 'Не удалось переактивировать карту');
+  } finally {
+    const current = document.getElementById(`phoenixReactivate-${index}`);
+    if (current) { current.disabled = false; current.textContent = 'Переактивировать'; }
+  }
+}
 function phoenixReaderOptions(selected='') {
   const current = String(selected || '');
-  const options = [`<option value="" ${current?'':'selected'}>Авто / не привязывать</option>`];
+  const options = [
+    `<option value="" ${(!current || current==='auto')?'selected':''}>${current==='auto'?'AUTO отключено · выберите конкретную карту':'Не использовать CA / FTA'}</option>`
+  ];
   phoenixReaders.forEach(reader => {
     const path = String(reader.stable_device || reader.device || '');
     const status = phoenixStatusInfo(reader);
@@ -2644,7 +2790,7 @@ function phoenixReaderOptions(selected='') {
     const suffix = [status.text, caSummary].filter(Boolean).map(text=>` · ${text}`).join('');
     options.push(`<option value="${satEscape(path)}" ${path===current?'selected':''}>Phoenix ${Number(reader.index||0)} · ${satEscape(path)}${satEscape(suffix)}</option>`);
   });
-  if (current && !phoenixReaders.some(reader => String(reader.stable_device || reader.device || '') === current)) {
+  if (current && current !== 'auto' && !phoenixReaders.some(reader => String(reader.stable_device || reader.device || '') === current)) {
     options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} · сейчас не найден</option>`);
   }
   return options.join('');
@@ -2660,19 +2806,23 @@ function renderPhoenixReaders() {
       const atr = reader.atr ? ` · ATR ${reader.atr}` : '';
       const managed = caManagerReader(path);
       const caSummary = caReaderSummary(path);
-      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}${caSummary?` · ${caSummary}`:''}`;
-      const stateText = managed ? `${stateInfo.text} · ${Number(managed.services_used||0)}/${Number(managed.max_services||10)}` : stateInfo.text;
+      const activation = managed ? caActivationInfo(managed) : stateInfo;
+      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}${caSummary?` · ${caSummary}`:''}${managed?.activation_detail?` · ${managed.activation_detail}`:''}`;
+      const stateText = managed ? `${activation.text} · ${Number(managed.services_used||0)}/${Number(managed.max_services||10)}` : stateInfo.text;
       const secondary = caSummary ? ` · ${caSummary}` : '';
-      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${Number(reader.index||0)}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${stateInfo.cls}">${satEscape(stateText)}</span></div>`;
+      const idx = Number(reader.index||0);
+      const maxServices = Number(managed?.max_services || 10);
+      const retrySeconds = Number(managed?.retry_seconds || 5);
+      const autoActivate = managed ? managed.auto_activate !== false : true;
+      const autoReactivate = managed ? managed.auto_reactivate !== false : true;
+      const detail = managed?.activation_detail || reader.detail || '';
+      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${idx}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${activation.cls}">${satEscape(stateText)}</span><div class="phoenix-controls"><label>Каналов <input id="phoenixMax-${idx}" type="number" min="1" max="64" value="${maxServices}" onchange="saveCaReaderSettings(${idx})"></label><label><input id="phoenixAutoActivate-${idx}" type="checkbox" ${autoActivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автоактивация</label><label><input id="phoenixAutoReactivate-${idx}" type="checkbox" ${autoReactivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автопереактивация</label><label>Повтор, с <input id="phoenixRetry-${idx}" type="number" min="2" max="300" value="${retrySeconds}" onchange="saveCaReaderSettings(${idx})"></label><button id="phoenixReactivate-${idx}" class="button-secondary" type="button" onclick="reactivatePhoenixReader(${idx})">Переактивировать</button><span class="phoenix-activation-detail">${satEscape(detail)}</span></div></div>`;
     }).join('') : '<div class="phoenix-empty">Phoenix/SmartMouse USB readers не обнаружены.</div>';
   }
   if (select) {
-    const previous = select.value;
+    const previous = select.value || 'auto';
     select.innerHTML = phoenixReaderOptions(previous);
-    if (!previous) {
-      const card = phoenixReaders.find(reader => reader.status === 'card');
-      if (card) select.value = String(card.stable_device || card.device || '');
-    }
+    select.value = previous === '' ? 'auto' : previous;
   }
 }
 async function loadPhoenixReaders() {
@@ -2959,7 +3109,7 @@ function openAddChannelModal() {
     <div class="phoenix-panel">
       <div class="phoenix-head"><strong>Phoenix / карты условного доступа</strong><button id="satPhoenixRefresh" class="button-secondary" type="button" onclick="refreshPhoenixReaders()">Обновить</button></div>
       <div id="satPhoenixReaders" class="phoenix-list"><div class="phoenix-empty">Поиск подключённых Phoenix...</div></div>
-      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Авто / не привязывать</option></select></div><small>CardManager резервирует до 10 локальных сервисных слотов на reader и использует стабильный /dev/serial/by-id. Сетевой CA-server и экспорт ключевого материала отсутствуют. FTA слот не занимает.</small></div>
+      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Выберите конкретную карту</option></select></div><small>Кодированные каналы привязываются только к выбранной физической карте. Автоматическое распределение между картами отключено. Лимит каналов задаётся отдельно для каждой карты (1–64). Автоактивация/автопереактивация относятся только к локальной reader/card session. FTA слот не занимает.</small></div>
     </div>
     <div class="sat-actions">
       <button id="satScanButton" class="button-primary" onclick="startSatelliteScan()">Сканировать каналы</button>

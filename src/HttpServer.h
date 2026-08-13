@@ -56,6 +56,8 @@ private:
     std::string qualityHistory(const std::string& target);
     std::string dvbAdapters();
     std::string caManagerStatus();
+    std::string handleCaReaderSettings(const std::string& body);
+    std::string handleCaReaderReactivate(const std::string& body);
     std::string handleDvbTune(const std::string& body, bool scan);
     std::string handleDvbAddChannels(const std::string& body);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
