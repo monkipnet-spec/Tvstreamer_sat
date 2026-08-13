@@ -31,8 +31,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 17";
-constexpr const char* kProgramVersion = "v131";
+constexpr const char* kProgramRelease = "Release 18";
+constexpr const char* kProgramVersion = "v132";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -767,6 +767,14 @@ std::string HttpServer::currentState() {
     root["telegram_chat_id"] = configManager.config.telegramChatId;
     root["program_release"] = kProgramRelease;
     root["program_version"] = kProgramVersion;
+    Json::Value interfaces(Json::arrayValue);
+    for (const auto& iface : enumerateNetworkInterfaces()) {
+        Json::Value item;
+        item["name"] = iface.name;
+        item["address"] = iface.address;
+        interfaces.append(item);
+    }
+    root["interfaces"] = interfaces;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["ca_manager"] = CardManager::instance().snapshot();
@@ -1663,7 +1671,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .stats-panel .status strong{color:#fff;font-size:.78rem}
 .stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
-.tile{position:relative;background:rgba(22,27,37,.94);padding:8px 10px 8px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:4px;height:286px;min-height:286px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
+.tile{position:relative;background:rgba(22,27,37,.94);padding:8px 10px 8px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:4px;height:252px;min-height:252px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
@@ -1682,18 +1690,19 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .status-line{display:flex;align-items:center;gap:5px;min-width:0;margin-top:2px;line-height:12px}.tile .status-pill{flex:0 0 auto;padding:1px 5px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:9px;text-transform:uppercase;letter-spacing:.06em}.tile .runtime-status{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#9ca8bb;font-size:9px}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
-.tile .decode-pill{display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;line-height:12px;letter-spacing:.05em;white-space:nowrap}
+.tile .decode-pill{display:inline-flex;align-items:center;justify-content:center;min-width:64px;padding:1px 5px;border-radius:999px;font-size:8px;font-weight:800;line-height:10px;letter-spacing:.035em;white-space:nowrap}
+.tile .info-row.decode-row strong{font-size:9px;line-height:10px}
 .tile .decode-pill.clear{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.28)}
 .tile .decode-pill.scrambled{background:rgba(255,95,95,.18);color:#ffc2c2;box-shadow:inset 0 0 0 1px rgba(255,95,95,.3)}
 .tile .decode-pill.waiting{background:rgba(255,184,77,.16);color:#ffe0a3;box-shadow:inset 0 0 0 1px rgba(255,184,77,.24)}
 .tile .decode-pill.offline{background:rgba(255,255,255,.07);color:#aeb7c8;box-shadow:inset 0 0 0 1px rgba(255,255,255,.1)}
-.tile .info{display:grid;grid-template-columns:1fr;gap:4px;font-size:11px;color:#b3b8c6}
+.tile .info{display:grid;grid-template-columns:1fr;gap:3px;font-size:11px;color:#b3b8c6}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
 .tile .info-row span{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .tile .info-row.placeholder{visibility:hidden}
-.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:1px}
-.tile .controls button{padding:6px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
+.tile .controls{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:0}
+.tile .controls button{padding:5px 8px;border:none;border-radius:10px;background:rgba(255,255,255,.06);color:#EEE;font-size:9px;cursor:pointer;transition:background .2s ease,transform .08s ease,box-shadow .2s ease}
 .tile .controls button:hover{background:rgba(255,255,255,.12)}
 .tile .controls button:active{transform:translateY(1px) scale(.98)}
 .tile .controls .start-button{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.26)}
@@ -1973,6 +1982,8 @@ function fetchState() {
       language = normalizeLanguage(storedLanguage || language);
       localStorage.setItem('tvstreammersat5-language', language);
       data.language = language;
+      const cachedInterfaces = Array.isArray(state.interfaces) ? state.interfaces : [];
+      if (!Array.isArray(data.interfaces) || !data.interfaces.length) data.interfaces = cachedInterfaces;
       state = data;
       applyLanguage();
       render(false);
@@ -2280,8 +2291,8 @@ function render(force=false) {
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
         ${stream.conditional_access_reader ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>
-        <div class="info-row"><strong>Декодирование</strong><span data-role="decode-status" class="decode-pill ${caDecodeInfo(stream).cls}" title="Контроль по A/V PID, scrambling_control и валидному PES">${caDecodeInfo(stream).text}</span></div>` : `<div class="info-row placeholder"><strong>CA</strong><span>—</span></div>
-        <div class="info-row placeholder"><strong>Декодирование</strong><span>—</span></div>`}
+        <div class="info-row decode-row"><strong>Декодирование</strong><span data-role="decode-status" class="decode-pill ${caDecodeInfo(stream).cls}" title="Контроль по A/V PID, scrambling_control и валидному PES">${caDecodeInfo(stream).text}</span></div>` : `<div class="info-row placeholder"><strong>CA</strong><span>—</span></div>
+        <div class="info-row placeholder decode-row"><strong>Декодирование</strong><span>—</span></div>`}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
       </div>
@@ -2520,7 +2531,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 17'} / ${state.program_version||'v131'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 18'} / ${state.program_version||'v132'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

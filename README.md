@@ -1,17 +1,14 @@
-# TVStreammerSAT5 — Release 17
+# TVStreammerSAT5 — Release 18
 
-### Compact tiles + DVB remap without demux/remux (v131)
+### Dashboard density + outgoing-interface selector recovery (v132)
 
-Release 17 compacts every stream tile to the same 286 px height. The separate `Статус` row is removed: the runtime state now appears on the same line as the `ONLINE/OFFLINE` badge, and the four control buttons sit immediately below `Bitrate Out`. FTA/IP placeholder rows are retained invisibly so all tiles remain equal height.
+Release 18 removes the remaining unused vertical space in stream tiles: all tiles remain equal height, but are reduced to 252 px, the information grid is tightened, and the control buttons sit directly under `Bitrate Out`. The `Декодирование` label and decode badge use a smaller font so CA telemetry takes less space without losing the green/red/waiting state.
 
-For a selected DVB service, explicit SID/V-PID/A-PID remapping no longer sends the already working SPTS through `tsdemux -> parser -> mpegtsmux`. The shared-DVB service relay discovers the real video/audio PIDs from the PMT, rewrites only the TS packet PID headers plus PAT/PMT/SDT references, recomputes PSI CRCs, and leaves PES payload/timestamps/private streams untouched. The resulting SPTS therefore continues directly into the existing StableUdpOutput/WISI five-second reservoir. Expected diagnostics include `DVB TS remap: ... mode=packet-pid-rewrite-no-demux-no-remux` followed by `DVB remap passthrough: ... demux=off remux=off`.
+The outgoing-interface selector is restored for both the regular stream editor and the satellite add-channel dialog. `/api/state` now carries the current network-interface list in addition to `/api/interfaces`, and the browser preserves the last valid interface list across a transient state refresh. This fixes the race where the 2-second `/api/state` poll could overwrite `state.interfaces` after `/api/interfaces` had already loaded, leaving only the automatic output-interface option.
 
-The WISI startup reservoir, periodic PCR restamping, 7x188 UDP packetization, shared DVB frontend fan-out, Phoenix/CardManager and decode telemetry are otherwise unchanged.
+DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 17 / v131.**
-
-
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 18 / v132.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -408,7 +405,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 17
+Description=TVStreammerSAT5 Release 18
 After=network-online.target
 Wants=network-online.target
 
