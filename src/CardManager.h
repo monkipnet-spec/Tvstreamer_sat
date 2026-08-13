@@ -81,6 +81,8 @@ private:
         std::string caid;
         std::string provider;
         unsigned maxServices = kDefaultMaxServices;
+        std::string backendId = "passthrough";
+        std::string backendConfig = "{}";
         bool autoActivate = true;
         bool autoReactivate = true;
         unsigned retrySeconds = 5;

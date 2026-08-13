@@ -1,6 +1,7 @@
 #include "CardManager.h"
 
 #include "PhoenixManager.h"
+#include "CaBackend.h"
 
 #include <algorithm>
 #include <ctime>
@@ -56,6 +57,7 @@ void CardManager::configure(const std::vector<CaReaderConfig>& readers) {
         cachedInventory_.clear();
         lastInventoryRefresh_ = {};
     }
+    CaBackendManager::instance().configure(readers);
     ensureMonitorStarted();
 }
 
@@ -122,6 +124,8 @@ CardManager::ReaderProfile CardManager::applyConfiguredPolicy(ReaderProfile prof
     profile.autoActivate = policy.autoActivate;
     profile.autoReactivate = policy.autoReactivate;
     profile.retrySeconds = policy.retrySeconds;
+    profile.backendId = policy.backendId.empty() ? "passthrough" : policy.backendId;
+    profile.backendConfig = policy.backendConfig.empty() ? "{}" : policy.backendConfig;
     return profile;
 }
 
@@ -439,6 +443,28 @@ bool CardManager::reserveService(const StreamConfig& config, std::string* error)
         return false;
     }
 
+    CaBackendReaderBinding backendReader;
+    backendReader.key = reader.key;
+    backendReader.stableDevice = reader.stableDevice;
+    backendReader.device = reader.device;
+    backendReader.serial = reader.serial;
+    backendReader.displayName = reader.displayName;
+    backendReader.cardSystem = reader.cardSystem;
+    backendReader.caid = reader.caid;
+    backendReader.provider = reader.provider;
+    backendReader.maxServices = reader.maxServices;
+    backendReader.backendId = reader.backendId;
+    backendReader.backendConfig = reader.backendConfig;
+    std::string backendError;
+    if (!CaBackendManager::instance().startService(config, backendReader, &backendError)) {
+        if (error) *error = backendError.empty() ? "failed to reserve CA backend service" : backendError;
+        std::cerr << "CA CardManager: backend reservation rejected reader=" << reader.key
+                  << " stream=" << config.id
+                  << " backend=" << reader.backendId
+                  << " error=" << backendError << std::endl;
+        return false;
+    }
+
     ServiceSlot slot;
     slot.streamId = config.id;
     slot.streamName = config.name;
@@ -460,36 +486,47 @@ bool CardManager::reserveService(const StreamConfig& config, std::string* error)
               << " external_owner=" << (reader.externalOwner ? "yes" : "no")
               << " auto_activate=" << (reader.autoActivate ? "yes" : "no")
               << " auto_reactivate=" << (reader.autoReactivate ? "yes" : "no")
-              << " native_backend=off" << std::endl;
+              << " backend=" << reader.backendId << std::endl;
     return true;
 }
 
 void CardManager::activateService(const std::string& streamId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = slotsByStream_.find(streamId);
-    if (found == slotsByStream_.end()) return;
-    found->second.active = true;
-    if (found->second.lastStatus.empty() || found->second.lastStatus == "RESERVED") {
-        found->second.lastStatus = "ACTIVE";
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = slotsByStream_.find(streamId);
+        if (found == slotsByStream_.end()) return;
+        found->second.active = true;
+        if (found->second.lastStatus.empty() || found->second.lastStatus == "RESERVED") {
+            found->second.lastStatus = "ACTIVE";
+        }
+        std::cerr << "CA CardManager: active reader=" << found->second.readerKey
+                  << " stream=" << found->second.streamId
+                  << " sid=" << found->second.serviceId << std::endl;
     }
-    std::cerr << "CA CardManager: active reader=" << found->second.readerKey
-              << " stream=" << found->second.streamId
-              << " sid=" << found->second.serviceId << std::endl;
+    CaBackendManager::instance().markServiceActive(streamId);
 }
 
 void CardManager::releaseService(const std::string& streamId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto found = slotsByStream_.find(streamId);
-    if (found == slotsByStream_.end()) return;
-    std::cerr << "CA CardManager: released reader=" << found->second.readerKey
-              << " stream=" << found->second.streamId
-              << " sid=" << found->second.serviceId << std::endl;
-    slotsByStream_.erase(found);
+    bool existed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = slotsByStream_.find(streamId);
+        if (found == slotsByStream_.end()) return;
+        std::cerr << "CA CardManager: released reader=" << found->second.readerKey
+                  << " stream=" << found->second.streamId
+                  << " sid=" << found->second.serviceId << std::endl;
+        slotsByStream_.erase(found);
+        existed = true;
+    }
+    if (existed) CaBackendManager::instance().stopService(streamId);
 }
 
 void CardManager::releaseAll() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    slotsByStream_.clear();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slotsByStream_.clear();
+    }
+    CaBackendManager::instance().stopAll();
 }
 
 void CardManager::recordTransaction(const std::string& streamId, uint64_t latencyMs,
@@ -528,6 +565,7 @@ Json::Value CardManager::slotToJson(const ServiceSlot& slot) const {
     item["max_latency_ms"] = Json::UInt64(slot.maxLatencyMs);
     item["average_latency_ms"] = slot.averageLatencyMs;
     item["last_transaction_at"] = isoTime(slot.lastTransactionAt);
+    item["backend"] = CaBackendManager::instance().streamState(slot.streamId);
     return item;
 }
 
@@ -536,8 +574,8 @@ Json::Value CardManager::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
     Json::Value root;
-    root["mode"] = "internal-control-plane";
-    root["native_card_backend"] = false;
+    root["mode"] = "internal-control-plane+plugin-backend";
+    root["ca_backend"] = CaBackendManager::instance().snapshot();
     root["network_ca_server"] = false;
     root["external_key_export"] = false;
     root["default_max_services"] = kDefaultMaxServices;
@@ -561,6 +599,7 @@ Json::Value CardManager::snapshot() const {
         item["auto_activate"] = reader.autoActivate;
         item["auto_reactivate"] = reader.autoReactivate;
         item["retry_seconds"] = reader.retrySeconds;
+        item["backend_id"] = reader.backendId;
         item["hardware_status"] = reader.hardwareStatus;
         item["hardware_detail"] = reader.hardwareDetail;
         item["external_owner"] = reader.externalOwner;
@@ -617,6 +656,7 @@ Json::Value CardManager::snapshot() const {
         item["auto_activate"] = policy.autoActivate;
         item["auto_reactivate"] = policy.autoReactivate;
         item["retry_seconds"] = std::clamp(policy.retrySeconds, 2u, 300u);
+        item["backend_id"] = policy.backendId.empty() ? "passthrough" : policy.backendId;
         item["hardware_status"] = "unavailable";
         item["external_owner"] = false;
         const ReaderLifecycle lifecycle = lifecycleFor(policy.readerKey);
@@ -657,6 +697,7 @@ Json::Value CardManager::snapshot() const {
             item["auto_activate"] = reader.autoActivate;
             item["auto_reactivate"] = reader.autoReactivate;
             item["retry_seconds"] = reader.retrySeconds;
+            item["backend_id"] = reader.backendId;
             item["hardware_status"] = "unavailable";
             item["external_owner"] = false;
             const ReaderLifecycle lifecycle = lifecycleFor(reader.key);
@@ -692,12 +733,15 @@ Json::Value CardManager::streamState(const std::string& streamId) const {
     if (found == slotsByStream_.end()) {
         result["managed"] = false;
         result["status"] = "UNBOUND";
+        result["backend"] = CaBackendManager::instance().streamState(streamId);
         result["native_card_backend"] = false;
         return result;
     }
     result = slotToJson(found->second);
     result["managed"] = true;
-    result["native_card_backend"] = false;
+    const Json::Value backendState = CaBackendManager::instance().streamState(streamId);
+    result["backend"] = backendState;
+    result["native_card_backend"] = backendState.get("native_plugin", false).asBool();
     ReaderProfile reader = applyConfiguredPolicy(resolveReader(found->second.readerKey, readers));
     result["reader_display_name"] = reader.displayName;
     result["reader_serial"] = reader.serial;
@@ -707,6 +751,7 @@ Json::Value CardManager::streamState(const std::string& streamId) const {
     result["hardware_status"] = reader.hardwareStatus;
     result["external_owner"] = reader.externalOwner;
     result["max_services"] = reader.maxServices;
+    result["backend_id"] = reader.backendId;
     const ReaderLifecycle lifecycle = lifecycleFor(reader.key);
     result["activation_status"] = lifecycle.status;
     result["activation_detail"] = lifecycle.detail;

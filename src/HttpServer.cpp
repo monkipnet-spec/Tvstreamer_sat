@@ -31,8 +31,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 20";
-constexpr const char* kProgramVersion = "v134";
+constexpr const char* kProgramRelease = "Release 22";
+constexpr const char* kProgramVersion = "v136";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -994,6 +994,8 @@ std::string HttpServer::handleCaReaderSettings(const std::string& body) {
         updated.autoActivate = request.get("auto_activate", true).asBool();
         updated.autoReactivate = request.get("auto_reactivate", true).asBool();
         updated.retrySeconds = std::clamp(request.get("retry_seconds", 5).asUInt(), 2u, 300u);
+        updated.backendId = request.get("backend_id", "").asString();
+        updated.backendConfig = request.get("backend_config", "").asString();
         if (updated.readerKey.empty() && updated.serial.empty()) {
             response["result"] = "error";
             response["error"] = "reader_key or serial is required";
@@ -1002,12 +1004,20 @@ std::string HttpServer::handleCaReaderSettings(const std::string& body) {
             for (auto& existing : configManager.config.caReaders) {
                 if ((!updated.readerKey.empty() && existing.readerKey == updated.readerKey) ||
                     (!updated.serial.empty() && !existing.serial.empty() && existing.serial == updated.serial)) {
+                    if (!request.isMember("backend_id")) updated.backendId = existing.backendId;
+                    if (updated.backendId.empty()) updated.backendId = "passthrough";
+                    if (!request.isMember("backend_config")) updated.backendConfig = existing.backendConfig;
+                    if (updated.backendConfig.empty()) updated.backendConfig = "{}";
                     existing = updated;
                     replaced = true;
                     break;
                 }
             }
-            if (!replaced) configManager.config.caReaders.push_back(updated);
+            if (!replaced) {
+                if (updated.backendId.empty()) updated.backendId = "passthrough";
+                if (updated.backendConfig.empty()) updated.backendConfig = "{}";
+                configManager.config.caReaders.push_back(updated);
+            }
             if (!configManager.save()) {
                 response["result"] = "error";
                 response["error"] = "failed to save CA reader settings";
@@ -1926,7 +1936,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
 .sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
 .phoenix-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
-.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.phoenix-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.phoenix-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls input[type=checkbox]{margin:0}.phoenix-controls button{padding:4px 8px;font-size:.68rem}.phoenix-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
+.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.phoenix-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.phoenix-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls select{max-width:210px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls input[type=checkbox]{margin:0}.phoenix-controls button{padding:4px 8px;font-size:.68rem}.phoenix-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
 @media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-controls{gap:7px}.phoenix-activation-detail{flex-basis:100%}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
@@ -2616,7 +2626,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 20'} / ${state.program_version||'v134'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 22'} / ${state.program_version||'v136'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2681,7 +2691,8 @@ function caReaderSummary(path) {
   if (!reader) return '';
   const identity = [reader.display_name, reader.caid ? `CAID ${reader.caid}` : '', reader.provider ? `PROVID ${reader.provider}` : ''].filter(Boolean).join(' · ');
   const slots = `${Number(reader.services_used||0)}/${Number(reader.max_services||10)}`;
-  return `${identity}${identity?' · ':''}слоты ${slots}`;
+  const backend = String(reader.backend_id || 'passthrough');
+  return `${identity}${identity?' · ':''}backend ${backend} · слоты ${slots}`;
 }
 function caStreamStatusText(stream) {
   const ca = stream?.ca || {};
@@ -2694,7 +2705,9 @@ function caStreamStatusText(stream) {
   const profile = [ca.caid ? `CAID ${ca.caid}` : '', ca.provider ? `PROVID ${ca.provider}` : ''].filter(Boolean).join(' · ');
   const stateText = ca.external_owner ? 'внешний владелец' : (ca.active ? 'слот активен' : 'слот зарезервирован');
   const route = stream.conditional_access_reader === 'auto' ? `НУЖНО ВЫБРАТЬ КАРТУ` : reader;
-  return `${route}${profile?` · ${profile}`:''} · ${stateText}`;
+  const backendId = String(ca.backend_id || ca.backend?.backend_id || 'passthrough');
+  const backendState = String(ca.backend?.status || '');
+  return `${route}${profile?` · ${profile}`:''} · backend ${backendId}${backendState?` · ${backendState}`:''} · ${stateText}`;
 }
 async function loadCaManager() {
   try {
@@ -2741,13 +2754,15 @@ async function saveCaReaderSettings(index) {
   const activateInput = document.getElementById(`phoenixAutoActivate-${index}`);
   const reactivateInput = document.getElementById(`phoenixAutoReactivate-${index}`);
   const retryInput = document.getElementById(`phoenixRetry-${index}`);
+  const backendInput = document.getElementById(`phoenixBackend-${index}`);
   const payload = {
     reader_key: path,
     serial: String(reader.serial || ''),
     max_services: Math.max(1, Math.min(64, Number(maxInput?.value || 10))),
     auto_activate: !!activateInput?.checked,
     auto_reactivate: !!reactivateInput?.checked,
-    retry_seconds: Math.max(2, Math.min(300, Number(retryInput?.value || 5)))
+    retry_seconds: Math.max(2, Math.min(300, Number(retryInput?.value || 5))),
+    backend_id: String(backendInput?.value || 'passthrough')
   };
   try {
     const response = await fetch('/api/ca-reader-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
@@ -2778,6 +2793,22 @@ async function reactivatePhoenixReader(index) {
     if (current) { current.disabled = false; current.textContent = 'Переактивировать'; }
   }
 }
+function caBackendOptions(selected='passthrough') {
+  const current = String(selected || 'passthrough');
+  const backends = Array.isArray(caManagerState?.ca_backend?.backends) ? caManagerState.ca_backend.backends : [];
+  const options = backends.map(item => {
+    const id = String(item.id || '');
+    if (!id) return '';
+    const label = String(item.display_name || id);
+    const suffix = item.builtin ? ' · встроенный' : (item.usable === false ? ' · ошибка загрузки' : ' · plugin');
+    return `<option value="${satEscape(id)}" ${id===current?'selected':''}>${satEscape(label + suffix)}</option>`;
+  }).filter(Boolean);
+  if (!backends.some(item => String(item.id || '') === current)) {
+    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} · не загружен</option>`);
+  }
+  return options.join('');
+}
+
 function phoenixReaderOptions(selected='') {
   const current = String(selected || '');
   const options = [
@@ -2815,8 +2846,9 @@ function renderPhoenixReaders() {
       const retrySeconds = Number(managed?.retry_seconds || 5);
       const autoActivate = managed ? managed.auto_activate !== false : true;
       const autoReactivate = managed ? managed.auto_reactivate !== false : true;
+      const backendId = String(managed?.backend_id || 'passthrough');
       const detail = managed?.activation_detail || reader.detail || '';
-      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${idx}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${activation.cls}">${satEscape(stateText)}</span><div class="phoenix-controls"><label>Каналов <input id="phoenixMax-${idx}" type="number" min="1" max="64" value="${maxServices}" onchange="saveCaReaderSettings(${idx})"></label><label><input id="phoenixAutoActivate-${idx}" type="checkbox" ${autoActivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автоактивация</label><label><input id="phoenixAutoReactivate-${idx}" type="checkbox" ${autoReactivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автопереактивация</label><label>Повтор, с <input id="phoenixRetry-${idx}" type="number" min="2" max="300" value="${retrySeconds}" onchange="saveCaReaderSettings(${idx})"></label><button id="phoenixReactivate-${idx}" class="button-secondary" type="button" onclick="reactivatePhoenixReader(${idx})">Переактивировать</button><span class="phoenix-activation-detail">${satEscape(detail)}</span></div></div>`;
+      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${idx}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${activation.cls}">${satEscape(stateText)}</span><div class="phoenix-controls"><label>Каналов <input id="phoenixMax-${idx}" type="number" min="1" max="64" value="${maxServices}" onchange="saveCaReaderSettings(${idx})"></label><label>Backend <select id="phoenixBackend-${idx}" onchange="saveCaReaderSettings(${idx})">${caBackendOptions(backendId)}</select></label><label><input id="phoenixAutoActivate-${idx}" type="checkbox" ${autoActivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автоактивация</label><label><input id="phoenixAutoReactivate-${idx}" type="checkbox" ${autoReactivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автопереактивация</label><label>Повтор, с <input id="phoenixRetry-${idx}" type="number" min="2" max="300" value="${retrySeconds}" onchange="saveCaReaderSettings(${idx})"></label><button id="phoenixReactivate-${idx}" class="button-secondary" type="button" onclick="reactivatePhoenixReader(${idx})">Переактивировать</button><span class="phoenix-activation-detail">${satEscape(detail)}</span></div></div>`;
     }).join('') : '<div class="phoenix-empty">Phoenix/SmartMouse USB readers не обнаружены.</div>';
   }
   if (select) {

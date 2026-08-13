@@ -62,6 +62,8 @@ struct CaReaderConfig {
     bool autoActivate = true;
     bool autoReactivate = true;
     unsigned retrySeconds = 5;
+    std::string backendId = "passthrough";
+    std::string backendConfig = "{}";
 
     Json::Value toJson() const;
     static CaReaderConfig fromJson(const Json::Value& root);

@@ -1,4 +1,5 @@
 #include "PhoenixManager.h"
+#include "ca/PhoenixSerialTransport.h"
 
 #include <algorithm>
 #include <array>
@@ -255,106 +256,18 @@ void flushSerial(int fd, int selector) {
 }
 
 ProbeResult probeCard(const std::string& device, const std::string& serial) {
+    ca::PhoenixSerialConfig config;
+    config.devicePath = device;
+    config.serial = serial;
+    config.detectMode = "cd";
+    config.probeProfiles = ca::PhoenixSerialTransport::defaultProbeProfiles(serial);
+
+    const auto transportResult = ca::PhoenixSerialTransport::probe(config);
     ProbeResult result;
-    const std::string canonical = canonicalDevice(device);
-    if (usedByAnotherProcess(canonical)) {
-        result.status = "busy";
-        result.detail = "device is already open by another process";
-        return result;
-    }
-
-    const int fd = ::open(device.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) {
-        result.status = (errno == EACCES || errno == EPERM) ? "permission" : "unavailable";
-        result.detail = std::strerror(errno);
-        return result;
-    }
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        result.status = "busy";
-        result.detail = "device lock is busy";
-        ::close(fd);
-        return result;
-    }
-
-    termios2 saved{};
-    const bool haveSaved = getSerialState(fd, saved);
-    if (!haveSaved) {
-        result.status = "unavailable";
-        result.detail = "cannot read serial port state";
-        ::flock(fd, LOCK_UN);
-        ::close(fd);
-        return result;
-    }
-
-    int modemSaved = 0;
-    const bool haveModem = ::ioctl(fd, TIOCMGET, &modemSaved) == 0;
-    // OSCam configuration for both active readers uses detect=cd.  With this
-    // non-inverted setting an asserted carrier-detect line is positive evidence
-    // that a card is physically inserted, even if the generic ATR parser cannot
-    // complete a reset/ATR exchange.
-    const bool cardDetectAsserted = haveModem && ((modemSaved & TIOCM_CAR) != 0);
-
-    auto pulse = [&](int line) {
-        int bits = 0;
-        if (::ioctl(fd, TIOCMGET, &bits) != 0) return;
-        bits &= ~line;
-        (void)::ioctl(fd, TIOCMSET, &bits);
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        bits |= line;
-        (void)::ioctl(fd, TIOCMSET, &bits);
-    };
-
-    std::vector<std::string> attempted;
-    for (const auto& profile : probeProfiles(serial)) {
-        attempted.push_back(std::to_string(profile.baud) + "(" + profile.label + ")");
-        if (!setSerialProfile(fd, saved, profile.baud)) continue;
-        flushSerial(fd, 2);
-
-        // Common Phoenix/SmartMouse wiring uses RTS or DTR for reset.  Try both
-        // without sending any application APDU or CA command.
-        pulse(TIOCM_RTS);
-        readAtrFor(std::chrono::milliseconds(750), fd, result.atr);
-        if (result.atr.empty()) {
-            flushSerial(fd, 0);
-            pulse(TIOCM_DTR);
-            readAtrFor(std::chrono::milliseconds(750), fd, result.atr);
-        }
-        if (!result.atr.empty()) {
-            result.status = "card";
-            identifyCard(result.atr, result.cardSystem, result.provider);
-            result.detail = "ATR received at " + std::to_string(profile.baud) +
-                            " baud (" + profile.label + ")" +
-                            (haveModem ? (cardDetectAsserted ? "; CD asserted" : "; CD not asserted") : "");
-            break;
-        }
-    }
-
-    if (haveModem) (void)::ioctl(fd, TIOCMSET, &modemSaved);
-    (void)::ioctl(fd, TCSETS2, &saved);
-    ::flock(fd, LOCK_UN);
-    ::close(fd);
-
-    if (!result.atr.empty()) return result;
-
-    std::ostringstream attempts;
-    for (size_t i = 0; i < attempted.size(); ++i) {
-        if (i) attempts << ", ";
-        attempts << attempted[i];
-    }
-
-    if (haveModem && cardDetectAsserted) {
-        // Do not report "no card" when the hardware card-detect signal says a
-        // card is inserted.  This was the misleading v125 behaviour observed
-        // after disabling the OSCam reader.
-        result.status = "card_unreadable";
-        result.detail = "card-detect asserted; ATR not received; tried " + attempts.str();
-    } else if (haveModem) {
-        result.status = "no_card";
-        result.detail = "card-detect not asserted; ATR not received; tried " + attempts.str();
-    } else {
-        result.status = "probe_failed";
-        result.detail = "ATR not received and card-detect is unavailable; tried " + attempts.str();
-    }
+    result.status = transportResult.status;
+    result.atr.assign(transportResult.atr.begin(), transportResult.atr.end());
+    result.detail = transportResult.detail;
+    if (!result.atr.empty()) identifyCard(result.atr, result.cardSystem, result.provider);
     return result;
 }
 

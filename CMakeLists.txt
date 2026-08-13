@@ -34,6 +34,8 @@ add_executable(TVStreammerSAT5
     src/DvbSatellite.cpp
     src/PhoenixManager.cpp
     src/CardManager.cpp
+    src/CaBackend.cpp
+    src/ca/PhoenixSerialTransport.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
@@ -86,6 +88,22 @@ target_link_libraries(TVStreammerSAT5
     ${JSONCPP_LIBRARIES}
     ${Boost_LIBRARIES}
     pthread
+    dl
     glib-2.0
     gio-2.0
 )
+
+
+option(TVSTREAMMERSAT5_BUILD_CA_PLUGIN_EXAMPLE "Build non-decoding CaBackend ABI example plugin" OFF)
+if(TVSTREAMMERSAT5_BUILD_CA_PLUGIN_EXAMPLE)
+    add_library(tvstreammersat5_ca_passthrough_example SHARED
+        examples/ca_backend_passthrough_plugin.cpp
+    )
+    target_include_directories(tvstreammersat5_ca_passthrough_example PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    set_target_properties(tvstreammersat5_ca_passthrough_example PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "tvstreammersat5-ca-passthrough-example"
+    )
+endif()

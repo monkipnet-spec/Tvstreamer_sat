@@ -1,4 +1,24 @@
-# TVStreammerSAT5 — Release 20
+# TVStreammerSAT5 — Release 22
+
+### PhoenixSerialTransport lifecycle layer (v136)
+
+Release 22 moves Phoenix/SmartMouse serial handling into `src/ca/PhoenixSerialTransport.{h,cpp}`. The transport owns exclusive-open/lock, DCD card detection, `termios2`/`BOTHER` custom baud profiles, RTS/DTR reset pulses, bounded ATR acquisition through `poll()`, restoration of the original serial state, reconnect and a one-shot probe helper. It intentionally exposes no generic APDU, control-word or descrambling API. `PhoenixManager` now uses this transport for reader probing instead of keeping a second low-level serial implementation in the UI/discovery layer.
+
+The known FTDI readers retain the 6.00 MHz initial profile (`16129 baud`, Fi=372) with `9600` fallback. Unknown readers probe the ISO-default profile first. Unlike the earlier experimental snippets, the transport does not open the tty with `O_NONBLOCK`; read readiness is controlled with `poll()`, avoiding immediate `EAGAIN`/false ATR failures. The selected reader is still independent and is never automatically balanced to another card.
+
+The v135 `CaBackend` ABI remains source/ABI-compatible. Official/operator backends continue to receive the stable reader path and can use their own authorised SDK. DVB shared-frontend/SPTS/remap and `StableUdpOutput.cpp` are unchanged.
+
+
+### Pluggable in-process CaBackend API (v135)
+
+Release 21 adds a complete in-process `CaBackend` plugin boundary for authorised local Conditional-Access integrations. The application discovers `.so` backends from `/opt/tvstreammersat5/ca-plugins` (or `TVSTREAMMERSAT5_CA_PLUGIN_DIR`), validates a versioned C ABI, opens a physical reader once, starts/stops per-SID service sessions, and sends the already selected DVB SPTS through an in-process MPEG-TS callback. There is no network CA server, no raw control-word getter/setter and no external key-export API.
+
+Each Phoenix reader now has a persistent `backend_id`; the web Phoenix panel shows a Backend selector populated from the actually loaded plugins. The safe built-in default is `passthrough`, which deliberately leaves encrypted packets unchanged. A real decoding backend therefore has to be supplied as an authorised operator/manufacturer plugin implementing `src/ca/CaBackendPluginApi.h`. Per-reader opaque plugin settings are stored as `backend_config` in `ca_readers` and passed only to the selected plugin.
+
+The new files are `src/CaBackend.h`, `src/CaBackend.cpp`, `src/ca/CaBackendPluginApi.h`, the ABI documentation `docs/CA_BACKEND_PLUGIN_API.md`, and a deliberately non-decoding example plugin in `examples/ca_backend_passthrough_plugin.cpp`. The optional CMake switch `TVSTREAMMERSAT5_BUILD_CA_PLUGIN_EXAMPLE=ON` builds that test `.so`. The DVB service relay attaches the backend transport hook after single-service selection and before the local UDP handoff, so an authorised backend can process the local SPTS without introducing a card-sharing service.
+
+`StableUdpOutput.cpp` and the WISI five-second startup reservoir, 20 ms periodic PCR, PCR restamping and 7x188/1316-byte UDP packetisation are unchanged. The native DVB scanner/shared-frontend path remains intact.
+
 
 ### Manual CA binding + DVB EMM intake telemetry (v134)
 
@@ -25,7 +45,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 20 / v134.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 22 / v136.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -422,7 +442,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 20
+Description=TVStreammerSAT5 Release 22
 After=network-online.target
 Wants=network-online.target
 

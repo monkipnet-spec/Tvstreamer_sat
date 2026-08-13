@@ -145,6 +145,10 @@ CaReaderConfig CaReaderConfig::fromJson(const Json::Value& root) {
     config.autoActivate = root.get("auto_activate", true).asBool();
     config.autoReactivate = root.get("auto_reactivate", true).asBool();
     config.retrySeconds = std::clamp(root.get("retry_seconds", 5).asUInt(), 2u, 300u);
+    config.backendId = root.get("backend_id", "passthrough").asString();
+    if (config.backendId.empty()) config.backendId = "passthrough";
+    config.backendConfig = root.get("backend_config", "{}").asString();
+    if (config.backendConfig.empty()) config.backendConfig = "{}";
     return config;
 }
 
@@ -156,6 +160,8 @@ Json::Value CaReaderConfig::toJson() const {
     root["auto_activate"] = autoActivate;
     root["auto_reactivate"] = autoReactivate;
     root["retry_seconds"] = std::clamp(retrySeconds, 2u, 300u);
+    root["backend_id"] = backendId.empty() ? "passthrough" : backendId;
+    root["backend_config"] = backendConfig.empty() ? "{}" : backendConfig;
     return root;
 }
 

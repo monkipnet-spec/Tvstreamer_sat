@@ -4,6 +4,7 @@
 #include "UdpInput.h"
 #include "DvbSatellite.h"
 #include "CardManager.h"
+#include "CaBackend.h"
 #include "protocols/GstProtocolTypes.h"
 #include "protocols/stream/StreamInputProtocol.h"
 #include "protocols/stream/StreamOutputProtocol.h"
@@ -643,6 +644,27 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
             gst_buffer_resize(buffer, 0, static_cast<gssize>(writeOffset));
         }
     }
+    return GST_PAD_PROBE_OK;
+}
+
+
+struct CaBackendTsProbeContext {
+    std::string streamId;
+};
+
+GstPadProbeReturn caBackendTsProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<CaBackendTsProbeContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+    GstBuffer* original = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!original) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = gst_buffer_make_writable(original);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (buffer != original) GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
+    (void)CaBackendManager::instance().processTransport(ctx->streamId, map.data, map.size);
+    gst_buffer_unmap(buffer, &map);
     return GST_PAD_PROBE_OK;
 }
 
@@ -2205,6 +2227,24 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
                 psiContext,
                 [](gpointer data) { delete static_cast<DvbSingleProgramPsiContext*>(data); });
             gst_object_unref(psiPad);
+        }
+    }
+
+    if (!state->config.conditionalAccessReader.empty()) {
+        GstPad* caPad = gst_element_get_static_pad(outputQueue, "src");
+        if (caPad) {
+            auto* caContext = new CaBackendTsProbeContext();
+            caContext->streamId = state->config.id;
+            gst_pad_add_probe(
+                caPad,
+                GST_PAD_PROBE_TYPE_BUFFER,
+                caBackendTsProbe,
+                caContext,
+                [](gpointer data) { delete static_cast<CaBackendTsProbeContext*>(data); });
+            gst_object_unref(caPad);
+            std::cerr << "CA backend transport hook attached: stream=" << state->config.id
+                      << " reader=" << state->config.conditionalAccessReader
+                      << " stage=selected-dvb-spts" << std::endl;
         }
     }
 
