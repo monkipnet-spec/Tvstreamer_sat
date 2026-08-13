@@ -33,6 +33,7 @@ struct DvbService {
 };
 
 struct FrontendStats {
+    bool available = false;
     bool locked = false;
     int signalPercent = 0;
     int qualityPercent = 0;
@@ -216,6 +217,7 @@ FrontendStats readFrontendStats(const DvbSatelliteParams& params) {
     FrontendStats result;
     const int fd = open(frontendPath(params).c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) return result;
+    result.available = true;
 
     fe_status_t status{};
     if (ioctl(fd, FE_READ_STATUS, &status) == 0) result.locked = (status & FE_HAS_LOCK) != 0;
@@ -250,6 +252,7 @@ FrontendStats readFrontendStats(const DvbSatelliteParams& params) {
 
 Json::Value statsToJson(const FrontendStats& stats) {
     Json::Value root;
+    root["available"] = stats.available;
     root["locked"] = stats.locked;
     root["signal"] = stats.signalPercent;
     root["quality"] = stats.qualityPercent;
@@ -517,6 +520,7 @@ bool waitForTune(GstElement* pipeline, GstElement* sink, const DvbSatelliteParam
         const auto now = std::chrono::steady_clock::now();
         if (lastStatsRead.time_since_epoch().count() == 0 || now - lastStatsRead >= std::chrono::milliseconds(350)) {
             FrontendStats stats = readFrontendStats(params);
+            bestStats.available = bestStats.available || stats.available;
             if (stats.signalPercent >= bestStats.signalPercent) bestStats.signalPercent = stats.signalPercent;
             if (stats.qualityPercent >= bestStats.qualityPercent) bestStats.qualityPercent = stats.qualityPercent;
             bestStats.locked = bestStats.locked || stats.locked;
@@ -780,6 +784,29 @@ Json::Value signal(const Json::Value& request) {
         return result;
     }
     return runTune(params, false, 900);
+}
+
+Json::Value signalFromUri(const std::string& uri) {
+    Json::Value result;
+    DvbSatelliteParams params;
+    std::string error;
+    if (!parseUri(uri, params, error)) {
+        result["error"] = error.empty() ? "Invalid DVB URI" : error;
+        result["locked"] = false;
+        result["signal"] = 0;
+        result["quality"] = 0;
+        return result;
+    }
+
+    // Important: this path does NOT instantiate dvbsrc and does NOT issue a
+    // tune command. It only reads FE status/statistics from the frontend that
+    // the live stream pipeline already owns. This prevents the dashboard from
+    // retuning or interrupting a channel while refreshing Signal/Quality.
+    const FrontendStats stats = readFrontendStats(params);
+    result = statsToJson(stats);
+    result["adapter"] = params.adapter;
+    result["frontend"] = params.frontend;
+    return result;
 }
 
 } // namespace DvbSatellite

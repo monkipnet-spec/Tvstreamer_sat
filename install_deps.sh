@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TVStreammerSAT5 Release 4 host build/runtime dependencies for Ubuntu/Debian.
+# TVStreammerSAT5 Release 6 host build/runtime dependencies for Ubuntu/Debian.
 # This script intentionally installs only libraries used by the current CMake
 # target plus GStreamer runtime plugins used by the protocol/transcoder modules.
 
@@ -22,7 +22,7 @@ fi
 APT_GET=("${SUDO[@]}" apt-get)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Installing TVStreammerSAT5 Release 4 dependencies..."
+echo "Installing TVStreammerSAT5 Release 6 dependencies..."
 
 "${APT_GET[@]}" update
 "${APT_GET[@]}" install -y --no-install-recommends \

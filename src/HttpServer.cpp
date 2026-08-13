@@ -29,8 +29,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 5";
-constexpr const char* kProgramVersion = "v119";
+constexpr const char* kProgramRelease = "Release 6";
+constexpr const char* kProgramVersion = "v120";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -790,6 +790,10 @@ std::string HttpServer::currentState() {
     root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
     auto snap = streamManager.snapshot();
+    // Reading FE status is cheap and does not retune the frontend, but several
+    // channel tiles may share the exact same DVB input/transponder. Cache one
+    // ioctl snapshot per live DVB URI for each /api/state response.
+    std::map<std::string, Json::Value> dvbSignalCache;
     for (const auto& cfg : configManager.config.streams) {
         Json::Value item = cfg.toJson();
         if (snap.count(cfg.id)) {
@@ -828,6 +832,31 @@ std::string HttpServer::currentState() {
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
+        const bool configuredDvb = DvbSatellite::isDvbUri(cfg.inputUri);
+        item["dvb_input"] = configuredDvb;
+        item["dvb_signal_available"] = false;
+        item["dvb_locked"] = false;
+        item["dvb_signal"] = 0;
+        item["dvb_quality"] = 0;
+        if (configuredDvb && item.get("active", false).asBool() &&
+            !item.get("using_backup", false).asBool() && !cfg.testPattern) {
+            const std::string liveDvbUri = item.get("active_input_uri", cfg.inputUri).asString();
+            if (DvbSatellite::isDvbUri(liveDvbUri)) {
+                auto cached = dvbSignalCache.find(liveDvbUri);
+                if (cached == dvbSignalCache.end()) {
+                    cached = dvbSignalCache.emplace(
+                        liveDvbUri, DvbSatellite::signalFromUri(liveDvbUri)).first;
+                }
+                const Json::Value& dvbStats = cached->second;
+                item["dvb_signal_available"] = dvbStats.get("available", false).asBool();
+                item["dvb_locked"] = dvbStats.get("locked", false).asBool();
+                item["dvb_signal"] = dvbStats.get("signal", 0).asInt();
+                item["dvb_quality"] = dvbStats.get("quality", 0).asInt();
+                if (dvbStats.isMember("signal_db")) item["dvb_signal_db"] = dvbStats["signal_db"];
+                if (dvbStats.isMember("cnr_db")) item["dvb_cnr_db"] = dvbStats["cnr_db"];
+            }
+        }
+
         Json::Value links(Json::arrayValue);
         for (const auto& output : streamOutputs(cfg)) {
             Json::Value link;
@@ -1537,11 +1566,16 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile:hover{transform:translateY(-1px);border-color:rgba(31,136,255,.3)}
 .tile.active{border-color:#17c261}
 .tile.error{border-color:#fb5f5f}
-.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px}
-.tile .delete-button{position:absolute;top:8px;right:8px;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
+.tile .top{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-right:64px}
+.tile .tile-actions{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:5px;z-index:2}
+.tile .delete-button{position:static;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
 .tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
-.tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff}
-.tile .badge{position:absolute;left:50%;top:10px;transform:translateX(-50%);padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tile .badge{position:static;transform:none;padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:9px;line-height:12px;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+.tile .dvb-meters{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;width:100%}
+.tile .dvb-meter{position:relative;height:13px;overflow:hidden;border-radius:999px;background:rgba(255,255,255,.07);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}
+.tile .dvb-meter-fill{position:absolute;left:0;top:0;bottom:0;width:0%;border-radius:inherit;transition:width .25s ease,background .25s ease;opacity:.9}
+.tile .dvb-meter-label{position:relative;z-index:1;display:flex;align-items:center;justify-content:center;height:100%;font-size:8px;font-weight:800;line-height:13px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.9);letter-spacing:.02em;white-space:nowrap}
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
@@ -1981,6 +2015,22 @@ function tilesStructureSignature() {
     streams: (state.streams || []).map(streamTileStructureSignature)
   });
 }
+function dvbMeterColor(value, locked) {
+  if (!locked) return '#d9363e';
+  if (value >= 65) return '#17c261';
+  if (value >= 35) return '#ffb84d';
+  return '#fb5f5f';
+}
+function updateDvbMeter(tile, kind, value, available, locked) {
+  const fill = tile.querySelector(`[data-role="dvb-${kind}-fill"]`);
+  const label = tile.querySelector(`[data-role="dvb-${kind}-label"]`);
+  if (!fill || !label) return;
+  const numeric = Math.max(0, Math.min(100, Number(value || 0)));
+  const shown = available ? Math.round(numeric) : 0;
+  fill.style.width = `${shown}%`;
+  fill.style.background = available ? dvbMeterColor(numeric, locked) : 'rgba(255,255,255,.12)';
+  label.textContent = `${kind === 'signal' ? 'S' : 'Q'} ${available ? `${shown}%` : '—'}`;
+}
 function updateStreamTile(tile, stream) {
   if (!tile || !stream) return;
   tile.classList.toggle('active', !!stream.active);
@@ -1989,6 +2039,13 @@ function updateStreamTile(tile, stream) {
   if (statusPill) {
     statusPill.className = `status-pill ${stream.active ? 'active' : 'stopped'}`;
     statusPill.textContent = stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline';
+  }
+
+  if (stream.dvb_input) {
+    const available = !!stream.dvb_signal_available;
+    const locked = !!stream.dvb_locked;
+    updateDvbMeter(tile, 'signal', stream.dvb_signal, available, locked);
+    updateDvbMeter(tile, 'quality', stream.dvb_quality, available, locked);
   }
 
   const activeInput = tile.querySelector('[data-role="active-input"]');
@@ -2051,9 +2108,15 @@ function render(force=false) {
           <div class="title">${stream.name || stream.id}</div>
           <div data-role="status-pill" class="status-pill ${stream.active ? 'active' : 'stopped'}">${stream.active ? (stream.using_backup ? 'Backup' : 'Online') : 'Offline'}</div>
         </div>
-        <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
       </div>
-      <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
+      <div class="tile-actions">
+        <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
+        <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
+      </div>
+      ${stream.dvb_input ? `<div class="dvb-meters" title="DVB Signal / Quality">
+        <div class="dvb-meter"><span data-role="dvb-signal-fill" class="dvb-meter-fill"></span><b data-role="dvb-signal-label" class="dvb-meter-label">S —</b></div>
+        <div class="dvb-meter"><span data-role="dvb-quality-fill" class="dvb-meter-fill"></span><b data-role="dvb-quality-label" class="dvb-meter-label">Q —</b></div>
+      </div>` : ''}
       <div class="info">
         <div class="info-row"><strong>${t('output')}</strong><span>${outputs.length > 1 ? outputBadgeText(stream) : outputType.toUpperCase()} · ${primaryLink}</span></div>
         <div class="info-row"><strong>${t('activeInput')}</strong><span data-role="active-input">${stream.active_input_label || t('primary')} · ${stream.active_input_uri || stream.input_uri || '—'}</span></div>
@@ -2293,7 +2356,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 5'} / ${state.program_version||'v119'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 6'} / ${state.program_version||'v120'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

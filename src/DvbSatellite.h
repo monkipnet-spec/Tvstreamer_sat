@@ -32,5 +32,7 @@ bool configureSource(GstElement* source, const DvbSatelliteParams& params, std::
 Json::Value adapters();
 Json::Value scan(const Json::Value& request);
 Json::Value signal(const Json::Value& request);
+// Read current frontend statistics without retuning it. Safe for live DVB tiles.
+Json::Value signalFromUri(const std::string& uri);
 
 } // namespace DvbSatellite

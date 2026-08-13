@@ -1,6 +1,6 @@
-# TVStreammerSAT5 — Release 5
+# TVStreammerSAT5 — Release 6
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 5 / v119.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 6 / v120.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -10,8 +10,15 @@ The web interface includes **Add channel / Добавить канал** for sat
 
 While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
 
-Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; the runtime tunes `dvbsrc`, selects that program with `tsdemux`, and remuxes the service to MPEG-TS before the normal output pipeline.
+Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; Release 6 tunes `dvbsrc` and selects that SID directly at MPEG-TS level with the `tsparse program_%u` request pad. The complete selected service is kept as SPTS, so original PMT/PCR and codec PIDs are preserved before the normal output path.
 
+### FTA DVB SPTS + tile signal meters (v120)
+
+Release 6 removes the DVB `tsdemux -> elementary parsers -> mpegtsmux` stage from normal satellite passthrough. That stage could leave a locked FTA transponder with no bytes after service selection when a service used an elementary-stream layout that the remux path did not accept. Selected DVB services now remain MPEG-TS throughout SID selection. UDP without explicit PID/SID remapping feeds this selected SPTS directly into the WISI-compatible StableUdpOutput sender.
+
+DVB tiles now show two compact live bars at the top: **S** (frontend signal strength) and **Q** (frontend quality/CNR-derived percentage). The dashboard reads frontend statistics with Linux DVB ioctls only; it does not instantiate a second `dvbsrc` or retune the live frontend. VBR/CBR is displayed at the top-right next to the delete button.
+
+If the five-second input watchdog expires while the frontend still reports LOCK, the status is now `DVB LOCK - no service data (SID ...)` instead of the misleading `no input signal`.
 
 ### Test-pattern SID / bitrate fix (v119)
 
@@ -108,8 +115,8 @@ A local backup file is also supported by the normal stream path. The input inter
 The web UI currently exposes:
 
 ```text
-udp-vbr   MPEG-TS over native GStreamer udpsink, bitrate follows the selected service
-udp-cbr   MPEG-TS over native GStreamer udpsink with mpegtsmux NULL padding to Target bitrate
+udp-vbr   MPEG-TS over WISI-compatible StableUdpOutput, bitrate follows the selected service
+udp-cbr   MPEG-TS over WISI-compatible StableUdpOutput with NULL padding to Target bitrate
 rtp       MPEG-TS over RTP/UDP
 srt       MPEG-TS over SRT listener or caller
 http      MPEG-TS over HTTP
@@ -119,7 +126,7 @@ rtmp      RTMP push
 youtube   RTMP push to YouTube Live
 ```
 
-UDP VBR and UDP CBR use the standard GStreamer `udpsink` network element. The previous custom `appsink`/C++ UDP reservoir and PCR rewriter has been removed from the active output path because it could hold the stream before first packet delivery. MPEG-TS is packetized as 7 × 188-byte packets per UDP datagram. UDP VBR follows the selected service rate. UDP CBR uses `mpegtsmux` NULL padding to the configured Target bitrate. When an output interface is configured, TVStreammerSAT5 resolves an interface address/name and applies both the multicast interface and local bind address to `udpsink`.
+UDP VBR and UDP CBR use the WISI-compatible StableUdpOutput path (`appsink` + application-level UDP sender). MPEG-TS is packetized as **7 × 188 = 1316 byte** UDP datagrams and intentionally accumulates a **5 second startup reservoir** before transmission. PCR is restamped and periodic PCR cadence is maintained by the sender. UDP VBR follows the selected service rate; UDP CBR pads transport slots to the configured target bitrate. The configured output interface/address is used by the sender for multicast routing/binding.
 
 RTP MPEG-TS output is selectable in the web UI. It uses `rtpmp2tpay` over UDP; with MTU 1400 the payload fits 7 MPEG-TS packets (7 × 188 = 1316 bytes), which is suitable for IPTV headends.
 
@@ -297,7 +304,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 4
+Description=TVStreammerSAT5 Release 6
 After=network-online.target
 Wants=network-online.target
 

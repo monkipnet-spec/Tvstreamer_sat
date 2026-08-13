@@ -2707,9 +2707,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     }
 
     if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Dvb) {
-        if (!hasElementFactory("dvbsrc") || !hasElementFactory("tsparse") ||
-            !hasElementFactory("tsdemux") || !hasElementFactory("mpegtsmux")) {
-            std::cerr << "missing DVB input elements: dvbsrc, tsparse, tsdemux or mpegtsmux" << std::endl;
+        if (!hasElementFactory("dvbsrc") || !hasElementFactory("tsparse")) {
+            std::cerr << "missing DVB input elements: dvbsrc or tsparse" << std::endl;
             return nullptr;
         }
 
@@ -2722,18 +2721,16 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
         GstElement* src = gst_element_factory_make("dvbsrc", "input_dvb_src");
         GstElement* parse = gst_element_factory_make("tsparse", "input_dvb_tsparse");
-        GstElement* preDemuxQueue = gst_element_factory_make("queue", "input_dvb_pre_demux_queue");
-        GstElement* demux = gst_element_factory_make("tsdemux", "input_dvb_demux");
-        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_dvb_mux");
-        // This queue is after SID selection + remux, so DVB input bitrate on the tile
-        // reflects the selected service instead of the complete transponder.
+        // Select the requested DVB program while it is still MPEG-TS.  The old
+        // tsdemux -> elementary parsers -> mpegtsmux path could reject otherwise
+        // valid FTA services (for example unusual audio/private stream layouts)
+        // and then the watchdog reported NO INPUT SIGNAL although the frontend
+        // remained locked.  tsparse program_%u preserves the complete selected
+        // service, including its original PMT/PCR/codec PIDs, without decoding.
         GstElement* queue = gst_element_factory_make("queue", "input_selected_queue");
-        if (!src || !parse || !preDemuxQueue || !demux || !mux || !queue ||
+        if (!src || !parse || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, parse) ||
-            !addElementOrFail(pipeline, preDemuxQueue) ||
-            !addElementOrFail(pipeline, demux) ||
-            !addElementOrFail(pipeline, mux) ||
             !addElementOrFail(pipeline, queue)) {
             return nullptr;
         }
@@ -2743,24 +2740,33 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
         configureTsPacketAlignment(parse);
-        configureQueue(preDemuxQueue, 3000000000ULL);
         configureQueue(queue, 3000000000ULL);
-        configureTsMux(mux, cfg);
-        if (cfg.inputServiceId > 0) {
-            setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(cfg.inputServiceId));
-        }
-        if (!gst_element_link_many(src, parse, preDemuxQueue, demux, nullptr) ||
-            !gst_element_link(mux, queue)) {
-            std::cerr << "DVB input pipeline link failed" << std::endl;
+        if (!gst_element_link(src, parse)) {
+            std::cerr << "DVB input pipeline link failed: dvbsrc -> tsparse" << std::endl;
             return nullptr;
         }
 
-        state->sourceContext = std::make_unique<RemapContext>();
-        state->sourceContext->mux = mux;
-        state->sourceContext->config = cfg;
-        state->sourceContext->flvMux = false;
-        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
-        sendServiceDescription(mux, cfg);
+        if (cfg.inputServiceId > 0) {
+            GstPadTemplate* programTemplate = gst_element_class_get_pad_template(
+                GST_ELEMENT_GET_CLASS(parse), "program_%u");
+            const std::string programPadName = "program_" + std::to_string(cfg.inputServiceId);
+            GstPad* programPad = programTemplate
+                ? gst_element_request_pad(parse, programTemplate, programPadName.c_str(), nullptr)
+                : nullptr;
+            GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
+            const bool linked = programPad && queueSinkPad &&
+                gst_pad_link(programPad, queueSinkPad) == GST_PAD_LINK_OK;
+            if (queueSinkPad) gst_object_unref(queueSinkPad);
+            if (programPad) gst_object_unref(programPad);
+            if (!linked) {
+                std::cerr << "DVB program selection failed: could not request/link "
+                          << programPadName << " from tsparse" << std::endl;
+                return nullptr;
+            }
+        } else if (!gst_element_link(parse, queue)) {
+            std::cerr << "DVB AUTO input pipeline link failed: tsparse -> queue" << std::endl;
+            return nullptr;
+        }
 
         std::cerr << "DVB-S/S2 input: adapter=" << params.adapter
                   << " frontend=" << params.frontend
@@ -2768,7 +2774,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                   << " symbol_rate=" << params.symbolRateK
                   << " polarity=" << params.polarity
                   << " delsys=" << params.deliverySystem
-                  << " input_sid=" << cfg.inputServiceId << std::endl;
+                  << " input_sid=" << cfg.inputServiceId
+                  << " selection=" << (cfg.inputServiceId > 0 ? "tsparse-program" : "full-ts-auto")
+                  << std::endl;
 
         terminalElement = queue;
         return src;
@@ -3216,7 +3224,19 @@ bool StreamManager::buildOutputBranch(
     // Feed the same transcoded TS to every TS-capable protocol and only apply remap
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
-    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) && !transcodedInput;
+    const auto sourceProtocol = state
+        ? tvs::stream_protocols::inputKind(state->config)
+        : tvs::stream_protocols::InputProtocolKind::Unknown;
+    const bool sourceAlreadySingleProgramTs = state && (
+        state->config.testPattern ||
+        (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->config.inputServiceId > 0));
+    // DVB SID selection is now done directly by tsparse program_%u, producing a
+    // complete SPTS. Test bars are also already a complete SPTS. Feeding either
+    // through another tsdemux/mpegtsmux cycle can drop valid streams and is not
+    // required by StableUdpOutput/WISI shaping. Remux only when explicit PID/SID
+    // remapping was requested, or when a generic multi-program input needs it.
+    const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
+        !transcodedInput && !sourceAlreadySingleProgramTs;
     const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
     if (needsRemux) {
         if (stableUdpRemux) {
@@ -4315,14 +4335,34 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
-                state->statusMessage = "no input signal";
-                notifyStreamState(
-                    state->config,
-                    "🔴",
-                    telegramText(configManager, "Нет входного сигнала", "No input signal"),
-                    telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
-                        "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
-                        "\nURL: " + state->activeInputUri);
+                const bool isDvb = DvbSatellite::isDvbUri(state->activeInputUri);
+                Json::Value dvbStats;
+                bool dvbLocked = false;
+                if (isDvb) {
+                    dvbStats = DvbSatellite::signalFromUri(state->activeInputUri);
+                    dvbLocked = dvbStats.get("locked", false).asBool();
+                }
+                if (dvbLocked) {
+                    const auto sid = state->config.inputServiceId;
+                    state->statusMessage = "DVB LOCK - no service data";
+                    if (sid > 0) state->statusMessage += " (SID " + std::to_string(sid) + ")";
+                    notifyStreamState(
+                        state->config,
+                        "🟠",
+                        telegramText(configManager, "DVB сигнал есть, но нет данных сервиса", "DVB locked, but no service data"),
+                        telegramText(configManager, "Frontend имеет LOCK, но выбранный сервис не передает данные", "Frontend is locked, but the selected service is not producing data") +
+                            (sid > 0 ? "\nSID: " + std::to_string(sid) : "") +
+                            "\nURL: " + state->activeInputUri);
+                } else {
+                    state->statusMessage = "no input signal";
+                    notifyStreamState(
+                        state->config,
+                        "🔴",
+                        telegramText(configManager, "Нет входного сигнала", "No input signal"),
+                        telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
+                            "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
+                            "\nURL: " + state->activeInputUri);
+                }
             }
         }
 
