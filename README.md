@@ -1,6 +1,17 @@
-# TVStreammerSAT5 — Release 11
+# TVStreammerSAT5 — Release 12
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 11 / v125.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 12 / v126.**
+
+
+### Phoenix card-presence / 6 MHz ATR fix (v126)
+
+v126 fixes the false **«НЕТ КАРТЫ»** state that appeared after OSCam released an active FTDI Phoenix reader. v125 probed ATR only at 9600 baud, which matches the usual 3.57 MHz ISO-7816 startup rate, while the deployed `A104JCGD` and `AD023J2Q` readers are configured at 6.00 MHz. The probe now tries the corresponding initial rate (~16129 baud, Fi=372) using Linux arbitrary-baud `termios2`, with a 9600 fallback. It also honours the hardware carrier-detect line used by the deployment (`detect=cd`): if CD reports an inserted card but ATR decoding still fails, the UI reports **«КАРТА · ATR НЕ ПРОЧИТАН»** instead of falsely claiming that the reader is empty. No application APDU, ECM/CW handling or descrambling logic is added by this probe.
+
+The DVB/SPTS path and `StableUdpOutput` WISI five-second startup reservoir are unchanged from v125/v124.
+
+### Per-tile DVB decode indication (v126)
+
+For DVB channels bound to a Phoenix reader, each stream tile now shows a live **ДЕКОД: ОК / ДЕКОД: НЕТ / ДЕКОД: … / ДЕКОД: OFF** indicator. The state is measured passively from the `transport_scrambling_control` bits of the selected service MPEG-TS immediately before the output branch. `ДЕКОД: ОК` is shown only after enough recent payload packets were observed and none were still marked scrambled; any recently scrambled payload packet changes the tile to `ДЕКОД: НЕТ`. This telemetry does not expose or store ECM/CW/key material and does not alter MPEG-TS packets.
 
 
 ### Internal Multi-Service CardManager (v125)
@@ -347,7 +358,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 11
+Description=TVStreammerSAT5 Release 12
 After=network-online.target
 Wants=network-online.target
 

@@ -30,8 +30,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 11";
-constexpr const char* kProgramVersion = "v125";
+constexpr const char* kProgramRelease = "Release 12";
+constexpr const char* kProgramVersion = "v126";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -819,6 +819,22 @@ std::string HttpServer::currentState() {
             item["output_cc_errors"] = Json::UInt64(streamState->outputCcErrorsDelta.load());
             item["input_cc_errors_total"] = Json::UInt64(streamState->inputCcErrors.load());
             item["output_cc_errors_total"] = Json::UInt64(streamState->outputCcErrors.load());
+            const uint64_t caPayloadPackets = streamState->outputTsPayloadPacketsDelta.load();
+            const uint64_t caScrambledPackets = streamState->outputTsScrambledPacketsDelta.load();
+            item["ca_output_payload_packets"] = Json::UInt64(caPayloadPackets);
+            item["ca_output_scrambled_packets"] = Json::UInt64(caScrambledPackets);
+            item["ca_output_scrambled_percent"] = caPayloadPackets > 0
+                ? (100.0 * static_cast<double>(caScrambledPackets) / static_cast<double>(caPayloadPackets))
+                : 0.0;
+            if (cfg.conditionalAccessReader.empty()) {
+                item["ca_decode_state"] = "not_applicable";
+            } else if (!streamState->active.load()) {
+                item["ca_decode_state"] = "offline";
+            } else if (streamState->outputBitrate.load() == 0 || caPayloadPackets < 20) {
+                item["ca_decode_state"] = "waiting";
+            } else {
+                item["ca_decode_state"] = caScrambledPackets > 0 ? "scrambled" : "clear";
+            }
             item["cc_errors"] = item["input_cc_errors"];
             item["cc_errors_total"] = item["input_cc_errors_total"];
         } else {
@@ -833,6 +849,10 @@ std::string HttpServer::currentState() {
             item["output_cc_errors"] = Json::UInt64(0);
             item["input_cc_errors_total"] = Json::UInt64(0);
             item["output_cc_errors_total"] = Json::UInt64(0);
+            item["ca_output_payload_packets"] = Json::UInt64(0);
+            item["ca_output_scrambled_packets"] = Json::UInt64(0);
+            item["ca_output_scrambled_percent"] = 0.0;
+            item["ca_decode_state"] = cfg.conditionalAccessReader.empty() ? "not_applicable" : "offline";
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
@@ -1612,6 +1632,11 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .status-pill{padding:2px 6px;background:rgba(255,255,255,.06);color:#c9d2e4;border-radius:999px;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
 .tile .status-pill.active{background:rgba(23,194,97,.15);color:#b6f7c2}
 .tile .status-pill.stopped{background:rgba(255,95,95,.14);color:#ffb3b3}
+.tile .decode-pill{display:inline-flex;align-items:center;justify-content:center;min-width:74px;padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;line-height:12px;letter-spacing:.05em;white-space:nowrap}
+.tile .decode-pill.clear{background:rgba(23,194,97,.18);color:#bdf8cb;box-shadow:inset 0 0 0 1px rgba(23,194,97,.28)}
+.tile .decode-pill.scrambled{background:rgba(255,95,95,.18);color:#ffc2c2;box-shadow:inset 0 0 0 1px rgba(255,95,95,.3)}
+.tile .decode-pill.waiting{background:rgba(255,184,77,.16);color:#ffe0a3;box-shadow:inset 0 0 0 1px rgba(255,184,77,.24)}
+.tile .decode-pill.offline{background:rgba(255,255,255,.07);color:#aeb7c8;box-shadow:inset 0 0 0 1px rgba(255,255,255,.1)}
 .tile .info{display:grid;grid-template-columns:1fr;gap:5px;font-size:11px;color:#b3b8c6}
 .tile .info-row{display:flex;justify-content:space-between;gap:8px;align-items:center}
 .tile .info-row strong{color:#fff;font-size:11px}
@@ -2042,6 +2067,7 @@ function streamTileStructureSignature(stream) {
     backup_file_loop: stream.backup_file_loop,
     input_service_id: stream.input_service_id,
     service_id: stream.service_id,
+    conditional_access_reader: stream.conditional_access_reader,
     cbr: stream.cbr,
     outputs: outputConfigsForStream(stream),
     links: streamLinks(stream)
@@ -2069,6 +2095,18 @@ function updateDvbMeter(tile, kind, value, available, locked) {
   fill.style.background = available ? dvbMeterColor(numeric, locked) : 'rgba(255,255,255,.12)';
   label.textContent = `${kind === 'signal' ? 'S' : 'Q'} ${available ? `${shown}%` : '—'}`;
 }
+function caDecodeInfo(stream) {
+  if (!stream?.conditional_access_reader) return {cls:'offline', text:'FTA', detail:'Не требуется'};
+  const mode = String(stream.ca_decode_state || (stream.active ? 'waiting' : 'offline'));
+  const scrambled = Number(stream.ca_output_scrambled_packets || 0);
+  const payload = Number(stream.ca_output_payload_packets || 0);
+  const percent = Number(stream.ca_output_scrambled_percent || 0);
+  if (mode === 'clear') return {cls:'clear', text:'ДЕКОД: ОК', detail:`ОТКРЫТ · scrambled 0/${payload}`};
+  if (mode === 'scrambled') return {cls:'scrambled', text:'ДЕКОД: НЕТ', detail:`ЗАКОДИРОВАН · ${percent.toFixed(1)}% (${scrambled}/${payload})`};
+  if (mode === 'offline') return {cls:'offline', text:'ДЕКОД: OFF', detail:'Канал остановлен'};
+  return {cls:'waiting', text:'ДЕКОД: …', detail:'ОЖИДАНИЕ MPEG-TS'};
+}
+
 function updateStreamTile(tile, stream) {
   if (!tile || !stream) return;
   tile.classList.toggle('active', !!stream.active);
@@ -2102,6 +2140,14 @@ function updateStreamTile(tile, stream) {
 
   const caStatus = tile.querySelector('[data-role="ca-status"]');
   if (caStatus) caStatus.textContent = caStreamStatusText(stream);
+
+  const decodeInfo = caDecodeInfo(stream);
+  const decodePill = tile.querySelector('[data-role="decode-status"]');
+  if (decodePill) {
+    decodePill.className = `decode-pill ${decodeInfo.cls}`;
+    decodePill.textContent = decodeInfo.text;
+    decodePill.title = `${decodeInfo.detail}. Контроль по transport_scrambling_control выходного MPEG-TS.`;
+  }
 
   const toggleButton = tile.querySelector('[data-role="stream-toggle"]');
   if (toggleButton) {
@@ -2164,7 +2210,8 @@ function render(force=false) {
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
-        ${stream.conditional_access_reader ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>` : ''}
+        ${stream.conditional_access_reader ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>
+        <div class="info-row"><strong>Декодирование</strong><span data-role="decode-status" class="decode-pill ${caDecodeInfo(stream).cls}" title="Контроль по transport_scrambling_control выходного MPEG-TS">${caDecodeInfo(stream).text}</span></div>` : ''}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${stream.status || ''}</span></div>
@@ -2404,7 +2451,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 11'} / ${state.program_version||'v125'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 12'} / ${state.program_version||'v126'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2499,6 +2546,8 @@ function phoenixStatusInfo(reader) {
     if (reader.card_system) return {cls:'card', text:`КАРТА · ${reader.card_system}`};
     return {cls:'card', text:'КАРТА · провайдер не определён'};
   }
+  if (status === 'card_unreadable') return {cls:'card', text:'КАРТА · ATR НЕ ПРОЧИТАН'};
+  if (status === 'probe_failed') return {cls:'warn', text:'КАРТА НЕ ПОДТВЕРЖДЕНА'};
   if (status === 'no_card') return {cls:'no-card', text:'НЕТ КАРТЫ'};
   if (status === 'busy') return {cls:'busy', text:'ЗАНЯТ'};
   if (status === 'detected') return {cls:'detected', text:'ОБНАРУЖЕН'};

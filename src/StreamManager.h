@@ -69,11 +69,20 @@ struct StreamState {
     std::atomic<uint64_t> inputCcErrorsDelta{0};
     std::atomic<uint64_t> outputCcErrors{0};
     std::atomic<uint64_t> outputCcErrorsDelta{0};
+    // Passive MPEG-TS scrambling telemetry for the web tile. These counters
+    // only inspect transport_scrambling_control on output packets; they never
+    // carry ECM/CW/key material and do not modify the transport path.
+    std::atomic<uint64_t> outputTsPayloadPackets{0};
+    std::atomic<uint64_t> outputTsScrambledPackets{0};
+    std::atomic<uint64_t> outputTsPayloadPacketsDelta{0};
+    std::atomic<uint64_t> outputTsScrambledPacketsDelta{0};
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
     uint64_t lastInputCcErrorsSample = 0;
     uint64_t lastOutputCcErrorsSample = 0;
+    uint64_t lastOutputTsPayloadPacketsSample = 0;
+    uint64_t lastOutputTsScrambledPacketsSample = 0;
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
@@ -85,6 +94,8 @@ struct StreamState {
     std::array<bool, 8192> outputContinuityValid {};
     std::vector<uint8_t> outputTsRemainder;
     std::mutex outputContinuityMutex;
+    std::vector<uint8_t> outputScramblingRemainder;
+    std::mutex outputScramblingMutex;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;

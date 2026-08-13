@@ -867,6 +867,83 @@ uint64_t countContinuityErrors(
     return errors;
 }
 
+struct TransportScramblingCount {
+    uint64_t payloadPackets = 0;
+    uint64_t scrambledPackets = 0;
+};
+
+TransportScramblingCount countTransportScrambling(
+    const guint8* data,
+    std::size_t size,
+    std::vector<uint8_t>& remainder,
+    std::mutex& mutex) {
+    TransportScramblingCount count;
+    if (!data || size == 0) return count;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<uint8_t> bytes;
+    bytes.reserve(remainder.size() + size);
+    bytes.insert(bytes.end(), remainder.begin(), remainder.end());
+    bytes.insert(bytes.end(), data, data + size);
+    remainder.clear();
+
+    const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
+    if (start == std::string::npos) {
+        const std::size_t keep = std::min<std::size_t>(bytes.size(), kTsPacketSize * 4 - 1);
+        remainder.assign(bytes.end() - keep, bytes.end());
+        return count;
+    }
+
+    std::size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const guint8* packet = bytes.data() + offset;
+        if (packet[0] != 0x47) break;
+        if ((packet[1] & 0x80) != 0) continue;
+
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
+        // Fixed PSI/SI and null packets cannot tell us whether the selected
+        // service media is clear, so exclude them from the decode indicator.
+        if (pid < 0x20 || pid == 0x1fff) continue;
+
+        const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+        if (adaptationControl != 1 && adaptationControl != 3) continue;
+
+        ++count.payloadPackets;
+        const guint8 scramblingControl = static_cast<guint8>((packet[3] >> 6) & 0x03);
+        if (scramblingControl != 0) ++count.scrambledPackets;
+    }
+
+    if (offset < bytes.size()) {
+        remainder.assign(bytes.begin() + offset, bytes.end());
+        if (remainder.size() > kTsPacketSize * 4) {
+            remainder.erase(remainder.begin(), remainder.end() - (kTsPacketSize * 4));
+        }
+    }
+    return count;
+}
+
+void updateOutputScramblingStats(StreamState* state, GstBuffer* buffer) {
+    if (!state || !buffer) return;
+    GstMapInfo map {};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
+    const auto count = countTransportScrambling(
+        map.data, map.size, state->outputScramblingRemainder, state->outputScramblingMutex);
+    gst_buffer_unmap(buffer, &map);
+    if (count.payloadPackets) {
+        state->outputTsPayloadPackets.fetch_add(count.payloadPackets, std::memory_order_relaxed);
+    }
+    if (count.scrambledPackets) {
+        state->outputTsScrambledPackets.fetch_add(count.scrambledPackets, std::memory_order_relaxed);
+    }
+}
+
+void updateOutputScramblingStats(StreamState* state, GstBufferList* list) {
+    if (!state || !list) return;
+    for (guint i = 0; i < gst_buffer_list_length(list); ++i) {
+        updateOutputScramblingStats(state, gst_buffer_list_get(list, i));
+    }
+}
+
 void updateInputContinuityErrors(StreamState* state, GstBuffer* buffer) {
     if (!state || !buffer) return;
     GstMapInfo map {};
@@ -2700,6 +2777,12 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->inputCcErrorsDelta = 0;
     state->outputCcErrors = 0;
     state->outputCcErrorsDelta = 0;
+    state->outputTsPayloadPackets = 0;
+    state->outputTsScrambledPackets = 0;
+    state->outputTsPayloadPacketsDelta = 0;
+    state->outputTsScrambledPacketsDelta = 0;
+    state->lastOutputTsPayloadPacketsSample = 0;
+    state->lastOutputTsScrambledPacketsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
@@ -2716,6 +2799,10 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         std::lock_guard<std::mutex> lock(state->outputContinuityMutex);
         state->outputContinuityValid.fill(false);
         state->outputTsRemainder.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
+        state->outputScramblingRemainder.clear();
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
@@ -2828,6 +2915,12 @@ bool StreamManager::restartTranscodedInput(
     state->inputCcErrorsDelta = 0;
     state->outputCcErrors = 0;
     state->outputCcErrorsDelta = 0;
+    state->outputTsPayloadPackets = 0;
+    state->outputTsScrambledPackets = 0;
+    state->outputTsPayloadPacketsDelta = 0;
+    state->outputTsScrambledPacketsDelta = 0;
+    state->lastOutputTsPayloadPacketsSample = 0;
+    state->lastOutputTsScrambledPacketsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
@@ -2838,6 +2931,10 @@ bool StreamManager::restartTranscodedInput(
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
     state->lastBitrateSample = state->lastInputActivity;
+    {
+        std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
+        state->outputScramblingRemainder.clear();
+    }
 
     std::cerr << "Transcoded input switch complete: active="
               << state->activeInputUri
@@ -4288,10 +4385,14 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     uint64_t currentOutputBytes = state->outputBytes.load();
     uint64_t currentInputCcErrors = state->inputCcErrors.load();
     uint64_t currentOutputCcErrors = state->outputCcErrors.load();
+    uint64_t currentOutputTsPayloadPackets = state->outputTsPayloadPackets.load();
+    uint64_t currentOutputTsScrambledPackets = state->outputTsScrambledPackets.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
     uint64_t inputCcDelta = currentInputCcErrors - state->lastInputCcErrorsSample;
     uint64_t outputCcDelta = currentOutputCcErrors - state->lastOutputCcErrorsSample;
+    uint64_t outputTsPayloadDelta = currentOutputTsPayloadPackets - state->lastOutputTsPayloadPacketsSample;
+    uint64_t outputTsScrambledDelta = currentOutputTsScrambledPackets - state->lastOutputTsScrambledPacketsSample;
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
@@ -4301,11 +4402,15 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
         : measuredOutputBitrate;
     state->inputCcErrorsDelta = inputCcDelta;
     state->outputCcErrorsDelta = outputCcDelta;
+    state->outputTsPayloadPacketsDelta = outputTsPayloadDelta;
+    state->outputTsScrambledPacketsDelta = outputTsScrambledDelta;
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
     state->lastInputCcErrorsSample = currentInputCcErrors;
     state->lastOutputCcErrorsSample = currentOutputCcErrors;
+    state->lastOutputTsPayloadPacketsSample = currentOutputTsPayloadPackets;
+    state->lastOutputTsScrambledPacketsSample = currentOutputTsScrambledPackets;
     state->lastBitrateSample = now;
 }
 GstPadProbeReturn StreamManager::inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data) {
@@ -4342,11 +4447,13 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
         if (buffer) {
             state->outputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
             updateOutputContinuityErrors(state, buffer);
+            updateOutputScramblingStats(state, buffer);
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
         GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
         state->outputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
         updateOutputContinuityErrors(state, list);
+        updateOutputScramblingStats(state, list);
     }
 
     return GST_PAD_PROBE_OK;

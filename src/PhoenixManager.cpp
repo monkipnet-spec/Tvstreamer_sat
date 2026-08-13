@@ -18,7 +18,8 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
-#include <termios.h>
+#include <asm/ioctls.h>
+#include <asm/termbits.h>
 #include <unistd.h>
 
 namespace PhoenixManager {
@@ -211,7 +212,49 @@ bool readAtrFor(std::chrono::milliseconds timeout, int fd, std::vector<unsigned 
     return !atr.empty();
 }
 
-ProbeResult probeCard(const std::string& device) {
+struct ProbeProfile {
+    unsigned baud = 9600;
+    std::string label;
+};
+
+std::vector<ProbeProfile> probeProfiles(const std::string& serial) {
+    // The two installed FTDI Phoenix readers are configured in the current
+    // deployment at 6.00 MHz.  ISO-7816 initial Fi=372 therefore gives
+    // approximately 6000000 / 372 = 16129 baud for ATR reception.  v125 used
+    // only 9600 baud (the usual 3.57 MHz initial rate), which produced a false
+    // "no card" result as soon as OSCam released the serial port.
+    if (serial == "A104JCGD" || serial == "AD023J2Q") {
+        return {{16129u, "6.00MHz/Fi372"}, {9600u, "ISO-default"}};
+    }
+    // Unknown Phoenix hardware remains conservative: normal ISO default first,
+    // then the 6 MHz profile used by this deployment.
+    return {{9600u, "ISO-default"}, {16129u, "6.00MHz/Fi372"}};
+}
+
+bool getSerialState(int fd, termios2& state) {
+    return ::ioctl(fd, TCGETS2, &state) == 0;
+}
+
+bool setSerialProfile(int fd, const termios2& base, unsigned baud) {
+    termios2 port = base;
+    port.c_iflag = INPCK;
+    port.c_oflag = 0;
+    port.c_lflag = 0;
+    port.c_cflag &= ~(CSIZE | PARODD | CBAUD | CRTSCTS);
+    port.c_cflag |= CS8 | CLOCAL | CREAD | PARENB | CSTOPB | BOTHER;
+    port.c_ispeed = baud;
+    port.c_ospeed = baud;
+    port.c_cc[VMIN] = 0;
+    port.c_cc[VTIME] = 1;
+    return ::ioctl(fd, TCSETS2, &port) == 0;
+}
+
+void flushSerial(int fd, int selector) {
+    // Linux TCFLSH selector values match tcflush(): 0=input, 2=input+output.
+    (void)::ioctl(fd, TCFLSH, selector);
+}
+
+ProbeResult probeCard(const std::string& device, const std::string& serial) {
     ProbeResult result;
     const std::string canonical = canonicalDevice(device);
     if (usedByAnotherProcess(canonical)) {
@@ -233,62 +276,85 @@ ProbeResult probeCard(const std::string& device) {
         return result;
     }
 
-    termios saved{};
-    const bool haveSaved = ::tcgetattr(fd, &saved) == 0;
-    termios port = saved;
-    if (!haveSaved) std::memset(&port, 0, sizeof(port));
-    ::cfmakeraw(&port);
-    ::cfsetispeed(&port, B9600);
-    ::cfsetospeed(&port, B9600);
-    port.c_cflag &= ~CSIZE;
-    port.c_cflag |= CS8 | CLOCAL | CREAD | PARENB | CSTOPB;
-    port.c_cflag &= ~PARODD;
-    port.c_iflag = INPCK;
-    port.c_cc[VMIN] = 0;
-    port.c_cc[VTIME] = 1;
-    if (::tcsetattr(fd, TCSANOW, &port) != 0) {
+    termios2 saved{};
+    const bool haveSaved = getSerialState(fd, saved);
+    if (!haveSaved) {
         result.status = "unavailable";
-        result.detail = "cannot configure serial port";
+        result.detail = "cannot read serial port state";
         ::flock(fd, LOCK_UN);
         ::close(fd);
         return result;
     }
-    ::tcflush(fd, TCIOFLUSH);
 
     int modemSaved = 0;
     const bool haveModem = ::ioctl(fd, TIOCMGET, &modemSaved) == 0;
+    // OSCam configuration for both active readers uses detect=cd.  With this
+    // non-inverted setting an asserted carrier-detect line is positive evidence
+    // that a card is physically inserted, even if the generic ATR parser cannot
+    // complete a reset/ATR exchange.
+    const bool cardDetectAsserted = haveModem && ((modemSaved & TIOCM_CAR) != 0);
+
     auto pulse = [&](int line) {
         int bits = 0;
         if (::ioctl(fd, TIOCMGET, &bits) != 0) return;
         bits &= ~line;
-        ::ioctl(fd, TIOCMSET, &bits);
+        (void)::ioctl(fd, TIOCMSET, &bits);
         std::this_thread::sleep_for(std::chrono::milliseconds(120));
         bits |= line;
-        ::ioctl(fd, TIOCMSET, &bits);
+        (void)::ioctl(fd, TIOCMSET, &bits);
     };
 
-    // Common Phoenix/SmartMouse wiring uses RTS or DTR for reset. Try RTS first;
-    // if no ATR is returned, perform one DTR reset attempt. No APDU is sent.
-    pulse(TIOCM_RTS);
-    readAtrFor(std::chrono::milliseconds(550), fd, result.atr);
-    if (result.atr.empty()) {
-        ::tcflush(fd, TCIFLUSH);
-        pulse(TIOCM_DTR);
-        readAtrFor(std::chrono::milliseconds(550), fd, result.atr);
+    std::vector<std::string> attempted;
+    for (const auto& profile : probeProfiles(serial)) {
+        attempted.push_back(std::to_string(profile.baud) + "(" + profile.label + ")");
+        if (!setSerialProfile(fd, saved, profile.baud)) continue;
+        flushSerial(fd, 2);
+
+        // Common Phoenix/SmartMouse wiring uses RTS or DTR for reset.  Try both
+        // without sending any application APDU or CA command.
+        pulse(TIOCM_RTS);
+        readAtrFor(std::chrono::milliseconds(750), fd, result.atr);
+        if (result.atr.empty()) {
+            flushSerial(fd, 0);
+            pulse(TIOCM_DTR);
+            readAtrFor(std::chrono::milliseconds(750), fd, result.atr);
+        }
+        if (!result.atr.empty()) {
+            result.status = "card";
+            identifyCard(result.atr, result.cardSystem, result.provider);
+            result.detail = "ATR received at " + std::to_string(profile.baud) +
+                            " baud (" + profile.label + ")" +
+                            (haveModem ? (cardDetectAsserted ? "; CD asserted" : "; CD not asserted") : "");
+            break;
+        }
     }
 
-    if (haveModem) ::ioctl(fd, TIOCMSET, &modemSaved);
-    if (haveSaved) ::tcsetattr(fd, TCSANOW, &saved);
+    if (haveModem) (void)::ioctl(fd, TIOCMSET, &modemSaved);
+    (void)::ioctl(fd, TCSETS2, &saved);
     ::flock(fd, LOCK_UN);
     ::close(fd);
 
-    if (result.atr.empty()) {
-        result.status = "no_card";
-        result.detail = "ATR not received";
-        return result;
+    if (!result.atr.empty()) return result;
+
+    std::ostringstream attempts;
+    for (size_t i = 0; i < attempted.size(); ++i) {
+        if (i) attempts << ", ";
+        attempts << attempted[i];
     }
-    result.status = "card";
-    identifyCard(result.atr, result.cardSystem, result.provider);
+
+    if (haveModem && cardDetectAsserted) {
+        // Do not report "no card" when the hardware card-detect signal says a
+        // card is inserted.  This was the misleading v125 behaviour observed
+        // after disabling the OSCam reader.
+        result.status = "card_unreadable";
+        result.detail = "card-detect asserted; ATR not received; tried " + attempts.str();
+    } else if (haveModem) {
+        result.status = "no_card";
+        result.detail = "card-detect not asserted; ATR not received; tried " + attempts.str();
+    } else {
+        result.status = "probe_failed";
+        result.detail = "ATR not received and card-detect is unavailable; tried " + attempts.str();
+    }
     return result;
 }
 
@@ -357,14 +423,15 @@ Json::Value readers(bool probeCardEnabled) {
         item["product"] = product;
         item["vendor_id"] = parentAttribute(sysDevice, "idVendor");
         item["product_id"] = parentAttribute(sysDevice, "idProduct");
-        item["serial"] = parentAttribute(sysDevice, "serial");
+        const std::string serial = parentAttribute(sysDevice, "serial");
+        item["serial"] = serial;
         item["phoenix_candidate"] = true;
 
         const std::string probeDevice = entry.stableDevice.empty() ? entry.device : entry.stableDevice;
         if (probeCardEnabled) {
-            const ProbeResult probe = probeCard(probeDevice);
+            const ProbeResult probe = probeCard(probeDevice, serial);
             item["status"] = probe.status;
-            if (probe.status == "card") item["card_present"] = true;
+            if (probe.status == "card" || probe.status == "card_unreadable") item["card_present"] = true;
             else if (probe.status == "no_card") item["card_present"] = false;
             else item["card_present"] = Json::Value(Json::nullValue);
             item["atr"] = hexBytes(probe.atr);
