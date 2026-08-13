@@ -2269,7 +2269,7 @@ function render(force=false) {
         <div class="info-row placeholder"><strong>Декодирование</strong><span>—</span></div>`}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
-        <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${stream.status || ''}</span></div>
+        <div class="info-row"><strong>${t('status')}</strong><span data-role="stream-status">${escapeHtmlValue(stream.status || '')}</span></div>
       </div>
       <div class="controls">
         <button data-role="stream-toggle" class="${stream.active ? 'stop-button' : 'start-button'}">${stream.active ? t('stop') : t('start')}</button>

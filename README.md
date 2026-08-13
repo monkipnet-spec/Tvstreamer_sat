@@ -1,9 +1,13 @@
-# TVStreammerSAT5 — Release 15
+# TVStreammerSAT5 — Release 16
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 15 / v129.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 16 / v130.**
 
 
 
+
+### Compact tile status/layout (v130)
+
+Release 16 moves the runtime stream state onto the same compact line as the ONLINE/OFFLINE pill, removes the separate **Статус** information row, places the control buttons immediately after **Bitrate Out**, and reduces the fixed tile height while preserving equal heights for DVB/FTA/CA/general stream tiles. This is a web-interface-only layout change; DVB, shared-front-end, CA/CardManager and the WISI five-second UDP reservoir are unchanged.
 
 ### Retry inactive/error streams cleanly (v129)
 
@@ -399,7 +403,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 15
+Description=TVStreammerSAT5 Release 16
 After=network-online.target
 Wants=network-online.target
 
