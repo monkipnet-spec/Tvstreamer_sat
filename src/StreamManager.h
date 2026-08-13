@@ -6,11 +6,13 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <chrono>
+#include <cstdint>
 #include <vector>
 
 #include "ConfigManager.h"
@@ -45,6 +47,21 @@ struct ExternalSrtOutputState {
     std::thread busThread;
 };
 
+struct SharedDvbFrontendState {
+    std::string tuningSignature;
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+    std::string multicastAddress;
+    uint16_t multicastPort = 0;
+    size_t consumers = 0;
+};
+
+struct DvbServiceRelayState {
+    GstElement* pipeline = nullptr;
+    GstBus* bus = nullptr;
+    uint16_t outputPort = 0;
+};
+
 struct StreamState {
     std::atomic<bool> active{false};
     std::atomic<bool> running{false};
@@ -59,6 +76,15 @@ struct StreamState {
     GstBus* bus = nullptr;
     std::thread busThread;
     StreamConfig config;
+    // runtimeConfig may point at the internal shared-DVB SPTS relay while
+    // config always remains the user-visible/original stream configuration.
+    StreamConfig runtimeConfig;
+    bool sharedDvbInput = false;
+    std::string sharedDvbFrontendKey;
+    std::string sharedDvbMulticastAddress;
+    uint16_t sharedDvbMulticastPort = 0;
+    std::string sharedDvbServiceRelayUri;
+    std::unique_ptr<DvbServiceRelayState> dvbServiceRelay;
     // Runtime PAT result used only when input_service_id=0 (Auto).
     // The configured value remains 0; effective selection is kept in state->config.
     std::atomic<uint64_t> inputBitrate{0};
@@ -74,16 +100,9 @@ struct StreamState {
     // carry ECM/CW/key material and do not modify the transport path.
     std::atomic<uint64_t> outputTsPayloadPackets{0};
     std::atomic<uint64_t> outputTsScrambledPackets{0};
+    std::atomic<uint64_t> outputTsClearPesStarts{0};
     std::atomic<uint64_t> outputTsPayloadPacketsDelta{0};
     std::atomic<uint64_t> outputTsScrambledPacketsDelta{0};
-    // Decode truth is based only on elementary-stream PIDs learned from the
-    // selected PMT. ECM/EMM/other clear private sections must never make an
-    // encrypted service look decoded.
-    std::atomic<uint64_t> outputTsMediaPackets{0};
-    std::atomic<uint64_t> outputTsScrambledMediaPackets{0};
-    std::atomic<uint64_t> outputTsClearPesStarts{0};
-    std::atomic<uint64_t> outputTsMediaPacketsDelta{0};
-    std::atomic<uint64_t> outputTsScrambledMediaPacketsDelta{0};
     std::atomic<uint64_t> outputTsClearPesStartsDelta{0};
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
@@ -92,8 +111,6 @@ struct StreamState {
     uint64_t lastOutputCcErrorsSample = 0;
     uint64_t lastOutputTsPayloadPacketsSample = 0;
     uint64_t lastOutputTsScrambledPacketsSample = 0;
-    uint64_t lastOutputTsMediaPacketsSample = 0;
-    uint64_t lastOutputTsScrambledMediaPacketsSample = 0;
     uint64_t lastOutputTsClearPesStartsSample = 0;
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
@@ -108,10 +125,11 @@ struct StreamState {
     std::mutex outputContinuityMutex;
     std::vector<uint8_t> outputScramblingRemainder;
     std::mutex outputScramblingMutex;
-    std::array<bool, 8192> outputMediaPidKnown {};
-    uint16_t outputPmtAssemblyPid = 0x1FFF;
-    std::vector<uint8_t> outputPmtSectionAssembly;
-    std::size_t outputPmtSectionExpected = 0;
+    // Media PID discovery for the decode indicator. Clear PSI/ECM/teletext
+    // packets must never be enough to report a channel as decoded.
+    uint16_t outputTelemetryPmtPid = 0x1FFF;
+    std::array<bool, 8192> outputTelemetryMediaPids {};
+    bool outputTelemetryMediaPidsKnown = false;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;
@@ -159,6 +177,14 @@ private:
     bool restartTranscodedInput(StreamState* state, const std::string& inputUri, bool useBackup);
     bool restartActiveInput(StreamState* state, const std::string& inputUri, bool useBackup);
     bool probeInputAvailable(const StreamConfig& baseConfig, const std::string& inputUri, std::chrono::milliseconds timeout);
+    bool prepareSharedDvbInput(StreamState* state, std::string& error);
+    void releaseSharedDvbInput(StreamState* state);
+    bool acquireSharedDvbFrontend(StreamState* state, std::string& error);
+    void releaseSharedDvbFrontend(StreamState* state);
+    bool startDvbServiceRelay(StreamState* state, std::string& error);
+    void stopDvbServiceRelay(StreamState* state);
+    uint16_t allocateDvbServiceRelayPort(const std::string& streamId);
+    void releaseDvbServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
     static void onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
     static void onFlvDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data);
@@ -182,6 +208,8 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
+    std::map<std::string, std::unique_ptr<SharedDvbFrontendState>> sharedDvbFrontends;
+    std::set<uint16_t> dvbServiceRelayPorts;
     struct HttpClientSession {
         std::string streamId;
         std::string clientIp;

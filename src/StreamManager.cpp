@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -151,10 +153,10 @@ void freeSrtAccessContext(gpointer data) {
 // unrelated services, but Linux DVB demux still returns the original PAT/SDT
 // tables from the complete transponder.  Players such as VLC therefore see
 // every service advertised by the original PAT even though only one service's
-// media PIDs are present. Keep the selected media packets byte-for-byte and
-// rewrite PAT plus SDT so both program mapping and service metadata advertise
-// only the selected SID. This avoids another tsdemux/mpegtsmux cycle, which
-// previously broke valid FTA/private streams, while producing a real SPTS.
+// media PIDs are present.  Keep the selected media packets byte-for-byte and
+// rewrite PAT/SDT to advertise only the selected service.
+// This avoids another tsdemux/mpegtsmux cycle, which previously broke valid
+// FTA/private streams, while producing a standards-compliant single-program TS.
 struct DvbSingleProgramPsiContext {
     uint16_t serviceId = 0;
     uint16_t pmtPid = 0x1FFF;
@@ -164,9 +166,93 @@ struct DvbSingleProgramPsiContext {
     uint8_t sdtVersion = 0;
     std::string serviceName;
     std::string serviceProvider;
-    bool scrambledService = false;
+    // When the physical DVB frontend is shared, every service sees the full
+    // transponder. Compact the buffer to the PID set discovered by the channel
+    // scan instead of remuxing with tsdemux/mpegtsmux. This preserves the
+    // working v122+ media path and keeps VBR at the service bitrate.
+    std::array<bool, 8192> allowedPids {};
+    bool filterPids = false;
     bool announced = false;
 };
+
+std::string sharedDvbFrontendKey(const DvbSatelliteParams& params) {
+    return std::to_string(params.adapter) + ":" + std::to_string(params.frontend);
+}
+
+std::string sharedDvbTuneSignature(const DvbSatelliteParams& p) {
+    std::ostringstream out;
+    out << p.adapter << ':' << p.frontend
+        << ':' << p.frequencyKHz << ':' << p.symbolRateK
+        << ':' << p.polarity << ':' << p.deliverySystem
+        << ':' << p.modulation << ':' << p.fec
+        << ':' << p.diseqcSource << ':' << p.lnbLof1KHz
+        << ':' << p.lnbLof2KHz << ':' << p.lnbSlofKHz
+        << ':' << p.streamId;
+    return out.str();
+}
+
+std::string sharedDvbMulticastAddress(const DvbSatelliteParams& params) {
+    const unsigned slot = static_cast<unsigned>((params.adapter * 16 + params.frontend) % 250);
+    return "239.255.250." + std::to_string(slot + 1);
+}
+
+uint16_t sharedDvbMulticastPort(const DvbSatelliteParams& params) {
+    const unsigned slot = static_cast<unsigned>((params.adapter * 16 + params.frontend) % 1000);
+    return static_cast<uint16_t>(45000 + slot);
+}
+
+bool configureServicePidFilter(DvbSingleProgramPsiContext& ctx, const std::string& pids) {
+    ctx.allowedPids.fill(false);
+    // Essential DVB SI tables kept for a standards-compliant service stream.
+    for (uint16_t pid : {uint16_t(0x0000), uint16_t(0x0001), uint16_t(0x0010),
+                         uint16_t(0x0011), uint16_t(0x0012), uint16_t(0x0014)}) {
+        ctx.allowedPids[pid] = true;
+    }
+    if (pids.empty() || pids == "8192") {
+        ctx.filterPids = false;
+        return false;
+    }
+    size_t start = 0;
+    bool any = false;
+    while (start <= pids.size()) {
+        const size_t end = pids.find(':', start);
+        const std::string token = pids.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!token.empty()) {
+            try {
+                const unsigned long value = std::stoul(token);
+                if (value < 8192) {
+                    ctx.allowedPids[static_cast<size_t>(value)] = true;
+                    any = true;
+                }
+            } catch (...) {
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    ctx.filterPids = any;
+    return any;
+}
+
+std::string popGstPipelineError(GstBus* bus, const std::string& fallback) {
+    if (!bus) return fallback;
+    GstMessage* msg = gst_bus_timed_pop_filtered(
+        bus, 1500 * GST_MSECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING));
+    if (!msg) return fallback;
+    std::string result = fallback;
+    if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
+        GError* err = nullptr;
+        gchar* dbg = nullptr;
+        gst_message_parse_error(msg, &err, &dbg);
+        if (err && err->message) result = err->message;
+        if (dbg && *dbg) result += std::string(" | ") + dbg;
+        if (err) g_error_free(err);
+        g_free(dbg);
+    }
+    gst_message_unref(msg);
+    return result;
+}
 
 uint32_t mpeg2SectionCrc32(const uint8_t* data, size_t size) {
     uint32_t crc = 0xFFFFFFFFU;
@@ -230,9 +316,12 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
     }
 
     if (pid == 0x0011 && (section[0] == 0x42 || section[0] == 0x46) && available >= 11) {
-        ctx->transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
-        ctx->sdtVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
-        ctx->originalNetworkId = static_cast<uint16_t>((section[8] << 8) | section[9]);
+        const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength >= 12 && total <= available) {
+            ctx->sdtVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
+            ctx->originalNetworkId = static_cast<uint16_t>((section[8] << 8) | section[9]);
+        }
     }
 
     // Fallback: identify the PMT directly. dvbsrc's selected PID set contains
@@ -275,37 +364,13 @@ void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     section[15] = static_cast<uint8_t>(crc & 0xFF);
 }
 
-void suppressPatPacketUntilPmtKnown(uint8_t* packet) {
-    if (!packet) return;
-    const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
-    std::memset(packet, 0xFF, kTsPacketSize);
-    packet[0] = 0x47;
-    packet[1] = 0x1F;
-    packet[2] = 0xFF;
-    packet[3] = static_cast<uint8_t>(0x10 | continuity);
-}
-
-std::vector<uint8_t> dvbServiceText(const std::string& value, std::size_t maxBytes) {
-    if (value.empty() || maxBytes == 0) return {};
-    const bool needsUtf8Marker = std::any_of(value.begin(), value.end(), [](unsigned char ch) {
-        return ch >= 0x80;
-    });
-    const std::size_t payloadLimit = maxBytes > (needsUtf8Marker ? 1U : 0U)
-        ? maxBytes - (needsUtf8Marker ? 1U : 0U)
-        : 0U;
-    std::size_t cut = std::min<std::size_t>(value.size(), payloadLimit);
-    // If the byte immediately after the cut is a UTF-8 continuation byte, move
-    // the cut back to the beginning of that code point.
-    while (cut > 0 && cut < value.size() &&
-           (static_cast<unsigned char>(value[cut]) & 0xC0U) == 0x80U) {
-        --cut;
-    }
-    std::string trimmed = value.substr(0, cut);
-    std::vector<uint8_t> result;
-    result.reserve(trimmed.size() + (needsUtf8Marker ? 1U : 0U));
-    if (needsUtf8Marker) result.push_back(0x15); // DVB UTF-8 selector.
-    result.insert(result.end(), trimmed.begin(), trimmed.end());
-    return result;
+std::vector<uint8_t> dvbUtf8ServiceText(const std::string& value, size_t maxBytes) {
+    std::vector<uint8_t> out;
+    if (value.empty() || maxBytes < 2) return out;
+    out.push_back(0x15); // DVB UTF-8 selector
+    const size_t copy = std::min(maxBytes - 1, value.size());
+    out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
+    return out;
 }
 
 void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
@@ -313,23 +378,27 @@ void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
     std::memset(packet, 0xFF, kTsPacketSize);
     packet[0] = 0x47;
-    packet[1] = 0x40; // PUSI + PID 0x0011 high bits.
+    packet[1] = 0x40; // PUSI + PID 0x11
     packet[2] = 0x11;
     packet[3] = static_cast<uint8_t>(0x10 | continuity);
-    packet[4] = 0x00; // pointer_field
+    packet[4] = 0x00;
 
-    const std::string fallbackName = "Service " + std::to_string(ctx.serviceId);
-    const auto provider = dvbServiceText(
-        ctx.serviceProvider.empty() ? "TVStreammerSAT5" : ctx.serviceProvider, 48);
-    const auto name = dvbServiceText(
-        ctx.serviceName.empty() ? fallbackName : ctx.serviceName, 88);
-    const std::size_t descriptorPayloadLength = 1 + 1 + provider.size() + 1 + name.size();
-    const std::size_t descriptorLength = 2 + descriptorPayloadLength;
-    const std::size_t sectionLength = 8 + 5 + descriptorLength + 4;
-    if (sectionLength > 0x0FFF || 3 + sectionLength > kTsPacketSize - 5) return;
+    const std::string nameText = ctx.serviceName.empty()
+        ? ("Service " + std::to_string(ctx.serviceId))
+        : ctx.serviceName;
+    auto provider = dvbUtf8ServiceText(ctx.serviceProvider, 48);
+    auto name = dvbUtf8ServiceText(nameText, 80);
+    while (provider.size() + name.size() > 140) {
+        if (name.size() > 2) name.pop_back();
+        else if (provider.size() > 2) provider.pop_back();
+        else break;
+    }
 
+    const size_t descriptorPayloadLength = 3 + provider.size() + name.size();
+    const size_t descriptorTotalLength = 2 + descriptorPayloadLength;
+    const uint16_t sectionLength = static_cast<uint16_t>(8 + 5 + descriptorTotalLength + 4);
     uint8_t* section = packet + 5;
-    section[0] = 0x42; // SDT actual transport stream.
+    section[0] = 0x42; // actual TS SDT
     section[1] = static_cast<uint8_t>(0xF0 | ((sectionLength >> 8) & 0x0F));
     section[2] = static_cast<uint8_t>(sectionLength & 0xFF);
     section[3] = static_cast<uint8_t>(ctx.transportStreamId >> 8);
@@ -341,26 +410,36 @@ void writeSingleProgramSdt(uint8_t* packet, const DvbSingleProgramPsiContext& ct
     section[9] = static_cast<uint8_t>(ctx.originalNetworkId & 0xFF);
     section[10] = 0xFF;
 
-    std::size_t pos = 11;
+    size_t pos = 11;
     section[pos++] = static_cast<uint8_t>(ctx.serviceId >> 8);
     section[pos++] = static_cast<uint8_t>(ctx.serviceId & 0xFF);
-    section[pos++] = 0xFC; // reserved + EIT flags off.
-    section[pos++] = static_cast<uint8_t>(0x80 | (ctx.scrambledService ? 0x10 : 0x00) |
-                                          ((descriptorLength >> 8) & 0x0F));
-    section[pos++] = static_cast<uint8_t>(descriptorLength & 0xFF);
-    section[pos++] = 0x48; // DVB service descriptor.
+    section[pos++] = 0xFC; // EIT flags off
+    const uint16_t loopLength = static_cast<uint16_t>(descriptorTotalLength);
+    section[pos++] = static_cast<uint8_t>(0x80 | ((loopLength >> 8) & 0x0F)); // running_status=4
+    section[pos++] = static_cast<uint8_t>(loopLength & 0xFF);
+    section[pos++] = 0x48; // service_descriptor
     section[pos++] = static_cast<uint8_t>(descriptorPayloadLength);
-    section[pos++] = 0x01; // digital television service.
+    section[pos++] = 0x01; // digital television service
     section[pos++] = static_cast<uint8_t>(provider.size());
-    for (uint8_t ch : provider) section[pos++] = ch;
+    for (uint8_t b : provider) section[pos++] = b;
     section[pos++] = static_cast<uint8_t>(name.size());
-    for (uint8_t ch : name) section[pos++] = ch;
+    for (uint8_t b : name) section[pos++] = b;
 
     const uint32_t crc = mpeg2SectionCrc32(section, pos);
     section[pos++] = static_cast<uint8_t>((crc >> 24) & 0xFF);
     section[pos++] = static_cast<uint8_t>((crc >> 16) & 0xFF);
     section[pos++] = static_cast<uint8_t>((crc >> 8) & 0xFF);
     section[pos++] = static_cast<uint8_t>(crc & 0xFF);
+}
+
+void suppressPatPacketUntilPmtKnown(uint8_t* packet) {
+    if (!packet) return;
+    const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
+    std::memset(packet, 0xFF, kTsPacketSize);
+    packet[0] = 0x47;
+    packet[1] = 0x1F;
+    packet[2] = 0xFF;
+    packet[3] = static_cast<uint8_t>(0x10 | continuity);
 }
 
 GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
@@ -378,11 +457,19 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
     GstMapInfo map{};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
 
+    size_t writeOffset = 0;
     for (size_t offset = 0; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
         uint8_t* packet = map.data + offset;
         if (packet[0] != 0x47) continue;
         discoverSelectedPmtFromPacket(packet, ctx);
         const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
+            ctx->allowedPids[ctx->pmtPid] = true;
+        }
+
+        const bool keepPacket = !ctx->filterPids || (pid < ctx->allowedPids.size() && ctx->allowedPids[pid]);
+        if (!keepPacket) continue;
+
         if (pid == 0x0000) {
             if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
                 writeSingleProgramPat(packet, *ctx);
@@ -390,23 +477,32 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
                     std::cerr << "DVB SPTS PSI filter: SID=" << ctx->serviceId
                               << " PMT_PID=" << ctx->pmtPid
                               << " PAT=single-program SDT=single-service media=passthrough"
+                              << " pid_filter=" << (ctx->filterPids ? "service" : "off")
                               << std::endl;
                     ctx->announced = true;
                 }
             } else {
-                // Never leak the original all-program PAT while waiting to learn
-                // the selected PMT PID. This keeps VLC from caching every service.
                 suppressPatPacketUntilPmtKnown(packet);
             }
         } else if (pid == 0x0011) {
-            // PID 0x11 from the tuner contains the original full-transponder SDT.
-            // Replace every packet on that PID, including continuation packets,
-            // so VLC cannot rebuild or cache service names for unrelated SIDs.
+            // SDT is also copied from the full transponder by Linux DVB demux.
+            // Replace it so VLC advertises only the selected service.
             writeSingleProgramSdt(packet, *ctx);
         }
+
+        if (writeOffset != offset) {
+            std::memmove(map.data + writeOffset, packet, kTsPacketSize);
+        }
+        writeOffset += kTsPacketSize;
     }
 
     gst_buffer_unmap(buffer, &map);
+    if (ctx->filterPids) {
+        if (writeOffset == 0) return GST_PAD_PROBE_DROP;
+        if (writeOffset < gst_buffer_get_size(buffer)) {
+            gst_buffer_resize(buffer, 0, static_cast<gssize>(writeOffset));
+        }
+    }
     return GST_PAD_PROBE_OK;
 }
 
@@ -964,97 +1060,119 @@ uint64_t countContinuityErrors(
 struct TransportScramblingCount {
     uint64_t payloadPackets = 0;
     uint64_t scrambledPackets = 0;
-    uint64_t mediaPackets = 0;
-    uint64_t scrambledMediaPackets = 0;
     uint64_t clearPesStarts = 0;
 };
 
-void parseOutputPmtMediaPids(const std::vector<uint8_t>& section, StreamState* state) {
-    if (!state || section.size() < 16 || section[0] != 0x02) return;
-    const std::size_t sectionLength = static_cast<std::size_t>(((section[1] & 0x0F) << 8) | section[2]);
-    const std::size_t total = 3 + sectionLength;
-    if (sectionLength < 13 || total > section.size()) return;
-    const uint16_t sid = static_cast<uint16_t>((section[3] << 8) | section[4]);
-    if (state->config.inputServiceId > 0 && sid != (state->config.inputServiceId & 0xFFFFU)) return;
-
-    const std::size_t end = total - 4; // CRC excluded.
-    const std::size_t programInfoLength = static_cast<std::size_t>(((section[10] & 0x0F) << 8) | section[11]);
-    if (12 + programInfoLength > end) return;
-    std::size_t pos = 12 + programInfoLength;
-    while (pos + 5 <= end) {
-        const uint16_t pid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
-        const std::size_t esInfoLength = static_cast<std::size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
-        if (pos + 5 + esInfoLength > end) break;
-        if (pid > 0 && pid < 0x1FFF) state->outputMediaPidKnown[pid] = true;
-        pos += 5 + esInfoLength;
+bool isVideoStreamType(uint8_t streamType) {
+    switch (streamType) {
+        case 0x01: case 0x02: case 0x10: case 0x1B: case 0x24: case 0x42:
+            return true;
+        default:
+            return false;
     }
 }
 
-void learnOutputMediaPidsFromPmt(const guint8* packet, StreamState* state) {
+bool descriptorLoopLooksAudio(const uint8_t* descriptors, size_t length) {
+    if (!descriptors) return false;
+    size_t pos = 0;
+    while (pos + 2 <= length) {
+        const uint8_t tag = descriptors[pos];
+        const size_t len = descriptors[pos + 1];
+        if (pos + 2 + len > length) break;
+        if (tag == 0x6A || tag == 0x7A || tag == 0x7B || tag == 0x7C) return true;
+        pos += 2 + len;
+    }
+    return false;
+}
+
+bool isAudioStreamType(uint8_t streamType, const uint8_t* descriptors, size_t descriptorLength) {
+    switch (streamType) {
+        case 0x03: case 0x04: case 0x0F: case 0x11: case 0x81: case 0x87:
+            return true;
+        case 0x06:
+            return descriptorLoopLooksAudio(descriptors, descriptorLength);
+        default:
+            return false;
+    }
+}
+
+void seedConfiguredMediaPids(StreamState* state) {
+    if (!state || state->outputTelemetryMediaPidsKnown) return;
+    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF)
+        state->outputTelemetryMediaPids[state->config.videoPid] = true;
+    if (state->config.audioPid > 0 && state->config.audioPid < 0x1FFF)
+        state->outputTelemetryMediaPids[state->config.audioPid] = true;
+}
+
+void discoverOutputMediaPids(const uint8_t* packet, StreamState* state) {
     if (!packet || !state || packet[0] != 0x47) return;
     const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
-    const std::size_t payload = tsPayloadOffset(packet);
-    if (payload >= kTsPacketSize) return;
+    size_t available = 0;
+    const uint8_t* section = tsSectionStart(packet, available);
+    if (!section || available < 8) return;
 
-    const bool pusi = (packet[1] & 0x40) != 0;
-    if (pusi) {
-        const std::size_t pointer = packet[payload];
-        const std::size_t start = payload + 1 + pointer;
-        if (start >= kTsPacketSize || packet[start] != 0x02) return;
-        state->outputPmtAssemblyPid = pid;
-        state->outputPmtSectionAssembly.assign(packet + start, packet + kTsPacketSize);
-        state->outputPmtSectionExpected = 0;
-    } else if (pid == state->outputPmtAssemblyPid && !state->outputPmtSectionAssembly.empty()) {
-        state->outputPmtSectionAssembly.insert(
-            state->outputPmtSectionAssembly.end(), packet + payload, packet + kTsPacketSize);
-    } else {
+    if (pid == 0x0000 && section[0] == 0x00) {
+        const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength < 9 || total > available) return;
+        const size_t entriesEnd = total - 4;
+        for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+            if (program != 0 && mappedPid > 0 && mappedPid < 0x1FFF) {
+                state->outputTelemetryPmtPid = mappedPid;
+                break;
+            }
+        }
         return;
     }
 
-    auto& section = state->outputPmtSectionAssembly;
-    if (section.size() >= 3 && state->outputPmtSectionExpected == 0) {
-        const std::size_t sectionLength = static_cast<std::size_t>(((section[1] & 0x0F) << 8) | section[2]);
-        const std::size_t expected = 3 + sectionLength;
-        if (section[0] != 0x02 || expected < 16 || expected > 4096) {
-            section.clear();
-            state->outputPmtAssemblyPid = 0x1FFF;
-            return;
+    if (pid != state->outputTelemetryPmtPid || section[0] != 0x02) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > available) return;
+    const size_t end = total - 4;
+    const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
+    if (12 + programInfoLength > end) return;
+
+    std::array<bool, 8192> discovered {};
+    size_t mediaCount = 0;
+    size_t pos = 12 + programInfoLength;
+    while (pos + 5 <= end) {
+        const uint8_t streamType = section[pos];
+        const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        if (pos + 5 + esInfoLength > end) break;
+        const uint8_t* descriptors = section + pos + 5;
+        if (elementaryPid < 0x1FFF &&
+            (isVideoStreamType(streamType) || isAudioStreamType(streamType, descriptors, esInfoLength))) {
+            discovered[elementaryPid] = true;
+            ++mediaCount;
         }
-        state->outputPmtSectionExpected = expected;
+        pos += 5 + esInfoLength;
     }
-    if (state->outputPmtSectionExpected > 0 && section.size() >= state->outputPmtSectionExpected) {
-        section.resize(state->outputPmtSectionExpected);
-        parseOutputPmtMediaPids(section, state);
-        section.clear();
-        state->outputPmtAssemblyPid = 0x1FFF;
-        state->outputPmtSectionExpected = 0;
+    if (mediaCount > 0) {
+        state->outputTelemetryMediaPids = discovered;
+        state->outputTelemetryMediaPidsKnown = true;
     }
 }
 
-TransportScramblingCount countTransportScrambling(
-    const guint8* data,
-    std::size_t size,
-    StreamState* state) {
+TransportScramblingCount countTransportScrambling(const guint8* data, std::size_t size, StreamState* state) {
     TransportScramblingCount count;
     if (!data || size == 0 || !state) return count;
-
     std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
-    if (state->config.videoPid > 0 && state->config.videoPid < 0x1FFF)
-        state->outputMediaPidKnown[state->config.videoPid] = true;
-    if (state->config.audioPid > 0 && state->config.audioPid < 0x1FFF)
-        state->outputMediaPidKnown[state->config.audioPid] = true;
+    seedConfiguredMediaPids(state);
 
-    auto& remainder = state->outputScramblingRemainder;
     std::vector<uint8_t> bytes;
-    bytes.reserve(remainder.size() + size);
-    bytes.insert(bytes.end(), remainder.begin(), remainder.end());
+    bytes.reserve(state->outputScramblingRemainder.size() + size);
+    bytes.insert(bytes.end(), state->outputScramblingRemainder.begin(), state->outputScramblingRemainder.end());
     bytes.insert(bytes.end(), data, data + size);
-    remainder.clear();
+    state->outputScramblingRemainder.clear();
 
     const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
     if (start == std::string::npos) {
         const std::size_t keep = std::min<std::size_t>(bytes.size(), kTsPacketSize * 4 - 1);
-        remainder.assign(bytes.end() - keep, bytes.end());
+        state->outputScramblingRemainder.assign(bytes.end() - keep, bytes.end());
         return count;
     }
 
@@ -1063,42 +1181,30 @@ TransportScramblingCount countTransportScrambling(
         const guint8* packet = bytes.data() + offset;
         if (packet[0] != 0x47) break;
         if ((packet[1] & 0x80) != 0) continue;
-
-        learnOutputMediaPidsFromPmt(packet, state);
-
+        discoverOutputMediaPids(packet, state);
         const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        if (pid >= state->outputTelemetryMediaPids.size() || !state->outputTelemetryMediaPids[pid]) continue;
         const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
-        const std::size_t payload = tsPayloadOffset(packet);
-        if ((adaptationControl != 1 && adaptationControl != 3) || payload >= kTsPacketSize) continue;
-
-        // Keep the broad counters for diagnostics, but do not use them to say
-        // that a CA service is decoded. Clear ECM/EMM packets are not media.
-        if (pid >= 0x20 && pid != 0x1FFF) {
-            ++count.payloadPackets;
-            const guint8 scramblingControl = static_cast<guint8>((packet[3] >> 6) & 0x03);
-            if (scramblingControl != 0) ++count.scrambledPackets;
-        }
-
-        if (pid >= state->outputMediaPidKnown.size() || !state->outputMediaPidKnown[pid]) continue;
-        ++count.mediaPackets;
+        if (adaptationControl != 1 && adaptationControl != 3) continue;
+        ++count.payloadPackets;
         const guint8 scramblingControl = static_cast<guint8>((packet[3] >> 6) & 0x03);
         if (scramblingControl != 0) {
-            ++count.scrambledMediaPackets;
-            continue;
-        }
-
-        // A clear scrambling bit alone is insufficient: require a real PES
-        // boundary on the selected elementary streams before declaring decode OK.
-        if ((packet[1] & 0x40) != 0 && payload + 4 <= kTsPacketSize &&
-            packet[payload] == 0x00 && packet[payload + 1] == 0x00 && packet[payload + 2] == 0x01) {
-            ++count.clearPesStarts;
+            ++count.scrambledPackets;
+        } else if ((packet[1] & 0x40) != 0) {
+            const size_t payloadOffset = tsPayloadOffset(packet);
+            if (payloadOffset + 3 <= kTsPacketSize &&
+                packet[payloadOffset] == 0x00 && packet[payloadOffset + 1] == 0x00 && packet[payloadOffset + 2] == 0x01) {
+                ++count.clearPesStarts;
+            }
         }
     }
 
     if (offset < bytes.size()) {
-        remainder.assign(bytes.begin() + offset, bytes.end());
-        if (remainder.size() > kTsPacketSize * 4) {
-            remainder.erase(remainder.begin(), remainder.end() - (kTsPacketSize * 4));
+        state->outputScramblingRemainder.assign(bytes.begin() + offset, bytes.end());
+        if (state->outputScramblingRemainder.size() > kTsPacketSize * 4) {
+            state->outputScramblingRemainder.erase(
+                state->outputScramblingRemainder.begin(),
+                state->outputScramblingRemainder.end() - (kTsPacketSize * 4));
         }
     }
     return count;
@@ -1110,16 +1216,9 @@ void updateOutputScramblingStats(StreamState* state, GstBuffer* buffer) {
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
     const auto count = countTransportScrambling(map.data, map.size, state);
     gst_buffer_unmap(buffer, &map);
-    if (count.payloadPackets)
-        state->outputTsPayloadPackets.fetch_add(count.payloadPackets, std::memory_order_relaxed);
-    if (count.scrambledPackets)
-        state->outputTsScrambledPackets.fetch_add(count.scrambledPackets, std::memory_order_relaxed);
-    if (count.mediaPackets)
-        state->outputTsMediaPackets.fetch_add(count.mediaPackets, std::memory_order_relaxed);
-    if (count.scrambledMediaPackets)
-        state->outputTsScrambledMediaPackets.fetch_add(count.scrambledMediaPackets, std::memory_order_relaxed);
-    if (count.clearPesStarts)
-        state->outputTsClearPesStarts.fetch_add(count.clearPesStarts, std::memory_order_relaxed);
+    if (count.payloadPackets) state->outputTsPayloadPackets.fetch_add(count.payloadPackets, std::memory_order_relaxed);
+    if (count.scrambledPackets) state->outputTsScrambledPackets.fetch_add(count.scrambledPackets, std::memory_order_relaxed);
+    if (count.clearPesStarts) state->outputTsClearPesStarts.fetch_add(count.clearPesStarts, std::memory_order_relaxed);
 }
 
 void updateOutputScramblingStats(StreamState* state, GstBufferList* list) {
@@ -1657,6 +1756,397 @@ StreamManager::~StreamManager() {
     stopAll();
 }
 
+uint16_t StreamManager::allocateDvbServiceRelayPort(const std::string& streamId) {
+    constexpr uint16_t kFirstPort = 47000;
+    constexpr uint16_t kPortCount = 12000;
+    const size_t hash = std::hash<std::string>{}(streamId);
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for (uint16_t offset = 0; offset < kPortCount; ++offset) {
+        const uint16_t port = static_cast<uint16_t>(kFirstPort + ((hash + offset) % kPortCount));
+        if (dvbServiceRelayPorts.insert(port).second) return port;
+    }
+    return 0;
+}
+
+void StreamManager::releaseDvbServiceRelayPort(uint16_t port) {
+    if (!port) return;
+    std::lock_guard<std::mutex> lock(managerMutex);
+    dvbServiceRelayPorts.erase(port);
+}
+
+bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "invalid stream state";
+        return false;
+    }
+
+    DvbSatelliteParams params;
+    if (!DvbSatellite::parseUri(state->runtimeConfig.inputUri, params, error)) {
+        if (error.empty()) error = "invalid DVB URI";
+        return false;
+    }
+
+    const std::string frontendKey = sharedDvbFrontendKey(params);
+    const std::string tuningSignature = sharedDvbTuneSignature(params);
+
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto existing = sharedDvbFrontends.find(frontendKey);
+        if (existing != sharedDvbFrontends.end()) {
+            if (existing->second->tuningSignature != tuningSignature) {
+                std::ostringstream ss;
+                ss << "DVB adapter " << params.adapter << " frontend " << params.frontend
+                   << " is already used by another transponder; stop those channels or select another adapter";
+                error = ss.str();
+                return false;
+            }
+            ++existing->second->consumers;
+            state->sharedDvbInput = true;
+            state->sharedDvbFrontendKey = frontendKey;
+            state->sharedDvbMulticastAddress = existing->second->multicastAddress;
+            state->sharedDvbMulticastPort = existing->second->multicastPort;
+            std::cerr << "Shared DVB frontend reused: " << frontendKey
+                      << " consumers=" << existing->second->consumers
+                      << " relay=udp://@" << state->sharedDvbMulticastAddress
+                      << ":" << state->sharedDvbMulticastPort << std::endl;
+            return true;
+        }
+    }
+
+    auto shared = std::make_unique<SharedDvbFrontendState>();
+    shared->tuningSignature = tuningSignature;
+    shared->multicastAddress = sharedDvbMulticastAddress(params);
+    shared->multicastPort = sharedDvbMulticastPort(params);
+    shared->consumers = 1;
+
+    GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
+    GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
+    GstElement* parse = gst_element_factory_make("tsparse", "shared_dvb_tsparse");
+    GstElement* queue = gst_element_factory_make("queue", "shared_dvb_queue");
+    GstElement* sink = gst_element_factory_make("udpsink", "shared_dvb_multicast_sink");
+    if (!pipeline || !source || !parse || !queue || !sink ||
+        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, parse) ||
+        !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+        }
+        error = "failed to create shared DVB frontend pipeline";
+        return false;
+    }
+
+    DvbSatelliteParams fullTsParams = params;
+    fullTsParams.pids = "8192";
+    if (!DvbSatellite::configureSource(source, fullTsParams, error)) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        if (error.empty()) error = "failed to configure shared DVB frontend";
+        return false;
+    }
+
+    configureTsPacketAlignment(parse);
+    configureQueue(queue, 12000000000ULL);
+    g_object_set(sink,
+        "host", shared->multicastAddress.c_str(),
+        "port", static_cast<gint>(shared->multicastPort),
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+    setStringPropertyIfPresent(sink, "multicast-iface", "lo");
+    setBooleanPropertyIfPresent(sink, "auto-multicast", TRUE);
+    setBooleanPropertyIfPresent(sink, "loop", TRUE);
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setIntPropertyIfPresent(sink, "ttl-mc", 1);
+    setIntPropertyIfPresent(sink, "buffer-size", 16 * 1024 * 1024);
+
+    if (!gst_element_link_many(source, parse, queue, sink, nullptr)) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        error = "failed to link shared DVB frontend pipeline";
+        return false;
+    }
+
+    shared->pipeline = pipeline;
+    shared->bus = gst_element_get_bus(pipeline);
+    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        error = popGstPipelineError(shared->bus, "failed to start shared DVB frontend");
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
+        if (shared->bus) {
+            gst_object_unref(shared->bus);
+            shared->bus = nullptr;
+        }
+        gst_object_unref(pipeline);
+        shared->pipeline = nullptr;
+        return false;
+    }
+
+    state->sharedDvbInput = true;
+    state->sharedDvbFrontendKey = frontendKey;
+    state->sharedDvbMulticastAddress = shared->multicastAddress;
+    state->sharedDvbMulticastPort = shared->multicastPort;
+
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        // Another concurrent start may have won the race while this pipeline was
+        // transitioning. Do not keep two owners of one frontend.
+        auto existing = sharedDvbFrontends.find(frontendKey);
+        if (existing != sharedDvbFrontends.end()) {
+            if (existing->second->tuningSignature != tuningSignature) {
+                gst_element_set_state(shared->pipeline, GST_STATE_NULL);
+                gst_element_get_state(shared->pipeline, nullptr, nullptr, GST_SECOND);
+                if (shared->bus) gst_object_unref(shared->bus);
+                gst_object_unref(shared->pipeline);
+                state->sharedDvbInput = false;
+                state->sharedDvbFrontendKey.clear();
+                error = "DVB frontend became busy with a different transponder";
+                return false;
+            }
+            ++existing->second->consumers;
+            state->sharedDvbMulticastAddress = existing->second->multicastAddress;
+            state->sharedDvbMulticastPort = existing->second->multicastPort;
+            gst_element_set_state(shared->pipeline, GST_STATE_NULL);
+            gst_element_get_state(shared->pipeline, nullptr, nullptr, GST_SECOND);
+            if (shared->bus) gst_object_unref(shared->bus);
+            gst_object_unref(shared->pipeline);
+            std::cerr << "Shared DVB frontend reused after concurrent start: " << frontendKey
+                      << " consumers=" << existing->second->consumers << std::endl;
+            return true;
+        }
+        sharedDvbFrontends[frontendKey] = std::move(shared);
+    }
+
+    std::cerr << "Shared DVB frontend started: " << frontendKey
+              << " frequency_khz=" << params.frequencyKHz
+              << " symbol_rate=" << params.symbolRateK
+              << " polarity=" << params.polarity
+              << " relay=udp://@" << state->sharedDvbMulticastAddress
+              << ":" << state->sharedDvbMulticastPort << std::endl;
+    return true;
+}
+
+void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
+    if (!state || !state->sharedDvbInput || state->sharedDvbFrontendKey.empty()) return;
+    std::unique_ptr<SharedDvbFrontendState> released;
+    const std::string key = state->sharedDvbFrontendKey;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = sharedDvbFrontends.find(key);
+        if (found != sharedDvbFrontends.end()) {
+            if (found->second->consumers > 1) {
+                --found->second->consumers;
+                std::cerr << "Shared DVB frontend retained: " << key
+                          << " consumers=" << found->second->consumers << std::endl;
+            } else {
+                released = std::move(found->second);
+                sharedDvbFrontends.erase(found);
+            }
+        }
+    }
+    if (released) {
+        if (released->pipeline) {
+            gst_element_set_state(released->pipeline, GST_STATE_NULL);
+            gst_element_get_state(released->pipeline, nullptr, nullptr, GST_SECOND);
+        }
+        if (released->bus) gst_object_unref(released->bus);
+        if (released->pipeline) gst_object_unref(released->pipeline);
+        std::cerr << "Shared DVB frontend stopped: " << key << std::endl;
+    }
+    state->sharedDvbInput = false;
+    state->sharedDvbFrontendKey.clear();
+    state->sharedDvbMulticastAddress.clear();
+    state->sharedDvbMulticastPort = 0;
+}
+
+bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error) {
+    if (!state || !state->sharedDvbInput || state->sharedDvbMulticastAddress.empty() || !state->sharedDvbMulticastPort) {
+        error = "shared DVB frontend is not ready";
+        return false;
+    }
+
+    DvbSatelliteParams params;
+    if (!DvbSatellite::parseUri(state->runtimeConfig.inputUri, params, error)) {
+        if (error.empty()) error = "invalid DVB URI for service relay";
+        return false;
+    }
+
+    const uint16_t outputPort = allocateDvbServiceRelayPort(state->config.id);
+    if (!outputPort) {
+        error = "no free internal UDP port for DVB service relay";
+        return false;
+    }
+
+    auto relay = std::make_unique<DvbServiceRelayState>();
+    relay->outputPort = outputPort;
+    GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
+    GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
+    GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
+    GstElement* parse = gst_element_factory_make("tsparse", "shared_service_tsparse");
+    GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
+    GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
+    if (!pipeline || !source || !inputQueue || !parse || !outputQueue || !sink ||
+        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
+        !addElementOrFail(pipeline, parse) || !addElementOrFail(pipeline, outputQueue) ||
+        !addElementOrFail(pipeline, sink)) {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+        }
+        releaseDvbServiceRelayPort(outputPort);
+        error = "failed to create DVB service relay pipeline";
+        return false;
+    }
+
+    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+    g_object_set(source,
+        "address", state->sharedDvbMulticastAddress.c_str(),
+        "port", static_cast<gint>(state->sharedDvbMulticastPort),
+        "reuse", TRUE,
+        "auto-multicast", TRUE,
+        "buffer-size", 16 * 1024 * 1024,
+        "caps", caps,
+        nullptr);
+    if (caps) gst_caps_unref(caps);
+    setStringPropertyIfPresent(source, "multicast-iface", "lo");
+    configureQueue(inputQueue, 12000000000ULL);
+    configureTsPacketAlignment(parse);
+    setBooleanPropertyIfPresent(parse, "set-timestamps", FALSE);
+    configureQueue(outputQueue, 8000000000ULL);
+    g_object_set(sink,
+        "host", "127.0.0.1",
+        "port", static_cast<gint>(outputPort),
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr);
+    setBooleanPropertyIfPresent(sink, "qos", FALSE);
+    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
+
+    if (!gst_element_link_many(source, inputQueue, parse, outputQueue, sink, nullptr)) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        releaseDvbServiceRelayPort(outputPort);
+        error = "failed to link DVB service relay pipeline";
+        return false;
+    }
+
+    if (state->config.inputServiceId > 0) {
+        GstPad* psiPad = gst_element_get_static_pad(parse, "src");
+        if (psiPad) {
+            auto* psiContext = new DvbSingleProgramPsiContext();
+            psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
+            psiContext->serviceName = state->config.serviceName;
+            psiContext->serviceProvider = state->config.serviceProvider;
+            configureServicePidFilter(*psiContext, params.pids);
+            if (!psiContext->filterPids) {
+                std::cerr << "Shared DVB service relay warning: stream=" << state->config.id
+                          << " SID=" << state->config.inputServiceId
+                          << " has no saved service PID list; relay will not drop unrelated PIDs" << std::endl;
+            }
+            gst_pad_add_probe(
+                psiPad,
+                GST_PAD_PROBE_TYPE_BUFFER,
+                dvbSingleProgramPsiProbe,
+                psiContext,
+                [](gpointer data) { delete static_cast<DvbSingleProgramPsiContext*>(data); });
+            gst_object_unref(psiPad);
+        }
+    }
+
+    relay->pipeline = pipeline;
+    relay->bus = gst_element_get_bus(pipeline);
+    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        error = popGstPipelineError(relay->bus, "failed to start DVB service relay");
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
+        if (relay->bus) gst_object_unref(relay->bus);
+        gst_object_unref(pipeline);
+        releaseDvbServiceRelayPort(outputPort);
+        return false;
+    }
+
+    state->sharedDvbServiceRelayUri = "udp://127.0.0.1:" + std::to_string(outputPort);
+    state->dvbServiceRelay = std::move(relay);
+    std::cerr << "DVB service relay started: stream=" << state->config.id
+              << " SID=" << state->config.inputServiceId
+              << " transponder=udp://@" << state->sharedDvbMulticastAddress
+              << ":" << state->sharedDvbMulticastPort
+              << " service=" << state->sharedDvbServiceRelayUri
+              << " mode=PID-passthrough-no-remux" << std::endl;
+    return true;
+}
+
+void StreamManager::stopDvbServiceRelay(StreamState* state) {
+    if (!state || !state->dvbServiceRelay) return;
+    auto relay = std::move(state->dvbServiceRelay);
+    if (relay->pipeline) {
+        gst_element_set_state(relay->pipeline, GST_STATE_NULL);
+        gst_element_get_state(relay->pipeline, nullptr, nullptr, GST_SECOND);
+    }
+    if (relay->bus) gst_object_unref(relay->bus);
+    if (relay->pipeline) gst_object_unref(relay->pipeline);
+    releaseDvbServiceRelayPort(relay->outputPort);
+    state->sharedDvbServiceRelayUri.clear();
+}
+
+bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error) {
+    if (!state) {
+        error = "invalid stream state";
+        return false;
+    }
+    state->runtimeConfig = state->config;
+    if (state->config.testPattern || !DvbSatellite::isDvbUri(state->config.inputUri)) return true;
+
+    DvbSatelliteParams params;
+    if (!DvbSatellite::parseUri(state->runtimeConfig.inputUri, params, error)) return false;
+
+    // Older configurations may not have a saved service PID list. Resolve it
+    // before the shared frontend is opened so the resolver is not blocked by
+    // our own exclusive tuner session.
+    if (state->config.inputServiceId > 0 && (params.pids.empty() || params.pids == "8192")) {
+        std::string resolvedPids;
+        bool scrambled = false;
+        std::string resolveError;
+        if (DvbSatellite::resolveServicePids(params, state->config.inputServiceId, resolvedPids, scrambled, resolveError)) {
+            params.pids = resolvedPids;
+            state->runtimeConfig.inputUri = DvbSatellite::buildUri(params);
+            std::cerr << "Shared DVB service PID auto-resolve: SID=" << state->config.inputServiceId
+                      << " pids=" << params.pids << std::endl;
+        } else {
+            std::cerr << "Shared DVB service PID auto-resolve failed for SID=" << state->config.inputServiceId
+                      << ": " << resolveError << "; continuing without PID compaction" << std::endl;
+        }
+    }
+
+    if (!acquireSharedDvbFrontend(state, error)) return false;
+    if (!startDvbServiceRelay(state, error)) {
+        releaseSharedDvbFrontend(state);
+        return false;
+    }
+
+    state->runtimeConfig = state->config;
+    state->runtimeConfig.inputUri = state->sharedDvbServiceRelayUri;
+    state->runtimeConfig.inputMode = "udp";
+    state->runtimeConfig.inputInterfaceAddress.clear();
+    state->runtimeConfig.inputInterfaceAddressConfigured = true;
+    // The local relay is already a selected SPTS. Keep the original SID in
+    // state->config for UI/telemetry, but do not ask generic UDP paths to select
+    // the same SID again.
+    state->runtimeConfig.inputServiceId = 0;
+    std::cerr << "Shared DVB input attached: stream=" << state->config.id
+              << " frontend=" << state->sharedDvbFrontendKey
+              << " SID=" << state->config.inputServiceId
+              << " source=" << state->sharedDvbServiceRelayUri << std::endl;
+    return true;
+}
+
+void StreamManager::releaseSharedDvbInput(StreamState* state) {
+    if (!state) return;
+    stopDvbServiceRelay(state);
+    releaseSharedDvbFrontend(state);
+    state->runtimeConfig = state->config;
+}
 
 void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg) {
     if (!sink) {
@@ -1942,26 +2432,37 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     }
 
     state->config = effectiveConfig;
+    state->runtimeConfig = effectiveConfig;
     state->primaryInputUri = effectiveConfig.inputUri;
     state->activeInputUri = effectiveConfig.testPattern ? kTestPatternUri : effectiveConfig.inputUri;
+
+    std::string sharedDvbError;
+    if (!prepareSharedDvbInput(state.get(), sharedDvbError)) {
+        state->statusMessage = "shared DVB input failed: " + sharedDvbError;
+        if (error) *error = sharedDvbError;
+        return false;
+    }
+
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = effectiveConfig;
+    state->sourceContext->config = state->runtimeConfig;
 
     if (effectiveConfig.transcodeEnabled && allOutputsUseStableUdp(effectiveConfig) &&
         GstTranscoderProcess::isAvailable()) {
         std::string relayError;
         if (!tvs::protocols::prepareFifoRelay(effectiveConfig, relayError)) {
             state->statusMessage = "transcoded UDP relay setup failed: " + relayError;
+            releaseSharedDvbInput(state.get());
             if (error) *error = relayError;
             return false;
         }
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
-        const StreamConfig relayConfig = transcodeRelayOutputConfig(effectiveConfig);
+        const StreamConfig relayConfig = transcodeRelayOutputConfig(state->runtimeConfig);
         std::string gstError;
         if (!gstTranscoder->start(relayConfig, gstError)) {
             tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "gstreamer transcoder relay failed: " + gstError;
+            releaseSharedDvbInput(state.get());
             if (error) *error = gstError.empty() ? "GStreamer transcoder relay failed to start" : gstError;
             return false;
         }
@@ -1973,6 +2474,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             state->gstTranscoder.reset();
             tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "transcoded UDP output failed: " + relayError;
+            releaseSharedDvbInput(state.get());
             if (error) *error = relayError.empty() ? "failed to create transcoded UDP output" : relayError;
             return false;
         }
@@ -1997,12 +2499,15 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 gst_object_unref(state->bus);
                 state->bus = nullptr;
             }
+            gst_element_set_state(relayPipeline, GST_STATE_NULL);
+            gst_element_get_state(relayPipeline, nullptr, nullptr, GST_SECOND);
             gst_object_unref(relayPipeline);
             state->pipeline = nullptr;
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
             tvs::protocols::removeFifoRelay(effectiveConfig);
             state->statusMessage = "transcoded UDP relay playback failed";
+            releaseSharedDvbInput(state.get());
             if (error) *error = "failed to start post-transcode StableUdpOutput pipeline";
             return false;
         }
@@ -2032,6 +2537,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 if (state->gstTranscoder) state->gstTranscoder->stop();
             }
             tvs::protocols::removeFifoRelay(effectiveConfig);
+            if (state) releaseSharedDvbInput(state.get());
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
         }
@@ -2052,17 +2558,19 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
                       << ": " << srtRelayError << std::endl;
             state->statusMessage = "transcoded srt output failed: " + srtRelayError;
+            releaseSharedDvbInput(state.get());
             if (error) *error = srtRelayError.empty() ? "failed to start transcoded SRT output" : srtRelayError;
             return false;
         }
 
         auto gstTranscoder = std::make_unique<GstTranscoderProcess>();
         std::string gstError;
-        if (!gstTranscoder->start(effectiveConfig, gstError)) {
+        if (!gstTranscoder->start(state->runtimeConfig, gstError)) {
             std::cerr << "GStreamer transcoder setup failed for " << streamConfig.id
                       << ": " << gstError << std::endl;
             state->statusMessage = "gstreamer transcoder failed: " + gstError;
             stopExternalSrtOutputs(state.get());
+            releaseSharedDvbInput(state.get());
             if (error) *error = gstError.empty() ? "GStreamer transcoder failed to start" : gstError;
             return false;
         }
@@ -2100,6 +2608,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                     state->gstTranscoder->stop();
                 }
             }
+            if (state) releaseSharedDvbInput(state.get());
             if (error) *error = "duplicate stream start detected: " + streamConfig.id;
             return false;
         }
@@ -2115,6 +2624,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
+        releaseSharedDvbInput(state.get());
         if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
     }
@@ -2171,7 +2681,14 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             state->gstTranscoder->stop();
             state->gstTranscoder.reset();
         }
+        // A failed DVB transition can leave dvbsrc in READY. Always drive the
+        // complete pipeline to NULL before the last reference is released so
+        // the frontend fd is closed deterministically.
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
+        state->pipeline = nullptr;
         gst_object_unref(pipeline);
+        releaseSharedDvbInput(state.get());
         if (error) *error = playingError;
         return false;
     }
@@ -2200,6 +2717,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             gst_object_unref(state->pipeline);
             state->pipeline = nullptr;
         }
+        releaseSharedDvbInput(state.get());
         if (error) *error = "duplicate stream start detected: " + streamConfig.id;
         return false;
     }
@@ -2265,6 +2783,7 @@ bool StreamManager::stopStream(const std::string& id) {
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
+    releaseSharedDvbInput(&state);
     state.outputContexts.clear();
     state.sourceContext.reset();
     tvs::protocols::removeFifoRelay(stoppedConfig);
@@ -2323,6 +2842,7 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
         }
+        releaseSharedDvbInput(&state);
         state.outputContexts.clear();
         state.sourceContext.reset();
         tvs::protocols::removeFifoRelay(state.config);
@@ -2853,8 +3373,9 @@ bool StreamManager::probeInputAvailable(
     probeState.config = baseConfig;
     probeState.config.inputUri = inputUri;
     probeState.config.testPattern = false;
+    probeState.runtimeConfig = probeState.config;
     probeState.sourceContext = std::make_unique<RemapContext>();
-    probeState.sourceContext->config = probeState.config;
+    probeState.sourceContext->config = probeState.runtimeConfig;
 
     GstElement* pipeline = gst_pipeline_new(nullptr);
     if (!pipeline) {
@@ -2930,9 +3451,19 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         gst_element_set_state(oldPipeline, GST_STATE_NULL);
     }
 
-    state->config.inputUri = inputUri;
+    state->runtimeConfig = state->config;
+    state->runtimeConfig.testPattern = false;
+    if (!useBackup && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty()) {
+        state->runtimeConfig.inputUri = state->sharedDvbServiceRelayUri;
+        state->runtimeConfig.inputMode = "udp";
+        state->runtimeConfig.inputInterfaceAddress.clear();
+        state->runtimeConfig.inputInterfaceAddressConfigured = true;
+        state->runtimeConfig.inputServiceId = 0;
+    } else {
+        state->runtimeConfig.inputUri = inputUri;
+    }
     state->sourceContext = std::make_unique<RemapContext>();
-    state->sourceContext->config = state->config;
+    state->sourceContext->config = state->runtimeConfig;
     state->outputContexts.clear();
 
     GstElement* newPipeline = createPipeline(state);
@@ -2953,7 +3484,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->backupAttempted = useBackup;
     state->primaryRetryPending = !useBackup;
     state->inputLossNotified = false;
-    state->activeInputUri = inputUri;
+    state->activeInputUri = useBackup ? inputUri : state->primaryInputUri;
     state->active = true;
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
@@ -2964,18 +3495,12 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->outputCcErrorsDelta = 0;
     state->outputTsPayloadPackets = 0;
     state->outputTsScrambledPackets = 0;
+    state->outputTsClearPesStarts = 0;
     state->outputTsPayloadPacketsDelta = 0;
     state->outputTsScrambledPacketsDelta = 0;
-    state->outputTsMediaPackets = 0;
-    state->outputTsScrambledMediaPackets = 0;
-    state->outputTsClearPesStarts = 0;
-    state->outputTsMediaPacketsDelta = 0;
-    state->outputTsScrambledMediaPacketsDelta = 0;
     state->outputTsClearPesStartsDelta = 0;
     state->lastOutputTsPayloadPacketsSample = 0;
     state->lastOutputTsScrambledPacketsSample = 0;
-    state->lastOutputTsMediaPacketsSample = 0;
-    state->lastOutputTsScrambledMediaPacketsSample = 0;
     state->lastOutputTsClearPesStartsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
@@ -2997,10 +3522,9 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     {
         std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
         state->outputScramblingRemainder.clear();
-        state->outputMediaPidKnown.fill(false);
-        state->outputPmtAssemblyPid = 0x1FFF;
-        state->outputPmtSectionAssembly.clear();
-        state->outputPmtSectionExpected = 0;
+        state->outputTelemetryPmtPid = 0x1FFF;
+        state->outputTelemetryMediaPids.fill(false);
+        state->outputTelemetryMediaPidsKnown = false;
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
@@ -3009,8 +3533,21 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     GstStateChangeReturn ret = gst_element_set_state(newPipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
+        // A failed source transition can leave elements in READY. Drive the
+        // replacement to NULL before dropping it; the previous pipeline was
+        // already stopped above, so leave the stream offline for the normal
+        // monitor/restart path instead of retaining a half-started pipeline.
+        gst_element_set_state(newPipeline, GST_STATE_NULL);
+        gst_element_get_state(newPipeline, nullptr, nullptr, GST_SECOND);
+        if (newBus) gst_object_unref(newBus);
+        gst_object_unref(newPipeline);
+        state->pipeline = nullptr;
+        state->bus = nullptr;
         state->statusMessage = "error: restart playback failed";
         state->active = false;
+        if (oldBus) gst_object_unref(oldBus);
+        if (oldPipeline) gst_object_unref(oldPipeline);
+        return false;
     }
 
     if (oldBus) {
@@ -3019,7 +3556,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     if (oldPipeline) {
         gst_object_unref(oldPipeline);
     }
-    return ret != GST_STATE_CHANGE_FAILURE;
+    return true;
 }
 
 
@@ -3033,8 +3570,16 @@ bool StreamManager::restartTranscodedInput(
 
     const bool stableUdpRelay = allOutputsUseStableUdp(state->config);
     StreamConfig nextConfig = state->config;
-    nextConfig.inputUri = inputUri;
     nextConfig.testPattern = false;
+    if (!useBackup && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty()) {
+        nextConfig.inputUri = state->sharedDvbServiceRelayUri;
+        nextConfig.inputMode = "udp";
+        nextConfig.inputInterfaceAddress.clear();
+        nextConfig.inputInterfaceAddressConfigured = true;
+        nextConfig.inputServiceId = 0;
+    } else {
+        nextConfig.inputUri = inputUri;
+    }
 
     std::cerr << "Transcoded input switch: from=" << state->activeInputUri
               << " to=" << inputUri
@@ -3058,7 +3603,7 @@ bool StreamManager::restartTranscodedInput(
         }
     }
 
-    state->config = nextConfig;
+    state->runtimeConfig = nextConfig;
 
     std::string gstError;
     const StreamConfig transcoderConfig =
@@ -3091,6 +3636,8 @@ bool StreamManager::restartTranscodedInput(
                 gst_object_unref(state->bus);
                 state->bus = nullptr;
             }
+            gst_element_set_state(relayPipeline, GST_STATE_NULL);
+            gst_element_get_state(relayPipeline, nullptr, nullptr, GST_SECOND);
             gst_object_unref(relayPipeline);
             state->pipeline = nullptr;
             state->statusMessage = "error: transcoded UDP relay playback restart failed";
@@ -3103,7 +3650,7 @@ bool StreamManager::restartTranscodedInput(
     state->backupAttempted = useBackup;
     state->primaryRetryPending = !useBackup;
     state->inputLossNotified = false;
-    state->activeInputUri = inputUri;
+    state->activeInputUri = useBackup ? inputUri : state->primaryInputUri;
     state->active = true;
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
 
@@ -3115,18 +3662,12 @@ bool StreamManager::restartTranscodedInput(
     state->outputCcErrorsDelta = 0;
     state->outputTsPayloadPackets = 0;
     state->outputTsScrambledPackets = 0;
+    state->outputTsClearPesStarts = 0;
     state->outputTsPayloadPacketsDelta = 0;
     state->outputTsScrambledPacketsDelta = 0;
-    state->outputTsMediaPackets = 0;
-    state->outputTsScrambledMediaPackets = 0;
-    state->outputTsClearPesStarts = 0;
-    state->outputTsMediaPacketsDelta = 0;
-    state->outputTsScrambledMediaPacketsDelta = 0;
     state->outputTsClearPesStartsDelta = 0;
     state->lastOutputTsPayloadPacketsSample = 0;
     state->lastOutputTsScrambledPacketsSample = 0;
-    state->lastOutputTsMediaPacketsSample = 0;
-    state->lastOutputTsScrambledMediaPacketsSample = 0;
     state->lastOutputTsClearPesStartsSample = 0;
     state->inputBitrate = 0;
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
@@ -3141,10 +3682,9 @@ bool StreamManager::restartTranscodedInput(
     {
         std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
         state->outputScramblingRemainder.clear();
-        state->outputMediaPidKnown.fill(false);
-        state->outputPmtAssemblyPid = 0x1FFF;
-        state->outputPmtSectionAssembly.clear();
-        state->outputPmtSectionExpected = 0;
+        state->outputTelemetryPmtPid = 0x1FFF;
+        state->outputTelemetryMediaPids.fill(false);
+        state->outputTelemetryMediaPidsKnown = false;
     }
 
     std::cerr << "Transcoded input switch complete: active="
@@ -3207,7 +3747,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     if (!state) {
         return nullptr;
     }
-    const StreamConfig& cfg = state->config;
+    const StreamConfig& cfg = state->runtimeConfig;
     const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
     const std::string inputLower = toLower(input);
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
@@ -3288,18 +3828,16 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
-        // v127: dvbsrc PID filtering still carries the transponder's original
-        // PAT and SDT. Rewrite both tables to one selected SID while leaving
-        // PMT/PCR/PES/teletext/subtitle packets untouched. This removes the
-        // unrelated service list that VLC can otherwise reconstruct from SDT.
+        // v127: dvbsrc service PID filtering still carries the transponder's
+        // original PAT and SDT. Rewrite both to one selected service while
+        // leaving PMT/PCR/PES/teletext/subtitle packets untouched.
         if (cfg.inputServiceId > 0 && params.pids != "8192") {
             GstPad* psiPad = gst_element_get_static_pad(parse, "src");
             if (psiPad) {
                 auto* psiContext = new DvbSingleProgramPsiContext();
                 psiContext->serviceId = static_cast<uint16_t>(cfg.inputServiceId & 0xFFFFU);
-                psiContext->serviceName = cfg.serviceName.empty() ? cfg.name : cfg.serviceName;
+                psiContext->serviceName = cfg.serviceName;
                 psiContext->serviceProvider = cfg.serviceProvider;
-                psiContext->scrambledService = !cfg.conditionalAccessReader.empty();
                 gst_pad_add_probe(
                     psiPad,
                     GST_PAD_PROBE_TYPE_BUFFER,
@@ -3769,11 +4307,14 @@ bool StreamManager::buildOutputBranch(
     // to non-transcoded passthrough streams.
     const bool transcodedInput = state && state->config.transcodeEnabled;
     const auto sourceProtocol = state
-        ? tvs::stream_protocols::inputKind(state->config)
+        ? tvs::stream_protocols::inputKind(state->runtimeConfig)
         : tvs::stream_protocols::InputProtocolKind::Unknown;
+    const bool sharedDvbSpts = state && state->sharedDvbInput &&
+        !state->sharedDvbServiceRelayUri.empty() &&
+        state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri;
     const bool sourceAlreadySingleProgramTs = state && (
-        state->config.testPattern ||
-        (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->config.inputServiceId > 0));
+        state->runtimeConfig.testPattern || sharedDvbSpts ||
+        (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
     // also already a complete SPTS. Feeding either through another
@@ -4601,8 +5142,6 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     uint64_t currentOutputCcErrors = state->outputCcErrors.load();
     uint64_t currentOutputTsPayloadPackets = state->outputTsPayloadPackets.load();
     uint64_t currentOutputTsScrambledPackets = state->outputTsScrambledPackets.load();
-    uint64_t currentOutputTsMediaPackets = state->outputTsMediaPackets.load();
-    uint64_t currentOutputTsScrambledMediaPackets = state->outputTsScrambledMediaPackets.load();
     uint64_t currentOutputTsClearPesStarts = state->outputTsClearPesStarts.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
@@ -4610,8 +5149,6 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     uint64_t outputCcDelta = currentOutputCcErrors - state->lastOutputCcErrorsSample;
     uint64_t outputTsPayloadDelta = currentOutputTsPayloadPackets - state->lastOutputTsPayloadPacketsSample;
     uint64_t outputTsScrambledDelta = currentOutputTsScrambledPackets - state->lastOutputTsScrambledPacketsSample;
-    uint64_t outputTsMediaDelta = currentOutputTsMediaPackets - state->lastOutputTsMediaPacketsSample;
-    uint64_t outputTsScrambledMediaDelta = currentOutputTsScrambledMediaPackets - state->lastOutputTsScrambledMediaPacketsSample;
     uint64_t outputTsClearPesStartsDelta = currentOutputTsClearPesStarts - state->lastOutputTsClearPesStartsSample;
     double seconds = static_cast<double>(elapsedMs) / 1000.0;
 
@@ -4624,8 +5161,6 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     state->outputCcErrorsDelta = outputCcDelta;
     state->outputTsPayloadPacketsDelta = outputTsPayloadDelta;
     state->outputTsScrambledPacketsDelta = outputTsScrambledDelta;
-    state->outputTsMediaPacketsDelta = outputTsMediaDelta;
-    state->outputTsScrambledMediaPacketsDelta = outputTsScrambledMediaDelta;
     state->outputTsClearPesStartsDelta = outputTsClearPesStartsDelta;
 
     state->lastInputBytesSample = currentInputBytes;
@@ -4634,8 +5169,6 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     state->lastOutputCcErrorsSample = currentOutputCcErrors;
     state->lastOutputTsPayloadPacketsSample = currentOutputTsPayloadPackets;
     state->lastOutputTsScrambledPacketsSample = currentOutputTsScrambledPackets;
-    state->lastOutputTsMediaPacketsSample = currentOutputTsMediaPackets;
-    state->lastOutputTsScrambledMediaPacketsSample = currentOutputTsScrambledMediaPackets;
     state->lastOutputTsClearPesStartsSample = currentOutputTsClearPesStarts;
     state->lastBitrateSample = now;
 }
@@ -4892,7 +5425,17 @@ void StreamManager::monitorBus(const std::string& id) {
                     // Probe the primary input with an independent temporary pipeline.
                     // The active backup-file pipeline keeps playing uninterrupted while
                     // availability is checked. Switch only after real media data arrives.
-                    if (probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                    StreamConfig primaryProbeConfig = state->config;
+                    std::string primaryProbeUri = primaryUri;
+                    if (state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty()) {
+                        primaryProbeConfig.inputUri = state->sharedDvbServiceRelayUri;
+                        primaryProbeConfig.inputMode = "udp";
+                        primaryProbeConfig.inputInterfaceAddress.clear();
+                        primaryProbeConfig.inputInterfaceAddressConfigured = true;
+                        primaryProbeConfig.inputServiceId = 0;
+                        primaryProbeUri = state->sharedDvbServiceRelayUri;
+                    }
+                    if (probeInputAvailable(primaryProbeConfig, primaryProbeUri, kInputFailoverDelay)) {
                         notifyStreamState(
                             state->config,
                             "🟢",

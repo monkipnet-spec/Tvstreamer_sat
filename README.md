@@ -1,18 +1,41 @@
-# TVStreammerSAT5 — Release 13
+# TVStreammerSAT5 — Release 14
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 13 / v127.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 14 / v128.**
 
 
-### SPTS metadata, decode truth, equal tiles and DVB adapter selector (v127)
 
-v127 completes the single-program DVB cleanup by rewriting **both PAT and SDT** for the selected SID. The selected PMT/PCR/PES/teletext/subtitle packets remain byte-for-byte passthrough, while PID `0x0011` is replaced with a one-service SDT generated from the selected channel name/provider. VLC therefore no longer reconstructs the unused transponder service list from the original SDT. The expected log now contains `PAT=single-program SDT=single-service media=passthrough`.
+### Shared DVB frontend fan-out without remux (v128)
 
-The per-tile CA decode indicator is also made stricter. It learns the selected elementary-stream PIDs from PMT (with configured VPID/APID as fallback), counts scrambling only on those media PIDs, and requires a real clear PES boundary before showing **ДЕКОД: ОК**. Clear ECM/EMM/private sections can no longer create a false green decode state. If output exists but no selected video/audio/subtitle PES is confirmed, the tile shows **ДЕКОД: НЕТ МЕДИА**.
+Release 14 restores shared DVB frontend operation for channels on the same physical `adapter/frontend` and the same transponder. One `dvbsrc` owns the tuner and forwards the full transport stream to an internal loopback multicast relay. Every channel gets a lightweight internal service relay which keeps only its saved PMT/PCR/video/audio/teletext/subtitle/CA PID set and rewrites PAT/SDT to the selected SID. Unlike the old shared implementation, the service relay does **not** use `tsdemux -> mpegtsmux`, so the v122+ byte-preserving FTA/WISI path remains intact.
 
-All dashboard tiles now reserve the same DVB-meter and CA/decode row height, including FTA and non-DVB streams, and use a fixed common tile height. The Add Channel DVB dialog now provides discovered **Adapter** and **Frontend** values as drop-down lists populated from `/api/dvb-adapters`.
+Expected log sequence for two channels on adapter 5/frontend 0 is:
 
-The `StableUdpOutput` WISI five-second startup reservoir, PCR restamping, 20 ms periodic PCR and 7x188/1316-byte UDP packetisation are unchanged.
+```text
+Shared DVB frontend started: 5:0 ...
+DVB service relay started: stream=... SID=... mode=PID-passthrough-no-remux
+Shared DVB frontend reused: 5:0 consumers=2 ...
+DVB service relay started: stream=... SID=... mode=PID-passthrough-no-remux
+```
 
+If the same frontend is already tuned to a different transponder, startup is rejected with a clear error instead of trying to retune it. Failed GStreamer pipelines are explicitly driven to `GST_STATE_NULL` before unref, preventing the `Trying to dispose element ... but it is in READY` warning and deterministicly releasing the frontend descriptor. The Adapter/Frontend selectors also show current in-process consumers as `SHARED N` with the active frequency/polarization.
+
+The five-second WISI startup reservoir, StableUdpOutput PCR restamping/20 ms periodic PCR, and 7x188=1316 byte output packetization are unchanged.
+
+### DVB adapter selector, true SPTS service list and strict decode telemetry (v127)
+
+Release 13 changes the satellite **Adapter** and **Frontend** fields in **Добавить канал** to drop-down lists populated from `/api/dvb-adapters`. The selected `/dev/dvb/adapterN/frontendN` is stored in the normal `dvb://satellite?...` URI.
+
+The single-program PSI filter now rewrites both **PAT and SDT** for the selected SID. PMT/PCR/PES/video/audio/teletext/subtitle packets remain passthrough, while VLC receives only one advertised service instead of the complete transponder service list.
+
+```text
+DVB SPTS PSI filter: SID=<sid> PMT_PID=<pid> PAT=single-program SDT=single-service media=passthrough
+```
+
+The tile decode indicator now evaluates only actual outgoing A/V PIDs discovered from PMT (with configured VPID/APID as startup fallback). **ДЕКОД: ОК** additionally requires a valid clear PES start; clear PSI, ECM or teletext packets alone cannot turn the indicator green. Scrambled A/V or clear-looking payload without a valid PES is shown as **ДЕКОД: НЕТ**.
+
+All stream tiles use the same fixed layout height. FTA and non-DVB tiles reserve invisible meter/CA rows so all controls and rows align.
+
+`StableUdpOutput.cpp` and the WISI-specific five-second startup reservoir, PCR restamping, 20 ms periodic PCR generation and 7x188/1316-byte UDP packetisation are unchanged.
 
 ### Phoenix card-presence / 6 MHz ATR fix (v126)
 
@@ -35,12 +58,12 @@ The DVB SPTS path from v124 is unchanged. The WISI-specific five-second startup 
 
 ### DVB single-program PSI cleanup (v124)
 
-Release 10 fixes the case where VLC received the selected service media PIDs but still displayed every program from the satellite transponder. Linux `dvbsrc` PID filtering can preserve the original transponder PAT/SDT even after unrelated PES/PCR PIDs are removed. v124 keeps the selected PMT/PCR/video/audio/teletext/subtitle packets byte-for-byte and rewrites only PAT PID 0 so it advertises exactly one selected SID and its original PMT PID. Until the selected PMT is known the original all-program PAT is suppressed, preventing players from caching unrelated services. The five-second WISI startup reservoir, PCR restamping, 20 ms periodic PCR generation and 7x188 (1316-byte) UDP packetisation are unchanged.
+Release 10 introduced PAT single-program filtering after `dvbsrc` service PID selection. It keeps the selected PMT/PCR/video/audio/teletext/subtitle packets byte-for-byte and rewrites PAT PID 0 so it advertises exactly one selected SID and its original PMT PID. Some VLC builds still used the untouched transponder SDT to display unrelated service names; Release 13/v127 completes the cleanup by rewriting SDT too. The five-second WISI startup reservoir, PCR restamping, 20 ms periodic PCR generation and 7x188 (1316-byte) UDP packetisation are unchanged.
 
 Expected log line after the selected PMT has been identified:
 
 ```text
-DVB SPTS PSI filter: SID=<sid> PMT_PID=<pid> PAT=single-program media=passthrough SDT=preserved
+DVB SPTS PSI filter: SID=<sid> PMT_PID=<pid> PAT=single-program SDT=single-service media=passthrough
 ```
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
@@ -369,7 +392,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 13
+Description=TVStreammerSAT5 Release 14
 After=network-online.target
 Wants=network-online.target
 
