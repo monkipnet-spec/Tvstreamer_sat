@@ -1,6 +1,6 @@
-# TVStreammerSAT5 — Release 4
+# TVStreammerSAT5 — Release 5
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 4 / v118.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 5 / v119.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -11,6 +11,11 @@ The web interface includes **Add channel / Добавить канал** for sat
 While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
 
 Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; the runtime tunes `dvbsrc`, selects that program with `tsdemux`, and remuxes the service to MPEG-TS before the normal output pipeline.
+
+
+### Test-pattern SID / bitrate fix (v119)
+
+Release 5 fixes the satellite-channel replacement/test path. When a DVB channel has a configured input SID (for example 230), the internal `test://bars` transport is now demuxed in AUTO mode instead of trying to find that live DVB SID inside the synthetic TS. The same AUTO rule is applied to DVB output remuxing because the DVB source chain has already selected the requested SID before producing a clean single-program TS. The synthetic test source queue is also exposed to the normal input bitrate probe, so both input and output bitrate become visible while the test pattern is running. The 5-second WISI startup reservoir and periodic-PCR shaper are unchanged.
 
 ### WISI-compatible UDP reservoir (v118)
 

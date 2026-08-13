@@ -3070,7 +3070,10 @@ GstElement* StreamManager::createTestPatternChain(const StreamConfig& cfg, GstEl
     GstElement* audioParser = gst_element_factory_make("aacparse", "test_tone_aacparse");
     GstElement* audioQueue = gst_element_factory_make("queue", "test_tone_queue");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "test_bars_mux");
-    GstElement* queue = gst_element_factory_make("queue", "test_bars_queue");
+    // Keep the test source visible to the normal input bitrate probe.
+    // The previous name (test_bars_queue) was not searched by attachBitrateProbes(),
+    // which made a healthy test pattern show Bitrate In = 0/—.
+    GstElement* queue = gst_element_factory_make("queue", "input_queue");
 
     if (!src || !capsfilter || !convert || !encoder || !parser || !videoQueue ||
         !audioSrc || !audioConvert || !audioResample || !audioCapsfilter || !audioEncoder ||
@@ -3317,7 +3320,17 @@ bool StreamManager::buildRemapPipeline(
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
             return false;
         }
-        const uint32_t inputServiceId = cfg.inputServiceId;
+        // Test pattern and DVB source chains are already a clean single-program TS
+        // before they reach the output branch.  The DVB chain has already selected
+        // cfg.inputServiceId at its first tsdemux.  Selecting that original SID a
+        // second time here is wrong because the intermediate mpegtsmux creates a new
+        // single-program transport (normally program 1).  The same applies to the
+        // synthetic test transport.  AUTO therefore selects the only program here.
+        // Other multi-program inputs (UDP/SRT/File/etc.) still use inputServiceId.
+        const bool sourceAlreadySingleProgram =
+            cfg.testPattern ||
+            tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(cfg));
+        const uint32_t inputServiceId = sourceAlreadySingleProgram ? 0U : cfg.inputServiceId;
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
         }
