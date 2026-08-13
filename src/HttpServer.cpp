@@ -29,8 +29,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 6";
-constexpr const char* kProgramVersion = "v120";
+constexpr const char* kProgramRelease = "Release 7";
+constexpr const char* kProgramVersion = "v121";
 
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
@@ -1721,8 +1721,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .modal-content.satellite-modal{width:min(920px,100%);max-height:calc(100% - 12px);margin:0 auto}
 .sat-signal-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) auto;gap:10px;align-items:center;margin-bottom:14px;padding:12px;background:rgba(31,139,255,.08);border:1px solid rgba(57,189,248,.18);border-radius:14px}
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
-.sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
-@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 68px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(5),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(5){display:none}}
+.sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
+@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
 </style>
@@ -2356,7 +2356,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 6'} / ${state.program_version||'v120'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 7'} / ${state.program_version||'v121'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -2507,18 +2507,19 @@ function renderSatelliteServices() {
     return;
   }
   container.innerHTML = `
-    <div class="sat-service-head"><span><input id="satSelectAll" type="checkbox" checked onchange="toggleAllSatelliteServices(this.checked)" /></span><span>Канал</span><span>Провайдер</span><span>SID</span><span>PMT PID</span></div>
+    <div class="sat-service-head"><span><input id="satSelectAll" type="checkbox" checked onchange="toggleAllSatelliteServices(this.checked)" /></span><span>Канал</span><span>Провайдер</span><span>Доступ</span><span>SID</span><span>PMT PID</span></div>
     ${satelliteServices.map((service,index)=>`
       <label class="sat-service-row">
-        <input class="sat-service-check" type="checkbox" data-index="${index}" checked />
+        <input class="sat-service-check" type="checkbox" data-index="${index}" ${service.pmt_ready===false ? 'disabled' : 'checked'} />
         <span class="sat-service-name" title="${satEscape(service.name)}">${satEscape(service.name || ('Service ' + service.service_id))}</span>
         <span class="sat-service-provider" title="${satEscape(service.provider)}">${satEscape(service.provider || '—')}</span>
+        <span><span class="sat-access ${service.scrambled ? 'ca' : (service.pmt_ready===false ? 'unknown' : 'fta')}" title="${service.scrambled ? 'Кодированный канал (CA)' : (service.pmt_ready===false ? 'PMT/PID ещё не получены' : 'Открытый канал (FTA)')}">${service.scrambled ? 'КОД.' : (service.pmt_ready===false ? 'ПРОВ.' : 'FTA')}</span></span>
         <span>${Number(service.service_id || 0)}</span>
-        <span>${Number(service.pmt_pid || 0)}</span>
+        <span title="PCR PID: ${Number(service.pcr_pid || 0)}; PIDs: ${(Array.isArray(service.stream_pids) ? service.stream_pids : []).join(', ')}">${Number(service.pmt_pid || 0)}</span>
       </label>`).join('')}`;
 }
 function toggleAllSatelliteServices(checked) {
-  document.querySelectorAll('.sat-service-check').forEach(input => { input.checked = checked; });
+  document.querySelectorAll('.sat-service-check:not(:disabled)').forEach(input => { input.checked = checked; });
 }
 async function startSatelliteScan() {
   const button = document.getElementById('satScanButton');
@@ -2538,9 +2539,12 @@ async function startSatelliteScan() {
     satelliteServices = Array.isArray(data.services) ? data.services : [];
     renderSatelliteServices();
     if (status) {
+      const caCount = satelliteServices.filter(service=>service.scrambled === true).length;
+      const pendingCount = satelliteServices.filter(service=>service.pmt_ready === false).length;
+      const ftaCount = satelliteServices.filter(service=>service.scrambled !== true && service.pmt_ready !== false).length;
       status.textContent = data.error && !satelliteServices.length
         ? data.error
-        : `Найдено каналов: ${satelliteServices.length}${data.error ? ` (${data.error})` : ''}`;
+        : `Найдено: ${satelliteServices.length} · FTA: ${ftaCount} · Код.: ${caCount}${pendingCount ? ` · PMT: ${pendingCount} не готово` : ''}${data.error ? ` (${data.error})` : ''}`;
     }
   } catch (error) {
     satelliteServices = [];

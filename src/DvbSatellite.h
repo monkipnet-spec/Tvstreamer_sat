@@ -20,6 +20,8 @@ struct DvbSatelliteParams {
     uint32_t lnbLof2KHz = 10600000;
     uint32_t lnbSlofKHz = 11700000;
     int streamId = -1;
+    // Colon-separated DVB PID filter. 8192 means full transport stream.
+    std::string pids = "8192";
 };
 
 namespace DvbSatellite {
@@ -34,5 +36,9 @@ Json::Value scan(const Json::Value& request);
 Json::Value signal(const Json::Value& request);
 // Read current frontend statistics without retuning it. Safe for live DVB tiles.
 Json::Value signalFromUri(const std::string& uri);
+// Resolve the PMT/PCR/elementary PIDs for one service so dvbsrc can capture
+// the complete service without relying on tsparse program_%u filtering.
+bool resolveServicePids(const DvbSatelliteParams& params, uint32_t serviceId,
+                        std::string& pids, bool& scrambled, std::string& error);
 
 } // namespace DvbSatellite

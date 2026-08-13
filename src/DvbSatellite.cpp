@@ -27,7 +27,12 @@ namespace {
 struct DvbService {
     uint16_t serviceId = 0;
     uint16_t pmtPid = 0;
+    uint16_t pcrPid = 0x1FFF;
     uint8_t serviceType = 0;
+    bool scrambled = false;
+    bool pmtParsed = false;
+    std::vector<uint16_t> streamPids;
+    std::vector<uint16_t> caPids;
     std::string name;
     std::string provider;
 };
@@ -315,7 +320,17 @@ public:
             item.serviceId = sid;
             item.pmtPid = pmt;
             const auto meta = serviceMap.find(sid);
-            if (meta != serviceMap.end()) item = meta->second, item.pmtPid = pmt;
+            if (meta != serviceMap.end()) {
+                item = meta->second;
+                item.serviceId = sid;
+                item.pmtPid = pmt;
+            }
+            if (item.scrambled) {
+                for (uint16_t caPid : catCaPids) {
+                    if (std::find(item.caPids.begin(), item.caPids.end(), caPid) == item.caPids.end())
+                        item.caPids.push_back(caPid);
+                }
+            }
             if (item.name.empty()) item.name = "Service " + std::to_string(sid);
             result.push_back(std::move(item));
         }
@@ -332,10 +347,31 @@ private:
         size_t expected = 0;
     };
 
+    bool isPmtPid(uint16_t pid) const {
+        for (const auto& [sid, pmtPid] : programMap) {
+            (void)sid;
+            if (pmtPid == pid) return true;
+        }
+        return false;
+    }
+
+    void markPacketScrambled(uint16_t pid) {
+        for (auto& [sid, service] : serviceMap) {
+            (void)sid;
+            if (service.pcrPid == pid ||
+                std::find(service.streamPids.begin(), service.streamPids.end(), pid) != service.streamPids.end()) {
+                service.scrambled = true;
+            }
+        }
+    }
+
     void parsePacket(const uint8_t* packet) {
         if (packet[0] != 0x47 || (packet[1] & 0x80)) return;
         const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
-        if (pid != 0x0000 && pid != 0x0011) return;
+        const uint8_t scrambling = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
+        if (scrambling != 0) markPacketScrambled(pid);
+
+        if (pid != 0x0000 && pid != 0x0001 && pid != 0x0011 && !isPmtPid(pid)) return;
         const bool payloadStart = (packet[1] & 0x40) != 0;
         const uint8_t adaptation = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
         if (adaptation == 0 || adaptation == 2) return;
@@ -421,7 +457,9 @@ private:
 
     void parseSection(uint16_t pid, const uint8_t* section, size_t size) {
         if (pid == 0x0000) parsePat(section, size);
+        else if (pid == 0x0001) parseCat(section, size);
         else if (pid == 0x0011) parseSdt(section, size);
+        else if (isPmtPid(pid)) parsePmt(section, size);
     }
 
     void parsePat(const uint8_t* section, size_t size) {
@@ -430,8 +468,79 @@ private:
         for (size_t pos = 8; pos + 4 <= end; pos += 4) {
             const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
             const uint16_t pid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
-            if (program != 0) programMap[program] = pid;
+            if (program != 0) {
+                programMap[program] = pid;
+                DvbService& service = serviceMap[program];
+                service.serviceId = program;
+                service.pmtPid = pid;
+            }
         }
+    }
+
+    static bool collectCaDescriptors(const uint8_t* data, size_t size, std::vector<uint16_t>* caPids) {
+        bool found = false;
+        size_t pos = 0;
+        while (pos + 2 <= size) {
+            const uint8_t tag = data[pos];
+            const size_t length = data[pos + 1];
+            if (pos + 2 + length > size) break;
+            if (tag == 0x09) { // conditional_access_descriptor
+                found = true;
+                if (caPids && length >= 4) {
+                    const uint8_t* d = data + pos + 2;
+                    const uint16_t caPid = static_cast<uint16_t>(((d[2] & 0x1F) << 8) | d[3]);
+                    if (caPid < 0x1FFF &&
+                        std::find(caPids->begin(), caPids->end(), caPid) == caPids->end()) {
+                        caPids->push_back(caPid);
+                    }
+                }
+            }
+            pos += 2 + length;
+        }
+        return found;
+    }
+
+    void parseCat(const uint8_t* section, size_t size) {
+        if (size < 12 || section[0] != 0x01) return;
+        const size_t end = size >= 4 ? size - 4 : 0;
+        if (end <= 8) return;
+        std::vector<uint16_t> found;
+        collectCaDescriptors(section + 8, end - 8, &found);
+        for (uint16_t pid : found) catCaPids.insert(pid);
+    }
+
+    void parsePmt(const uint8_t* section, size_t size) {
+        if (size < 16 || section[0] != 0x02) return;
+        const uint16_t sid = static_cast<uint16_t>((section[3] << 8) | section[4]);
+        const size_t end = size >= 4 ? size - 4 : 0;
+        if (end <= 12) return;
+
+        DvbService& service = serviceMap[sid];
+        service.serviceId = sid;
+        if (const auto it = programMap.find(sid); it != programMap.end()) service.pmtPid = it->second;
+        service.pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);
+
+        const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
+        size_t pos = 12;
+        if (pos + programInfoLength > end) return;
+        if (collectCaDescriptors(section + pos, programInfoLength, &service.caPids)) service.scrambled = true;
+        pos += programInfoLength;
+
+        std::vector<uint16_t> streamPids;
+        while (pos + 5 <= end) {
+            const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+            const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+            pos += 5;
+            if (pos + esInfoLength > end) break;
+            if (collectCaDescriptors(section + pos, esInfoLength, &service.caPids)) service.scrambled = true;
+            if (elementaryPid != 0x1FFF &&
+                std::find(streamPids.begin(), streamPids.end(), elementaryPid) == streamPids.end()) {
+                streamPids.push_back(elementaryPid);
+            }
+            pos += esInfoLength;
+        }
+        if (!streamPids.empty()) service.streamPids = std::move(streamPids);
+        service.pmtParsed = true;
     }
 
     void parseSdt(const uint8_t* section, size_t size) {
@@ -439,8 +548,10 @@ private:
         const size_t end = size >= 4 ? size - 4 : 0;
         size_t pos = 11;
         while (pos + 5 <= end) {
-            DvbService service;
-            service.serviceId = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            const uint16_t sid = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+            DvbService& service = serviceMap[sid];
+            service.serviceId = sid;
+            if ((section[pos + 3] & 0x10) != 0) service.scrambled = true; // free_CA_mode
             const size_t descriptorLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
             pos += 5;
             const size_t descriptorEnd = std::min(end, pos + descriptorLength);
@@ -465,11 +576,12 @@ private:
                             service.name = decodeDvbText(descriptor + inner, nameLength);
                         }
                     }
+                } else if (tag == 0x09) {
+                    service.scrambled = true;
                 }
                 pos += 2 + length;
             }
             pos = descriptorEnd;
-            serviceMap[service.serviceId] = std::move(service);
         }
     }
 
@@ -477,7 +589,32 @@ private:
     std::map<uint16_t, SectionState> sections;
     std::map<uint16_t, uint16_t> programMap;
     std::map<uint16_t, DvbService> serviceMap;
+    std::set<uint16_t> catCaPids;
 };
+
+std::string servicePidsString(const DvbService& service) {
+    // Never build a PSI-only service filter. If PMT/ES data has not arrived,
+    // keep the full transport stream so startup can retry PID discovery.
+    if (!service.pmtParsed || service.streamPids.empty()) return {};
+
+    std::set<uint16_t> pids = {0x0000, 0x0001, 0x0010, 0x0011, 0x0012, 0x0014};
+    if (service.pmtPid > 0 && service.pmtPid < 0x1FFF) pids.insert(service.pmtPid);
+    if (service.pcrPid < 0x1FFF) pids.insert(service.pcrPid);
+    for (uint16_t pid : service.streamPids) {
+        if (pid < 0x1FFF) pids.insert(pid);
+    }
+    for (uint16_t pid : service.caPids) {
+        if (pid < 0x1FFF) pids.insert(pid);
+    }
+    std::ostringstream out;
+    bool first = true;
+    for (uint16_t pid : pids) {
+        if (!first) out << ':';
+        first = false;
+        out << pid;
+    }
+    return out.str();
+}
 
 bool waitForTune(GstElement* pipeline, GstElement* sink, const DvbSatelliteParams& params,
                  int timeoutMs, PsiScanner* scanner, FrontendStats& bestStats, std::string& error) {
@@ -616,10 +753,25 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
             Json::Value item;
             item["service_id"] = service.serviceId;
             item["pmt_pid"] = service.pmtPid;
+            item["pcr_pid"] = service.pcrPid < 0x1FFF ? service.pcrPid : 0;
             item["service_type"] = service.serviceType;
             item["name"] = service.name;
             item["provider"] = service.provider;
-            item["input_uri"] = DvbSatellite::buildUri(params);
+            item["scrambled"] = service.scrambled;
+            const bool pmtReady = service.pmtParsed && !service.streamPids.empty();
+            item["pmt_ready"] = pmtReady;
+            item["access"] = service.scrambled ? "CA" : (pmtReady ? "FTA" : "UNKNOWN");
+            Json::Value streamPids(Json::arrayValue);
+            for (uint16_t pid : service.streamPids) streamPids.append(pid);
+            item["stream_pids"] = streamPids;
+            Json::Value caPids(Json::arrayValue);
+            for (uint16_t pid : service.caPids) caPids.append(pid);
+            item["ca_pids"] = caPids;
+            const std::string pids = servicePidsString(service);
+            item["service_pids"] = pids;
+            DvbSatelliteParams serviceParams = params;
+            serviceParams.pids = pids.empty() ? "8192" : pids;
+            item["input_uri"] = DvbSatellite::buildUri(serviceParams);
             services.append(item);
         }
         result["services"] = services;
@@ -658,6 +810,7 @@ bool parseUri(const std::string& uri, DvbSatelliteParams& params, std::string& e
     if (const auto it = query.find("delivery_system"); it != query.end()) params.deliverySystem = lower(it->second);
     if (const auto it = query.find("modulation"); it != query.end()) params.modulation = lower(it->second);
     if (const auto it = query.find("fec"); it != query.end()) params.fec = lower(it->second);
+    if (const auto it = query.find("pids"); it != query.end() && !it->second.empty()) params.pids = it->second;
 
     if (params.frequencyKHz < 900000 || params.frequencyKHz > 14000000 ||
         params.symbolRateK < 100 || params.symbolRateK > 60000 ||
@@ -683,7 +836,8 @@ std::string buildUri(const DvbSatelliteParams& params) {
         << "&lnb_lof1_khz=" << params.lnbLof1KHz
         << "&lnb_lof2_khz=" << params.lnbLof2KHz
         << "&lnb_slof_khz=" << params.lnbSlofKHz
-        << "&stream_id=" << params.streamId;
+        << "&stream_id=" << params.streamId
+        << "&pids=" << percentEncode(params.pids.empty() ? "8192" : params.pids);
     return uri.str();
 }
 
@@ -708,7 +862,7 @@ bool configureSource(GstElement* source, const DvbSatelliteParams& params, std::
         "lnb-lof1", params.lnbLof1KHz,
         "lnb-lof2", params.lnbLof2KHz,
         "lnb-slof", params.lnbSlofKHz,
-        "pids", "8192",
+        "pids", (params.pids.empty() ? "8192" : params.pids.c_str()),
         "stats-reporting-interval", 20U,
         "tuning-timeout", static_cast<guint64>(5000000),
         nullptr);
@@ -807,6 +961,34 @@ Json::Value signalFromUri(const std::string& uri) {
     result["adapter"] = params.adapter;
     result["frontend"] = params.frontend;
     return result;
+}
+
+bool resolveServicePids(const DvbSatelliteParams& params, uint32_t serviceId,
+                        std::string& pids, bool& scrambled, std::string& error) {
+    pids.clear();
+    scrambled = false;
+    if (serviceId == 0 || serviceId > 0xFFFF) {
+        error = "Invalid DVB service id";
+        return false;
+    }
+
+    DvbSatelliteParams scanParams = params;
+    scanParams.pids = "8192";
+    Json::Value result = runTune(scanParams, true, 3200);
+    if (result.isMember("services") && result["services"].isArray()) {
+        for (const auto& item : result["services"]) {
+            if (item.get("service_id", 0).asUInt() != serviceId) continue;
+            pids = item.get("service_pids", "").asString();
+            scrambled = item.get("scrambled", false).asBool();
+            if (!pids.empty()) {
+                error.clear();
+                return true;
+            }
+        }
+    }
+    error = result.get("error", "").asString();
+    if (error.empty()) error = "DVB service PMT/PIDs not found for SID " + std::to_string(serviceId);
+    return false;
 }
 
 } // namespace DvbSatellite

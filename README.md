@@ -1,6 +1,6 @@
-# TVStreammerSAT5 — Release 6
+# TVStreammerSAT5 — Release 7
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 6 / v120.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 7 / v121.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -8,13 +8,17 @@ The application receives live streams, monitors their state and bitrate, can swi
 
 The web interface includes **Add channel / Добавить канал** for satellite tuners exposed by Linux as `/dev/dvb/adapterN/frontendN`. The dialog accepts satellite frequency in **MHz**, symbol rate in kSym/s, polarity, DVB-S/DVB-S2, modulation/FEC, DiSEqC input, LNB LOF values and optional DVB-S2 stream ID.
 
-While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
+While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/PMT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
 
-Satellite streams are stored as `dvb://satellite?...` inputs. Each tile keeps the selected `input_service_id`; Release 6 tunes `dvbsrc` and selects that SID directly at MPEG-TS level with the `tsparse program_%u` request pad. The complete selected service is kept as SPTS, so original PMT/PCR and codec PIDs are preserved before the normal output path.
+Satellite streams are stored as `dvb://satellite?...` inputs. Each scan result now includes the PMT/PCR and every elementary PID of the selected service. Release 7 stores that PID list in the channel URI and configures `dvbsrc` to capture the complete service directly, avoiding the `tsparse program_%u` request-pad path that could forward only PSI/SI on some GStreamer builds. The normal WISI-compatible 5-second UDP reservoir remains unchanged.
+
+### DVB service PID capture + FTA/CA scan indication (v121)
+
+Release 7 fixes the case where a locked DVB-S/S2 channel showed only about 50–100 kbit/s input bitrate. That rate is characteristic of PAT/PMT/SDT/NIT and other service information without the video/audio PES packets. The scanner now parses PMT tables, records PCR and all elementary PIDs, detects Conditional Access from SDT/PMT CA signalling, and marks each scan result as **FTA** or **КОД.**. New channels carry their exact `dvbsrc` PID filter; older v120 channels automatically resolve the PID list at startup and fall back to the full transponder only if PMT discovery fails.
 
 ### FTA DVB SPTS + tile signal meters (v120)
 
-Release 6 removes the DVB `tsdemux -> elementary parsers -> mpegtsmux` stage from normal satellite passthrough. That stage could leave a locked FTA transponder with no bytes after service selection when a service used an elementary-stream layout that the remux path did not accept. Selected DVB services now remain MPEG-TS throughout SID selection. UDP without explicit PID/SID remapping feeds this selected SPTS directly into the WISI-compatible StableUdpOutput sender.
+Release 6 removed the DVB `tsdemux -> elementary parsers -> mpegtsmux` stage from normal satellite passthrough. Release 7 keeps that principle but replaces `tsparse program_%u` service filtering with deterministic `dvbsrc` PID capture. UDP without explicit PID/SID remapping continues into the WISI-compatible StableUdpOutput sender.
 
 DVB tiles now show two compact live bars at the top: **S** (frontend signal strength) and **Q** (frontend quality/CNR-derived percentage). The dashboard reads frontend statistics with Linux DVB ioctls only; it does not instantiate a second `dvbsrc` or retune the live frontend. VBR/CBR is displayed at the top-right next to the delete button.
 
@@ -304,7 +308,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 6
+Description=TVStreammerSAT5 Release 7
 After=network-online.target
 Wants=network-online.target
 

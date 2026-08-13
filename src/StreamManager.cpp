@@ -2719,14 +2719,37 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
+        // v121 selects the service at the DVB demux/filter level.  On GStreamer
+        // versions used by Ubuntu 24.04 the tsparse program_%u request pad can
+        // deliver PAT/PMT/SI while failing to forward the service PES packets
+        // (the observed symptom is ~50-100 kbit/s instead of the TV service).
+        // Resolve PMT/PCR/ES PIDs and ask dvbsrc to capture exactly those PIDs,
+        // then use tsparse's normal src pad. This preserves all codec/private
+        // PES packets and avoids the request-pad segment-event warning.
+        bool serviceScrambled = false;
+        std::string servicePidError;
+        if (cfg.inputServiceId > 0 && (params.pids.empty() || params.pids == "8192")) {
+            std::string resolvedPids;
+            if (DvbSatellite::resolveServicePids(
+                    params, cfg.inputServiceId, resolvedPids, serviceScrambled, servicePidError)) {
+                params.pids = resolvedPids;
+                std::cerr << "DVB service PID auto-resolve: SID=" << cfg.inputServiceId
+                          << " pids=" << params.pids
+                          << " access=" << (serviceScrambled ? "CA" : "FTA") << std::endl;
+            } else {
+                // Never fall back to tsparse program_%u: full TS is preferable to
+                // a false 93-kbit/s service. New scan-created tiles already carry
+                // their service PID list in the dvb:// URI, so this path is mainly
+                // for configurations created by v120 and older.
+                params.pids = "8192";
+                std::cerr << "DVB service PID auto-resolve failed for SID=" << cfg.inputServiceId
+                          << ": " << servicePidError
+                          << "; falling back to full transport stream" << std::endl;
+            }
+        }
+
         GstElement* src = gst_element_factory_make("dvbsrc", "input_dvb_src");
         GstElement* parse = gst_element_factory_make("tsparse", "input_dvb_tsparse");
-        // Select the requested DVB program while it is still MPEG-TS.  The old
-        // tsdemux -> elementary parsers -> mpegtsmux path could reject otherwise
-        // valid FTA services (for example unusual audio/private stream layouts)
-        // and then the watchdog reported NO INPUT SIGNAL although the frontend
-        // remained locked.  tsparse program_%u preserves the complete selected
-        // service, including its original PMT/PCR/codec PIDs, without decoding.
         GstElement* queue = gst_element_factory_make("queue", "input_selected_queue");
         if (!src || !parse || !queue ||
             !addElementOrFail(pipeline, src) ||
@@ -2741,30 +2764,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
         configureTsPacketAlignment(parse);
         configureQueue(queue, 3000000000ULL);
-        if (!gst_element_link(src, parse)) {
-            std::cerr << "DVB input pipeline link failed: dvbsrc -> tsparse" << std::endl;
-            return nullptr;
-        }
-
-        if (cfg.inputServiceId > 0) {
-            GstPadTemplate* programTemplate = gst_element_class_get_pad_template(
-                GST_ELEMENT_GET_CLASS(parse), "program_%u");
-            const std::string programPadName = "program_" + std::to_string(cfg.inputServiceId);
-            GstPad* programPad = programTemplate
-                ? gst_element_request_pad(parse, programTemplate, programPadName.c_str(), nullptr)
-                : nullptr;
-            GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
-            const bool linked = programPad && queueSinkPad &&
-                gst_pad_link(programPad, queueSinkPad) == GST_PAD_LINK_OK;
-            if (queueSinkPad) gst_object_unref(queueSinkPad);
-            if (programPad) gst_object_unref(programPad);
-            if (!linked) {
-                std::cerr << "DVB program selection failed: could not request/link "
-                          << programPadName << " from tsparse" << std::endl;
-                return nullptr;
-            }
-        } else if (!gst_element_link(parse, queue)) {
-            std::cerr << "DVB AUTO input pipeline link failed: tsparse -> queue" << std::endl;
+        if (!gst_element_link_many(src, parse, queue, nullptr)) {
+            std::cerr << "DVB input pipeline link failed: dvbsrc -> tsparse -> queue" << std::endl;
             return nullptr;
         }
 
@@ -2775,7 +2776,9 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                   << " polarity=" << params.polarity
                   << " delsys=" << params.deliverySystem
                   << " input_sid=" << cfg.inputServiceId
-                  << " selection=" << (cfg.inputServiceId > 0 ? "tsparse-program" : "full-ts-auto")
+                  << " selection=" << ((cfg.inputServiceId > 0 && params.pids != "8192")
+                        ? "dvbsrc-service-pids" : "full-ts")
+                  << " pids=" << params.pids
                   << std::endl;
 
         terminalElement = queue;
@@ -3230,11 +3233,12 @@ bool StreamManager::buildOutputBranch(
     const bool sourceAlreadySingleProgramTs = state && (
         state->config.testPattern ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->config.inputServiceId > 0));
-    // DVB SID selection is now done directly by tsparse program_%u, producing a
-    // complete SPTS. Test bars are also already a complete SPTS. Feeding either
-    // through another tsdemux/mpegtsmux cycle can drop valid streams and is not
-    // required by StableUdpOutput/WISI shaping. Remux only when explicit PID/SID
-    // remapping was requested, or when a generic multi-program input needs it.
+    // DVB service selection is done by dvbsrc PID filters resolved from the
+    // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
+    // also already a complete SPTS. Feeding either through another
+    // tsdemux/mpegtsmux cycle can drop valid/private streams and is not required
+    // by StableUdpOutput/WISI shaping. Remux only for explicit PID/SID remapping
+    // or a generic multi-program input.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
     const bool needsRemux = (outputConfig.remapEnabled || stableUdpRemux) && !transcodedInput;
