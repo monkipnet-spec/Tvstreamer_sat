@@ -30,7 +30,6 @@ namespace {
 
 constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
-constexpr guint64 kTsSmoothingLatency = 300 * GST_MSECOND;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
@@ -3266,7 +3265,20 @@ bool StreamManager::buildPassthroughPipeline(
         return false;
     }
     const StreamConfig& cfg = outputConfig;
-    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
+
+    // v122: StableUdpOutput already owns the output clock, five-second WISI
+    // reservoir and PCR restamping.  A second tsparse with set-timestamps and
+    // smoothing-latency immediately before the appsink can wait indefinitely
+    // for an input PCR/timeline even while the selected DVB SPTS is flowing.
+    // The observed signature was a healthy ~2 Mbit/s DVB input but only 2632
+    // bytes (two 1316-byte chunks) reaching the reservoir, pcr_pid=0x1fff and
+    // Bitrate Out=0.  Feed the already-normalised MPEG-TS directly to the
+    // reservoir for UDP; all source chains reaching this function expose TS,
+    // and DVB/test chains are already packet-aligned upstream.
+    const bool directStableUdpTs = usesStableUdpShaper(cfg);
+    GstElement* tsparse = directStableUdpTs
+        ? nullptr
+        : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
     GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     const bool cbrPacingActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
     GstElement* pacer = cbrPacingActive
@@ -3274,11 +3286,11 @@ bool StreamManager::buildPassthroughPipeline(
         : nullptr;
     GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
 
-    if (!tsparse || !queue || !sink || (cbrPacingActive && !pacer)) {
+    if ((!directStableUdpTs && !tsparse) || !queue || !sink || (cbrPacingActive && !pacer)) {
         return false;
     }
 
-    if (!addElementOrFail(pipeline, tsparse) ||
+    if ((!directStableUdpTs && !addElementOrFail(pipeline, tsparse)) ||
         !addElementOrFail(pipeline, queue) ||
         (pacer && !addElementOrFail(pipeline, pacer))) {
         return false;
@@ -3286,12 +3298,15 @@ bool StreamManager::buildPassthroughPipeline(
 
     configureOutputQueue(queue, cfg);
     configureCbrPacer(pacer, cfg);
-    configureTsPacketAlignment(tsparse);
-    if (isUdpOutput(cfg)) {
-        setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
-        setUInt64PropertyIfPresent(tsparse, "smoothing-latency", kTsSmoothingLatency);
+
+    if (directStableUdpTs) {
+        std::cerr << "Stable UDP passthrough: direct MPEG-TS -> WISI reservoir"
+                  << " timestamp_tsparse=off smoothing=off"
+                  << " packetization=preserve-upstream" << std::endl;
+        return gst_element_link_many(sourceTail, queue, sink, nullptr);
     }
 
+    configureTsPacketAlignment(tsparse);
     return pacer
         ? gst_element_link_many(sourceTail, tsparse, queue, pacer, sink, nullptr)
         : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);

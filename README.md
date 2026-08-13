@@ -1,6 +1,6 @@
-# TVStreammerSAT5 — Release 7
+# TVStreammerSAT5 — Release 8
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 7 / v121.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 8 / v122.**
 
 The application receives live streams, monitors their state and bitrate, can switch to a backup input, optionally transcodes video/audio with GStreamer, remaps MPEG-TS service metadata where supported, and publishes one or more output formats.
 
@@ -11,6 +11,17 @@ The web interface includes **Add channel / Добавить канал** for sat
 While the dialog is open, TVStreammerSAT5 shows frontend lock, signal and quality. **Scan channels / Сканировать каналы** tunes the selected transponder, reads PAT/PMT/SDT tables, lists discovered services with SID/provider information, and lets the operator select which services to save. Saving creates one normal stream tile per selected service. UDP output ports are allocated sequentially from the configured first port, and the dialog lets the operator choose the output network interface used for multicast.
 
 Satellite streams are stored as `dvb://satellite?...` inputs. Each scan result now includes the PMT/PCR and every elementary PID of the selected service. Release 7 stores that PID list in the channel URI and configures `dvbsrc` to capture the complete service directly, avoiding the `tsparse program_%u` request-pad path that could forward only PSI/SI on some GStreamer builds. The normal WISI-compatible 5-second UDP reservoir remains unchanged.
+
+
+### Stable UDP DVB passthrough fix (v122)
+
+Release 8 fixes a zero-output condition where the selected DVB service was healthy at the input (for example ~2.1 Mbit/s) but StableUdpOutput received only two 1316-byte chunks and then reported no PCR (`pcr_pid=8191`). The cause was a redundant output `tsparse` configured with timestamp generation and smoothing immediately before the WISI reservoir. StableUdpOutput already owns the output timeline and PCR restamping, so UDP passthrough now feeds the already-normalised MPEG-TS directly into the five-second reservoir. The WISI startup reservoir, 20 ms periodic PCR generation and 7x188 UDP packetisation are unchanged.
+
+Expected v122 log line for a normal UDP passthrough branch:
+
+```text
+Stable UDP passthrough: direct MPEG-TS -> WISI reservoir timestamp_tsparse=off smoothing=off packetization=preserve-upstream
+```
 
 ### DVB service PID capture + FTA/CA scan indication (v121)
 
@@ -308,7 +319,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 7
+Description=TVStreammerSAT5 Release 8
 After=network-online.target
 Wants=network-online.target
 
