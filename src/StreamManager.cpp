@@ -238,7 +238,7 @@ GstPadProbeReturn sharedDvbPidStatsProbe(
             ctx->packets[pid] * kTsPacketSize * 8.0 / seconds / 1000.0);
         present << pid << '=' << kbps;
     }
-    std::cerr << "Shared DVB PID stats: frontend=" << ctx->frontendKey
+    std::cerr << "Shared DVB PID stats: stage=dvbsrc-src frontend=" << ctx->frontendKey
               << " total=" << totalKbps << "kbps"
               << " present=" << (first ? "none" : present.str()) << std::endl;
     ctx->packets.fill(0);
@@ -2337,11 +2337,10 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
 
     GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
     GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
-    GstElement* parse = gst_element_factory_make("tsparse", "shared_dvb_tsparse");
     GstElement* queue = gst_element_factory_make("queue", "shared_dvb_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "shared_dvb_multicast_sink");
-    if (!pipeline || !source || !parse || !queue || !sink ||
-        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, parse) ||
+    if (!pipeline || !source || !queue || !sink ||
+        !addElementOrFail(pipeline, source) ||
         !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -2360,8 +2359,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
-    configureTsPacketAlignment(parse);
-    GstPad* statsPad = gst_element_get_static_pad(parse, "src");
+    GstPad* statsPad = gst_element_get_static_pad(source, "src");
     if (statsPad) {
         auto* statsContext = new SharedDvbPidStatsContext();
         statsContext->frontendKey = frontendKey;
@@ -2387,7 +2385,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     setIntPropertyIfPresent(sink, "ttl-mc", 1);
     setIntPropertyIfPresent(sink, "buffer-size", 16 * 1024 * 1024);
 
-    if (!gst_element_link_many(source, parse, queue, sink, nullptr)) {
+    if (!gst_element_link_many(source, queue, sink, nullptr)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         error = "failed to link shared DVB frontend pipeline";
