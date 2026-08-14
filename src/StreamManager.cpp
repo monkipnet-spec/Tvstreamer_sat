@@ -193,6 +193,60 @@ struct DvbSingleProgramPsiContext {
     size_t pmtSectionExpected = 0;
 };
 
+struct SharedDvbPidStatsContext {
+    std::string frontendKey;
+    std::array<uint64_t, 8192> packets {};
+    uint64_t totalPackets = 0;
+    std::chrono::steady_clock::time_point windowStarted =
+        std::chrono::steady_clock::now();
+};
+
+GstPadProbeReturn sharedDvbPidStatsProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<SharedDvbPidStatsContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    for (size_t offset = 0; offset + kTsPacketSize <= map.size;
+         offset += kTsPacketSize) {
+        const uint8_t* packet = map.data + offset;
+        if (packet[0] != 0x47) continue;
+        const uint16_t pid = static_cast<uint16_t>(
+            ((packet[1] & 0x1F) << 8) | packet[2]);
+        ++ctx->packets[pid];
+        ++ctx->totalPackets;
+    }
+    gst_buffer_unmap(buffer, &map);
+
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(
+        now - ctx->windowStarted).count();
+    if (seconds < 10.0) return GST_PAD_PROBE_OK;
+
+    const uint64_t totalKbps = static_cast<uint64_t>(
+        ctx->totalPackets * kTsPacketSize * 8.0 / seconds / 1000.0);
+    std::ostringstream present;
+    bool first = true;
+    for (size_t pid = 0; pid < ctx->packets.size(); ++pid) {
+        if (ctx->packets[pid] == 0) continue;
+        if (!first) present << ',';
+        first = false;
+        const uint64_t kbps = static_cast<uint64_t>(
+            ctx->packets[pid] * kTsPacketSize * 8.0 / seconds / 1000.0);
+        present << pid << '=' << kbps;
+    }
+    std::cerr << "Shared DVB PID stats: frontend=" << ctx->frontendKey
+              << " total=" << totalKbps << "kbps"
+              << " present=" << (first ? "none" : present.str()) << std::endl;
+    ctx->packets.fill(0);
+    ctx->totalPackets = 0;
+    ctx->windowStarted = now;
+    return GST_PAD_PROBE_OK;
+}
+
 std::string sharedDvbFrontendKey(const DvbSatelliteParams& params) {
     return std::to_string(params.adapter) + ":" + std::to_string(params.frontend);
 }
@@ -236,21 +290,33 @@ bool addExplicitDvbPids(std::set<uint16_t>& target, const std::string& pids) {
 std::string formatDvbPids(const std::set<uint16_t>& pids) {
     std::ostringstream out;
     bool first = true;
-    for (uint16_t pid : pids) {
+    const auto append = [&](uint16_t pid) {
         // dvbsrc always reserves filters 0 and 1 for PAT and CAT.
-        if (pid <= 1) continue;
+        if (pid <= 1) return;
         if (!first) out << ':';
         first = false;
         out << pid;
+    };
+    for (uint16_t pid : pids) {
+        // Keep service media and CA filters ahead of optional DVB SI. Some
+        // adapters expose fewer hardware demux slots than dvbsrc's limit.
+        if (pid == 0x0011) continue;
+        append(pid);
     }
+    if (pids.count(0x0011)) append(0x0011);
     return out.str();
 }
 
 std::set<uint16_t> requestedDvbPids(const DvbSatelliteParams& requested) {
     std::set<uint16_t> pids;
     if (!addExplicitDvbPids(pids, requested.pids)) return pids;
-    for (uint16_t pid : {uint16_t(0x0000), uint16_t(0x0001), uint16_t(0x0010),
-                         uint16_t(0x0011), uint16_t(0x0012), uint16_t(0x0014)}) {
+    // PAT/CAT are added by dvbsrc. SDT is retained for service metadata; NIT,
+    // EIT and TDT are not needed by the single-program relay and waste scarce
+    // hardware demux filters before PCR/video/audio on some DVB adapters.
+    pids.erase(0x0010);
+    pids.erase(0x0012);
+    pids.erase(0x0014);
+    for (uint16_t pid : {uint16_t(0x0000), uint16_t(0x0001), uint16_t(0x0011)}) {
         pids.insert(pid);
     }
     return pids;
@@ -2295,6 +2361,18 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     }
 
     configureTsPacketAlignment(parse);
+    GstPad* statsPad = gst_element_get_static_pad(parse, "src");
+    if (statsPad) {
+        auto* statsContext = new SharedDvbPidStatsContext();
+        statsContext->frontendKey = frontendKey;
+        gst_pad_add_probe(
+            statsPad,
+            GST_PAD_PROBE_TYPE_BUFFER,
+            sharedDvbPidStatsProbe,
+            statsContext,
+            [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
+        gst_object_unref(statsPad);
+    }
     configureQueue(queue, 12000000000ULL);
     g_object_set(sink,
         "host", shared->multicastAddress.c_str(),
