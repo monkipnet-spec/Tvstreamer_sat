@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 class NewcamdClient {
@@ -19,7 +21,10 @@ public:
     bool login();
     void disconnect();
     void start_receiver();
-    void set_key_update_callback(std::function<void(const uint8_t*)> cb) { callback_ = cb; }
+    void set_key_update_callback(std::function<void(const uint8_t*)> cb) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callback_ = std::move(cb);
+    }
 
 private:
     void receiver_loop();
@@ -29,6 +34,7 @@ private:
     boost::asio::io_context io_context_;
     std::unique_ptr<boost::asio::ip::tcp::socket> socket_;
     std::thread receiver_thread_;
+    std::mutex mutex_;
     std::function<void(const uint8_t*)> callback_;
     std::atomic<bool> running_{false};
 };
