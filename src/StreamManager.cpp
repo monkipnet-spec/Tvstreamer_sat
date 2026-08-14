@@ -197,6 +197,7 @@ struct SharedDvbPidStatsContext {
     std::string frontendKey;
     std::array<uint64_t, 8192> packets {};
     uint64_t totalPackets = 0;
+    std::vector<uint8_t> remainder;
     std::chrono::steady_clock::time_point windowStarted =
         std::chrono::steady_clock::now();
 };
@@ -210,16 +211,40 @@ GstPadProbeReturn sharedDvbPidStatsProbe(
 
     GstMapInfo map{};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
-    for (size_t offset = 0; offset + kTsPacketSize <= map.size;
-         offset += kTsPacketSize) {
-        const uint8_t* packet = map.data + offset;
-        if (packet[0] != 0x47) continue;
+    std::vector<uint8_t> bytes;
+    bytes.reserve(ctx->remainder.size() + map.size);
+    bytes.insert(bytes.end(), ctx->remainder.begin(), ctx->remainder.end());
+    bytes.insert(bytes.end(), map.data, map.data + map.size);
+    ctx->remainder.clear();
+    gst_buffer_unmap(buffer, &map);
+
+    size_t start = std::string::npos;
+    const size_t maxOffset = std::min<size_t>(kTsPacketSize, bytes.size());
+    for (size_t candidate = 0; candidate < maxOffset; ++candidate) {
+        if (bytes[candidate] == 0x47 &&
+            candidate + kTsPacketSize < bytes.size() &&
+            bytes[candidate + kTsPacketSize] == 0x47) {
+            start = candidate;
+            break;
+        }
+    }
+    if (start == std::string::npos) {
+        const size_t keep = std::min<size_t>(bytes.size(), kTsPacketSize * 2 - 1);
+        ctx->remainder.assign(bytes.end() - keep, bytes.end());
+        return GST_PAD_PROBE_OK;
+    }
+
+    size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const uint8_t* packet = bytes.data() + offset;
+        if (packet[0] != 0x47) break;
         const uint16_t pid = static_cast<uint16_t>(
             ((packet[1] & 0x1F) << 8) | packet[2]);
         ++ctx->packets[pid];
         ++ctx->totalPackets;
     }
-    gst_buffer_unmap(buffer, &map);
+    ctx->remainder.assign(
+        bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
 
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(
@@ -246,7 +271,6 @@ GstPadProbeReturn sharedDvbPidStatsProbe(
     ctx->windowStarted = now;
     return GST_PAD_PROBE_OK;
 }
-
 std::string sharedDvbFrontendKey(const DvbSatelliteParams& params) {
     return std::to_string(params.adapter) + ":" + std::to_string(params.frontend);
 }
@@ -2576,7 +2600,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         return false;
     }
 
-    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
     g_object_set(source,
         "address", state->sharedDvbMulticastAddress.c_str(),
         "port", static_cast<gint>(state->sharedDvbMulticastPort),
