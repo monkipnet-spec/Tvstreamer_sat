@@ -454,11 +454,17 @@ void healAllowedPidsFromSelectedPmtSection(DvbSingleProgramPsiContext* ctx, cons
         pos += esInfoLength;
     }
 
-    if (added > 0 && !ctx->pidSelfHealAnnounced) {
-        std::cerr << "DVB SPTS PID filter self-heal: SID=" << ctx->serviceId
-                  << " PMT_PID=" << ctx->pmtPid
-                  << " added_pids=" << added
-                  << " source=selected-pmt" << std::endl;
+    if (!ctx->pidSelfHealAnnounced) {
+        if (added > 0) {
+            std::cerr << "DVB SPTS PID filter self-heal: SID=" << ctx->serviceId
+                      << " PMT_PID=" << ctx->pmtPid
+                      << " added_pids=" << added
+                      << " source=selected-pmt" << std::endl;
+        } else {
+            std::cerr << "DVB SPTS PID filter ready: SID=" << ctx->serviceId
+                      << " PMT_PID=" << ctx->pmtPid
+                      << " source=selected-pmt saved-pids-complete" << std::endl;
+        }
         ctx->pidSelfHealAnnounced = true;
     }
 }
