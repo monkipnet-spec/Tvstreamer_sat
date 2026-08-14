@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <functional>
@@ -2086,6 +2087,18 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
 
     const std::string frontendKey = sharedDvbFrontendKey(params);
     const std::string tuningSignature = sharedDvbTuneSignature(params);
+    const std::string device = "/dev/dvb/adapter" + std::to_string(params.adapter) +
+                               "/frontend" + std::to_string(params.frontend);
+    if (!std::filesystem::exists(device)) {
+        error = "DVB frontend device not found: " + device +
+                "; check the adapter number and tuner driver";
+        return false;
+    }
+    if (access(device.c_str(), R_OK | W_OK) != 0) {
+        error = "DVB frontend device is not accessible: " + device +
+                " (" + std::strerror(errno) + ")";
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(managerMutex);
