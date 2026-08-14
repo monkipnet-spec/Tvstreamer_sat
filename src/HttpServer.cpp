@@ -1429,6 +1429,15 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("cam_clients")) {
         nextConfig.camClients = configManager.config.camClients;
     }
+    const bool hasStreamArray = root.isMember("streams") && root["streams"].isArray();
+    const bool explicitlyAllowEmptyStreams = root.get("allow_empty_streams", false).asBool();
+    if ((!hasStreamArray || nextConfig.streams.empty()) &&
+        !previousConfig.streams.empty() && !explicitlyAllowEmptyStreams) {
+        nextConfig.streams = previousConfig.streams;
+        std::cerr << "Config save preserved " << previousConfig.streams.size()
+                  << " existing stream(s): request contained no streams or an empty stream list"
+                  << std::endl;
+    }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
     std::vector<StreamConfig> streamsToRestart;
@@ -1593,7 +1602,22 @@ std::string HttpServer::handleStartStream(const std::string& body) {
         return Json::writeString(writer, response);
     }
 
-    const auto cfg = StreamConfig::fromJson(root);
+    const std::string streamId = root.get("id", "").asString();
+    const auto configuredStream = std::find_if(
+        configManager.config.streams.begin(), configManager.config.streams.end(),
+        [&streamId](const StreamConfig& stream) { return stream.id == streamId; });
+    if (streamId.empty() || configuredStream == configManager.config.streams.end()) {
+        const std::string message = streamId.empty()
+            ? "missing stream id"
+            : ("stream is not present in saved configuration: " + streamId);
+        std::cerr << "Start stream rejected: " << message << std::endl;
+        response["result"] = "error";
+        response["error"] = message;
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
+
+    const StreamConfig cfg = *configuredStream;
     std::string startError;
     bool started = streamManager.startStream(cfg, &startError);
     if (!started && streamManager.isStreamActive(cfg.id)) started = true;
@@ -2091,6 +2115,8 @@ let metricsPollTimer = null;
 let stateFetchPromise = null;
 let metricsFetchPromise = null;
 let lastTileStructureSignature = '';
+let lastKnownStreams = [];
+let allowEmptyStreamStateOnce = false;
 let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
 let satelliteSignalTimer = null;
@@ -2162,6 +2188,18 @@ function fetchState() {
       return response.json();
     })
     .then(data => {
+      if (!Array.isArray(data.streams)) {
+        throw new Error('state response does not contain a streams array');
+      }
+      if (data.streams.length > 0) {
+        lastKnownStreams = data.streams;
+      } else if (lastKnownStreams.length > 0 && !allowEmptyStreamStateOnce) {
+        console.warn('TVStreammerSAT5 ignored an unexpected empty stream list');
+        data.streams = lastKnownStreams;
+        data.stream_count = lastKnownStreams.length;
+        data.active_count = 0;
+      }
+      allowEmptyStreamStateOnce = false;
       const storedLanguage = localStorage.getItem('tvstreammersat5-language');
       const serverLanguage = normalizeLanguage(data.language);
       language = normalizeLanguage(storedLanguage || language);
@@ -2540,8 +2578,17 @@ async function toggleStream(id, active, button=null) {
 function deleteStream(id) {
   const stream = state.streams.find(s=>s.id===id);
   if (!stream || !window.confirm(`${t('removeConfirm')} «${stream.name || stream.id}»?`)) return;
+  allowEmptyStreamStateOnce = state.streams.length === 1;
   fetch('/api/delete-stream', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})
-    .then(()=>{ closeModal(); setTimeout(fetchState, 300); });
+    .then(()=>{
+      lastKnownStreams = state.streams.filter(item => item.id !== id);
+      closeModal();
+      setTimeout(fetchState, 300);
+    })
+    .catch(error => {
+      allowEmptyStreamStateOnce = false;
+      uiError(error?.message || error);
+    });
 }
 function restartProgram() {
   if (!window.confirm(t('restartConfirm'))) return;

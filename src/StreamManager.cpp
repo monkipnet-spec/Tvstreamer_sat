@@ -2169,6 +2169,14 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateResult == GST_STATE_CHANGE_FAILURE) {
         error = popGstPipelineError(shared->bus, "failed to start shared DVB frontend");
+        std::ostringstream context;
+        context << " [device=/dev/dvb/adapter" << params.adapter
+                << "/frontend" << params.frontend
+                << " frequency_khz=" << params.frequencyKHz
+                << " symbol_rate=" << params.symbolRateK
+                << " polarity=" << params.polarity
+                << "; check device existence, permissions, adapter use and signal]";
+        error += context.str();
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
         if (shared->bus) {

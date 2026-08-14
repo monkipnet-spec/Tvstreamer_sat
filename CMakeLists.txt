@@ -130,6 +130,7 @@ target_include_directories(tvstreammersat5_ca_newcamd PRIVATE
 )
 target_link_libraries(tvstreammersat5_ca_newcamd PRIVATE
     ${Boost_LIBRARIES}
+    ${JSONCPP_LIBRARIES}
     ${DVBCSA_LIBRARIES}
     OpenSSL::Crypto
     $<$<BOOL:${CRYPT_LIBRARY}>:${CRYPT_LIBRARY}>
