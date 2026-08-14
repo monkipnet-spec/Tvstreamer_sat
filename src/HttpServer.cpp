@@ -478,12 +478,9 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
-            } else if (target == "/api/ca-reader-settings") {
+            } else if (target == "/api/cam-client-settings") {
                 res.set(http::field::content_type, "application/json");
-                res.body() = handleCaReaderSettings(req.body());
-            } else if (target == "/api/ca-reader-reactivate") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = handleCaReaderReactivate(req.body());
+                res.body() = handleCamClientSettings(req.body());
             } else if (target == "/api/dvb-signal") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleDvbTune(req.body(), false);
@@ -771,6 +768,9 @@ std::string HttpServer::currentState() {
     root["language"] = configManager.config.language;
     root["telegram_token"] = configManager.config.telegramToken;
     root["telegram_chat_id"] = configManager.config.telegramChatId;
+    Json::Value camClients(Json::arrayValue);
+    for (const auto& client : configManager.config.camClients) camClients.append(client.toJson());
+    root["cam_clients"] = camClients;
     root["program_release"] = kProgramRelease;
     root["program_version"] = kProgramVersion;
     Json::Value interfaces(Json::arrayValue);
@@ -843,7 +843,7 @@ std::string HttpServer::currentState() {
             item["ca_output_scrambled_percent"] = caPayloadPackets > 0
                 ? (100.0 * static_cast<double>(caScrambledPackets) / static_cast<double>(caPayloadPackets))
                 : 0.0;
-            if (cfg.conditionalAccessReader.empty()) {
+            if (cfg.conditionalAccessClient.empty()) {
                 item["ca_decode_state"] = "not_applicable";
             } else if (!streamState->active.load()) {
                 item["ca_decode_state"] = "offline";
@@ -874,7 +874,7 @@ std::string HttpServer::currentState() {
             item["ca_output_scrambled_packets"] = Json::UInt64(0);
             item["ca_output_clear_pes_starts"] = Json::UInt64(0);
             item["ca_output_scrambled_percent"] = 0.0;
-            item["ca_decode_state"] = cfg.conditionalAccessReader.empty() ? "not_applicable" : "offline";
+            item["ca_decode_state"] = cfg.conditionalAccessClient.empty() ? "not_applicable" : "offline";
             item["cc_errors"] = Json::UInt64(0);
             item["cc_errors_total"] = Json::UInt64(0);
         }
@@ -976,7 +976,7 @@ std::string HttpServer::caManagerStatus() {
     return Json::writeString(writer, CardManager::instance().snapshot());
 }
 
-std::string HttpServer::handleCaReaderSettings(const std::string& body) {
+std::string HttpServer::handleCamClientSettings(const std::string& body) {
     Json::Value response;
     Json::Value request;
     Json::CharReaderBuilder readerBuilder;
@@ -984,67 +984,72 @@ std::string HttpServer::handleCaReaderSettings(const std::string& body) {
     std::istringstream input(body);
     if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
         response["result"] = "error";
-        response["error"] = "invalid CA reader settings: " + errors;
+        response["error"] = "invalid CAM client settings: " + errors;
     } else {
-        CaReaderConfig updated;
-        updated.readerKey = request.get("reader_key", "").asString();
-        updated.serial = request.get("serial", "").asString();
-        updated.maxServices = std::clamp(request.get("max_services", 10).asUInt(), 1u,
-                                         CardManager::kMaxConfigurableServices);
-        updated.autoActivate = request.get("auto_activate", true).asBool();
-        updated.autoReactivate = request.get("auto_reactivate", true).asBool();
-        updated.retrySeconds = std::clamp(request.get("retry_seconds", 5).asUInt(), 2u, 300u);
-        updated.backendId = request.get("backend_id", "").asString();
-        updated.backendConfig = request.get("backend_config", "").asString();
-        if (updated.readerKey.empty() && updated.serial.empty()) {
-            response["result"] = "error";
-            response["error"] = "reader_key or serial is required";
+        auto configToString = [](const Json::Value& value) {
+            Json::StreamWriterBuilder writer;
+            writer["indentation"] = "";
+            return Json::writeString(writer, value.isNull() ? Json::Value(Json::objectValue) : value);
+        };
+        auto parseClient = [&](const Json::Value& item) {
+            CamClientConfig updated;
+            updated.id = item.get("id", item.get("client_id", "").asString()).asString();
+            updated.name = item.get("name", updated.id).asString();
+            updated.maxServices = std::clamp(item.get("max_services", 10).asUInt(), 1u,
+                                             CardManager::kMaxConfigurableServices);
+            updated.backendId = item.get("backend_id", "newcamd").asString();
+            if (updated.backendId.empty() || updated.backendId == "passthrough") updated.backendId = "newcamd";
+            if (item.isMember("backend_config")) {
+                updated.backendConfig = item["backend_config"].isString()
+                    ? item["backend_config"].asString()
+                    : configToString(item["backend_config"]);
+            } else {
+                Json::Value backendConfig;
+                backendConfig["host"] = item.get("host", "127.0.0.1").asString();
+                backendConfig["port"] = item.get("port", 15000).asInt();
+                backendConfig["user"] = item.get("user", "user").asString();
+                backendConfig["pass"] = item.get("pass", "pass").asString();
+                backendConfig["des"] = item.get("des", "0102030405060708091011121314").asString();
+                updated.backendConfig = configToString(backendConfig);
+            }
+            if (updated.backendConfig.empty()) updated.backendConfig = "{}";
+            return updated;
+        };
+
+        std::vector<CamClientConfig> nextClients;
+        if (request["clients"].isArray()) {
+            for (const auto& item : request["clients"]) {
+                CamClientConfig client = parseClient(item);
+                if (!client.id.empty()) nextClients.push_back(client);
+            }
+            configManager.config.camClients = nextClients;
         } else {
+            CamClientConfig updated = parseClient(request);
+            if (updated.id.empty()) {
+                response["result"] = "error";
+                response["error"] = "client id is required";
+                Json::StreamWriterBuilder writer;
+                return Json::writeString(writer, response);
+            }
             bool replaced = false;
-            for (auto& existing : configManager.config.caReaders) {
-                if ((!updated.readerKey.empty() && existing.readerKey == updated.readerKey) ||
-                    (!updated.serial.empty() && !existing.serial.empty() && existing.serial == updated.serial)) {
-                    if (!request.isMember("backend_id")) updated.backendId = existing.backendId;
-                    if (updated.backendId.empty()) updated.backendId = "passthrough";
-                    if (!request.isMember("backend_config")) updated.backendConfig = existing.backendConfig;
-                    if (updated.backendConfig.empty()) updated.backendConfig = "{}";
+            for (auto& existing : configManager.config.camClients) {
+                if (existing.id == updated.id) {
                     existing = updated;
                     replaced = true;
                     break;
                 }
             }
-            if (!replaced) {
-                if (updated.backendId.empty()) updated.backendId = "passthrough";
-                if (updated.backendConfig.empty()) updated.backendConfig = "{}";
-                configManager.config.caReaders.push_back(updated);
-            }
-            if (!configManager.save()) {
-                response["result"] = "error";
-                response["error"] = "failed to save CA reader settings";
-            } else {
-                CardManager::instance().configure(configManager.config.caReaders);
-                response = CardManager::instance().snapshot();
-                response["result"] = "ok";
-            }
+            if (!replaced) configManager.config.camClients.push_back(updated);
         }
-    }
-    Json::StreamWriterBuilder writer;
-    return Json::writeString(writer, response);
-}
 
-std::string HttpServer::handleCaReaderReactivate(const std::string& body) {
-    Json::Value response;
-    Json::Value request;
-    Json::CharReaderBuilder readerBuilder;
-    std::string errors;
-    std::istringstream input(body);
-    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
-        response["result"] = "error";
-        response["error"] = "invalid CA reader reactivation request: " + errors;
-    } else {
-        const std::string readerKey = request.get("reader_key", "").asString();
-        response = CardManager::instance().reactivateReader(readerKey);
-        response["ca_manager"] = CardManager::instance().snapshot();
+        if (!configManager.save()) {
+            response["result"] = "error";
+            response["error"] = "failed to save CAM client settings";
+        } else {
+            CardManager::instance().configure(configManager.config.camClients);
+            response = CardManager::instance().snapshot();
+            response["result"] = "ok";
+        }
     }
     Json::StreamWriterBuilder writer;
     return Json::writeString(writer, response);
@@ -1090,13 +1095,13 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
     int basePort = std::clamp(request.get("base_port", 5000).asInt(), 1, 65535);
     const std::string interfaceAddress = request.get("interface_address", "").asString();
     const bool autoStart = request.get("auto_start", false).asBool();
-    const std::string conditionalAccessReader = request.get("conditional_access_reader", "").asString();
+    const std::string conditionalAccessClient = request.get("conditional_access_client", "").asString();
     bool hasScrambledSelection = false;
     for (const auto& selected : request["channels"]) {
         if (selected.get("scrambled", false).asBool()) { hasScrambledSelection = true; break; }
     }
-    if (hasScrambledSelection && (conditionalAccessReader.empty() || conditionalAccessReader == "auto")) {
-        response["error"] = "Для кодированных каналов выберите конкретную Phoenix-карту; автоматическое распределение между картами отключено";
+    if (hasScrambledSelection && (conditionalAccessClient.empty() || conditionalAccessClient == "auto")) {
+        response["error"] = "Select a CAM client for scrambled channels";
         Json::StreamWriterBuilder writer;
         return Json::writeString(writer, response);
     }
@@ -1171,8 +1176,8 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
         config.serviceId = sid;
         config.serviceName = config.name;
         config.serviceProvider = item.get("provider", "").asString();
-        config.conditionalAccessReader = item.get("scrambled", false).asBool()
-            ? conditionalAccessReader
+        config.conditionalAccessClient = item.get("scrambled", false).asBool()
+            ? conditionalAccessClient
             : "";
         config.videoPid = 0;
         config.audioPid = 0;
@@ -1417,8 +1422,8 @@ void HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("language")) {
         nextConfig.language = configManager.config.language;
     }
-    if (!root.isMember("ca_readers")) {
-        nextConfig.caReaders = configManager.config.caReaders;
+    if (!root.isMember("cam_clients")) {
+        nextConfig.camClients = configManager.config.camClients;
     }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
@@ -1438,7 +1443,7 @@ void HttpServer::handleSaveConfig(const std::string& body) {
 
     configManager.config = nextConfig;
     configManager.save();
-    CardManager::instance().configure(configManager.config.caReaders);
+    CardManager::instance().configure(configManager.config.camClients);
     refreshHttpPorts();
 
     for (const auto& id : streamsToStop) {
@@ -1592,7 +1597,7 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     response["stream_id"] = cfg.id;
     if (started) {
         response["result"] = "ok";
-        if (!cfg.conditionalAccessReader.empty()) {
+        if (!cfg.conditionalAccessClient.empty()) {
             response["ca"] = CardManager::instance().streamState(cfg.id);
         }
     } else {
@@ -1935,9 +1940,9 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .sat-signal-panel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr)) auto;gap:10px;align-items:center;margin-bottom:14px;padding:12px;background:rgba(31,139,255,.08);border:1px solid rgba(57,189,248,.18);border-radius:14px}
 .sat-meter{display:grid;gap:5px}.sat-meter-head{display:flex;justify-content:space-between;gap:8px;color:#cfd8ea;font-size:.78rem}.sat-meter-head strong{color:#fff}.sat-bar{height:9px;background:rgba(255,255,255,.07);border-radius:999px;overflow:hidden}.sat-bar>span{display:block;height:100%;width:0;background:linear-gradient(90deg,#fb5f5f,#ffbd4a,#17c261);transition:width .25s ease}.sat-lock{padding:6px 9px;border-radius:999px;background:rgba(255,95,95,.14);color:#ffb3b3;font-size:.72rem;white-space:nowrap}.sat-lock.locked{background:rgba(23,194,97,.15);color:#b6f7c2}
 .sat-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.sat-field{display:flex;flex-direction:column;gap:5px}.sat-field label{color:#9aa3b1;font-size:.72rem}.sat-field input,.sat-field select{width:100%;box-sizing:border-box;padding:8px 9px;background:#121825;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#eee}.sat-field.wide{grid-column:span 2}.sat-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}.sat-scan-status{color:#9aa3b1;font-size:.78rem}.sat-services{max-height:320px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px}.sat-service-head,.sat-service-row{display:grid;grid-template-columns:34px minmax(170px,1.8fr) minmax(110px,1fr) 92px 72px 72px;gap:8px;align-items:center;padding:8px 10px}.sat-service-head{position:sticky;top:0;background:#121825;color:#9aa3b1;font-size:.7rem;z-index:1}.sat-service-row{border-top:1px solid rgba(255,255,255,.06);font-size:.78rem}.sat-service-row:hover{background:rgba(255,255,255,.035)}.sat-service-row input[type=checkbox]{width:16px;height:16px}.sat-service-name{color:#fff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-service-provider{color:#c5cada;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sat-access{display:inline-flex;align-items:center;justify-content:center;min-width:58px;padding:3px 7px;border-radius:999px;font-size:.68rem;font-weight:800;letter-spacing:.02em}.sat-access.fta{color:#8ff0b5;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.sat-access.ca{color:#ff9da5;background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.38)}.sat-access.unknown{color:#ffd78a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.34)}.sat-empty{padding:28px 12px;text-align:center;color:#9aa3b1}.sat-output{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)}
-.phoenix-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
-.phoenix-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.phoenix-head strong{color:#e9ddff}.phoenix-list{display:grid;gap:6px}.phoenix-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.phoenix-row .phoenix-name{font-weight:800;color:#fff}.phoenix-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.phoenix-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.phoenix-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.phoenix-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.phoenix-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.phoenix-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.phoenix-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.phoenix-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.phoenix-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.phoenix-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls select{max-width:210px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.phoenix-controls input[type=checkbox]{margin:0}.phoenix-controls button{padding:4px 8px;font-size:.68rem}.phoenix-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.phoenix-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.phoenix-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
-@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.phoenix-row{grid-template-columns:78px minmax(120px,1fr)}.phoenix-row .phoenix-state{grid-column:1/-1;justify-self:start}.phoenix-controls{gap:7px}.phoenix-activation-detail{flex-basis:100%}.phoenix-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
+.cam-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
+.cam-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.cam-head strong{color:#e9ddff}.cam-list{display:grid;gap:6px}.cam-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.cam-row .cam-name{font-weight:800;color:#fff}.cam-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.cam-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.cam-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.cam-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.cam-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.cam-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.cam-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.cam-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.cam-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.cam-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls select{max-width:210px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls input[type=checkbox]{margin:0}.cam-controls button{padding:4px 8px;font-size:.68rem}.cam-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cam-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.cam-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
+@media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.cam-row{grid-template-columns:78px minmax(120px,1fr)}.cam-row .cam-state{grid-column:1/-1;justify-self:start}.cam-controls{gap:7px}.cam-activation-detail{flex-basis:100%}.cam-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}
 
 </style>
@@ -1968,6 +1973,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <div class="system-menu-list">
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
+<button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
@@ -2045,9 +2051,8 @@ let satelliteSignalPending = false;
 let satelliteScanning = false;
 let satelliteServices = [];
 let dvbAdapters = [];
-let phoenixReaders = [];
-let phoenixReadersLoaded = false;
-let caManagerState = {readers:[]};
+let camClientsLoaded = false;
+let caManagerState = {clients:[]};
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -2234,7 +2239,7 @@ function streamTileStructureSignature(stream) {
     backup_file_loop: stream.backup_file_loop,
     input_service_id: stream.input_service_id,
     service_id: stream.service_id,
-    conditional_access_reader: stream.conditional_access_reader,
+    conditional_access_client: stream.conditional_access_client,
     cbr: stream.cbr,
     outputs: outputConfigsForStream(stream),
     links: streamLinks(stream)
@@ -2263,7 +2268,7 @@ function updateDvbMeter(tile, kind, value, available, locked) {
   label.textContent = `${kind === 'signal' ? 'S' : 'Q'} ${available ? `${shown}%` : '—'}`;
 }
 function caDecodeInfo(stream) {
-  if (!stream?.conditional_access_reader) return {cls:'offline', text:'FTA', detail:'Не требуется'};
+  if (!stream?.conditional_access_client) return {cls:'offline', text:'FTA', detail:'Не требуется'};
   const mode = String(stream.ca_decode_state || (stream.active ? 'waiting' : 'offline'));
   const scrambled = Number(stream.ca_output_scrambled_packets || 0);
   const payload = Number(stream.ca_output_payload_packets || 0);
@@ -2385,7 +2390,7 @@ function render(force=false) {
         <div class="info-row"><strong>${t('primary')}</strong><span>${stream.input_uri || '—'}</span></div>
         <div class="info-row"><strong>${t('backup')}</strong><span>${stream.backup_input_uri || '—'}${stream.backup_input_type === 'file' && stream.backup_file_loop ? ' · loop' : ''}</span></div>
         <div class="info-row"><strong>${t('sid')}</strong><span>${stream.service_id || '—'}</span></div>
-        ${stream.conditional_access_reader ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>
+        ${stream.conditional_access_client ? `<div class="info-row"><strong>CA</strong><span data-role="ca-status">${caStreamStatusText(stream)}</span></div>
         <div class="info-row decode-row"><strong>Декодирование</strong><span data-role="decode-status" class="decode-pill ${caDecodeInfo(stream).cls}" title="Контроль по A/V PID, scrambling_control и валидному PES">${caDecodeInfo(stream).text}</span></div>` : `<div class="info-row placeholder"><strong>CA</strong><span>—</span></div>
         <div class="info-row placeholder decode-row"><strong>Декодирование</strong><span>—</span></div>`}
         <div class="info-row"><strong>${t('bitrateIn')}</strong><span data-role="bitrate-in">${stream.bitrate_in_kbps ? stream.bitrate_in_kbps + ' kbps' : '—'}</span></div>
@@ -2677,206 +2682,168 @@ function openTelegramModal() {
 function satEscape(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 }
-function caManagerReader(path) {
-  const wanted = String(path || '');
-  return (caManagerState?.readers || []).find(reader => {
-    const key = String(reader.key || '');
-    const stable = String(reader.stable_device || '');
-    const device = String(reader.device || '');
-    return wanted && (wanted === key || wanted === stable || wanted === device);
-  }) || null;
+function camClientsForUi() {
+  const live = Array.isArray(caManagerState?.clients) ? caManagerState.clients : [];
+  return live.length ? live : (Array.isArray(state.cam_clients) ? state.cam_clients.map(client => ({...client, ...parseCamBackendConfig(client)})) : []);
 }
-function caReaderSummary(path) {
-  const reader = caManagerReader(path);
-  if (!reader) return '';
-  const identity = [reader.display_name, reader.caid ? `CAID ${reader.caid}` : '', reader.provider ? `PROVID ${reader.provider}` : ''].filter(Boolean).join(' · ');
-  const slots = `${Number(reader.services_used||0)}/${Number(reader.max_services||10)}`;
-  const backend = String(reader.backend_id || 'passthrough');
-  return `${identity}${identity?' · ':''}backend ${backend} · слоты ${slots}`;
+function parseCamBackendConfig(client={}) {
+  const raw = client.backend_config;
+  if (raw && typeof raw === 'object') return raw;
+  if (typeof raw === 'string' && raw.trim()) {
+    try { return JSON.parse(raw); } catch (_) { return {}; }
+  }
+  return {};
+}
+function camClientSummary(id) {
+  const wanted = String(id || '');
+  const client = camClientsForUi().find(item => String(item.id || '') === wanted);
+  if (!client) return '';
+  const config = parseCamBackendConfig(client);
+  const endpoint = client.endpoint || ((client.host || config.host) ? `${client.host || config.host}:${client.port || config.port || 0}` : 'not configured');
+  const slots = `${Number(client.services_used||0)}/${Number(client.max_services||10)}`;
+  return `${client.name || client.id} / ${endpoint} / ${client.backend_id || 'newcamd'} / ${slots}`;
 }
 function caStreamStatusText(stream) {
   const ca = stream?.ca || {};
-  if (!stream?.conditional_access_reader) return 'FTA / не привязан';
-  if (!ca.managed) {
-    const profile = caReaderSummary(stream.conditional_access_reader);
-    return profile || 'Phoenix настроен · слот свободен';
-  }
-  const reader = ca.reader_display_name || ca.reader_serial || 'Phoenix';
-  const profile = [ca.caid ? `CAID ${ca.caid}` : '', ca.provider ? `PROVID ${ca.provider}` : ''].filter(Boolean).join(' · ');
-  const stateText = ca.external_owner ? 'внешний владелец' : (ca.active ? 'слот активен' : 'слот зарезервирован');
-  const route = stream.conditional_access_reader === 'auto' ? `НУЖНО ВЫБРАТЬ КАРТУ` : reader;
-  const backendId = String(ca.backend_id || ca.backend?.backend_id || 'passthrough');
-  const backendState = String(ca.backend?.status || '');
-  return `${route}${profile?` · ${profile}`:''} · backend ${backendId}${backendState?` · ${backendState}`:''} · ${stateText}`;
+  if (!stream?.conditional_access_client) return 'FTA / no CAM';
+  if (!ca.managed) return camClientSummary(stream.conditional_access_client) || 'CAM client configured / slot free';
+  const client = ca.client_name || ca.client_display_name || ca.client || stream.conditional_access_client;
+  const backendId = String(ca.backend_id || ca.backend?.backend_id || 'newcamd');
+  const backendState = String(ca.backend?.status || ca.status || '');
+  const stateText = ca.active ? 'active' : 'reserved';
+  return `${client} / backend ${backendId}${backendState?` / ${backendState}`:''} / ${stateText}`;
 }
 async function loadCaManager() {
   try {
     const response = await fetch('/api/ca-manager', {cache:'no-store'});
     caManagerState = await response.json();
   } catch (_) {
-    caManagerState = {readers:[]};
+    caManagerState = {clients:[]};
   }
   return caManagerState;
 }
-function phoenixStatusInfo(reader) {
-  const status = String(reader?.status || 'unknown');
-  if (status === 'card') {
-    if (reader.provider_name) return {cls:'card', text:String(reader.provider_name)};
-    if (reader.card_system) return {cls:'card', text:`КАРТА · ${reader.card_system}`};
-    return {cls:'card', text:'КАРТА · провайдер не определён'};
-  }
-  if (status === 'card_unreadable') return {cls:'card', text:'КАРТА · ATR НЕ ПРОЧИТАН'};
-  if (status === 'probe_failed') return {cls:'warn', text:'КАРТА НЕ ПОДТВЕРЖДЕНА'};
-  if (status === 'no_card') return {cls:'no-card', text:'НЕТ КАРТЫ'};
-  if (status === 'busy') return {cls:'busy', text:'ЗАНЯТ'};
-  if (status === 'detected') return {cls:'detected', text:'ОБНАРУЖЕН'};
-  if (status === 'permission') return {cls:'warn', text:'НЕТ ДОСТУПА'};
-  return {cls:'warn', text:'НЕ ОПРЕДЕЛЁН'};
-}
-function caActivationInfo(reader) {
-  const status = String(reader?.activation_status || 'UNKNOWN');
-  if (status === 'READY') return {cls:'card', text:'АКТИВНА'};
-  if (status === 'CARD_UNREADABLE') return {cls:'card', text:'КАРТА · ATR НЕ ПРОЧИТАН'};
-  if (status === 'PROBING') return {cls:'detected', text:'АКТИВАЦИЯ…'};
-  if (status === 'EXTERNAL_OWNER') return {cls:'busy', text:'ВНЕШНИЙ ВЛАДЕЛЕЦ'};
-  if (status === 'NO_CARD') return {cls:'no-card', text:'НЕТ КАРТЫ'};
-  if (status === 'UNAVAILABLE') return {cls:'warn', text:'РИДЕР НЕДОСТУПЕН'};
-  if (status === 'PERMISSION') return {cls:'warn', text:'НЕТ ДОСТУПА'};
-  if (status === 'PROBE_FAILED') return {cls:'warn', text:'ОШИБКА АКТИВАЦИИ'};
-  if (status === 'DETECTED') return {cls:'detected', text:'ОЖИДАЕТ АКТИВАЦИИ'};
-  return {cls:'detected', text:'НЕ АКТИВИРОВАНА'};
-}
-async function saveCaReaderSettings(index) {
-  const reader = phoenixReaders.find(item => Number(item.index||0) === Number(index));
-  if (!reader) return;
-  const path = String(reader.stable_device || reader.device || '');
-  const maxInput = document.getElementById(`phoenixMax-${index}`);
-  const activateInput = document.getElementById(`phoenixAutoActivate-${index}`);
-  const reactivateInput = document.getElementById(`phoenixAutoReactivate-${index}`);
-  const retryInput = document.getElementById(`phoenixRetry-${index}`);
-  const backendInput = document.getElementById(`phoenixBackend-${index}`);
-  const payload = {
-    reader_key: path,
-    serial: String(reader.serial || ''),
-    max_services: Math.max(1, Math.min(64, Number(maxInput?.value || 10))),
-    auto_activate: !!activateInput?.checked,
-    auto_reactivate: !!reactivateInput?.checked,
-    retry_seconds: Math.max(2, Math.min(300, Number(retryInput?.value || 5))),
-    backend_id: String(backendInput?.value || 'passthrough')
-  };
-  try {
-    const response = await fetch('/api/ca-reader-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-    const data = await response.json();
-    if (!response.ok || data.result === 'error') throw new Error(data.error || `HTTP ${response.status}`);
-    caManagerState = data;
-    renderPhoenixReaders();
-  } catch (error) {
-    alert(error.message || 'Не удалось сохранить настройки карты');
-  }
-}
-async function reactivatePhoenixReader(index) {
-  const reader = phoenixReaders.find(item => Number(item.index||0) === Number(index));
-  if (!reader) return;
-  const path = String(reader.stable_device || reader.device || '');
-  const button = document.getElementById(`phoenixReactivate-${index}`);
-  if (button) { button.disabled = true; button.textContent = 'Активация…'; }
-  try {
-    const response = await fetch('/api/ca-reader-reactivate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reader_key:path})});
-    const data = await response.json();
-    if (data.ca_manager) caManagerState = data.ca_manager;
-    await loadPhoenixReaders();
-    renderPhoenixReaders();
-  } catch (error) {
-    alert(error.message || 'Не удалось переактивировать карту');
-  } finally {
-    const current = document.getElementById(`phoenixReactivate-${index}`);
-    if (current) { current.disabled = false; current.textContent = 'Переактивировать'; }
-  }
-}
-function caBackendOptions(selected='passthrough') {
-  const current = String(selected || 'passthrough');
+function caBackendOptions(selected='newcamd') {
+  const current = String(selected || 'newcamd');
   const backends = Array.isArray(caManagerState?.ca_backend?.backends) ? caManagerState.ca_backend.backends : [];
   const options = backends.map(item => {
     const id = String(item.id || '');
-    if (!id) return '';
+    if (!id || id === 'passthrough') return '';
     const label = String(item.display_name || id);
-    const suffix = item.builtin ? ' · встроенный' : (item.usable === false ? ' · ошибка загрузки' : ' · plugin');
+    const suffix = item.usable === false ? ' / load error' : ' / plugin';
     return `<option value="${satEscape(id)}" ${id===current?'selected':''}>${satEscape(label + suffix)}</option>`;
   }).filter(Boolean);
   if (!backends.some(item => String(item.id || '') === current)) {
-    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} · не загружен</option>`);
+    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} / not loaded</option>`);
   }
   return options.join('');
 }
-
-function phoenixReaderOptions(selected='') {
+function camClientOptions(selected='') {
   const current = String(selected || '');
-  const options = [
-    `<option value="" ${(!current || current==='auto')?'selected':''}>${current==='auto'?'AUTO отключено · выберите конкретную карту':'Не использовать CA / FTA'}</option>`
-  ];
-  phoenixReaders.forEach(reader => {
-    const path = String(reader.stable_device || reader.device || '');
-    const status = phoenixStatusInfo(reader);
-    const caSummary = caReaderSummary(path);
-    const suffix = [status.text, caSummary].filter(Boolean).map(text=>` · ${text}`).join('');
-    options.push(`<option value="${satEscape(path)}" ${path===current?'selected':''}>Phoenix ${Number(reader.index||0)} · ${satEscape(path)}${satEscape(suffix)}</option>`);
+  const options = [`<option value="" ${(!current || current==='auto')?'selected':''}>Do not use CAM / FTA</option>`];
+  camClientsForUi().forEach(client => {
+    const id = String(client.id || '');
+    if (!id) return;
+    options.push(`<option value="${satEscape(id)}" ${id===current?'selected':''}>${satEscape(camClientSummary(id) || id)}</option>`);
   });
-  if (current && current !== 'auto' && !phoenixReaders.some(reader => String(reader.stable_device || reader.device || '') === current)) {
-    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} · сейчас не найден</option>`);
+  if (current && current !== 'auto' && !camClientsForUi().some(client => String(client.id || '') === current)) {
+    options.push(`<option value="${satEscape(current)}" selected>${satEscape(current)} / missing</option>`);
   }
   return options.join('');
 }
-function renderPhoenixReaders() {
-  const list = document.getElementById('satPhoenixReaders');
-  const select = document.getElementById('satPhoenixReaderSelect');
+function renderCamClients() {
+  const list = document.getElementById('satCamClients');
+  const select = document.getElementById('satCamClientSelect');
+  const clients = camClientsForUi();
   if (list) {
-    list.innerHTML = phoenixReaders.length ? phoenixReaders.map(reader => {
-      const stateInfo = phoenixStatusInfo(reader);
-      const path = String(reader.stable_device || reader.device || '');
-      const hw = [reader.manufacturer, reader.product].filter(Boolean).join(' ') || reader.driver || '';
-      const atr = reader.atr ? ` · ATR ${reader.atr}` : '';
-      const managed = caManagerReader(path);
-      const caSummary = caReaderSummary(path);
-      const activation = managed ? caActivationInfo(managed) : stateInfo;
-      const title = `${path}${hw ? ` · ${hw}` : ''}${atr}${reader.detail ? ` · ${reader.detail}` : ''}${caSummary?` · ${caSummary}`:''}${managed?.activation_detail?` · ${managed.activation_detail}`:''}`;
-      const stateText = managed ? `${activation.text} · ${Number(managed.services_used||0)}/${Number(managed.max_services||10)}` : stateInfo.text;
-      const secondary = caSummary ? ` · ${caSummary}` : '';
-      const idx = Number(reader.index||0);
-      const maxServices = Number(managed?.max_services || 10);
-      const retrySeconds = Number(managed?.retry_seconds || 5);
-      const autoActivate = managed ? managed.auto_activate !== false : true;
-      const autoReactivate = managed ? managed.auto_reactivate !== false : true;
-      const backendId = String(managed?.backend_id || 'passthrough');
-      const detail = managed?.activation_detail || reader.detail || '';
-      return `<div class="phoenix-row" title="${satEscape(title)}"><span class="phoenix-name">Phoenix ${idx}</span><span class="phoenix-device">${satEscape(path)}${hw?` · ${satEscape(hw)}`:''}${satEscape(secondary)}</span><span class="phoenix-state ${activation.cls}">${satEscape(stateText)}</span><div class="phoenix-controls"><label>Каналов <input id="phoenixMax-${idx}" type="number" min="1" max="64" value="${maxServices}" onchange="saveCaReaderSettings(${idx})"></label><label>Backend <select id="phoenixBackend-${idx}" onchange="saveCaReaderSettings(${idx})">${caBackendOptions(backendId)}</select></label><label><input id="phoenixAutoActivate-${idx}" type="checkbox" ${autoActivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автоактивация</label><label><input id="phoenixAutoReactivate-${idx}" type="checkbox" ${autoReactivate?'checked':''} onchange="saveCaReaderSettings(${idx})"> Автопереактивация</label><label>Повтор, с <input id="phoenixRetry-${idx}" type="number" min="2" max="300" value="${retrySeconds}" onchange="saveCaReaderSettings(${idx})"></label><button id="phoenixReactivate-${idx}" class="button-secondary" type="button" onclick="reactivatePhoenixReader(${idx})">Переактивировать</button><span class="phoenix-activation-detail">${satEscape(detail)}</span></div></div>`;
-    }).join('') : '<div class="phoenix-empty">Phoenix/SmartMouse USB readers не обнаружены.</div>';
+    list.innerHTML = clients.length ? clients.map(client => {
+      const id = String(client.id || '');
+      const status = String(client.status || (client.endpoint ? 'CONFIGURED' : 'NOT_CONFIGURED'));
+      return `<div class="cam-row"><span class="cam-name">${satEscape(client.name || id)}</span><span class="cam-device">${satEscape(camClientSummary(id) || id)}</span><span class="cam-state ${status==='CONFIGURED'?'card':'warn'}">${satEscape(status)}</span></div>`;
+    }).join('') : '<div class="cam-empty">No CAM clients configured.</div>';
   }
   if (select) {
-    const previous = select.value || 'auto';
-    select.innerHTML = phoenixReaderOptions(previous);
-    select.value = previous === '' ? 'auto' : previous;
+    const previous = select.value || '';
+    select.innerHTML = camClientOptions(previous);
+    select.value = previous === 'auto' ? '' : previous;
   }
 }
-async function loadPhoenixReaders() {
-  try {
-    const response = await fetch('/api/dvb-adapters', {cache:'no-store'});
-    const data = await response.json();
-    phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
-    phoenixReadersLoaded = true;
-    await loadCaManager();
-    return data;
-  } catch (_) {
-    phoenixReaders = [];
-    phoenixReadersLoaded = true;
-    return {adapters:[], phoenix_readers:[]};
-  }
+async function loadCamClients() {
+  await loadCaManager();
+  camClientsLoaded = true;
+  renderCamClients();
+  return caManagerState;
 }
-async function refreshPhoenixReaders() {
-  const button = document.getElementById('satPhoenixRefresh');
+async function refreshCamClients() {
+  const button = document.getElementById('satCamRefresh');
   if (button) button.disabled = true;
-  await loadPhoenixReaders();
-  renderPhoenixReaders();
+  await loadCamClients();
   if (button) button.disabled = false;
+}
+function defaultNewcamdClient(index=1) {
+  return {id:`newcamd-${index}`, name:`OSCam ${index}`, backend_id:'newcamd', max_services:10, backend_config:{host:'127.0.0.1', port:15000, user:'user', pass:'pass', des:'0102030405060708091011121314'}};
+}
+function newcamdRowHtml(client={}, index=0) {
+  const cfg = parseCamBackendConfig(client);
+  return `<div class="newcamd-row" data-index="${index}">
+    <div class="form-row"><label>ID</label><input data-cam-field="id" value="${satEscape(client.id || '')}" /></div>
+    <div class="form-row"><label>Name</label><input data-cam-field="name" value="${satEscape(client.name || client.id || '')}" /></div>
+    <div class="form-row"><label>OSCam host</label><input data-cam-field="host" value="${satEscape(cfg.host || client.host || '127.0.0.1')}" /></div>
+    <div class="form-row"><label>Port</label><input data-cam-field="port" type="number" min="1" max="65535" value="${Number(cfg.port || client.port || 15000)}" /></div>
+    <div class="form-row"><label>User</label><input data-cam-field="user" value="${satEscape(cfg.user || client.user || 'user')}" /></div>
+    <div class="form-row"><label>Password</label><input data-cam-field="pass" type="password" value="${satEscape(cfg.pass || client.pass || '')}" /></div>
+    <div class="form-row full"><label>DES key</label><input data-cam-field="des" value="${satEscape(cfg.des || client.des || '0102030405060708091011121314')}" /></div>
+    <div class="form-row"><label>Max channels</label><input data-cam-field="max_services" type="number" min="1" max="64" value="${Number(client.max_services || 10)}" /></div>
+    <div class="form-row"><label>Backend</label><select data-cam-field="backend_id">${caBackendOptions(client.backend_id || 'newcamd')}</select></div>
+    <div class="form-row"><label>&nbsp;</label><button class="button-secondary" type="button" onclick="removeNewcamdRow(this)">Remove</button></div>
+  </div>`;
+}
+function addNewcamdRow(client=null) {
+  const rows = document.getElementById('newcamdRows');
+  if (!rows) return;
+  const index = rows.querySelectorAll('.newcamd-row').length + 1;
+  rows.insertAdjacentHTML('beforeend', newcamdRowHtml(client || defaultNewcamdClient(index), index));
+}
+function removeNewcamdRow(button) {
+  button?.closest('.newcamd-row')?.remove();
+}
+function collectNewcamdClients() {
+  return [...document.querySelectorAll('.newcamd-row')].map((row, index) => {
+    const value = field => row.querySelector(`[data-cam-field="${field}"]`)?.value || '';
+    const id = value('id') || `newcamd-${index+1}`;
+    return {
+      id,
+      name: value('name') || id,
+      max_services: Math.max(1, Math.min(64, Number(value('max_services') || 10))),
+      backend_id: value('backend_id') || 'newcamd',
+      backend_config: {host:value('host') || '127.0.0.1', port:Number(value('port') || 15000), user:value('user') || 'user', pass:value('pass'), des:value('des') || '0102030405060708091011121314'}
+    };
+  }).filter(client => client.id);
+}
+async function saveNewcamdSettings() {
+  const clients = collectNewcamdClients();
+  const response = await fetch('/api/cam-client-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clients})});
+  const data = await response.json();
+  if (!response.ok || data.result === 'error') {
+    alert(data.error || `HTTP ${response.status}`);
+    return;
+  }
+  caManagerState = data;
+  state.cam_clients = clients;
+  closeModal();
+  fetchState();
+}
+async function openNewcamdModal() {
+  await loadCaManager();
+  const clients = Array.isArray(state.cam_clients) && state.cam_clients.length ? state.cam_clients : [defaultNewcamdClient(1)];
+  openModal(`
+    <h2>Newcamd / OSCam</h2>
+    <div id="newcamdRows" class="form-grid full">${clients.map((client,index)=>newcamdRowHtml(client,index)).join('')}</div>
+    <div class="modal-actions">
+      <button class="button-secondary" type="button" onclick="addNewcamdRow()">Add client</button>
+      <button class="button-secondary" onclick="closeModal()">Cancel</button>
+      <button class="button-primary" onclick="saveNewcamdSettings()">Save</button>
+    </div>
+  `);
 }
 function refreshSatelliteFrontendOptions(preferredFrontend=null) {
   const adapterSelect = document.getElementById('satAdapter');
@@ -2997,10 +2964,7 @@ async function loadSatelliteAdapters() {
   try {
     const response = await fetch('/api/dvb-adapters', {cache:'no-store'});
     const data = await response.json();
-    phoenixReaders = Array.isArray(data.phoenix_readers) ? data.phoenix_readers : [];
-    phoenixReadersLoaded = true;
-    await loadCaManager();
-    renderPhoenixReaders();
+    await loadCamClients();
     dvbAdapters = Array.isArray(data.adapters) ? data.adapters : [];
     if (!data.dvbsrc_available) {
       refreshSatelliteAdapterOptions();
@@ -3097,7 +3061,7 @@ async function saveSelectedSatelliteChannels() {
     base_port:Number(document.getElementById('satBasePort')?.value || 5000),
     target_bitrate_kbps:Number(document.getElementById('satTargetBitrate')?.value || 12000),
     interface_address:document.getElementById('satOutputInterface')?.value || '',
-    conditional_access_reader:document.getElementById('satPhoenixReaderSelect')?.value || '',
+    conditional_access_client:document.getElementById('satCamClientSelect')?.value || '',
     auto_start:document.getElementById('satAutoStart')?.checked === true
   };
   try {
@@ -3138,10 +3102,10 @@ function openAddChannelModal() {
       <div class="sat-field"><label>ISI / Stream ID</label><input id="satStreamId" type="number" min="-1" max="255" value="-1" onchange="updateSatelliteSignal()" /></div>
     </div>
     <div id="satDeviceInfo" class="sat-scan-status" style="margin-top:8px">Поиск DVB frontend...</div>
-    <div class="phoenix-panel">
-      <div class="phoenix-head"><strong>Phoenix / карты условного доступа</strong><button id="satPhoenixRefresh" class="button-secondary" type="button" onclick="refreshPhoenixReaders()">Обновить</button></div>
-      <div id="satPhoenixReaders" class="phoenix-list"><div class="phoenix-empty">Поиск подключённых Phoenix...</div></div>
-      <div class="phoenix-select"><div class="sat-field"><label>Для кодированных каналов</label><select id="satPhoenixReaderSelect"><option value="">Выберите конкретную карту</option></select></div><small>Кодированные каналы привязываются только к выбранной физической карте. Автоматическое распределение между картами отключено. Лимит каналов задаётся отдельно для каждой карты (1–64). Автоактивация/автопереактивация относятся только к локальной reader/card session. FTA слот не занимает.</small></div>
+    <div class="cam-panel">
+      <div class="cam-head"><strong>CAM clients / Newcamd</strong><button id="satCamRefresh" class="button-secondary" type="button" onclick="refreshCamClients()">Refresh</button></div>
+      <div id="satCamClients" class="cam-list"><div class="cam-empty">Loading CAM clients...</div></div>
+      <div class="cam-select"><div class="sat-field"><label>CAM for scrambled channels</label><select id="satCamClientSelect"><option value="">Do not use CAM / FTA</option></select></div><small>Select the CAM client used to descramble saved encrypted services. Configure Newcamd/OSCam in System / Newcamd.</small></div>
     </div>
     <div class="sat-actions">
       <button id="satScanButton" class="button-primary" onclick="startSatelliteScan()">Сканировать каналы</button>
@@ -3172,7 +3136,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', conditional_access_reader:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', conditional_access_client:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, input_service_id:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -3379,7 +3343,7 @@ function openStreamForm(stream) {
     const transcoderInfo = state.transcoder || {};
     const transcoderAvailable = transcoderInfo.available === true;
     const transcoderMissing = Array.isArray(transcoderInfo.missing_elements) ? transcoderInfo.missing_elements.join(', ') : '';
-    const phoenixOptions = phoenixReaderOptions(stream.conditional_access_reader || '');
+    const camOptions = camClientOptions(stream.conditional_access_client || '');
     const transcoderStatus = transcoderAvailable
       ? `Доступно: H.264 ${transcoderInfo.video_encoder || 'encoder'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
       : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
@@ -3388,7 +3352,7 @@ function openStreamForm(stream) {
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
-        <div class="form-row full" id="streamPhoenixRow" style="display:${String(stream.input_uri||'').startsWith('dvb://')?'':'none'}"><label>Phoenix / карта (для кодированного DVB-канала)</label><select id="streamConditionalAccessReader">${phoenixOptions}</select><small>Выбор сохраняет привязку канала к найденному Phoenix. FTA-поток от этого параметра не зависит.</small></div>
+        <div class="form-row full" id="streamCamRow" style="display:${String(stream.input_uri||'').startsWith('dvb://')?'': 'none'}"><label>CAM client (scrambled DVB)</label><select id="streamConditionalAccessClient">${camOptions}</select><small>Select a CAM/Newcamd client for encrypted DVB services. FTA streams do not use this setting.</small></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
         <div class="form-row full"><label>Тестовая таблица</label><div class="checkbox-inline"><input id="streamTestPattern" type="checkbox" ${stream.test_pattern ? 'checked' : ''} /><span>Использовать вместо входных потоков</span></div></div>
@@ -3422,7 +3386,7 @@ function openStreamForm(stream) {
 
   const formLoaders = [];
   if (!state.interfaces || !state.interfaces.length) formLoaders.push(loadInterfaces());
-  if (String(stream.input_uri || '').startsWith('dvb://') && !phoenixReadersLoaded) formLoaders.push(loadPhoenixReaders());
+  if (String(stream.input_uri || '').startsWith('dvb://') && !camClientsLoaded) formLoaders.push(loadCamClients().then(()=>{ camClientsLoaded = true; }));
   if (formLoaders.length) Promise.all(formLoaders).then(renderStreamForm);
   else renderStreamForm();
 }
@@ -3595,7 +3559,7 @@ function saveStream(id) {
     service_id: Number(document.getElementById('streamServiceId').value),
     service_name: document.getElementById('streamServiceName').value,
     service_provider: document.getElementById('streamProvider').value,
-    conditional_access_reader: document.getElementById('streamConditionalAccessReader')?.value || ''
+    conditional_access_client: document.getElementById('streamConditionalAccessClient')?.value || ''
   };
   const existingIndex = state.streams.findIndex(s=>s.id===id);
   if (existingIndex >= 0) {

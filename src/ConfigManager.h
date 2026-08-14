@@ -47,7 +47,7 @@ struct StreamConfig {
     uint32_t serviceId = 1;
     std::string serviceName;
     std::string serviceProvider;
-    std::string conditionalAccessReader;
+    std::string conditionalAccessClient;
     std::vector<StreamOutputConfig> additionalOutputs;
 
     Json::Value toJson() const;
@@ -55,18 +55,15 @@ struct StreamConfig {
 };
 
 
-struct CaReaderConfig {
-    std::string readerKey;
-    std::string serial;
+struct CamClientConfig {
+    std::string id;
+    std::string name;
     unsigned maxServices = 10;
-    bool autoActivate = true;
-    bool autoReactivate = true;
-    unsigned retrySeconds = 5;
-    std::string backendId = "passthrough";
+    std::string backendId = "newcamd";
     std::string backendConfig = "{}";
 
     Json::Value toJson() const;
-    static CaReaderConfig fromJson(const Json::Value& root);
+    static CamClientConfig fromJson(const Json::Value& root);
 };
 
 struct AppConfig {
@@ -78,7 +75,7 @@ struct AppConfig {
     std::string telegramToken;
     std::string telegramChatId;
     std::vector<StreamConfig> streams;
-    std::vector<CaReaderConfig> caReaders;
+    std::vector<CamClientConfig> camClients;
 
     Json::Value toJson() const;
     static AppConfig fromJson(const Json::Value& root);

@@ -77,7 +77,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
         : config.serviceId;
     config.serviceName = root.get("service_name", "").asString();
     config.serviceProvider = root.get("service_provider", "").asString();
-    config.conditionalAccessReader = root.get("conditional_access_reader", "").asString();
+    config.conditionalAccessClient = root.get("conditional_access_client", "").asString();
     if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {
         const auto primary = StreamOutputConfig::fromJson(root["outputs"][0]);
         config.outputType = primary.outputType;
@@ -128,7 +128,7 @@ Json::Value StreamConfig::toJson() const {
     root["service_id"] = serviceId;
     root["service_name"] = serviceName;
     root["service_provider"] = serviceProvider;
-    root["conditional_access_reader"] = conditionalAccessReader;
+    root["conditional_access_client"] = conditionalAccessClient;
     Json::Value extraOutputs(Json::arrayValue);
     for (const auto& output : additionalOutputs) {
         extraOutputs.append(output.toJson());
@@ -137,34 +137,27 @@ Json::Value StreamConfig::toJson() const {
     return root;
 }
 
-CaReaderConfig CaReaderConfig::fromJson(const Json::Value& root) {
-    CaReaderConfig config;
-    config.readerKey = root.get("reader_key", "").asString();
-    config.serial = root.get("serial", "").asString();
+CamClientConfig CamClientConfig::fromJson(const Json::Value& root) {
+    CamClientConfig config;
+    config.id = root.get("id", "").asString();
+    config.name = root.get("name", config.id).asString();
     config.maxServices = std::clamp(root.get("max_services", 10).asUInt(), 1u, 64u);
-    config.autoActivate = root.get("auto_activate", true).asBool();
-    config.autoReactivate = root.get("auto_reactivate", true).asBool();
-    config.retrySeconds = std::clamp(root.get("retry_seconds", 5).asUInt(), 2u, 300u);
-    config.backendId = root.get("backend_id", "passthrough").asString();
-    if (config.backendId.empty()) config.backendId = "passthrough";
+    config.backendId = root.get("backend_id", "newcamd").asString();
+    if (config.backendId.empty() || config.backendId == "passthrough") config.backendId = "newcamd";
     config.backendConfig = root.get("backend_config", "{}").asString();
     if (config.backendConfig.empty()) config.backendConfig = "{}";
     return config;
 }
 
-Json::Value CaReaderConfig::toJson() const {
+Json::Value CamClientConfig::toJson() const {
     Json::Value root;
-    root["reader_key"] = readerKey;
-    root["serial"] = serial;
+    root["id"] = id;
+    root["name"] = name.empty() ? id : name;
     root["max_services"] = std::clamp(maxServices, 1u, 64u);
-    root["auto_activate"] = autoActivate;
-    root["auto_reactivate"] = autoReactivate;
-    root["retry_seconds"] = std::clamp(retrySeconds, 2u, 300u);
-    root["backend_id"] = backendId.empty() ? "passthrough" : backendId;
+    root["backend_id"] = backendId.empty() ? "newcamd" : backendId;
     root["backend_config"] = backendConfig.empty() ? "{}" : backendConfig;
     return root;
 }
-
 Json::Value AppConfig::toJson() const {
     Json::Value root;
     root["login"] = login;
@@ -174,9 +167,9 @@ Json::Value AppConfig::toJson() const {
     root["language"] = language;
     root["telegram_token"] = telegramToken;
     root["telegram_chat_id"] = telegramChatId;
-    Json::Value caReadersJson(Json::arrayValue);
-    for (const auto& reader : caReaders) caReadersJson.append(reader.toJson());
-    root["ca_readers"] = caReadersJson;
+    Json::Value camClientsJson(Json::arrayValue);
+    for (const auto& client : camClients) camClientsJson.append(client.toJson());
+    root["cam_clients"] = camClientsJson;
     Json::Value list(Json::arrayValue);
     for (const auto& stream : streams) {
         list.append(stream.toJson());
@@ -197,8 +190,8 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     }
     config.telegramToken = root.get("telegram_token", "").asString();
     config.telegramChatId = root.get("telegram_chat_id", "").asString();
-    if (root.isMember("ca_readers") && root["ca_readers"].isArray()) {
-        for (const auto& item : root["ca_readers"]) config.caReaders.push_back(CaReaderConfig::fromJson(item));
+    if (root.isMember("cam_clients") && root["cam_clients"].isArray()) {
+        for (const auto& item : root["cam_clients"]) config.camClients.push_back(CamClientConfig::fromJson(item));
     }
     if (root.isMember("streams") && root["streams"].isArray()) {
         for (const auto& item : root["streams"]) {

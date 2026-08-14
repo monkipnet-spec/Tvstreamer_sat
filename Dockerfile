@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-system-dev \
     libboost-thread-dev \
     libcurl4-openssl-dev \
+    libssl-dev \
+    libcrypt-dev \
+    libdvbcsa-dev \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     libgstreamer-plugins-bad1.0-dev \
@@ -33,6 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-system1.83.0 \
     libboost-thread1.83.0 \
     libcurl4t64 \
+    libssl3t64 \
+    libcrypt1 \
+    libdvbcsa1 \
     libjsoncpp25 \
     libgstreamer1.0-0 \
     gstreamer1.0-tools \
@@ -60,6 +66,8 @@ RUN set -eux; \
     else echo "No supported AAC encoder was found in the runtime image" >&2; exit 1; fi
 
 COPY --from=build /src/build/TVStreammerSAT5 /app/TVStreammerSAT5
+RUN mkdir -p /opt/tvstreammersat5/ca-plugins
+COPY --from=build /src/build/tvstreammersat5-ca-newcamd.so /opt/tvstreammersat5/ca-plugins/tvstreammersat5-ca-newcamd.so
 
 WORKDIR /data
 EXPOSE 9000/tcp

@@ -1,34 +1,30 @@
 #include "CardManager.h"
 
-#include "PhoenixManager.h"
 #include "CaBackend.h"
 
 #include <algorithm>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
-#include <set>
 #include <sstream>
 #include <utility>
 
 namespace {
 
-std::string readerPath(const Json::Value& item) {
-    const std::string stable = item.get("stable_device", "").asString();
-    return stable.empty() ? item.get("device", "").asString() : stable;
+Json::Value parseBackendConfig(const std::string& value) {
+    Json::Value parsed;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::istringstream input(value.empty() ? "{}" : value);
+    if (!Json::parseFromStream(builder, input, &parsed, &errors)) return Json::Value(Json::objectValue);
+    return parsed;
 }
 
-std::string ttySerialFromPath(const std::string& path) {
-    const auto marker = path.find("UART_");
-    if (marker == std::string::npos) return {};
-    const auto begin = marker + 5;
-    const auto end = path.find("-if", begin);
-    if (end == std::string::npos || end <= begin) return {};
-    return path.substr(begin, end - begin);
-}
-
-bool lifecycleReady(const std::string& status) {
-    return status == "READY" || status == "CARD_UNREADABLE";
+std::string endpointText(const Json::Value& config) {
+    const std::string host = config.get("host", "").asString();
+    const int port = config.get("port", 0).asInt();
+    if (host.empty() || port <= 0) return {};
+    return host + ":" + std::to_string(port);
 }
 
 } // namespace
@@ -38,27 +34,24 @@ CardManager& CardManager::instance() {
     return manager;
 }
 
-CardManager::~CardManager() {
-    stopMonitor_.store(true);
-    if (monitorThread_.joinable()) monitorThread_.join();
-}
-
-void CardManager::configure(const std::vector<CaReaderConfig>& readers) {
+void CardManager::configure(const std::vector<CamClientConfig>& clients) {
+    std::vector<CamClientConfig> normalized;
+    normalized.reserve(clients.size());
+    for (auto client : clients) {
+        if (client.id.empty()) continue;
+        client.maxServices = std::clamp(client.maxServices, 1u, kMaxConfigurableServices);
+        if (client.name.empty()) client.name = client.id;
+        if (client.backendId.empty() || client.backendId == "passthrough") client.backendId = "newcamd";
+        if (client.backendConfig.empty()) client.backendConfig = "{}";
+        normalized.push_back(std::move(client));
+    }
+    std::vector<CamClientConfig> configured;
     {
         std::lock_guard<std::mutex> lock(configMutex_);
-        readerConfigs_ = readers;
-        for (auto& item : readerConfigs_) {
-            item.maxServices = std::clamp(item.maxServices, 1u, kMaxConfigurableServices);
-            item.retrySeconds = std::clamp(item.retrySeconds, 2u, 300u);
-        }
+        clients_ = std::move(normalized);
+        configured = clients_;
     }
-    {
-        std::lock_guard<std::mutex> lock(inventoryMutex_);
-        cachedInventory_.clear();
-        lastInventoryRefresh_ = {};
-    }
-    CaBackendManager::instance().configure(readers);
-    ensureMonitorStarted();
+    CaBackendManager::instance().configure(configured);
 }
 
 std::string CardManager::isoTime(const std::chrono::system_clock::time_point& value) {
@@ -75,392 +68,81 @@ std::string CardManager::isoTime(const std::chrono::system_clock::time_point& va
     return out.str();
 }
 
-CardManager::ReaderProfile CardManager::applyKnownProfile(ReaderProfile profile) {
-    if (profile.serial == "A104JCGD") {
-        profile.displayName = "Voprosy_otvety";
-        profile.cardSystem = "Irdeto";
-        profile.caid = "0652";
-        profile.provider = "0406BE";
-        profile.maxServices = 10;
-    } else if (profile.serial == "AD023J2Q") {
-        profile.displayName = "Pervy1";
-        profile.cardSystem = "Irdeto";
-        profile.caid = "0652";
-        profile.provider = "0400DC";
-        profile.maxServices = 10;
-    }
-    return profile;
+std::string CardManager::displayName(const CamClientConfig& client) {
+    return client.name.empty() ? client.id : client.name;
 }
 
-CaReaderConfig CardManager::configuredPolicy(const ReaderProfile& profile) const {
-    CaReaderConfig result;
-    result.readerKey = profile.key;
-    result.serial = profile.serial;
-    result.maxServices = profile.maxServices;
-    result.autoActivate = true;
-    result.autoReactivate = true;
-    result.retrySeconds = 5;
-
-    std::lock_guard<std::mutex> lock(configMutex_);
-    for (const auto& config : readerConfigs_) {
-        if ((!config.readerKey.empty() && (config.readerKey == profile.key ||
-                                           config.readerKey == profile.stableDevice ||
-                                           config.readerKey == profile.device)) ||
-            (!config.serial.empty() && config.serial == profile.serial)) {
-            result = config;
-            if (result.readerKey.empty()) result.readerKey = profile.key;
-            if (result.serial.empty()) result.serial = profile.serial;
-            result.maxServices = std::clamp(result.maxServices, 1u, kMaxConfigurableServices);
-            result.retrySeconds = std::clamp(result.retrySeconds, 2u, 300u);
-            break;
-        }
-    }
-    return result;
-}
-
-CardManager::ReaderProfile CardManager::applyConfiguredPolicy(ReaderProfile profile) const {
-    const CaReaderConfig policy = configuredPolicy(profile);
-    profile.maxServices = policy.maxServices;
-    profile.autoActivate = policy.autoActivate;
-    profile.autoReactivate = policy.autoReactivate;
-    profile.retrySeconds = policy.retrySeconds;
-    profile.backendId = policy.backendId.empty() ? "passthrough" : policy.backendId;
-    profile.backendConfig = policy.backendConfig.empty() ? "{}" : policy.backendConfig;
-    return profile;
-}
-
-std::map<std::string, CardManager::ReaderProfile> CardManager::inventory(bool forceRefresh) const {
-    std::lock_guard<std::mutex> cacheLock(inventoryMutex_);
-    const auto now = std::chrono::steady_clock::now();
-    if (!forceRefresh && !cachedInventory_.empty() &&
-        lastInventoryRefresh_.time_since_epoch().count() != 0 &&
-        now - lastInventoryRefresh_ < std::chrono::seconds(2)) {
-        return cachedInventory_;
-    }
-
-    std::map<std::string, ReaderProfile> result;
-    const Json::Value readers = PhoenixManager::readers(false);
-    for (const auto& item : readers) {
-        ReaderProfile profile;
-        profile.stableDevice = readerPath(item);
-        profile.device = item.get("device", "").asString();
-        profile.serial = item.get("serial", "").asString();
-        if (profile.serial.empty()) profile.serial = ttySerialFromPath(profile.stableDevice);
-        profile.key = profile.stableDevice.empty() ? profile.device : profile.stableDevice;
-        profile.displayName = item.get("name", "Phoenix").asString();
-        profile.hardwareStatus = item.get("status", "unknown").asString();
-        profile.hardwareDetail = item.get("detail", "").asString();
-        profile.externalOwner = profile.hardwareStatus == "busy";
-        profile = applyConfiguredPolicy(applyKnownProfile(std::move(profile)));
-        if (!profile.key.empty()) result[profile.key] = profile;
-    }
-    cachedInventory_ = result;
-    lastInventoryRefresh_ = now;
-    return result;
-}
-
-CardManager::ReaderProfile CardManager::resolveReader(
-    const std::string& requested,
-    const std::map<std::string, ReaderProfile>& readers) {
+CamClientConfig CardManager::findClient(const std::string& requested) const {
     if (requested.empty()) return {};
-    for (const auto& [key, reader] : readers) {
-        if (requested == key || requested == reader.stableDevice || requested == reader.device ||
-            requested == reader.serial) {
-            return reader;
-        }
+    std::lock_guard<std::mutex> lock(configMutex_);
+    for (const auto& client : clients_) {
+        if (client.id == requested || client.name == requested) return client;
     }
-
-    ReaderProfile fallback;
-    fallback.key = requested;
-    fallback.stableDevice = requested;
-    fallback.serial = ttySerialFromPath(requested);
-    fallback.displayName = "Phoenix";
-    fallback.hardwareStatus = "unavailable";
-    fallback.hardwareDetail = "configured reader is not currently detected";
-    return applyKnownProfile(std::move(fallback));
+    return {};
 }
 
-void CardManager::ensureMonitorStarted() {
-    bool expected = false;
-    if (!monitorStarted_.compare_exchange_strong(expected, true)) return;
-    stopMonitor_.store(false);
-    monitorThread_ = std::thread([this]() { monitorLoop(); });
-}
-
-void CardManager::updateSlotLifecycleStatus(const std::string& readerKey, const std::string& status) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [id, slot] : slotsByStream_) {
-        (void)id;
-        if (slot.readerKey != readerKey) continue;
-        if (status == "READY" || status == "CARD_UNREADABLE") {
-            if (slot.lastStatus == "EXTERNAL_OWNER" || slot.lastStatus == "READER_UNAVAILABLE" ||
-                slot.lastStatus == "NO_CARD" || slot.lastStatus == "PROBE_FAILED" ||
-                slot.lastStatus == "RESERVED") {
-                slot.lastStatus = slot.active ? "ACTIVE" : "RESERVED";
-            }
-        } else if (status == "EXTERNAL_OWNER") slot.lastStatus = "EXTERNAL_OWNER";
-        else if (status == "NO_CARD") slot.lastStatus = "NO_CARD";
-        else if (status == "UNAVAILABLE") slot.lastStatus = "READER_UNAVAILABLE";
-        else if (status == "PERMISSION") slot.lastStatus = "READER_PERMISSION";
-        else if (status == "PROBE_FAILED") slot.lastStatus = "PROBE_FAILED";
-    }
-}
-
-CardManager::ReaderLifecycle CardManager::lifecycleFor(const std::string& readerKey) const {
-    std::lock_guard<std::mutex> lock(lifecycleMutex_);
-    const auto found = lifecycle_.find(readerKey);
-    return found == lifecycle_.end() ? ReaderLifecycle{} : found->second;
-}
-
-void CardManager::updateLifecycleFromHardware(const ReaderProfile& reader) {
-    std::string slotStatus;
-    {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        auto& state = lifecycle_[reader.key];
-        if (reader.externalOwner) {
-            state.status = "EXTERNAL_OWNER";
-            state.detail = reader.hardwareDetail;
-            state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(reader.retrySeconds);
-            slotStatus = state.status;
-        } else if (state.status == "UNKNOWN" || state.status == "EXTERNAL_OWNER" || state.status == "UNAVAILABLE") {
-            state.status = "DETECTED";
-            state.detail = "reader is free; activation probe pending";
-            state.nextAttempt = std::chrono::steady_clock::now();
-            slotStatus = state.status;
-        }
-    }
-    if (!slotStatus.empty()) updateSlotLifecycleStatus(reader.key, slotStatus);
-}
-
-void CardManager::markMissingReaders(const std::map<std::string, ReaderProfile>& readers) {
-    std::set<std::string> knownKeys;
-    {
-        std::lock_guard<std::mutex> lock(configMutex_);
-        for (const auto& config : readerConfigs_) if (!config.readerKey.empty()) knownKeys.insert(config.readerKey);
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [id, slot] : slotsByStream_) {
-            (void)id;
-            knownKeys.insert(slot.readerKey);
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        for (const auto& [key, state] : lifecycle_) {
-            (void)state;
-            knownKeys.insert(key);
-        }
-    }
-    for (const auto& key : knownKeys) {
-        if (readers.count(key)) continue;
-        {
-            std::lock_guard<std::mutex> lock(lifecycleMutex_);
-            auto& state = lifecycle_[key];
-            state.status = "UNAVAILABLE";
-            state.detail = "configured reader is not currently detected";
-            state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        }
-        updateSlotLifecycleStatus(key, "UNAVAILABLE");
-    }
-}
-
-Json::Value CardManager::probeReaderNow(const std::string& readerKey, bool manual) {
-    Json::Value response;
-    response["reader"] = readerKey;
-    if (readerKey.empty()) {
-        response["result"] = "error";
-        response["status"] = "INVALID_READER";
-        return response;
-    }
-
-    const auto readers = inventory(true);
-    const ReaderProfile profile = applyConfiguredPolicy(resolveReader(readerKey, readers));
-    if (profile.key.empty() || profile.hardwareStatus == "unavailable") {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        auto& state = lifecycle_[readerKey];
-        state.status = "UNAVAILABLE";
-        state.detail = "reader is not detected";
-        state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(profile.retrySeconds ? profile.retrySeconds : 5);
-        response["result"] = "error";
-        response["status"] = state.status;
-        response["detail"] = state.detail;
-        return response;
-    }
-    if (profile.externalOwner) {
-        {
-            std::lock_guard<std::mutex> lock(lifecycleMutex_);
-            auto& state = lifecycle_[profile.key];
-            state.status = "EXTERNAL_OWNER";
-            state.detail = profile.hardwareDetail;
-            state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(profile.retrySeconds);
-        }
-        updateSlotLifecycleStatus(profile.key, "EXTERNAL_OWNER");
-        response["result"] = "busy";
-        response["status"] = "EXTERNAL_OWNER";
-        response["detail"] = profile.hardwareDetail;
-        return response;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        auto& state = lifecycle_[profile.key];
-        if (state.probing) {
-            response["result"] = "busy";
-            response["status"] = "PROBING";
-            response["detail"] = "reader activation probe already in progress";
-            return response;
-        }
-        state.probing = true;
-        state.status = "PROBING";
-        state.detail = manual ? "manual reactivation in progress" : "automatic activation in progress";
-    }
-
-    const Json::Value probe = PhoenixManager::reader(profile.key, true);
-    const auto nowSystem = std::chrono::system_clock::now();
-    std::string lifecycleStatus = "PROBE_FAILED";
-    std::string detail = "reader disappeared during activation probe";
-    std::string atr;
-    std::string detectedSystem;
-    std::string detectedProvider;
-    if (!probe.isNull()) {
-        const std::string status = probe.get("status", "unknown").asString();
-        detail = probe.get("detail", "").asString();
-        atr = probe.get("atr", "").asString();
-        detectedSystem = probe.get("card_system", "").asString();
-        detectedProvider = probe.get("provider_name", "").asString();
-        if (status == "card") lifecycleStatus = "READY";
-        else if (status == "card_unreadable") lifecycleStatus = "CARD_UNREADABLE";
-        else if (status == "no_card") lifecycleStatus = "NO_CARD";
-        else if (status == "busy") lifecycleStatus = "EXTERNAL_OWNER";
-        else if (status == "permission") lifecycleStatus = "PERMISSION";
-        else if (status == "unavailable") lifecycleStatus = "UNAVAILABLE";
-        else lifecycleStatus = "PROBE_FAILED";
-    }
-
-    uint64_t attempts = 0;
-    {
-        std::lock_guard<std::mutex> lock(lifecycleMutex_);
-        auto& state = lifecycle_[profile.key];
-        state.probing = false;
-        state.status = lifecycleStatus;
-        state.detail = detail;
-        state.atr = atr;
-        state.detectedCardSystem = detectedSystem;
-        state.detectedProvider = detectedProvider;
-        ++state.attempts;
-        attempts = state.attempts;
-        state.lastAttempt = nowSystem;
-        if (lifecycleReady(lifecycleStatus)) state.lastReady = nowSystem;
-        state.nextAttempt = std::chrono::steady_clock::now() + std::chrono::seconds(profile.retrySeconds);
-    }
-    updateSlotLifecycleStatus(profile.key, lifecycleStatus);
-
-    std::cerr << "CA CardManager: " << (manual ? "manual" : "auto")
-              << " reader activation reader=" << profile.key
-              << " status=" << lifecycleStatus
-              << " attempt=" << attempts
-              << " retry=" << profile.retrySeconds << "s" << std::endl;
-
-    response["result"] = lifecycleReady(lifecycleStatus) ? "ok" : "error";
-    response["status"] = lifecycleStatus;
-    response["detail"] = detail;
-    response["attempts"] = Json::UInt64(attempts);
-    response["atr"] = atr;
-    return response;
-}
-
-Json::Value CardManager::reactivateReader(const std::string& readerKey) {
-    ensureMonitorStarted();
-    return probeReaderNow(readerKey, true);
-}
-
-void CardManager::monitorLoop() {
-    while (!stopMonitor_.load()) {
-        const auto readers = inventory(true);
-        markMissingReaders(readers);
-        const auto now = std::chrono::steady_clock::now();
-
-        for (const auto& [key, reader] : readers) {
-            updateLifecycleFromHardware(reader);
-            ReaderLifecycle state = lifecycleFor(key);
-            if (reader.externalOwner || state.probing || lifecycleReady(state.status)) continue;
-
-            bool shouldProbe = false;
-            if (state.status == "DETECTED") {
-                const bool wasReadyBefore = state.lastReady.time_since_epoch().count() != 0;
-                shouldProbe = wasReadyBefore ? reader.autoReactivate : reader.autoActivate;
-            } else if ((state.status == "NO_CARD" || state.status == "PROBE_FAILED" ||
-                      state.status == "PERMISSION" || state.status == "UNAVAILABLE" ||
-                      state.status == "EXTERNAL_OWNER") && reader.autoReactivate &&
-                     (state.nextAttempt.time_since_epoch().count() == 0 || now >= state.nextAttempt)) {
-                shouldProbe = true;
-            }
-            if (shouldProbe) (void)probeReaderNow(key, false);
-            if (stopMonitor_.load()) break;
-        }
-
-        for (int i = 0; i < 10 && !stopMonitor_.load(); ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
-    }
+Json::Value CardManager::clientStatusJson(const CamClientConfig& client) {
+    Json::Value item;
+    item["id"] = client.id;
+    item["name"] = displayName(client);
+    item["max_services"] = std::clamp(client.maxServices, 1u, kMaxConfigurableServices);
+    item["backend_id"] = client.backendId.empty() ? "newcamd" : client.backendId;
+    const Json::Value backendConfig = parseBackendConfig(client.backendConfig);
+    item["configured"] = !client.id.empty();
+    item["endpoint"] = endpointText(backendConfig);
+    item["host"] = backendConfig.get("host", "").asString();
+    item["port"] = backendConfig.get("port", 0).asInt();
+    item["user"] = backendConfig.get("user", "").asString();
+    item["des_configured"] = !backendConfig.get("des", "").asString().empty();
+    item["status"] = item["endpoint"].asString().empty() ? "NOT_CONFIGURED" : "CONFIGURED";
+    return item;
 }
 
 bool CardManager::reserveService(const StreamConfig& config, std::string* error) {
     if (error) error->clear();
-    if (config.conditionalAccessReader.empty()) return true;
-    ensureMonitorStarted();
+    if (config.conditionalAccessClient.empty()) return true;
+    if (config.conditionalAccessClient == "auto") {
+        if (error) *error = "CAM auto routing is disabled: select a CAM client for this channel";
+        return false;
+    }
 
-    const auto readers = inventory(true);
+    CamClientConfig client = findClient(config.conditionalAccessClient);
+    if (client.id.empty()) {
+        if (error) *error = "CAM client is not configured: " + config.conditionalAccessClient;
+        return false;
+    }
+    client.maxServices = std::clamp(client.maxServices, 1u, kMaxConfigurableServices);
+    if (client.backendId.empty()) client.backendId = "newcamd";
+    if (client.backendConfig.empty()) client.backendConfig = "{}";
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (slotsByStream_.count(config.id)) return true;
 
-    ReaderProfile reader;
-    if (config.conditionalAccessReader == "auto") {
-        if (error) *error = "CA AUTO routing is disabled: select the specific Phoenix reader assigned to this channel";
-        std::cerr << "CA CardManager: reservation rejected stream=" << config.id
-                  << " reason=legacy-auto-routing-disabled" << std::endl;
-        return false;
-    }
-    reader = applyConfiguredPolicy(resolveReader(config.conditionalAccessReader, readers));
-    if (reader.key.empty()) {
-        if (error) *error = "CA reader path is empty";
-        return false;
-    }
-
     const auto used = static_cast<unsigned>(std::count_if(
         slotsByStream_.begin(), slotsByStream_.end(), [&](const auto& entry) {
-            return entry.second.readerKey == reader.key;
+            return entry.second.clientId == client.id;
         }));
-    if (used >= reader.maxServices) {
+    if (used >= client.maxServices) {
         if (error) {
-            *error = "CA service limit reached for " + reader.key + ": " +
-                     std::to_string(used) + "/" + std::to_string(reader.maxServices);
+            *error = "CAM client service limit reached for " + client.id + ": " +
+                     std::to_string(used) + "/" + std::to_string(client.maxServices);
         }
-        std::cerr << "CA CardManager: reservation rejected reader=" << reader.key
-                  << " stream=" << config.id << " slots=" << used << "/"
-                  << reader.maxServices << std::endl;
         return false;
     }
 
-    CaBackendReaderBinding backendReader;
-    backendReader.key = reader.key;
-    backendReader.stableDevice = reader.stableDevice;
-    backendReader.device = reader.device;
-    backendReader.serial = reader.serial;
-    backendReader.displayName = reader.displayName;
-    backendReader.cardSystem = reader.cardSystem;
-    backendReader.caid = reader.caid;
-    backendReader.provider = reader.provider;
-    backendReader.maxServices = reader.maxServices;
-    backendReader.backendId = reader.backendId;
-    backendReader.backendConfig = reader.backendConfig;
+    CaBackendReaderBinding backendClient;
+    backendClient.key = client.id;
+    backendClient.displayName = displayName(client);
+    backendClient.maxServices = client.maxServices;
+    backendClient.backendId = client.backendId;
+    backendClient.backendConfig = client.backendConfig;
+
     std::string backendError;
-    if (!CaBackendManager::instance().startService(config, backendReader, &backendError)) {
-        if (error) *error = backendError.empty() ? "failed to reserve CA backend service" : backendError;
-        std::cerr << "CA CardManager: backend reservation rejected reader=" << reader.key
+    if (!CaBackendManager::instance().startService(config, backendClient, &backendError)) {
+        if (error) *error = backendError.empty() ? "failed to reserve CAM backend service" : backendError;
+        std::cerr << "CAM manager: backend reservation rejected client=" << client.id
                   << " stream=" << config.id
-                  << " backend=" << reader.backendId
+                  << " backend=" << client.backendId
                   << " error=" << backendError << std::endl;
         return false;
     }
@@ -470,23 +152,18 @@ bool CardManager::reserveService(const StreamConfig& config, std::string* error)
     slot.streamName = config.name;
     slot.serviceId = config.inputServiceId ? config.inputServiceId : config.serviceId;
     slot.serviceProvider = config.serviceProvider;
-    slot.requestedReader = config.conditionalAccessReader;
-    slot.readerKey = reader.key;
-    const ReaderLifecycle lifecycle = lifecycleFor(reader.key);
-    slot.lastStatus = reader.externalOwner ? "EXTERNAL_OWNER" :
-        (lifecycleReady(lifecycle.status) ? "RESERVED" : lifecycle.status);
-    if (slot.lastStatus.empty() || slot.lastStatus == "UNKNOWN" || slot.lastStatus == "DETECTED") {
-        slot.lastStatus = "RESERVED";
-    }
+    slot.requestedClient = config.conditionalAccessClient;
+    slot.clientId = client.id;
+    slot.clientName = displayName(client);
+    slot.backendId = client.backendId;
+    slot.lastStatus = "RESERVED";
     slotsByStream_[config.id] = std::move(slot);
-    std::cerr << "CA CardManager: reserved reader=" << reader.key
+
+    std::cerr << "CAM manager: reserved client=" << client.id
               << " stream=" << config.id
               << " sid=" << (config.inputServiceId ? config.inputServiceId : config.serviceId)
-              << " slots=" << (used + 1) << "/" << reader.maxServices
-              << " external_owner=" << (reader.externalOwner ? "yes" : "no")
-              << " auto_activate=" << (reader.autoActivate ? "yes" : "no")
-              << " auto_reactivate=" << (reader.autoReactivate ? "yes" : "no")
-              << " backend=" << reader.backendId << std::endl;
+              << " slots=" << (used + 1) << "/" << client.maxServices
+              << " backend=" << client.backendId << std::endl;
     return true;
 }
 
@@ -499,7 +176,7 @@ void CardManager::activateService(const std::string& streamId) {
         if (found->second.lastStatus.empty() || found->second.lastStatus == "RESERVED") {
             found->second.lastStatus = "ACTIVE";
         }
-        std::cerr << "CA CardManager: active reader=" << found->second.readerKey
+        std::cerr << "CAM manager: active client=" << found->second.clientId
                   << " stream=" << found->second.streamId
                   << " sid=" << found->second.serviceId << std::endl;
     }
@@ -512,7 +189,7 @@ void CardManager::releaseService(const std::string& streamId) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto found = slotsByStream_.find(streamId);
         if (found == slotsByStream_.end()) return;
-        std::cerr << "CA CardManager: released reader=" << found->second.readerKey
+        std::cerr << "CAM manager: released client=" << found->second.clientId
                   << " stream=" << found->second.streamId
                   << " sid=" << found->second.serviceId << std::endl;
         slotsByStream_.erase(found);
@@ -528,6 +205,7 @@ void CardManager::releaseAll() {
     }
     CaBackendManager::instance().stopAll();
 }
+
 
 void CardManager::recordTransaction(const std::string& streamId, uint64_t latencyMs,
                                     bool success, const std::string& status) {
@@ -552,9 +230,9 @@ Json::Value CardManager::slotToJson(const ServiceSlot& slot) const {
     item["stream_name"] = slot.streamName;
     item["service_id"] = slot.serviceId;
     item["service_provider"] = slot.serviceProvider;
-    item["reader"] = slot.readerKey;
-    item["requested_reader"] = slot.requestedReader;
-    item["auto_assigned"] = slot.requestedReader == "auto";
+    item["client"] = slot.clientId;
+    item["client_name"] = slot.clientName;
+    item["requested_client"] = slot.requestedClient;
     item["active"] = slot.active;
     item["status"] = slot.lastStatus;
     item["reserved_at"] = isoTime(slot.reservedAt);
@@ -565,16 +243,21 @@ Json::Value CardManager::slotToJson(const ServiceSlot& slot) const {
     item["max_latency_ms"] = Json::UInt64(slot.maxLatencyMs);
     item["average_latency_ms"] = slot.averageLatencyMs;
     item["last_transaction_at"] = isoTime(slot.lastTransactionAt);
+    item["backend_id"] = slot.backendId;
     item["backend"] = CaBackendManager::instance().streamState(slot.streamId);
     return item;
 }
 
 Json::Value CardManager::snapshot() const {
-    const auto readers = inventory();
+    std::vector<CamClientConfig> clients;
+    {
+        std::lock_guard<std::mutex> configLock(configMutex_);
+        clients = clients_;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
 
     Json::Value root;
-    root["mode"] = "internal-control-plane+plugin-backend";
+    root["mode"] = "cam-client+plugin-backend";
     root["ca_backend"] = CaBackendManager::instance().snapshot();
     root["network_ca_server"] = false;
     root["external_key_export"] = false;
@@ -582,151 +265,30 @@ Json::Value CardManager::snapshot() const {
     root["max_configurable_services"] = kMaxConfigurableServices;
     root["reserved_services"] = Json::UInt(slotsByStream_.size());
 
-    Json::Value readerList(Json::arrayValue);
-    for (const auto& [key, rawReader] : readers) {
-        ReaderProfile reader = applyConfiguredPolicy(rawReader);
-        const ReaderLifecycle lifecycle = lifecycleFor(key);
-        Json::Value item;
-        item["key"] = key;
-        item["stable_device"] = reader.stableDevice;
-        item["device"] = reader.device;
-        item["serial"] = reader.serial;
-        item["display_name"] = reader.displayName;
-        item["card_system"] = reader.cardSystem;
-        item["caid"] = reader.caid;
-        item["provider"] = reader.provider;
-        item["max_services"] = reader.maxServices;
-        item["auto_activate"] = reader.autoActivate;
-        item["auto_reactivate"] = reader.autoReactivate;
-        item["retry_seconds"] = reader.retrySeconds;
-        item["backend_id"] = reader.backendId;
-        item["hardware_status"] = reader.hardwareStatus;
-        item["hardware_detail"] = reader.hardwareDetail;
-        item["external_owner"] = reader.externalOwner;
-        item["activation_status"] = lifecycle.status;
-        item["activation_detail"] = lifecycle.detail;
-        item["activation_attempts"] = Json::UInt64(lifecycle.attempts);
-        item["activation_probing"] = lifecycle.probing;
-        item["last_activation_attempt"] = isoTime(lifecycle.lastAttempt);
-        item["last_ready"] = isoTime(lifecycle.lastReady);
-        item["atr"] = lifecycle.atr;
-        item["detected_card_system"] = lifecycle.detectedCardSystem;
-        item["detected_provider"] = lifecycle.detectedProvider;
-
+    Json::Value clientList(Json::arrayValue);
+    for (const auto& client : clients) {
+        Json::Value item = clientStatusJson(client);
         Json::Value services(Json::arrayValue);
         unsigned active = 0;
         for (const auto& [streamId, slot] : slotsByStream_) {
             (void)streamId;
-            if (slot.readerKey != key) continue;
+            if (slot.clientId != client.id) continue;
             services.append(slotToJson(slot));
             if (slot.active) ++active;
         }
-        item["services"] = services;
-        item["services_used"] = Json::UInt(services.size());
-        item["services_active"] = active;
-        item["services_free"] = reader.maxServices > services.size()
-            ? Json::UInt(reader.maxServices - static_cast<unsigned>(services.size()))
-            : Json::UInt(0);
-        readerList.append(item);
-    }
-
-    // Keep configured/disconnected readers visible even without an active slot.
-    std::vector<CaReaderConfig> policies;
-    {
-        std::lock_guard<std::mutex> configLock(configMutex_);
-        policies = readerConfigs_;
-    }
-    for (const auto& policy : policies) {
-        if (policy.readerKey.empty()) continue;
-        bool exists = false;
-        for (const auto& item : readerList) {
-            if (item.get("key", "").asString() == policy.readerKey ||
-                (!policy.serial.empty() && item.get("serial", "").asString() == policy.serial)) {
-                exists = true;
-                break;
-            }
-        }
-        if (exists) continue;
-        Json::Value item;
-        item["key"] = policy.readerKey;
-        item["stable_device"] = policy.readerKey;
-        item["serial"] = policy.serial;
-        item["display_name"] = "Phoenix";
-        item["max_services"] = std::clamp(policy.maxServices, 1u, kMaxConfigurableServices);
-        item["auto_activate"] = policy.autoActivate;
-        item["auto_reactivate"] = policy.autoReactivate;
-        item["retry_seconds"] = std::clamp(policy.retrySeconds, 2u, 300u);
-        item["backend_id"] = policy.backendId.empty() ? "passthrough" : policy.backendId;
-        item["hardware_status"] = "unavailable";
-        item["external_owner"] = false;
-        const ReaderLifecycle lifecycle = lifecycleFor(policy.readerKey);
-        item["activation_status"] = lifecycle.status == "UNKNOWN" ? "UNAVAILABLE" : lifecycle.status;
-        item["activation_detail"] = lifecycle.detail;
-        item["activation_attempts"] = Json::UInt64(lifecycle.attempts);
-        item["last_activation_attempt"] = isoTime(lifecycle.lastAttempt);
-        item["last_ready"] = isoTime(lifecycle.lastReady);
-        item["services"] = Json::Value(Json::arrayValue);
-        item["services_used"] = 0;
-        item["services_active"] = 0;
-        item["services_free"] = item["max_services"];
-        readerList.append(item);
-    }
-
-    // Keep configured-but-temporarily-disconnected readers with active slots visible.
-    for (const auto& [streamId, slot] : slotsByStream_) {
-        (void)streamId;
-        Json::Value* existing = nullptr;
-        for (auto& item : readerList) {
-            if (item.get("key", "").asString() == slot.readerKey) {
-                existing = &item;
-                break;
-            }
-        }
-        if (!existing) {
-            ReaderProfile reader = applyConfiguredPolicy(resolveReader(slot.readerKey, readers));
-            Json::Value item;
-            item["key"] = reader.key;
-            item["stable_device"] = reader.stableDevice;
-            item["device"] = reader.device;
-            item["serial"] = reader.serial;
-            item["display_name"] = reader.displayName;
-            item["card_system"] = reader.cardSystem;
-            item["caid"] = reader.caid;
-            item["provider"] = reader.provider;
-            item["max_services"] = reader.maxServices;
-            item["auto_activate"] = reader.autoActivate;
-            item["auto_reactivate"] = reader.autoReactivate;
-            item["retry_seconds"] = reader.retrySeconds;
-            item["backend_id"] = reader.backendId;
-            item["hardware_status"] = "unavailable";
-            item["external_owner"] = false;
-            const ReaderLifecycle lifecycle = lifecycleFor(reader.key);
-            item["activation_status"] = lifecycle.status;
-            item["activation_detail"] = lifecycle.detail;
-            item["services"] = Json::Value(Json::arrayValue);
-            readerList.append(item);
-            existing = &readerList[readerList.size() - 1];
-        }
-        (*existing)["services"].append(slotToJson(slot));
-    }
-
-    for (auto& item : readerList) {
         const unsigned maxServices = item.get("max_services", kDefaultMaxServices).asUInt();
-        const unsigned used = item["services"].isArray() ? item["services"].size() : 0;
-        unsigned active = 0;
-        if (item["services"].isArray()) {
-            for (const auto& slot : item["services"]) if (slot.get("active", false).asBool()) ++active;
-        }
+        const unsigned used = services.size();
+        item["services"] = services;
         item["services_used"] = used;
         item["services_active"] = active;
         item["services_free"] = maxServices > used ? maxServices - used : 0;
+        clientList.append(item);
     }
-    root["readers"] = readerList;
+    root["clients"] = clientList;
     return root;
 }
 
 Json::Value CardManager::streamState(const std::string& streamId) const {
-    const auto readers = inventory();
     std::lock_guard<std::mutex> lock(mutex_);
     Json::Value result;
     const auto found = slotsByStream_.find(streamId);
@@ -742,18 +304,7 @@ Json::Value CardManager::streamState(const std::string& streamId) const {
     const Json::Value backendState = CaBackendManager::instance().streamState(streamId);
     result["backend"] = backendState;
     result["native_card_backend"] = backendState.get("native_plugin", false).asBool();
-    ReaderProfile reader = applyConfiguredPolicy(resolveReader(found->second.readerKey, readers));
-    result["reader_display_name"] = reader.displayName;
-    result["reader_serial"] = reader.serial;
-    result["caid"] = reader.caid;
-    result["provider"] = reader.provider;
-    result["card_system"] = reader.cardSystem;
-    result["hardware_status"] = reader.hardwareStatus;
-    result["external_owner"] = reader.externalOwner;
-    result["max_services"] = reader.maxServices;
-    result["backend_id"] = reader.backendId;
-    const ReaderLifecycle lifecycle = lifecycleFor(reader.key);
-    result["activation_status"] = lifecycle.status;
-    result["activation_detail"] = lifecycle.detail;
+    result["client_display_name"] = found->second.clientName;
+    result["backend_id"] = found->second.backendId;
     return result;
 }

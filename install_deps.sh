@@ -20,6 +20,10 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 APT_GET=("${SUDO[@]}" apt-get)
+BOOST_SYSTEM_DEV_PACKAGE="libboost-dev"
+if apt-cache show libboost-system-dev >/dev/null 2>&1; then
+    BOOST_SYSTEM_DEV_PACKAGE="libboost-system-dev"
+fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing TVStreammerSAT5 Release 7 dependencies..."
@@ -34,7 +38,10 @@ echo "Installing TVStreammerSAT5 Release 7 dependencies..."
     libgstreamer-plugins-bad1.0-dev \
     libcurl4-openssl-dev \
     libjsoncpp-dev \
-    libboost-system-dev \
+    libssl-dev \
+    libcrypt-dev \
+    libdvbcsa-dev \
+    "${BOOST_SYSTEM_DEV_PACKAGE}" \
     libboost-thread-dev \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \

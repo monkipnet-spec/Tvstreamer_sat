@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_library(CRYPT_LIBRARY crypt)
 
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-mpegts-1.0)
 pkg_check_modules(LIBCURL REQUIRED libcurl)
@@ -22,7 +23,7 @@ if(NOT DVBCSA_FOUND)
     endif()
 endif()
 
-find_package(Boost REQUIRED COMPONENTS system thread)
+find_package(Boost REQUIRED COMPONENTS thread)
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/src
@@ -46,10 +47,8 @@ add_executable(TVStreammerSAT5
     src/utils.cpp
     src/ConfigManager.cpp
     src/DvbSatellite.cpp
-    src/PhoenixManager.cpp
     src/CardManager.cpp
     src/CaBackend.cpp
-    src/ca/PhoenixSerialTransport.cpp
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
@@ -133,6 +132,7 @@ target_link_libraries(tvstreammersat5_ca_newcamd PRIVATE
     ${Boost_LIBRARIES}
     ${DVBCSA_LIBRARIES}
     OpenSSL::Crypto
+    $<$<BOOL:${CRYPT_LIBRARY}>:${CRYPT_LIBRARY}>
 )
 set_target_properties(tvstreammersat5_ca_newcamd PROPERTIES
     PREFIX ""

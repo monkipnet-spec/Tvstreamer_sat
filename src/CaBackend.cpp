@@ -1,5 +1,4 @@
 #include "CaBackend.h"
-#include "ca/PhoenixSerialTransport.h"
 
 #include <algorithm>
 #include <chrono>
@@ -107,9 +106,9 @@ std::string CaBackendManager::extractDvbPids(const std::string& uri) {
     return value;
 }
 
-void CaBackendManager::configure(const std::vector<CaReaderConfig>& readers) {
+void CaBackendManager::configure(const std::vector<CamClientConfig>& clients) {
     std::lock_guard<std::mutex> lock(mutex_);
-    readerPolicies_ = readers;
+    clientPolicies_ = clients;
     if (!sessions_.empty()) {
         // Running streams keep their current plugin instances. Discovery is
         // refreshed when no CA sessions are active to avoid invalidating ABI
@@ -255,33 +254,6 @@ bool CaBackendManager::ensureReaderOpenLocked(LoadedBackend& backend,
         return true;
     }
 
-    // Reader lifecycle preflight is intentionally protocol-neutral: it only
-    // verifies local ownership/card-detect and performs reset+ATR acquisition.
-    // No application APDU or CA-specific command is sent here.
-    ca::PhoenixSerialConfig serialConfig;
-    serialConfig.devicePath = !reader.stableDevice.empty() ? reader.stableDevice : reader.device;
-    serialConfig.serial = reader.serial;
-    serialConfig.detectMode = "cd";
-    serialConfig.probeProfiles = ca::PhoenixSerialTransport::defaultProbeProfiles(reader.serial);
-    const auto preflight = ca::PhoenixSerialTransport::probe(serialConfig);
-    if (preflight.status == "busy" || preflight.status == "permission" ||
-        preflight.status == "unavailable" || preflight.status == "no_card") {
-        error = "Phoenix preflight failed: " + preflight.status;
-        if (!preflight.detail.empty()) error += ": " + preflight.detail;
-        return false;
-    }
-    if (preflight.status == "card_unreadable" || preflight.status == "probe_failed") {
-        // DCD may still prove a card is physically present while a backend SDK
-        // uses its own reset/clock negotiation. Allow open_reader() to decide.
-        std::cerr << "CA backend Phoenix preflight warning: reader=" << reader.key
-                  << " status=" << preflight.status
-                  << " detail=" << preflight.detail << std::endl;
-    } else if (preflight.status == "card") {
-        std::cerr << "CA backend Phoenix preflight OK: reader=" << reader.key
-                  << " baud=" << preflight.baud
-                  << " profile=" << preflight.profileLabel << std::endl;
-    }
-
     tvs_ca_reader_info_v1 info{};
     info.reader_key = reader.key.c_str();
     info.device = reader.device.c_str();
@@ -370,7 +342,7 @@ bool CaBackendManager::startService(const StreamConfig& stream,
 
     sessions_.emplace(stream.id, std::move(session));
     std::cerr << "CA backend service reserved: stream=" << stream.id
-              << " reader=" << reader.key
+              << " client=" << reader.key
               << " backend=" << backend->id
               << " mode=" << (backend->builtin ? "passthrough" : "plugin") << std::endl;
     return true;
@@ -398,7 +370,7 @@ void CaBackendManager::stopService(const std::string& streamId) {
     }
     releaseReaderLocked(*backend, session.readerKey);
     std::cerr << "CA backend service stopped: stream=" << streamId
-              << " reader=" << session.readerKey
+              << " client=" << session.readerKey
               << " backend=" << session.backendId << std::endl;
 }
 
@@ -490,7 +462,7 @@ Json::Value CaBackendManager::backendToJsonLocked(const LoadedBackend& backend) 
     item["entitlement_status"] = (backend.capabilities & TVS_CA_CAP_ENTITLEMENT_STATUS) != 0;
     item["reader_reconnect"] = (backend.capabilities & TVS_CA_CAP_READER_RECONNECT) != 0;
     item["load_error"] = backend.loadError;
-    item["open_readers"] = Json::UInt(backend.readerRefs.size());
+    item["open_clients"] = Json::UInt(backend.readerRefs.size());
     if (!backend.builtin && backend.api && backend.api->status_json) {
         const char* status = backend.api->status_json(backend.instance);
         if (status && *status) {
@@ -518,7 +490,7 @@ Json::Value CaBackendManager::streamState(const std::string& streamId) const {
     const ServiceSession& session = found->second;
     result["managed"] = true;
     result["backend_id"] = session.backendId;
-    result["reader"] = session.readerKey;
+    result["client"] = session.readerKey;
     result["active"] = session.active;
     result["passthrough"] = session.passthrough;
     result["status"] = session.status;

@@ -47,7 +47,7 @@ constexpr const char* kTestPatternUri = "test://bars";
 class CardReservationGuard {
 public:
     CardReservationGuard(const StreamConfig& config, std::string* error)
-        : streamId_(config.id), managed_(!config.conditionalAccessReader.empty()) {
+        : streamId_(config.id), managed_(!config.conditionalAccessClient.empty()) {
         if (!managed_) {
             reserved_ = true;
             return;
@@ -2230,7 +2230,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
-    if (!state->config.conditionalAccessReader.empty()) {
+    if (!state->config.conditionalAccessClient.empty()) {
         GstPad* caPad = gst_element_get_static_pad(outputQueue, "src");
         if (caPad) {
             auto* caContext = new CaBackendTsProbeContext();
@@ -2243,7 +2243,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
                 [](gpointer data) { delete static_cast<CaBackendTsProbeContext*>(data); });
             gst_object_unref(caPad);
             std::cerr << "CA backend transport hook attached: stream=" << state->config.id
-                      << " reader=" << state->config.conditionalAccessReader
+                      << " cam_client=" << state->config.conditionalAccessClient
                       << " stage=selected-dvb-spts" << std::endl;
         }
     }

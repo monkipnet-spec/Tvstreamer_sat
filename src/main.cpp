@@ -35,7 +35,7 @@ int main() {
     std::cerr << "Config loaded: http_port=" << configManager.config.httpPort
               << " login=" << configManager.config.login << std::endl;
 
-    CardManager::instance().configure(configManager.config.caReaders);
+    CardManager::instance().configure(configManager.config.camClients);
 
     TelegramNotifier notifier(configManager);
     StreamManager streamManager(configManager, notifier);

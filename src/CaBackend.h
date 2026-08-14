@@ -35,8 +35,8 @@ public:
     CaBackendManager(const CaBackendManager&) = delete;
     CaBackendManager& operator=(const CaBackendManager&) = delete;
 
-    // Reload discoverable .so plugins and keep persisted reader policy.
-    void configure(const std::vector<CaReaderConfig>& readers);
+    // Reload discoverable .so plugins and keep persisted CAM-client policy.
+    void configure(const std::vector<CamClientConfig>& clients);
 
     bool startService(const StreamConfig& stream,
                       const CaBackendReaderBinding& reader,
@@ -110,6 +110,6 @@ private:
     mutable std::mutex mutex_;
     std::map<std::string, LoadedBackend> backends_;
     std::map<std::string, ServiceSession> sessions_;
-    std::vector<CaReaderConfig> readerPolicies_;
+    std::vector<CamClientConfig> clientPolicies_;
     tvs_ca_host_api_v1 hostApi_{};
 };
