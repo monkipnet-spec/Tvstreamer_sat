@@ -15,14 +15,14 @@
 
 class NewcamdClient {
 public:
-    using KeyUpdateCallback = std::function<void(uint8_t, const uint8_t*)>;
+    using KeyUpdateCallback = std::function<void(uint16_t, uint8_t, const uint8_t*)>;
 
     NewcamdClient(const std::string& host, int port, const std::string& user, const std::string& pass, const std::string& des);
     ~NewcamdClient();
 
     bool connect();
     bool login();
-    bool send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm);
+    bool send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm, uint16_t* message_id = nullptr);
     void disconnect();
     void start_receiver();
     void set_key_update_callback(KeyUpdateCallback cb) {
@@ -41,7 +41,7 @@ private:
     bool parse_des_key();
     bool derive_key_from_seed(const uint8_t* seed, size_t seed_size);
     std::string md5_crypt_password() const;
-    bool send_message(std::vector<uint8_t> payload, uint16_t service_id, uint16_t caid, uint32_t provid, bool use_msg_id);
+    bool send_message(std::vector<uint8_t> payload, uint16_t service_id, uint16_t caid, uint32_t provid, bool use_msg_id, uint16_t* message_id = nullptr);
     bool receive_message(Message& message, bool check_msg_id);
     void receiver_loop();
     void set_error(const std::string& error);

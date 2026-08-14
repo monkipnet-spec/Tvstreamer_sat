@@ -167,7 +167,7 @@ bool NewcamdClient::connect() {
     }
 }
 
-bool NewcamdClient::send_message(std::vector<uint8_t> payload, uint16_t service_id, uint16_t caid, uint32_t provid, bool use_msg_id) {
+bool NewcamdClient::send_message(std::vector<uint8_t> payload, uint16_t service_id, uint16_t caid, uint32_t provid, bool use_msg_id, uint16_t* message_id) {
     if (!socket_ || !socket_->is_open()) {
         set_error("Newcamd socket is not open");
         return false;
@@ -204,10 +204,12 @@ bool NewcamdClient::send_message(std::vector<uint8_t> payload, uint16_t service_
 
     {
         std::lock_guard<std::mutex> lock(write_mutex_);
+        if (message_id) *message_id = 0;
         if (use_msg_id) {
             ++msg_id_;
             plain[2] = static_cast<uint8_t>(msg_id_ >> 8);
             plain[3] = static_cast<uint8_t>(msg_id_ & 0xFF);
+            if (message_id) *message_id = msg_id_;
         }
 
         const size_t pad = (8 - ((plain.size() - 1) % 8)) % 8;
@@ -372,7 +374,7 @@ bool NewcamdClient::login() {
     }
 }
 
-bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm) {
+bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm, uint16_t* message_id) {
     if (!authenticated_) {
         set_error("Newcamd ECM request skipped: client is not authenticated");
         return false;
@@ -381,7 +383,7 @@ bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid
         set_error("Newcamd ECM request is not a valid ECM section");
         return false;
     }
-    if (!send_message(ecm, service_id, caid, provid & 0x00FFFFFFu, true)) return false;
+    if (!send_message(ecm, service_id, caid, provid & 0x00FFFFFFu, true, message_id)) return false;
     set_error({});
     return true;
 }
@@ -407,8 +409,8 @@ void NewcamdClient::receiver_loop() {
 
         const uint8_t command = message.payload[0];
         if ((command == 0x80 || command == 0x81) && message.payload.size() >= 19) {
-            callback(0, message.payload.data() + 3);
-            callback(1, message.payload.data() + 11);
+            callback(message.id, 0, message.payload.data() + 3);
+            callback(message.id, 1, message.payload.data() + 11);
         } else if (command == 0x80 || command == 0x81) {
             set_error("Newcamd ECM response did not contain a control word");
         }

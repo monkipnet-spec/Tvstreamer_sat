@@ -104,15 +104,16 @@ struct ServiceBinding {
     std::set<EcmDescriptor> ecmPids;
     std::map<uint16_t, SectionAssembler> assemblers;
     std::set<std::string> sentEcms;
+    std::set<uint16_t> pendingEcmIds;
+    ControlWordSlot even;
+    ControlWordSlot odd;
     uint64_t ecmRequests = 0;
+    uint64_t cwUpdates = 0;
 };
 
 struct NewcamdSession {
     std::unique_ptr<NewcamdClient> client;
     bool connected = false;
-    ControlWordSlot even;
-    ControlWordSlot odd;
-    std::mutex keyMutex;
     std::string lastError;
 
     ~NewcamdSession() {
@@ -289,15 +290,30 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         config.get("pass", "pass").asString(),
         config.get("des", "0102030405060708091011121314").asString());
 
-    NewcamdSession* sessionPtr = session.get();
-    session->client->set_key_update_callback([sessionPtr](uint8_t parity, const uint8_t* cw) {
-        if (!cw || !sessionPtr) return;
-        std::lock_guard<std::mutex> lock(sessionPtr->keyMutex);
-        ControlWordSlot& slot = (parity & 1) ? sessionPtr->odd : sessionPtr->even;
+    session->client->set_key_update_callback([inst, clientKey](uint16_t messageId, uint8_t parity, const uint8_t* cw) {
+        if (!cw || !inst || messageId == 0) return;
+        std::lock_guard<std::mutex> lock(inst->mutex);
+        ServiceBinding* target = nullptr;
+        ServiceBinding* singleCandidate = nullptr;
+        unsigned candidates = 0;
+        for (auto& [streamId, binding] : inst->servicesByStream) {
+            (void)streamId;
+            if (binding.clientKey != clientKey) continue;
+            ++candidates;
+            singleCandidate = &binding;
+            if (binding.pendingEcmIds.erase(messageId) > 0) {
+                target = &binding;
+                break;
+            }
+        }
+        if (!target && candidates == 1) target = singleCandidate;
+        if (!target) return;
+        ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
         if (!slot.key) return;
         dvbcsa_key_set(cw, slot.key);
         slot.valid = true;
         ++slot.updates;
+        ++target->cwUpdates;
     });
 
     if (session->client->connect() && session->client->login()) {
@@ -337,10 +353,10 @@ static int newcamd_start_service(void* instance, const char* reader_key, const s
         write_error(error, error_size, "Newcamd CAM client is not connected");
         return TVS_CA_RESULT_ERROR;
     }
-    ServiceBinding binding;
+    inst->servicesByStream.erase(service->stream_id);
+    auto& binding = inst->servicesByStream.try_emplace(service->stream_id).first->second;
     binding.clientKey = reader_key;
     binding.serviceId = service->service_id <= 0xFFFF ? static_cast<uint16_t>(service->service_id) : 0;
-    inst->servicesByStream[service->stream_id] = std::move(binding);
     return TVS_CA_RESULT_OK;
 }
 
@@ -385,7 +401,7 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     binding.pmtPid = pid;
                     parse_pmt_section(section, binding);
                 } else if (section[0] == 0x80 || section[0] == 0x81) {
-                    if (binding.ecmPids.empty()) binding.ecmPids.insert(descriptor_for_pid(binding, pid));
+                    if (binding.ecmPids.empty()) continue;
                     bool knownEcmPid = false;
                     for (const auto& ecm : binding.ecmPids) if (ecm.pid == pid) knownEcmPid = true;
                     if (knownEcmPid) {
@@ -393,8 +409,10 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                         const std::string signature = ecm_signature(section);
                         if (binding.sentEcms.insert(signature).second) {
                             const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
-                            if (session->client->send_ecm(binding.serviceId, ecm.caid, ecm.provid, section)) {
+                            uint16_t messageId = 0;
+                            if (session->client->send_ecm(binding.serviceId, ecm.caid, ecm.provid, section, &messageId)) {
                                 ++binding.ecmRequests;
+                                if (messageId != 0) binding.pendingEcmIds.insert(messageId);
                             } else {
                                 session->lastError = session->client->last_error();
                             }
@@ -423,8 +441,7 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             continue;
         }
 
-        std::lock_guard<std::mutex> keyLock(session->keyMutex);
-        ControlWordSlot& slot = scramblingControl == 3 ? session->odd : session->even;
+        ControlWordSlot& slot = scramblingControl == 3 ? binding.odd : binding.even;
         if (!slot.valid || !slot.key) {
             waitingForKey = true;
             continue;
@@ -473,9 +490,10 @@ static const char* newcamd_status_json(void* instance) {
         if (!entry.second || !entry.second->connected) continue;
         ++connected;
         if (entry.second->client && entry.second->client->authenticated()) ++authenticated;
-        std::lock_guard<std::mutex> keyLock(entry.second->keyMutex);
-        if (entry.second->even.valid) ++evenKeys;
-        if (entry.second->odd.valid) ++oddKeys;
+    }
+    for (const auto& entry : inst->servicesByStream) {
+        if (entry.second.even.valid) ++evenKeys;
+        if (entry.second.odd.valid) ++oddKeys;
     }
     status = "{\"status\":\"" + std::string(connected ? "connected" : "disconnected") +
              "\",\"clients\":" + std::to_string(connected) +
