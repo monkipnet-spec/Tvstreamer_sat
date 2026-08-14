@@ -124,3 +124,5 @@ set_target_properties(tvstreammersat5_ca_newcamd PROPERTIES
     PREFIX ""
     OUTPUT_NAME "tvstreammersat5-ca-newcamd"
 )
+install(TARGETS TVStreammerSAT5 RUNTIME DESTINATION bin)
+install(TARGETS tvstreammersat5_ca_newcamd LIBRARY DESTINATION /opt/tvstreammersat5/ca-plugins)

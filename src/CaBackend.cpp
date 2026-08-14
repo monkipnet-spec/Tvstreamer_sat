@@ -140,21 +140,40 @@ void CaBackendManager::unloadPluginsLocked() {
 }
 
 void CaBackendManager::loadPluginsLocked() {
-    std::string directory = kDefaultPluginDirectory;
+    std::vector<std::filesystem::path> directories;
     if (const char* env = std::getenv("TVSTREAMMERSAT5_CA_PLUGIN_DIR")) {
-        if (*env) directory = env;
+        if (*env) directories.emplace_back(env);
     }
+
     std::error_code ec;
-    if (!std::filesystem::exists(directory, ec)) return;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec && !executable.empty()) {
+        const auto executableDir = executable.parent_path();
+        directories.push_back(executableDir / "ca-plugins");
+        directories.push_back(executableDir);
+    }
+    directories.emplace_back(kDefaultPluginDirectory);
 
     std::vector<std::string> files;
-    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file()) continue;
-        const auto path = entry.path();
-        if (path.extension() == ".so") files.push_back(path.string());
+    std::set<std::string> seenDirectories;
+    for (const auto& directory : directories) {
+        const auto normalized = directory.lexically_normal().string();
+        if (normalized.empty() || !seenDirectories.insert(normalized).second) continue;
+        if (!std::filesystem::exists(directory, ec) || ec) {
+            ec.clear();
+            continue;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            const auto path = entry.path();
+            if (path.extension() == ".so") files.push_back(path.string());
+        }
+        ec.clear();
     }
+
     std::sort(files.begin(), files.end());
+    files.erase(std::unique(files.begin(), files.end()), files.end());
     for (const auto& path : files) loadPluginFileLocked(path);
 }
 
