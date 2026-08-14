@@ -79,4 +79,7 @@ void NewcamdClient::disconnect() {
 }
 
 bool NewcamdClient::get_dcw(const std::vector<uint8_t>& ecm, std::vector<uint8_t>& dcw) {
-// ... existing code ...
+    (void)ecm;
+    dcw.clear();
+    return false;
+}
