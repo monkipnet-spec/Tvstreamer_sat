@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-mpegts-1.0)
 pkg_check_modules(LIBCURL REQUIRED libcurl)
@@ -107,3 +108,19 @@ if(TVSTREAMMERSAT5_BUILD_CA_PLUGIN_EXAMPLE)
         OUTPUT_NAME "tvstreammersat5-ca-passthrough-example"
     )
 endif()
+
+add_library(tvstreammersat5_ca_newcamd SHARED
+    src/ca/backends/newcamd/NewcamdPlugin.cpp
+    src/ca/backends/newcamd/NewcamdClient.cpp
+)
+target_include_directories(tvstreammersat5_ca_newcamd PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(tvstreammersat5_ca_newcamd PRIVATE
+    ${Boost_LIBRARIES}
+    OpenSSL::Crypto
+)
+set_target_properties(tvstreammersat5_ca_newcamd PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "tvstreammersat5-ca-newcamd"
+)
