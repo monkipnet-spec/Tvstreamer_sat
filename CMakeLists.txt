@@ -10,6 +10,7 @@ find_package(OpenSSL REQUIRED)
 pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-base-1.0 gstreamer-app-1.0 gstreamer-mpegts-1.0)
 pkg_check_modules(LIBCURL REQUIRED libcurl)
 pkg_check_modules(JSONCPP REQUIRED jsoncpp)
+pkg_check_modules(DVBCSA REQUIRED libdvbcsa)
 
 find_package(Boost REQUIRED COMPONENTS system thread)
 
@@ -19,6 +20,7 @@ include_directories(
     ${LIBCURL_INCLUDE_DIRS}
     ${JSONCPP_INCLUDE_DIRS}
     ${Boost_INCLUDE_DIRS}
+    ${DVBCSA_INCLUDE_DIRS}
 )
 
 link_directories(
@@ -26,6 +28,7 @@ link_directories(
     ${LIBCURL_LIBRARY_DIRS}
     ${JSONCPP_LIBRARY_DIRS}
     ${Boost_LIBRARY_DIRS}
+    ${DVBCSA_LIBRARY_DIRS}
 )
 
 add_executable(TVStreammerSAT5
@@ -118,6 +121,7 @@ target_include_directories(tvstreammersat5_ca_newcamd PRIVATE
 )
 target_link_libraries(tvstreammersat5_ca_newcamd PRIVATE
     ${Boost_LIBRARIES}
+    ${DVBCSA_LIBRARIES}
     OpenSSL::Crypto
 )
 set_target_properties(tvstreammersat5_ca_newcamd PROPERTIES

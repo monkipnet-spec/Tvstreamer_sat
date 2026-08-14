@@ -1,10 +1,14 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <boost/asio.hpp>
-#include <mutex>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
 #include <thread>
+#include <vector>
 
 class NewcamdClient {
 public:
@@ -14,18 +18,17 @@ public:
     bool connect();
     bool login();
     void disconnect();
-    
-    // Отправка ECM и получение DCW (заглушка на данном этапе)
-    bool get_dcw(const std::vector<uint8_t>& ecm, std::vector<uint8_t>& dcw);
+    void start_receiver();
+    void set_key_update_callback(std::function<void(const uint8_t*)> cb) { callback_ = cb; }
 
 private:
-    std::string host_;
+    void receiver_loop();
+
+    std::string host_, user_, pass_, des_;
     int port_;
-    std::string user_;
-    std::string pass_;
-    std::string des_;
-    
     boost::asio::io_context io_context_;
     std::unique_ptr<boost::asio::ip::tcp::socket> socket_;
-    std::mutex mutex_;
+    std::thread receiver_thread_;
+    std::function<void(const uint8_t*)> callback_;
+    std::atomic<bool> running_{false};
 };
