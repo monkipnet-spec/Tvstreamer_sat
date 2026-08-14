@@ -237,6 +237,8 @@ std::string formatDvbPids(const std::set<uint16_t>& pids) {
     std::ostringstream out;
     bool first = true;
     for (uint16_t pid : pids) {
+        // dvbsrc always reserves filters 0 and 1 for PAT and CAT.
+        if (pid <= 1) continue;
         if (!first) out << ':';
         first = false;
         out << pid;
@@ -244,33 +246,78 @@ std::string formatDvbPids(const std::set<uint16_t>& pids) {
     return out.str();
 }
 
-std::string sharedDvbPidUnion(const DvbSatelliteParams& requested,
-                              const std::vector<StreamConfig>& configuredStreams,
-                              size_t& matchedServices) {
-    std::set<uint16_t> unionPids;
-    matchedServices = 0;
-    const std::string signature = sharedDvbTuneSignature(requested);
-
-    for (const auto& stream : configuredStreams) {
-        DvbSatelliteParams candidate;
-        std::string parseError;
-        if (!DvbSatellite::parseUri(stream.inputUri, candidate, parseError) ||
-            sharedDvbTuneSignature(candidate) != signature) {
-            continue;
-        }
-        if (addExplicitDvbPids(unionPids, candidate.pids)) ++matchedServices;
-    }
-
-    if (unionPids.empty() && addExplicitDvbPids(unionPids, requested.pids)) {
-        matchedServices = 1;
-    }
-    if (unionPids.empty()) return "8192";
-
+std::set<uint16_t> requestedDvbPids(const DvbSatelliteParams& requested) {
+    std::set<uint16_t> pids;
+    if (!addExplicitDvbPids(pids, requested.pids)) return pids;
     for (uint16_t pid : {uint16_t(0x0000), uint16_t(0x0001), uint16_t(0x0010),
                          uint16_t(0x0011), uint16_t(0x0012), uint16_t(0x0014)}) {
-        unionPids.insert(pid);
+        pids.insert(pid);
     }
-    return formatDvbPids(unionPids);
+    return pids;
+}
+
+bool buildSharedDvbPids(
+    const std::map<std::string, std::set<uint16_t>>& consumers,
+    std::string& requestedPids,
+    size_t& filterCount,
+    std::string& error) {
+    constexpr size_t kMaxDvbSrcFilters = 32;
+    std::set<uint16_t> unionPids;
+    bool fullTransportStream = false;
+    for (const auto& [streamId, pids] : consumers) {
+        (void)streamId;
+        if (pids.empty()) {
+            fullTransportStream = true;
+            break;
+        }
+        unionPids.insert(pids.begin(), pids.end());
+    }
+
+    filterCount = fullTransportStream ? 1 : unionPids.size();
+    if (!fullTransportStream && filterCount > kMaxDvbSrcFilters) {
+        std::ostringstream message;
+        message << "active services require " << filterCount
+                << " DVB PID filters, but GStreamer dvbsrc supports "
+                << kMaxDvbSrcFilters
+                << "; stop a channel or use another frontend";
+        error = message.str();
+        return false;
+    }
+
+    requestedPids =
+        fullTransportStream || unionPids.empty() ? "8192" : formatDvbPids(unionPids);
+    return true;
+}
+
+bool applySharedDvbPids(
+    SharedDvbFrontendState& shared,
+    const std::map<std::string, std::set<uint16_t>>& consumers,
+    size_t& filterCount,
+    std::string& error,
+    bool restartSource = false) {
+    std::string requestedPids;
+    if (!buildSharedDvbPids(consumers, requestedPids, filterCount, error)) return false;
+    if (shared.source && requestedPids != shared.requestedPids) {
+        if (restartSource && shared.pipeline) {
+            if (gst_element_set_state(shared.pipeline, GST_STATE_READY) ==
+                GST_STATE_CHANGE_FAILURE) {
+                error = "failed to pause shared DVB frontend for PID filter update";
+                return false;
+            }
+            gst_element_get_state(
+                shared.pipeline, nullptr, nullptr, 2 * GST_SECOND);
+        }
+        g_object_set(shared.source, "pids", requestedPids.c_str(), nullptr);
+        if (restartSource && shared.pipeline &&
+            gst_element_set_state(shared.pipeline, GST_STATE_PLAYING) ==
+                GST_STATE_CHANGE_FAILURE) {
+            error = "failed to restart shared DVB frontend after PID filter update";
+            return false;
+        }
+    }
+    shared.consumerPids = consumers;
+    shared.requestedPids = requestedPids;
+    return true;
 }
 std::string sharedDvbMulticastAddress(const DvbSatelliteParams& params) {
     const unsigned slot = static_cast<unsigned>((params.adapter * 16 + params.frontend) % 250);
@@ -2156,9 +2203,17 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
 
     const std::string frontendKey = sharedDvbFrontendKey(params);
     const std::string tuningSignature = sharedDvbTuneSignature(params);
-    size_t pidUnionServices = 0;
-    const std::string frontendPids = sharedDvbPidUnion(
-        params, configManager.config.streams, pidUnionServices);
+    const std::string consumerId = state->config.id.empty()
+        ? state->runtimeConfig.id : state->config.id;
+    const std::set<uint16_t> servicePids = requestedDvbPids(params);
+    std::map<std::string, std::set<uint16_t>> initialConsumers;
+    initialConsumers[consumerId] = servicePids;
+    std::string frontendPids;
+    size_t pidFilterCount = 0;
+    if (!buildSharedDvbPids(
+            initialConsumers, frontendPids, pidFilterCount, error)) {
+        return false;
+    }
     const std::string device = "/dev/dvb/adapter" + std::to_string(params.adapter) +
                                "/frontend" + std::to_string(params.frontend);
     if (!std::filesystem::exists(device)) {
@@ -2183,6 +2238,13 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                 error = ss.str();
                 return false;
             }
+            auto activeConsumers = existing->second->consumerPids;
+            activeConsumers[consumerId] = servicePids;
+            size_t activeFilterCount = 0;
+            if (!applySharedDvbPids(
+                    *existing->second, activeConsumers, activeFilterCount, error)) {
+                return false;
+            }
             ++existing->second->consumers;
             state->sharedDvbInput = true;
             state->sharedDvbFrontendKey = frontendKey;
@@ -2190,6 +2252,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             state->sharedDvbMulticastPort = existing->second->multicastPort;
             std::cerr << "Shared DVB frontend reused: " << frontendKey
                       << " consumers=" << existing->second->consumers
+                      << " pid_services=" << existing->second->consumerPids.size()
+                      << " pid_filters=" << activeFilterCount
+                      << " pids=" << existing->second->requestedPids
                       << " relay=udp://@" << state->sharedDvbMulticastAddress
                       << ":" << state->sharedDvbMulticastPort << std::endl;
             return true;
@@ -2201,6 +2266,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     shared->multicastAddress = sharedDvbMulticastAddress(params);
     shared->multicastPort = sharedDvbMulticastPort(params);
     shared->consumers = 1;
+    shared->consumerPids = initialConsumers;
+    shared->requestedPids = frontendPids;
 
     GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
     GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
@@ -2250,6 +2317,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     }
 
     shared->pipeline = pipeline;
+    shared->source = source;
     shared->bus = gst_element_get_bus(pipeline);
     const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
     if (stateResult == GST_STATE_CHANGE_FAILURE) {
@@ -2294,6 +2362,19 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                 error = "DVB frontend became busy with a different transponder";
                 return false;
             }
+            auto activeConsumers = existing->second->consumerPids;
+            activeConsumers[consumerId] = servicePids;
+            size_t activeFilterCount = 0;
+            if (!applySharedDvbPids(
+                    *existing->second, activeConsumers, activeFilterCount, error)) {
+                gst_element_set_state(shared->pipeline, GST_STATE_NULL);
+                gst_element_get_state(shared->pipeline, nullptr, nullptr, GST_SECOND);
+                if (shared->bus) gst_object_unref(shared->bus);
+                gst_object_unref(shared->pipeline);
+                state->sharedDvbInput = false;
+                state->sharedDvbFrontendKey.clear();
+                return false;
+            }
             ++existing->second->consumers;
             state->sharedDvbMulticastAddress = existing->second->multicastAddress;
             state->sharedDvbMulticastPort = existing->second->multicastPort;
@@ -2312,8 +2393,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
               << " frequency_khz=" << params.frequencyKHz
               << " symbol_rate=" << params.symbolRateK
               << " polarity=" << params.polarity
-              << " pid_mode=" << (frontendPids == "8192" ? "full-ts" : "explicit-union")
-              << " pid_services=" << pidUnionServices
+              << " pid_mode=" << (frontendPids == "8192" ? "full-ts" : "active-union")
+              << " pid_services=" << initialConsumers.size()
+              << " pid_filters=" << pidFilterCount
               << " pids=" << frontendPids
               << " relay=udp://@" << state->sharedDvbMulticastAddress
               << ":" << state->sharedDvbMulticastPort << std::endl;
@@ -2324,14 +2406,29 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
     if (!state || !state->sharedDvbInput || state->sharedDvbFrontendKey.empty()) return;
     std::unique_ptr<SharedDvbFrontendState> released;
     const std::string key = state->sharedDvbFrontendKey;
+    const std::string consumerId = state->config.id.empty()
+        ? state->runtimeConfig.id : state->config.id;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
         auto found = sharedDvbFrontends.find(key);
         if (found != sharedDvbFrontends.end()) {
             if (found->second->consumers > 1) {
+                auto activeConsumers = found->second->consumerPids;
+                activeConsumers.erase(consumerId);
+                size_t activeFilterCount = 0;
+                std::string pidError;
+                if (!applySharedDvbPids(
+                        *found->second, activeConsumers, activeFilterCount,
+                        pidError, true)) {
+                    std::cerr << "Shared DVB PID filter shrink failed: " << key
+                              << " error=" << pidError << std::endl;
+                }
                 --found->second->consumers;
                 std::cerr << "Shared DVB frontend retained: " << key
-                          << " consumers=" << found->second->consumers << std::endl;
+                          << " consumers=" << found->second->consumers
+                          << " pid_services=" << found->second->consumerPids.size()
+                          << " pid_filters=" << activeFilterCount
+                          << " pids=" << found->second->requestedPids << std::endl;
             } else {
                 released = std::move(found->second);
                 sharedDvbFrontends.erase(found);

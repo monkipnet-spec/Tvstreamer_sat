@@ -50,10 +50,13 @@ struct ExternalSrtOutputState {
 struct SharedDvbFrontendState {
     std::string tuningSignature;
     GstElement* pipeline = nullptr;
+    GstElement* source = nullptr;
     GstBus* bus = nullptr;
     std::string multicastAddress;
     uint16_t multicastPort = 0;
     size_t consumers = 0;
+    std::map<std::string, std::set<uint16_t>> consumerPids;
+    std::string requestedPids;
 };
 
 struct DvbServiceRelayState {
