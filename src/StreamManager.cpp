@@ -209,6 +209,69 @@ std::string sharedDvbTuneSignature(const DvbSatelliteParams& p) {
     return out.str();
 }
 
+bool addExplicitDvbPids(std::set<uint16_t>& target, const std::string& pids) {
+    if (pids.empty() || pids == "8192") return false;
+    bool added = false;
+    size_t start = 0;
+    while (start <= pids.size()) {
+        const size_t end = pids.find(':', start);
+        const std::string token = pids.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!token.empty()) {
+            try {
+                const unsigned long value = std::stoul(token);
+                if (value < 8192) {
+                    target.insert(static_cast<uint16_t>(value));
+                    added = true;
+                }
+            } catch (...) {
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return added;
+}
+
+std::string formatDvbPids(const std::set<uint16_t>& pids) {
+    std::ostringstream out;
+    bool first = true;
+    for (uint16_t pid : pids) {
+        if (!first) out << ':';
+        first = false;
+        out << pid;
+    }
+    return out.str();
+}
+
+std::string sharedDvbPidUnion(const DvbSatelliteParams& requested,
+                              const std::vector<StreamConfig>& configuredStreams,
+                              size_t& matchedServices) {
+    std::set<uint16_t> unionPids;
+    matchedServices = 0;
+    const std::string signature = sharedDvbTuneSignature(requested);
+
+    for (const auto& stream : configuredStreams) {
+        DvbSatelliteParams candidate;
+        std::string parseError;
+        if (!DvbSatellite::parseUri(stream.inputUri, candidate, parseError) ||
+            sharedDvbTuneSignature(candidate) != signature) {
+            continue;
+        }
+        if (addExplicitDvbPids(unionPids, candidate.pids)) ++matchedServices;
+    }
+
+    if (unionPids.empty() && addExplicitDvbPids(unionPids, requested.pids)) {
+        matchedServices = 1;
+    }
+    if (unionPids.empty()) return "8192";
+
+    for (uint16_t pid : {uint16_t(0x0000), uint16_t(0x0001), uint16_t(0x0010),
+                         uint16_t(0x0011), uint16_t(0x0012), uint16_t(0x0014)}) {
+        unionPids.insert(pid);
+    }
+    return formatDvbPids(unionPids);
+}
 std::string sharedDvbMulticastAddress(const DvbSatelliteParams& params) {
     const unsigned slot = static_cast<unsigned>((params.adapter * 16 + params.frontend) % 250);
     return "239.255.250." + std::to_string(slot + 1);
@@ -2093,6 +2156,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
 
     const std::string frontendKey = sharedDvbFrontendKey(params);
     const std::string tuningSignature = sharedDvbTuneSignature(params);
+    size_t pidUnionServices = 0;
+    const std::string frontendPids = sharedDvbPidUnion(
+        params, configManager.config.streams, pidUnionServices);
     const std::string device = "/dev/dvb/adapter" + std::to_string(params.adapter) +
                                "/frontend" + std::to_string(params.frontend);
     if (!std::filesystem::exists(device)) {
@@ -2152,9 +2218,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
-    DvbSatelliteParams fullTsParams = params;
-    fullTsParams.pids = "8192";
-    if (!DvbSatellite::configureSource(source, fullTsParams, error)) {
+    DvbSatelliteParams sharedInputParams = params;
+    sharedInputParams.pids = frontendPids;
+    if (!DvbSatellite::configureSource(source, sharedInputParams, error)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         if (error.empty()) error = "failed to configure shared DVB frontend";
@@ -2246,6 +2312,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
               << " frequency_khz=" << params.frequencyKHz
               << " symbol_rate=" << params.symbolRateK
               << " polarity=" << params.polarity
+              << " pid_mode=" << (frontendPids == "8192" ? "full-ts" : "explicit-union")
+              << " pid_services=" << pidUnionServices
+              << " pids=" << frontendPids
               << " relay=udp://@" << state->sharedDvbMulticastAddress
               << ":" << state->sharedDvbMulticastPort << std::endl;
     return true;
