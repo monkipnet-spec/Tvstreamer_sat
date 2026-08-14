@@ -1605,10 +1605,14 @@ std::string HttpServer::handleStartStream(const std::string& body) {
             response["ca"] = CardManager::instance().streamState(cfg.id);
         }
     } else {
-        response["result"] = "error";
-        response["error"] = startError.empty()
+        const std::string message = startError.empty()
             ? ("Failed to start stream: " + (cfg.name.empty() ? cfg.id : cfg.name))
             : startError;
+        std::cerr << "Start stream failed: id=" << cfg.id
+                  << " name=" << (cfg.name.empty() ? cfg.id : cfg.name)
+                  << " error=" << message << std::endl;
+        response["result"] = "error";
+        response["error"] = message;
     }
 
     Json::StreamWriterBuilder writer;
@@ -2120,6 +2124,20 @@ async function fetchJson(url, options={}, timeoutMs=30000) {
 function streamById(id) {
   return (state.streams || []).find(stream => String(stream.id) === String(id));
 }
+function setStreamStatusMessage(id, message, level='info') {
+  const esc = window.CSS?.escape ? CSS.escape(String(id)) : String(id).replace(/["\\]/g, '\\$&');
+  const tile = document.querySelector(`.tile[data-stream-id="${esc}"]`);
+  const target = tile?.querySelector('[data-role="runtime-status"]');
+  if (!target) return;
+  target.textContent = message || '';
+  target.title = message || '';
+  target.dataset.level = level;
+}
+function restoreStreamButton(button, text) {
+  if (!button) return;
+  button.disabled = false;
+  if (text) button.textContent = text;
+}
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -2496,18 +2514,25 @@ async function toggleStream(id, active, button=null) {
   if (button) {
     button.disabled = true;
     button.textContent = active ? 'Stopping...' : 'Starting...';
+    setStreamStatusMessage(id, active ? 'Stopping stream...' : 'Starting stream...', 'pending');
   }
+  const restoreTimer = setTimeout(() => {
+    streamActionBusy.delete(id);
+    restoreStreamButton(button, originalText);
+    setStreamStatusMessage(id, active ? 'Stop request timed out' : 'Start request timed out', 'error');
+  }, active ? 17000 : 47000);
   try {
     const data = await fetchJson(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}, active ? 15000 : 45000);
     if (data.result === 'error') throw new Error(data.error || (active ? 'Stop failed' : 'Start failed'));
+    setStreamStatusMessage(id, active ? 'Stop command accepted' : 'Start command accepted', 'ok');
   } catch (error) {
-    uiError(error?.message || error);
+    const message = error?.message || String(error);
+    setStreamStatusMessage(id, message, 'error');
+    uiError(message);
   } finally {
+    clearTimeout(restoreTimer);
     streamActionBusy.delete(id);
-    if (button) {
-      button.disabled = false;
-      if (originalText) button.textContent = originalText;
-    }
+    restoreStreamButton(button, originalText);
     setTimeout(fetchState, 300);
     setTimeout(fetchState, 1500);
   }

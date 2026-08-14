@@ -2771,8 +2771,15 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     CardReservationGuard cardReservation(streamConfig, error);
     if (!cardReservation.ok()) {
         if (error && error->empty()) *error = "failed to reserve conditional-access service slot";
+        std::cerr << "Stream start failed before pipeline: id=" << streamConfig.id
+                  << " stage=cam-reserve error=" << (error ? *error : std::string()) << std::endl;
         return false;
     }
+    std::cerr << "Stream start requested: id=" << streamConfig.id
+              << " name=" << (streamConfig.name.empty() ? streamConfig.id : streamConfig.name)
+              << " input=" << streamConfig.inputUri
+              << " cam=" << (streamConfig.conditionalAccessClient.empty() ? "none" : streamConfig.conditionalAccessClient)
+              << std::endl;
 
     auto state = std::make_unique<StreamState>();
 
@@ -2797,6 +2804,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     if (!prepareSharedDvbInput(state.get(), sharedDvbError)) {
         state->statusMessage = "shared DVB input failed: " + sharedDvbError;
         if (error) *error = sharedDvbError;
+        std::cerr << "Stream start failed: id=" << streamConfig.id
+                  << " stage=shared-dvb-input error=" << sharedDvbError << std::endl;
         return false;
     }
 
