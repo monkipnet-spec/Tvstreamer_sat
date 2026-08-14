@@ -185,6 +185,9 @@ struct DvbSingleProgramPsiContext {
     bool filterPids = false;
     bool announced = false;
     bool pidSelfHealAnnounced = false;
+    bool pidFilterWarmupAnnounced = false;
+    std::vector<uint8_t> patSectionBuffer;
+    size_t patSectionExpected = 0;
     std::vector<uint8_t> pmtSectionBuffer;
     size_t pmtSectionExpected = 0;
 };
@@ -304,30 +307,78 @@ const uint8_t* tsSectionStart(const uint8_t* packet, size_t& available) {
     available = kTsPacketSize - start;
     return packet + start;
 }
+bool appendPsiSectionFromPacket(const uint8_t* packet,
+                                uint8_t expectedTableId,
+                                std::vector<uint8_t>& buffer,
+                                size_t& expectedSize) {
+    if (!packet || packet[0] != 0x47) return false;
+    const size_t payload = tsPayloadOffset(packet);
+    if (payload >= kTsPacketSize) return false;
+    size_t start = payload;
+    if ((packet[1] & 0x40) != 0) {
+        const size_t pointer = packet[payload];
+        if (payload + 1 + pointer >= kTsPacketSize) return false;
+        start = payload + 1 + pointer;
+        buffer.clear();
+        expectedSize = 0;
+    } else if (buffer.empty()) {
+        return false;
+    }
+
+    buffer.insert(buffer.end(), packet + start, packet + kTsPacketSize);
+    if (expectedSize == 0 && buffer.size() >= 3) {
+        if (buffer[0] != expectedTableId) {
+            buffer.clear();
+            return false;
+        }
+        const size_t sectionLength = static_cast<size_t>(((buffer[1] & 0x0F) << 8) | buffer[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength < 5 || total > 4096) {
+            buffer.clear();
+            expectedSize = 0;
+            return false;
+        }
+        expectedSize = total;
+    }
+    return expectedSize > 0 && buffer.size() >= expectedSize;
+}
+
+void parsePatForSelectedPmt(const uint8_t* section, size_t total, DvbSingleProgramPsiContext* ctx) {
+    if (!section || !ctx || total < 12 || section[0] != 0x00) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    if (sectionLength < 9 || 3 + sectionLength > total) return;
+    ctx->transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
+    ctx->patVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
+    const size_t entriesEnd = 3 + sectionLength - 4;
+    for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+        const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+        const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+        if (program == ctx->serviceId && mappedPid > 0 && mappedPid < 0x1FFF) {
+            if (ctx->pmtPid != mappedPid) {
+                ctx->pmtPid = mappedPid;
+                ctx->allowedPids[mappedPid] = true;
+                ctx->pmtSectionBuffer.clear();
+                ctx->pmtSectionExpected = 0;
+            }
+            return;
+        }
+    }
+}
 
 void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
     if (!packet || !ctx || packet[0] != 0x47) return;
     const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+
+    if (pid == 0x0000 && appendPsiSectionFromPacket(packet, 0x00, ctx->patSectionBuffer, ctx->patSectionExpected)) {
+        parsePatForSelectedPmt(ctx->patSectionBuffer.data(), ctx->patSectionExpected, ctx);
+        ctx->patSectionBuffer.clear();
+        ctx->patSectionExpected = 0;
+        return;
+    }
+
     size_t available = 0;
     const uint8_t* section = tsSectionStart(packet, available);
     if (!section || available < 8) return;
-
-    if (pid == 0x0000 && section[0] == 0x00) {
-        const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
-        const size_t total = 3 + sectionLength;
-        if (sectionLength < 9 || total > available) return;
-        ctx->transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
-        ctx->patVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
-        const size_t entriesEnd = total >= 4 ? total - 4 : 0;
-        for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
-            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
-            const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
-            if (program == ctx->serviceId && mappedPid > 0 && mappedPid < 0x1FFF) {
-                ctx->pmtPid = mappedPid;
-                return;
-            }
-        }
-    }
 
     if (pid == 0x0011 && (section[0] == 0x42 || section[0] == 0x46) && available >= 11) {
         const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
@@ -338,9 +389,8 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
         }
     }
 
-    // Fallback: identify the PMT directly. dvbsrc's selected PID set contains
-    // only the chosen service PMT, so this also works if a very large PAT spans
-    // more than one TS packet and the selected entry is not in the first packet.
+    // Fallback: identify the PMT directly. This works when the PMT PID is
+    // present in saved pids even if PAT was too large or delayed.
     if (pid != 0x0000 && section[0] == 0x02 && available >= 8) {
         const uint16_t program = static_cast<uint16_t>((section[3] << 8) | section[4]);
         if (program == ctx->serviceId) ctx->pmtPid = pid;
@@ -417,36 +467,7 @@ void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext*
     const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
     if (pid != ctx->pmtPid || pid >= 0x1FFF) return;
 
-    const size_t payload = tsPayloadOffset(packet);
-    if (payload >= kTsPacketSize) return;
-    size_t start = payload;
-    if ((packet[1] & 0x40) != 0) {
-        const size_t pointer = packet[payload];
-        if (payload + 1 + pointer >= kTsPacketSize) return;
-        start = payload + 1 + pointer;
-        ctx->pmtSectionBuffer.clear();
-        ctx->pmtSectionExpected = 0;
-    } else if (ctx->pmtSectionBuffer.empty()) {
-        return;
-    }
-
-    ctx->pmtSectionBuffer.insert(ctx->pmtSectionBuffer.end(), packet + start, packet + kTsPacketSize);
-    if (ctx->pmtSectionExpected == 0 && ctx->pmtSectionBuffer.size() >= 3) {
-        if (ctx->pmtSectionBuffer[0] != 0x02) {
-            ctx->pmtSectionBuffer.clear();
-            return;
-        }
-        const size_t sectionLength = static_cast<size_t>(((ctx->pmtSectionBuffer[1] & 0x0F) << 8) |
-                                                         ctx->pmtSectionBuffer[2]);
-        const size_t total = 3 + sectionLength;
-        if (sectionLength < 13 || total > 4096) {
-            ctx->pmtSectionBuffer.clear();
-            ctx->pmtSectionExpected = 0;
-            return;
-        }
-        ctx->pmtSectionExpected = total;
-    }
-    if (ctx->pmtSectionExpected > 0 && ctx->pmtSectionBuffer.size() >= ctx->pmtSectionExpected) {
+    if (appendPsiSectionFromPacket(packet, 0x02, ctx->pmtSectionBuffer, ctx->pmtSectionExpected)) {
         healAllowedPidsFromSelectedPmtSection(ctx, ctx->pmtSectionBuffer.data(), ctx->pmtSectionExpected);
         ctx->pmtSectionBuffer.clear();
         ctx->pmtSectionExpected = 0;
@@ -707,7 +728,13 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 
         healAllowedPidsFromSelectedPmt(packet, ctx);
 
-        const bool keepPacket = !ctx->filterPids || (pid < ctx->allowedPids.size() && ctx->allowedPids[pid]);
+        const bool filterReady = !ctx->filterPids || ctx->pidSelfHealAnnounced;
+        if (ctx->filterPids && !filterReady && !ctx->pidFilterWarmupAnnounced) {
+            std::cerr << "DVB SPTS PID filter warmup: SID=" << ctx->serviceId
+                      << " saved_pid_filter=pending-pmt full-ts-pass-until-healed" << std::endl;
+            ctx->pidFilterWarmupAnnounced = true;
+        }
+        const bool keepPacket = !filterReady || (pid < ctx->allowedPids.size() && ctx->allowedPids[pid]);
         if (!keepPacket) continue;
 
         // For DVB remap, rewrite only TS headers + PMT/PAT/SDT.  PES payload,

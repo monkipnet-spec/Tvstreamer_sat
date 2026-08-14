@@ -453,9 +453,8 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleStartStream(req.body());
             } else if (target == "/api/stop-stream") {
-                handleStopStream(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = "{\"result\": \"ok\"}";
+                res.body() = handleStopStream(req.body());
             } else if (target == "/api/restart-program") {
                 handleRestartProgram();
                 res.set(http::field::content_type, "application/json");
@@ -502,7 +501,12 @@ void HttpServer::handleSession(tcp::socket socket) {
         res.content_length(res.body().size());
         http::write(socket, res);
     } catch (const std::exception& ex) {
-        std::cerr << "HTTP session failed: " << ex.what() << std::endl;
+        const std::string message = ex.what();
+        if (message.find("bad method") != std::string::npos) {
+            std::cerr << "HTTP non-HTTP request ignored on web port: " << message << std::endl;
+        } else {
+            std::cerr << "HTTP session failed: " << message << std::endl;
+        }
     }
 }
 
@@ -1611,17 +1615,31 @@ std::string HttpServer::handleStartStream(const std::string& body) {
     return Json::writeString(writer, response);
 }
 
-void HttpServer::handleStopStream(const std::string& body) {
+std::string HttpServer::handleStopStream(const std::string& body) {
+    Json::Value response;
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
-        std::cerr << "Invalid stop-stream payload: " << errs << std::endl;
-        return;
+        const std::string message = "Invalid stop-stream payload: " + errs;
+        std::cerr << message << std::endl;
+        response["result"] = "error";
+        response["error"] = message;
+    } else {
+        const std::string id = root.get("id", "").asString();
+        if (id.empty()) {
+            response["result"] = "error";
+            response["error"] = "missing stream id";
+        } else {
+            const bool stopped = streamManager.stopStream(id);
+            response["result"] = stopped ? "ok" : "error";
+            if (!stopped) response["error"] = "stream is not active: " + id;
+            response["stream_id"] = id;
+        }
     }
-    std::string id = root.get("id", "").asString();
-    streamManager.stopStream(id);
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 void HttpServer::handleRestartProgram() {
@@ -2038,6 +2056,27 @@ document.addEventListener('click', event => {
   const menu = document.getElementById('systemMenu');
   if (menu && !menu.contains(event.target)) closeSystemMenu();
 });
+document.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-stream-action]');
+  if (!button) return;
+  const id = button.dataset.streamId || button.closest('.tile[data-stream-id]')?.dataset.streamId || '';
+  if (!id) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const action = button.dataset.streamAction;
+  if (action === 'toggle') {
+    const stream = (state.streams || []).find(item => String(item.id) === String(id));
+    toggleStream(id, stream ? !!stream.active : button.dataset.streamActive === '1');
+  } else if (action === 'edit') {
+    editStream(id);
+  } else if (action === 'delete') {
+    deleteStream(id);
+  } else if (action === 'quality') {
+    openQualityModal(id);
+  } else if (action === 'copy') {
+    copyStreamLinks(id, button);
+  }
+});
 let state = {};
 let statePollTimer = null;
 let metricsPollTimer = null;
@@ -2330,7 +2369,9 @@ function updateStreamTile(tile, stream) {
   if (toggleButton) {
     toggleButton.className = stream.active ? 'stop-button' : 'start-button';
     toggleButton.textContent = stream.active ? t('stop') : t('start');
-    toggleButton.onclick = () => toggleStream(stream.id, !!stream.active);
+    toggleButton.dataset.streamId = String(stream.id);
+    toggleButton.dataset.streamActive = stream.active ? '1' : '0';
+    toggleButton.onclick = null;
   }
 }
 function updateLiveTiles() {
@@ -2378,7 +2419,7 @@ function render(force=false) {
       </div>
       <div class="tile-actions">
         <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
-        <button class="delete-button" title="Удалить поток" aria-label="Удалить поток" onclick="deleteStream('${stream.id}')">×</button>
+        <button class="delete-button" title="РЈРґР°Р»РёС‚СЊ РїРѕС‚РѕРє" aria-label="РЈРґР°Р»РёС‚СЊ РїРѕС‚РѕРє" data-stream-action="delete" data-stream-id="${escapeHtmlValue(stream.id)}">Г—</button>
       </div>
       <div class="dvb-meters${stream.dvb_input ? '' : ' placeholder'}" title="${stream.dvb_input ? 'DVB Signal / Quality' : ''}">
         <div class="dvb-meter"><span data-role="dvb-signal-fill" class="dvb-meter-fill"></span><b data-role="dvb-signal-label" class="dvb-meter-label">S —</b></div>
@@ -2397,10 +2438,10 @@ function render(force=false) {
         <div class="info-row"><strong>${t('bitrateOut')}</strong><span data-role="bitrate-out">${stream.bitrate_out_kbps ? stream.bitrate_out_kbps + ' kbps' : '—'}</span></div>
       </div>
       <div class="controls">
-        <button data-role="stream-toggle" class="${stream.active ? 'stop-button' : 'start-button'}">${stream.active ? t('stop') : t('start')}</button>
-        <button onclick="editStream('${stream.id}')">${t('edit')}</button>
-        <button class="quality-button" onclick="openQualityModal('${stream.id}')">${t('chart')}</button>
-        <button class="copy-button" onclick="copyStreamLinks('${stream.id}', this)">${links.length > 1 ? 'URLs' : 'URL'}</button>
+        <button data-role="stream-toggle" data-stream-action="toggle" data-stream-id="${escapeHtmlValue(stream.id)}" data-stream-active="${stream.active ? '1' : '0'}" class="${stream.active ? 'stop-button' : 'start-button'}">${stream.active ? t('stop') : t('start')}</button>
+        <button data-stream-action="edit" data-stream-id="${escapeHtmlValue(stream.id)}">${t('edit')}</button>
+        <button class="quality-button" data-stream-action="quality" data-stream-id="${escapeHtmlValue(stream.id)}">${t('chart')}</button>
+        <button class="copy-button" data-stream-action="copy" data-stream-id="${escapeHtmlValue(stream.id)}">${links.length > 1 ? 'URLs' : 'URL'}</button>
       </div>`;
     tiles.appendChild(tile);
     updateStreamTile(tile, stream);
