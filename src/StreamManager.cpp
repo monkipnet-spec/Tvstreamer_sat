@@ -184,6 +184,7 @@ struct DvbSingleProgramPsiContext {
     std::array<bool, 8192> allowedPids {};
     bool filterPids = false;
     bool announced = false;
+    bool pidSelfHealAnnounced = false;
 };
 
 std::string sharedDvbFrontendKey(const DvbSatelliteParams& params) {
@@ -344,7 +345,77 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
     }
 }
 
+size_t allowCaDescriptorPids(DvbSingleProgramPsiContext* ctx, const uint8_t* descriptors, size_t size) {
+    if (!ctx || !descriptors) return 0;
+    size_t added = 0;
+    size_t pos = 0;
+    while (pos + 2 <= size) {
+        const uint8_t tag = descriptors[pos];
+        const uint8_t length = descriptors[pos + 1];
+        pos += 2;
+        if (pos + length > size) break;
+        if (tag == 0x09 && length >= 4) {
+            const uint16_t caPid = static_cast<uint16_t>(((descriptors[pos + 2] & 0x1F) << 8) | descriptors[pos + 3]);
+            if (caPid > 0 && caPid < ctx->allowedPids.size() && !ctx->allowedPids[caPid]) {
+                ctx->allowedPids[caPid] = true;
+                ++added;
+            }
+        }
+        pos += length;
+    }
+    return added;
+}
 
+void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
+    if (!packet || !ctx || !ctx->filterPids || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid != ctx->pmtPid || pid >= 0x1FFF) return;
+
+    size_t available = 0;
+    const uint8_t* section = tsSectionStart(packet, available);
+    if (!section || available < 16 || section[0] != 0x02) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t total = 3 + sectionLength;
+    if (sectionLength < 13 || total > available) return;
+    const uint16_t program = static_cast<uint16_t>((section[3] << 8) | section[4]);
+    const uint16_t advertised = ctx->remapEnabled && ctx->outputServiceId > 0 ? ctx->outputServiceId : ctx->serviceId;
+    if (program != ctx->serviceId && program != advertised) return;
+
+    const size_t end = total - 4;
+    size_t added = 0;
+    const uint16_t pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);
+    if (pcrPid < ctx->allowedPids.size() && !ctx->allowedPids[pcrPid]) {
+        ctx->allowedPids[pcrPid] = true;
+        ++added;
+    }
+
+    const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);
+    size_t pos = 12;
+    if (pos + programInfoLength > end) return;
+    added += allowCaDescriptorPids(ctx, section + pos, programInfoLength);
+    pos += programInfoLength;
+
+    while (pos + 5 <= end) {
+        const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
+        const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
+        pos += 5;
+        if (pos + esInfoLength > end) break;
+        if (elementaryPid > 0 && elementaryPid < ctx->allowedPids.size() && !ctx->allowedPids[elementaryPid]) {
+            ctx->allowedPids[elementaryPid] = true;
+            ++added;
+        }
+        added += allowCaDescriptorPids(ctx, section + pos, esInfoLength);
+        pos += esInfoLength;
+    }
+
+    if (added > 0 && !ctx->pidSelfHealAnnounced) {
+        std::cerr << "DVB SPTS PID filter self-heal: SID=" << ctx->serviceId
+                  << " PMT_PID=" << ctx->pmtPid
+                  << " added_pids=" << added
+                  << " source=selected-pmt" << std::endl;
+        ctx->pidSelfHealAnnounced = true;
+    }
+}
 uint16_t advertisedDvbServiceId(const DvbSingleProgramPsiContext& ctx) {
     return ctx.remapEnabled && ctx.outputServiceId > 0 ? ctx.outputServiceId : ctx.serviceId;
 }
@@ -597,6 +668,8 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
         if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
             ctx->allowedPids[ctx->pmtPid] = true;
         }
+
+        healAllowedPidsFromSelectedPmt(packet, ctx);
 
         const bool keepPacket = !ctx->filterPids || (pid < ctx->allowedPids.size() && ctx->allowedPids[pid]);
         if (!keepPacket) continue;
