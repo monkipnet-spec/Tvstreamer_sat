@@ -1,7 +1,9 @@
 #include "../../CaBackendPluginApi.h"
 #include "NewcamdClient.h"
 
+extern "C" {
 #include <dvbcsa/dvbcsa.h>
+}
 #include <jsoncpp/json/json.h>
 
 #include <algorithm>
