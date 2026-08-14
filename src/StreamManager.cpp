@@ -185,6 +185,8 @@ struct DvbSingleProgramPsiContext {
     bool filterPids = false;
     bool announced = false;
     bool pidSelfHealAnnounced = false;
+    std::vector<uint8_t> pmtSectionBuffer;
+    size_t pmtSectionExpected = 0;
 };
 
 std::string sharedDvbFrontendKey(const DvbSatelliteParams& params) {
@@ -366,22 +368,15 @@ size_t allowCaDescriptorPids(DvbSingleProgramPsiContext* ctx, const uint8_t* des
     return added;
 }
 
-void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
-    if (!packet || !ctx || !ctx->filterPids || packet[0] != 0x47) return;
-    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
-    if (pid != ctx->pmtPid || pid >= 0x1FFF) return;
-
-    size_t available = 0;
-    const uint8_t* section = tsSectionStart(packet, available);
-    if (!section || available < 16 || section[0] != 0x02) return;
+void healAllowedPidsFromSelectedPmtSection(DvbSingleProgramPsiContext* ctx, const uint8_t* section, size_t total) {
+    if (!ctx || !ctx->filterPids || !section || total < 16 || section[0] != 0x02) return;
     const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
-    const size_t total = 3 + sectionLength;
-    if (sectionLength < 13 || total > available) return;
+    if (sectionLength < 13 || 3 + sectionLength > total) return;
     const uint16_t program = static_cast<uint16_t>((section[3] << 8) | section[4]);
     const uint16_t advertised = ctx->remapEnabled && ctx->outputServiceId > 0 ? ctx->outputServiceId : ctx->serviceId;
     if (program != ctx->serviceId && program != advertised) return;
 
-    const size_t end = total - 4;
+    const size_t end = 3 + sectionLength - 4;
     size_t added = 0;
     const uint16_t pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);
     if (pcrPid < ctx->allowedPids.size() && !ctx->allowedPids[pcrPid]) {
@@ -414,6 +409,47 @@ void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext*
                   << " added_pids=" << added
                   << " source=selected-pmt" << std::endl;
         ctx->pidSelfHealAnnounced = true;
+    }
+}
+
+void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
+    if (!packet || !ctx || !ctx->filterPids || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid != ctx->pmtPid || pid >= 0x1FFF) return;
+
+    const size_t payload = tsPayloadOffset(packet);
+    if (payload >= kTsPacketSize) return;
+    size_t start = payload;
+    if ((packet[1] & 0x40) != 0) {
+        const size_t pointer = packet[payload];
+        if (payload + 1 + pointer >= kTsPacketSize) return;
+        start = payload + 1 + pointer;
+        ctx->pmtSectionBuffer.clear();
+        ctx->pmtSectionExpected = 0;
+    } else if (ctx->pmtSectionBuffer.empty()) {
+        return;
+    }
+
+    ctx->pmtSectionBuffer.insert(ctx->pmtSectionBuffer.end(), packet + start, packet + kTsPacketSize);
+    if (ctx->pmtSectionExpected == 0 && ctx->pmtSectionBuffer.size() >= 3) {
+        if (ctx->pmtSectionBuffer[0] != 0x02) {
+            ctx->pmtSectionBuffer.clear();
+            return;
+        }
+        const size_t sectionLength = static_cast<size_t>(((ctx->pmtSectionBuffer[1] & 0x0F) << 8) |
+                                                         ctx->pmtSectionBuffer[2]);
+        const size_t total = 3 + sectionLength;
+        if (sectionLength < 13 || total > 4096) {
+            ctx->pmtSectionBuffer.clear();
+            ctx->pmtSectionExpected = 0;
+            return;
+        }
+        ctx->pmtSectionExpected = total;
+    }
+    if (ctx->pmtSectionExpected > 0 && ctx->pmtSectionBuffer.size() >= ctx->pmtSectionExpected) {
+        healAllowedPidsFromSelectedPmtSection(ctx, ctx->pmtSectionBuffer.data(), ctx->pmtSectionExpected);
+        ctx->pmtSectionBuffer.clear();
+        ctx->pmtSectionExpected = 0;
     }
 }
 uint16_t advertisedDvbServiceId(const DvbSingleProgramPsiContext& ctx) {

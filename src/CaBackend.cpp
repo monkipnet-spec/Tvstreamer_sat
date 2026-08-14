@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -11,6 +12,12 @@
 
 namespace {
 
+std::string lowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
 void writeError(char* buffer, size_t size, const std::string& text) {
     if (!buffer || size == 0) return;
     const size_t count = std::min(size - 1, text.size());
@@ -173,14 +180,22 @@ void CaBackendManager::loadPluginsLocked() {
 
     std::sort(files.begin(), files.end());
     files.erase(std::unique(files.begin(), files.end()), files.end());
-    for (const auto& path : files) loadPluginFileLocked(path);
+    std::set<std::string> loadedPluginFilenames;
+    for (const auto& path : files) {
+        const std::string filename = lowerAscii(std::filesystem::path(path).filename().string());
+        if (!filename.empty() && loadedPluginFilenames.count(filename)) {
+            std::cerr << "CA backend plugin duplicate filename ignored: " << path << std::endl;
+            continue;
+        }
+        if (loadPluginFileLocked(path) && !filename.empty()) loadedPluginFilenames.insert(filename);
+    }
 }
 
-void CaBackendManager::loadPluginFileLocked(const std::string& path) {
+bool CaBackendManager::loadPluginFileLocked(const std::string& path) {
     void* library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!library) {
         std::cerr << "CA backend plugin load failed: " << path << ": " << dlerror() << std::endl;
-        return;
+        return false;
     }
 
     dlerror();
@@ -189,7 +204,7 @@ void CaBackendManager::loadPluginFileLocked(const std::string& path) {
     if (symbolError || !entry) {
         std::cerr << "CA backend plugin missing entry point: " << path << std::endl;
         dlclose(library);
-        return;
+        return false;
     }
 
     const tvs_ca_backend_api_v1* api = entry();
@@ -197,20 +212,20 @@ void CaBackendManager::loadPluginFileLocked(const std::string& path) {
     if (!validPluginApi(api, error)) {
         std::cerr << "CA backend plugin rejected: " << path << ": " << error << std::endl;
         dlclose(library);
-        return;
+        return false;
     }
     const std::string id = safeString(api->backend_id);
     if (backends_.count(id)) {
         std::cerr << "CA backend plugin duplicate id ignored: " << id << " path=" << path << std::endl;
         dlclose(library);
-        return;
+        return false;
     }
 
     void* instance = api->create(&hostApi_);
     if (!instance) {
         std::cerr << "CA backend plugin create failed: " << id << " path=" << path << std::endl;
         dlclose(library);
-        return;
+        return false;
     }
 
     LoadedBackend backend;
@@ -229,6 +244,7 @@ void CaBackendManager::loadPluginFileLocked(const std::string& path) {
     std::cerr << "CA backend plugin loaded: id=" << id
               << " path=" << path
               << " capabilities=0x" << std::hex << api->capabilities << std::dec << std::endl;
+    return true;
 }
 
 CaBackendManager::LoadedBackend* CaBackendManager::findBackendLocked(const std::string& id) {

@@ -98,7 +98,7 @@ private:
 
     void unloadPluginsLocked();
     void loadPluginsLocked();
-    void loadPluginFileLocked(const std::string& path);
+    bool loadPluginFileLocked(const std::string& path);
     LoadedBackend* findBackendLocked(const std::string& id);
     const LoadedBackend* findBackendLocked(const std::string& id) const;
     bool ensureReaderOpenLocked(LoadedBackend& backend,
