@@ -2063,18 +2063,22 @@ document.addEventListener('click', event => {
   if (!id) return;
   event.preventDefault();
   event.stopPropagation();
-  const action = button.dataset.streamAction;
-  if (action === 'toggle') {
-    const stream = (state.streams || []).find(item => String(item.id) === String(id));
-    toggleStream(id, stream ? !!stream.active : button.dataset.streamActive === '1');
-  } else if (action === 'edit') {
-    editStream(id);
-  } else if (action === 'delete') {
-    deleteStream(id);
-  } else if (action === 'quality') {
-    openQualityModal(id);
-  } else if (action === 'copy') {
-    copyStreamLinks(id, button);
+  try {
+    const action = button.dataset.streamAction;
+    if (action === 'toggle') {
+      const stream = streamById(id);
+      toggleStream(id, stream ? !!stream.active : button.dataset.streamActive === '1', button);
+    } else if (action === 'edit') {
+      editStream(id);
+    } else if (action === 'delete') {
+      deleteStream(id);
+    } else if (action === 'quality') {
+      openQualityModal(id);
+    } else if (action === 'copy') {
+      copyStreamLinks(id, button);
+    }
+  } catch (error) {
+    uiError(error?.message || error);
   }
 });
 let state = {};
@@ -2092,6 +2096,30 @@ let satelliteServices = [];
 let dvbAdapters = [];
 let camClientsLoaded = false;
 let caManagerState = {clients:[]};
+let streamActionBusy = new Set();
+function uiError(message) {
+  console.error(message);
+  window.alert(String(message || 'UI error'));
+}
+async function fetchJson(url, options={}, timeoutMs=30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {...options, signal: controller.signal});
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    return data;
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`Request timeout: ${url}`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function streamById(id) {
+  return (state.streams || []).find(stream => String(stream.id) === String(id));
+}
 function saveLanguagePreference(sourceState=state) {
   if (!Array.isArray(sourceState.streams)) return;
   fetch('/api/save-config', {
@@ -2125,8 +2153,12 @@ function fetchState() {
       if (!Array.isArray(data.interfaces) || !data.interfaces.length) data.interfaces = cachedInterfaces;
       state = data;
       applyLanguage();
-      render(false);
-      refreshSubscriberSessions();
+      try {
+        render(false);
+        refreshSubscriberSessions();
+      } catch (error) {
+        console.error('TVStreammerSAT5 render failed:', error);
+      }
       if (serverLanguage !== language) saveLanguagePreference(data);
       return data;
     })
@@ -2449,20 +2481,36 @@ function render(force=false) {
   lastTileStructureSignature = signature;
   updateLiveTiles();
 }
-function toggleStream(id, active) {
+async function toggleStream(id, active, button=null) {
+  const stream = streamById(id);
+  const body = active ? {id} : stream;
+  if (!body) {
+    uiError(`Stream not found in UI state: ${id}`);
+    fetchState();
+    return;
+  }
+  if (streamActionBusy.has(id)) return;
+  streamActionBusy.add(id);
   const url = active ? '/api/stop-stream' : '/api/start-stream';
-  const body = active ? {id} : state.streams.find(s=>s.id===id);
-  fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(async response=>{
-      let data = {};
-      try { data = await response.json(); } catch (_) {}
-      if (!active && data.result === 'error') {
-        window.alert(data.error || 'Не удалось запустить поток');
-      }
-      setTimeout(fetchState,500);
-      setTimeout(fetchState,1500);
-    })
-    .catch(error=>window.alert(error?.message || 'Ошибка управления потоком'));
+  const originalText = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = active ? 'Stopping...' : 'Starting...';
+  }
+  try {
+    const data = await fetchJson(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}, active ? 15000 : 45000);
+    if (data.result === 'error') throw new Error(data.error || (active ? 'Stop failed' : 'Start failed'));
+  } catch (error) {
+    uiError(error?.message || error);
+  } finally {
+    streamActionBusy.delete(id);
+    if (button) {
+      button.disabled = false;
+      if (originalText) button.textContent = originalText;
+    }
+    setTimeout(fetchState, 300);
+    setTimeout(fetchState, 1500);
+  }
 }
 function deleteStream(id) {
   const stream = state.streams.find(s=>s.id===id);
@@ -2756,8 +2804,7 @@ function caStreamStatusText(stream) {
 }
 async function loadCaManager() {
   try {
-    const response = await fetch('/api/ca-manager', {cache:'no-store'});
-    caManagerState = await response.json();
+    caManagerState = await fetchJson('/api/ca-manager', {cache:'no-store'}, 10000);
   } catch (_) {
     caManagerState = {clients:[]};
   }
@@ -2820,8 +2867,18 @@ async function refreshCamClients() {
   await loadCamClients();
   if (button) button.disabled = false;
 }
+function nextNewcamdIndex() {
+  const used = new Set([...document.querySelectorAll('.newcamd-row [data-cam-field="id"]')].map(input => String(input.value || '')));
+  let index = document.querySelectorAll('.newcamd-row').length + 1;
+  while (used.has(`newcamd-${index}`)) index += 1;
+  return index;
+}
 function defaultNewcamdClient(index=1) {
   return {id:`newcamd-${index}`, name:`OSCam ${index}`, backend_id:'newcamd', max_services:10, backend_config:{host:'127.0.0.1', port:15000, user:'user', pass:'pass', des:'0102030405060708091011121314'}};
+}
+function newcamdSettingsClients() {
+  const configured = Array.isArray(state.cam_clients) ? state.cam_clients : [];
+  return configured.length ? configured : [defaultNewcamdClient(1)];
 }
 function newcamdRowHtml(client={}, index=0) {
   const cfg = parseCamBackendConfig(client);
@@ -2841,7 +2898,7 @@ function newcamdRowHtml(client={}, index=0) {
 function addNewcamdRow(client=null) {
   const rows = document.getElementById('newcamdRows');
   if (!rows) return;
-  const index = rows.querySelectorAll('.newcamd-row').length + 1;
+  const index = client ? rows.querySelectorAll('.newcamd-row').length + 1 : nextNewcamdIndex();
   rows.insertAdjacentHTML('beforeend', newcamdRowHtml(client || defaultNewcamdClient(index), index));
 }
 function removeNewcamdRow(button) {
@@ -2862,29 +2919,41 @@ function collectNewcamdClients() {
 }
 async function saveNewcamdSettings() {
   const clients = collectNewcamdClients();
-  const response = await fetch('/api/cam-client-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clients})});
-  const data = await response.json();
-  if (!response.ok || data.result === 'error') {
-    alert(data.error || `HTTP ${response.status}`);
-    return;
+  try {
+    const data = await fetchJson('/api/cam-client-settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({clients})}, 15000);
+    if (data.result === 'error') throw new Error(data.error || 'Failed to save CAM clients');
+    caManagerState = data;
+    state.cam_clients = clients;
+    closeModal();
+    fetchState();
+  } catch (error) {
+    uiError(error?.message || error);
   }
-  caManagerState = data;
-  state.cam_clients = clients;
-  closeModal();
-  fetchState();
+}
+function renderNewcamdRows(clients) {
+  const rows = document.getElementById('newcamdRows');
+  if (!rows) return;
+  rows.innerHTML = clients.map((client,index)=>newcamdRowHtml(client,index)).join('');
 }
 async function openNewcamdModal() {
-  await loadCaManager();
-  const clients = Array.isArray(state.cam_clients) && state.cam_clients.length ? state.cam_clients : [defaultNewcamdClient(1)];
+  const clients = newcamdSettingsClients();
   openModal(`
-    <h2>Newcamd / OSCam</h2>
+    <h2>Newcamd / OSCam CAM clients</h2>
+    <div class="cam-empty" id="newcamdSettingsStatus">Add one OSCam/Newcamd client per server or satellite package, then select the client when adding DVB channels.</div>
     <div id="newcamdRows" class="form-grid full">${clients.map((client,index)=>newcamdRowHtml(client,index)).join('')}</div>
     <div class="modal-actions">
-      <button class="button-secondary" type="button" onclick="addNewcamdRow()">Add client</button>
+      <button class="button-secondary" type="button" onclick="addNewcamdRow()">Add CAM client</button>
       <button class="button-secondary" onclick="closeModal()">Cancel</button>
       <button class="button-primary" onclick="saveNewcamdSettings()">Save</button>
     </div>
   `);
+  loadCaManager().then(snapshot => {
+    const status = document.getElementById('newcamdSettingsStatus');
+    if (status) status.textContent = `${(snapshot.clients || []).length} CAM client(s) configured. Use Add CAM client for another OSCam/Newcamd server.`;
+  }).catch(error => {
+    const status = document.getElementById('newcamdSettingsStatus');
+    if (status) status.textContent = error?.message || 'CAM manager refresh failed';
+  });
 }
 function refreshSatelliteFrontendOptions(preferredFrontend=null) {
   const adapterSelect = document.getElementById('satAdapter');
