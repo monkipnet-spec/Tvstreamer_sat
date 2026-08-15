@@ -1,4 +1,9 @@
-# TVStreammerSAT5 — Release 33
+# TVStreammerSAT5 — Release 34
+
+
+### TS framing diagnostics for CA path (v149)
+
+Release 34 adds diagnostic-only MPEG-TS framing counters around the existing CA transport hook. It reports buffer alignment, sync/adaptation/TEI anomalies, payload lengths modulo 8 and a representative scrambled-packet sample once per second. The diagnostic code does not modify TS payload, CA key handling, DVB tuning, StableUdpOutput, WISI reservoir, PCR or continuity-normalization logic.
 
 ### CA/Newcamd shutdown deadlock fix (v148)
 

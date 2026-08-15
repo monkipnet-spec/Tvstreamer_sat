@@ -7,7 +7,9 @@ extern "C" {
 #include <jsoncpp/json/json.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -109,6 +111,27 @@ struct ServiceBinding {
     ControlWordSlot odd;
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
+
+    // Diagnostic-only MPEG-TS framing counters. These counters never modify
+    // TS payload or CA state; they are used to correlate PES corruption with
+    // input buffer alignment, TS sync/adaptation errors and payload lengths.
+    uint64_t diagLastLogMs = 0;
+    uint64_t diagCalls = 0;
+    uint64_t diagUnalignedBuffers = 0;
+    uint64_t diagBadSyncPackets = 0;
+    uint64_t diagTeiPackets = 0;
+    uint64_t diagBadAdaptationPackets = 0;
+    uint64_t diagPayloadPackets = 0;
+    uint64_t diagNonModulo8Payloads = 0;
+    uint64_t diagScrambledPackets = 0;
+    uint64_t diagScrambledNonModulo8Payloads = 0;
+    uint16_t diagSamplePid = 0;
+    uint8_t diagSampleScrambling = 0;
+    uint8_t diagSampleAdaptation = 0;
+    uint16_t diagSamplePayload = 0;
+    uint8_t diagSampleCc = 0;
+    bool diagSamplePusi = false;
+    bool diagSampleTei = false;
 };
 
 struct NewcamdSession {
@@ -154,6 +177,12 @@ Json::Value parse_config(const char* json, std::string& error) {
 
 uint16_t parse_pid(const uint8_t* packet) {
     return static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+}
+
+uint64_t monotonic_ms() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 const uint8_t* ts_payload(uint8_t* packet, size_t* payloadSize) {
@@ -396,13 +425,66 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     bool changed = false;
     bool waitingForKey = false;
     bool sawEcm = false;
+
+    ++binding.diagCalls;
+    const size_t bufferRemainder = size % kTsPacketSize;
+    if (bufferRemainder != 0) ++binding.diagUnalignedBuffers;
+
     for (size_t offset = 0; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
         uint8_t* packet = data + offset;
-        if (packet[0] != 0x47) continue;
+        if (packet[0] != 0x47) {
+            ++binding.diagBadSyncPackets;
+            continue;
+        }
 
         result->packets_seen++;
         const uint16_t pid = parse_pid(packet);
+        const bool tei = (packet[1] & 0x80) != 0;
         const bool payloadStart = (packet[1] & 0x40) != 0;
+        const uint8_t scramblingControl = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
+        const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
+        const uint8_t continuityCounter = static_cast<uint8_t>(packet[3] & 0x0F);
+
+        if (tei) ++binding.diagTeiPackets;
+        if (scramblingControl != 0) ++binding.diagScrambledPackets;
+
+        size_t diagnosticPayloadSize = 0;
+        bool validAdaptation = true;
+        if (adaptationControl == 0) {
+            validAdaptation = false;
+        } else if (adaptationControl == 1) {
+            diagnosticPayloadSize = kTsPacketSize - 4;
+        } else if (adaptationControl == 3) {
+            const size_t adaptationLength = packet[4];
+            if (5 + adaptationLength > kTsPacketSize) {
+                validAdaptation = false;
+            } else {
+                const size_t diagnosticPayloadOffset = 5 + adaptationLength;
+                if (diagnosticPayloadOffset < kTsPacketSize) {
+                    diagnosticPayloadSize = kTsPacketSize - diagnosticPayloadOffset;
+                }
+            }
+        }
+
+        if (!validAdaptation) {
+            ++binding.diagBadAdaptationPackets;
+        } else if (diagnosticPayloadSize > 0) {
+            ++binding.diagPayloadPackets;
+            if ((diagnosticPayloadSize % 8) != 0) {
+                ++binding.diagNonModulo8Payloads;
+                if (scramblingControl == 2 || scramblingControl == 3) {
+                    ++binding.diagScrambledNonModulo8Payloads;
+                    binding.diagSamplePid = pid;
+                    binding.diagSampleScrambling = scramblingControl;
+                    binding.diagSampleAdaptation = adaptationControl;
+                    binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
+                    binding.diagSampleCc = continuityCounter;
+                    binding.diagSamplePusi = payloadStart;
+                    binding.diagSampleTei = tei;
+                }
+            }
+        }
+
         size_t payloadSize = 0;
         const uint8_t* payload = ts_payload(packet, &payloadSize);
 
@@ -436,7 +518,6 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             }
         }
 
-        const uint8_t scramblingControl = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
         if (scramblingControl == 0) {
             result->packets_clear++;
             continue;
@@ -468,6 +549,33 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         packet[3] &= 0x3F;
         result->packets_changed++;
         changed = true;
+    }
+
+    const uint64_t diagNowMs = monotonic_ms();
+    if (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000) {
+        binding.diagLastLogMs = diagNowMs;
+        std::cerr
+            << "CA TS DIAG: stream=" << stream_id
+            << " calls=" << binding.diagCalls
+            << " buffer_size=" << size
+            << " remainder=" << bufferRemainder
+            << " unaligned_buffers=" << binding.diagUnalignedBuffers
+            << " bad_sync=" << binding.diagBadSyncPackets
+            << " tei=" << binding.diagTeiPackets
+            << " bad_afc=" << binding.diagBadAdaptationPackets
+            << " payload_packets=" << binding.diagPayloadPackets
+            << " nonmod8=" << binding.diagNonModulo8Payloads
+            << " scrambled=" << binding.diagScrambledPackets
+            << " scrambled_nonmod8=" << binding.diagScrambledNonModulo8Payloads
+            << " sample_pid=" << binding.diagSamplePid
+            << " sample_sc=" << static_cast<unsigned>(binding.diagSampleScrambling)
+            << " sample_afc=" << static_cast<unsigned>(binding.diagSampleAdaptation)
+            << " sample_payload=" << binding.diagSamplePayload
+            << " sample_mod8=" << (binding.diagSamplePayload % 8)
+            << " sample_cc=" << static_cast<unsigned>(binding.diagSampleCc)
+            << " sample_pusi=" << (binding.diagSamplePusi ? 1 : 0)
+            << " sample_tei=" << (binding.diagSampleTei ? 1 : 0)
+            << std::endl;
     }
 
     if (changed) {
