@@ -11,6 +11,11 @@
 #include "protocols/stream/StreamOutputProtocol.h"
 
 #include <algorithm>
+#include <array>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <set>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -351,6 +356,362 @@ bool sharedDvbLooksAligned(const uint8_t* data, size_t size, size_t candidate) {
         if (data[next] != 0x47) return false;
     }
     return true;
+}
+
+// v155 diagnostic-only byte audit for the shared DVB ingest path.  It never
+// changes a GstBuffer.  The source and pre-UDP probes produce cumulative exact
+// 188-byte packet fingerprints at the same packet counts.  The receiver probe
+// additionally correlates packets against a bounded source history, so payload
+// changes or packet loss across the internal loopback UDP hop can be separated
+// from corruption already present at dvbsrc output.
+constexpr size_t kDvbByteAuditHistoryLimit = 65536;
+constexpr uint64_t kDvbByteAuditLogIntervalPackets = 10000;
+constexpr uint64_t kDvbByteAuditFNVOffset = 1469598103934665603ULL;
+constexpr uint64_t kDvbByteAuditFNVPrime = 1099511628211ULL;
+
+struct DvbByteAuditPacket {
+    uint64_t seq = 0;
+    uint64_t fingerprint = 0;
+    uint16_t pid = 0;
+    uint8_t cc = 0;
+};
+
+struct DvbByteAuditHistory {
+    uint64_t generation = 0;
+    uint64_t nextSeq = 1;
+    std::deque<DvbByteAuditPacket> packets;
+};
+
+std::mutex gDvbByteAuditMutex;
+std::map<std::string, DvbByteAuditHistory> gDvbByteAuditHistories;
+
+uint64_t dvbByteAuditHash(const uint8_t* data, size_t size) {
+    uint64_t hash = kDvbByteAuditFNVOffset;
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(data[i]);
+        hash *= kDvbByteAuditFNVPrime;
+    }
+    return hash;
+}
+
+uint64_t dvbByteAuditRoll(uint64_t current, uint64_t packetFingerprint) {
+    // Fold the exact packet fingerprint into an order-sensitive cumulative
+    // digest. Source and pre-internal-UDP stages must have identical values at
+    // every equal packet count when no bytes were modified in the pipeline.
+    current ^= packetFingerprint;
+    current *= kDvbByteAuditFNVPrime;
+    return current;
+}
+
+struct DvbByteAuditContext {
+    std::string frontendKey;
+    std::string streamId;
+    std::string stage;
+    std::vector<uint8_t> remainder;
+    bool publishSourceHistory = false;
+    bool compareWithSourceHistory = false;
+    bool sourceHistoryStarted = false;
+    bool receiverAligned = false;
+    bool receiverPending = false;
+    uint64_t pendingFingerprint = 0;
+    uint16_t pendingPid = 0;
+    uint8_t pendingCc = 0;
+    uint64_t sourceGeneration = 0;
+    uint64_t expectedSourceSeq = 0;
+    uint64_t packets = 0;
+    uint64_t rollingHash = kDvbByteAuditFNVOffset;
+    uint64_t unalignedBuffers = 0;
+    uint64_t alignmentMisses = 0;
+    uint64_t resyncBytes = 0;
+    uint64_t matched = 0;
+    uint64_t payloadMismatches = 0;
+    uint64_t sourceSkippedPackets = 0;
+    uint64_t receiverDuplicates = 0;
+    uint64_t receiverUnmatched = 0;
+    uint64_t receiverRealigns = 0;
+    uint64_t nextLogPacket = kDvbByteAuditLogIntervalPackets;
+};
+
+void dvbByteAuditStartSourceHistory(DvbByteAuditContext* ctx) {
+    if (!ctx || !ctx->publishSourceHistory || ctx->sourceHistoryStarted) return;
+    std::lock_guard<std::mutex> lock(gDvbByteAuditMutex);
+    auto& history = gDvbByteAuditHistories[ctx->frontendKey];
+    ++history.generation;
+    history.nextSeq = 1;
+    history.packets.clear();
+    ctx->sourceGeneration = history.generation;
+    ctx->sourceHistoryStarted = true;
+}
+
+void dvbByteAuditPublishSourcePacket(
+    DvbByteAuditContext* ctx,
+    uint64_t fingerprint,
+    uint16_t pid,
+    uint8_t cc) {
+    if (!ctx || !ctx->publishSourceHistory) return;
+    dvbByteAuditStartSourceHistory(ctx);
+    std::lock_guard<std::mutex> lock(gDvbByteAuditMutex);
+    auto it = gDvbByteAuditHistories.find(ctx->frontendKey);
+    if (it == gDvbByteAuditHistories.end()) return;
+    auto& history = it->second;
+    if (history.generation != ctx->sourceGeneration) return;
+    history.packets.push_back(DvbByteAuditPacket{
+        history.nextSeq++, fingerprint, pid, cc});
+    while (history.packets.size() > kDvbByteAuditHistoryLimit) {
+        history.packets.pop_front();
+    }
+}
+
+bool dvbByteAuditPacketEquals(
+    const DvbByteAuditPacket& source,
+    uint64_t fingerprint,
+    uint16_t pid,
+    uint8_t cc) {
+    return source.fingerprint == fingerprint && source.pid == pid && source.cc == cc;
+}
+
+void dvbByteAuditCompareReceiverPacket(
+    DvbByteAuditContext* ctx,
+    uint64_t fingerprint,
+    uint16_t pid,
+    uint8_t cc) {
+    if (!ctx || !ctx->compareWithSourceHistory) return;
+    std::lock_guard<std::mutex> lock(gDvbByteAuditMutex);
+    auto it = gDvbByteAuditHistories.find(ctx->frontendKey);
+    if (it == gDvbByteAuditHistories.end() || it->second.packets.empty()) {
+        ++ctx->receiverUnmatched;
+        ctx->receiverAligned = false;
+        ctx->receiverPending = false;
+        return;
+    }
+    const auto& history = it->second;
+    if (ctx->sourceGeneration != history.generation) {
+        ctx->sourceGeneration = history.generation;
+        ctx->receiverAligned = false;
+        ctx->receiverPending = false;
+        ctx->expectedSourceSeq = 0;
+    }
+
+    const auto findMatchingSeq = [&](uint64_t minSeq, uint64_t maxSeq) -> uint64_t {
+        for (auto rit = history.packets.rbegin(); rit != history.packets.rend(); ++rit) {
+            if (rit->seq < minSeq) break;
+            if (rit->seq > maxSeq) continue;
+            if (dvbByteAuditPacketEquals(*rit, fingerprint, pid, cc)) return rit->seq;
+        }
+        return 0;
+    };
+
+    if (!ctx->receiverAligned) {
+        // Use two consecutive packets to establish the source sequence. This
+        // avoids false alignment on frequently repeated PAT/CAT/SI packets.
+        if (!ctx->receiverPending) {
+            ctx->receiverPending = true;
+            ctx->pendingFingerprint = fingerprint;
+            ctx->pendingPid = pid;
+            ctx->pendingCc = cc;
+            return;
+        }
+
+        const uint64_t historyBack = history.packets.back().seq;
+        const uint64_t searchMin = historyBack > 16384
+            ? historyBack - 16384 : history.packets.front().seq;
+        uint64_t currentSeq = 0;
+        for (auto rit = history.packets.rbegin(); rit != history.packets.rend(); ++rit) {
+            if (rit->seq < searchMin) break;
+            if (!dvbByteAuditPacketEquals(*rit, fingerprint, pid, cc)) continue;
+            if (rit->seq <= history.packets.front().seq) continue;
+            const size_t previousIndex = static_cast<size_t>(
+                (rit->seq - 1) - history.packets.front().seq);
+            if (previousIndex >= history.packets.size()) continue;
+            const auto& previous = history.packets[previousIndex];
+            if (dvbByteAuditPacketEquals(
+                    previous,
+                    ctx->pendingFingerprint,
+                    ctx->pendingPid,
+                    ctx->pendingCc)) {
+                currentSeq = rit->seq;
+                break;
+            }
+        }
+        if (currentSeq != 0) {
+            ctx->receiverAligned = true;
+            ctx->receiverPending = false;
+            ctx->expectedSourceSeq = currentSeq + 1;
+            ctx->matched += 2;
+            ++ctx->receiverRealigns;
+            return;
+        }
+
+        ++ctx->receiverUnmatched;
+        ctx->pendingFingerprint = fingerprint;
+        ctx->pendingPid = pid;
+        ctx->pendingCc = cc;
+        return;
+    }
+
+    if (ctx->expectedSourceSeq < history.packets.front().seq) {
+        ++ctx->receiverUnmatched;
+        ctx->receiverAligned = false;
+        ctx->receiverPending = false;
+        return;
+    }
+    if (ctx->expectedSourceSeq > history.packets.back().seq) {
+        // The receiver should normally trail the source by the queue/socket
+        // latency. If scheduling briefly reverses that order, retry alignment on
+        // the next packet rather than classifying it as payload corruption.
+        ++ctx->receiverUnmatched;
+        ctx->receiverAligned = false;
+        ctx->receiverPending = false;
+        return;
+    }
+
+    const size_t expectedIndex = static_cast<size_t>(
+        ctx->expectedSourceSeq - history.packets.front().seq);
+    if (expectedIndex < history.packets.size() &&
+        dvbByteAuditPacketEquals(history.packets[expectedIndex], fingerprint, pid, cc)) {
+        ++ctx->matched;
+        ++ctx->expectedSourceSeq;
+        return;
+    }
+
+    // First look forward a short distance. A match means source packets were
+    // absent at the receiver, not that the received packet payload changed.
+    const uint64_t forwardMax = std::min<uint64_t>(
+        history.packets.back().seq, ctx->expectedSourceSeq + 64);
+    const uint64_t forwardSeq = findMatchingSeq(ctx->expectedSourceSeq + 1, forwardMax);
+    if (forwardSeq != 0) {
+        ctx->sourceSkippedPackets += forwardSeq - ctx->expectedSourceSeq;
+        ++ctx->matched;
+        ctx->expectedSourceSeq = forwardSeq + 1;
+        return;
+    }
+
+    // A packet identical to one of the immediately preceding source packets is
+    // a receiver-side duplicate. Keep it separate from byte mismatches.
+    const uint64_t backwardMin = ctx->expectedSourceSeq > 8
+        ? ctx->expectedSourceSeq - 8 : history.packets.front().seq;
+    const uint64_t backwardMax = ctx->expectedSourceSeq > 0
+        ? ctx->expectedSourceSeq - 1 : 0;
+    if (backwardMax >= backwardMin &&
+        findMatchingSeq(backwardMin, backwardMax) != 0) {
+        ++ctx->receiverDuplicates;
+        return;
+    }
+
+    // No exact source packet exists around the expected sequence: the packet
+    // bytes differ. Advance one source slot so a single damaged packet does not
+    // turn the rest of the stream into a cascade of false mismatches.
+    ++ctx->payloadMismatches;
+    if (ctx->payloadMismatches <= 8 && expectedIndex < history.packets.size()) {
+        const auto& expected = history.packets[expectedIndex];
+        std::cerr << "DVB BYTE AUDIT MISMATCH: frontend=" << ctx->frontendKey
+                  << " stream=" << ctx->streamId
+                  << " source_seq=" << ctx->expectedSourceSeq
+                  << " source_pid=" << expected.pid
+                  << " recv_pid=" << pid
+                  << " source_cc=" << static_cast<unsigned int>(expected.cc)
+                  << " recv_cc=" << static_cast<unsigned int>(cc)
+                  << " source_hash=0x" << std::hex << expected.fingerprint
+                  << " recv_hash=0x" << fingerprint << std::dec
+                  << std::endl;
+    }
+    ++ctx->expectedSourceSeq;
+}
+
+void dvbByteAuditLog(const DvbByteAuditContext& ctx) {
+    std::ostringstream line;
+    line << "DVB BYTE AUDIT: stage=" << ctx.stage
+         << " frontend=" << ctx.frontendKey;
+    if (!ctx.streamId.empty()) line << " stream=" << ctx.streamId;
+    line << " packets=" << ctx.packets
+         << " hash=0x" << std::hex << ctx.rollingHash << std::dec
+         << " remainder=" << ctx.remainder.size()
+         << " unaligned_buffers=" << ctx.unalignedBuffers
+         << " alignment_misses=" << ctx.alignmentMisses
+         << " resync_bytes=" << ctx.resyncBytes;
+    if (ctx.compareWithSourceHistory) {
+        line << " matched=" << ctx.matched
+             << " payload_mismatches=" << ctx.payloadMismatches
+             << " source_skipped=" << ctx.sourceSkippedPackets
+             << " receiver_duplicates=" << ctx.receiverDuplicates
+             << " unmatched=" << ctx.receiverUnmatched
+             << " realigns=" << ctx.receiverRealigns
+             << " source_generation=" << ctx.sourceGeneration
+             << " expected_source_seq=" << ctx.expectedSourceSeq;
+    } else if (ctx.publishSourceHistory) {
+        line << " source_generation=" << ctx.sourceGeneration;
+    }
+    std::cerr << line.str() << std::endl;
+}
+
+void dvbByteAuditProcessPacket(DvbByteAuditContext* ctx, const uint8_t* packet) {
+    if (!ctx || !packet || packet[0] != 0x47) return;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    const uint8_t cc = static_cast<uint8_t>(packet[3] & 0x0F);
+    const uint64_t fingerprint = dvbByteAuditHash(packet, kTsPacketSize);
+    ctx->rollingHash = dvbByteAuditRoll(ctx->rollingHash, fingerprint);
+    ++ctx->packets;
+    if (ctx->publishSourceHistory) {
+        dvbByteAuditPublishSourcePacket(ctx, fingerprint, pid, cc);
+    }
+    if (ctx->compareWithSourceHistory) {
+        dvbByteAuditCompareReceiverPacket(ctx, fingerprint, pid, cc);
+    }
+    if (ctx->packets >= ctx->nextLogPacket) {
+        dvbByteAuditLog(*ctx);
+        while (ctx->packets >= ctx->nextLogPacket) {
+            ctx->nextLogPacket += kDvbByteAuditLogIntervalPackets;
+        }
+    }
+}
+
+GstPadProbeReturn dvbByteAuditProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<DvbByteAuditContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    if ((map.size % kTsPacketSize) != 0) ++ctx->unalignedBuffers;
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(ctx->remainder.size() + map.size);
+    bytes.insert(bytes.end(), ctx->remainder.begin(), ctx->remainder.end());
+    bytes.insert(bytes.end(), map.data, map.data + map.size);
+    ctx->remainder.clear();
+    gst_buffer_unmap(buffer, &map);
+
+    size_t start = std::string::npos;
+    const size_t maxOffset = std::min<size_t>(kTsPacketSize, bytes.size());
+    for (size_t candidate = 0; candidate < maxOffset; ++candidate) {
+        if (sharedDvbLooksAligned(bytes.data(), bytes.size(), candidate)) {
+            start = candidate;
+            break;
+        }
+    }
+    if (start == std::string::npos) {
+        ++ctx->alignmentMisses;
+        const size_t keep = std::min<size_t>(bytes.size(), kTsPacketSize * 2 - 1);
+        if (keep > 0) ctx->remainder.assign(bytes.end() - keep, bytes.end());
+        return GST_PAD_PROBE_OK;
+    }
+    if (start > 0) ctx->resyncBytes += start;
+
+    size_t offset = start;
+    for (; offset + kTsPacketSize <= bytes.size(); offset += kTsPacketSize) {
+        const uint8_t* packet = bytes.data() + offset;
+        if (packet[0] != 0x47) {
+            ++ctx->alignmentMisses;
+            break;
+        }
+        dvbByteAuditProcessPacket(ctx, packet);
+    }
+    if (offset < bytes.size()) {
+        ctx->remainder.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
+    }
+    return GST_PAD_PROBE_OK;
 }
 
 GstPadProbeReturn sharedDvbTsFramerProbe(
@@ -2854,6 +3215,24 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
+    // v155 byte-for-byte diagnostics at the DVB source. This probe publishes
+    // recent exact TS packet fingerprints for the corresponding service relay
+    // receiver to correlate against. It is read-only.
+    {
+        GstPad* auditPad = gst_element_get_static_pad(source, "src");
+        if (auditPad) {
+            auto* auditContext = new DvbByteAuditContext();
+            auditContext->frontendKey = frontendKey;
+            auditContext->stage = "dvbsrc-src";
+            auditContext->publishSourceHistory = true;
+            gst_pad_add_probe(
+                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                dvbByteAuditProbe, auditContext,
+                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+            gst_object_unref(auditPad);
+        }
+    }
+
     GstPad* statsPad = gst_element_get_static_pad(source, "src");
     if (statsPad) {
         auto* statsContext = new SharedDvbPidStatsContext();
@@ -2866,6 +3245,22 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             statsContext,
             [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
         gst_object_unref(statsPad);
+    }
+
+    // Same cumulative fingerprint immediately before the internal multicast
+    // udpsink. At equal packet counts its hash must match dvbsrc-src exactly.
+    {
+        GstPad* auditPad = gst_element_get_static_pad(queue, "src");
+        if (auditPad) {
+            auto* auditContext = new DvbByteAuditContext();
+            auditContext->frontendKey = frontendKey;
+            auditContext->stage = "pre-internal-udp";
+            gst_pad_add_probe(
+                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                dvbByteAuditProbe, auditContext,
+                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+            gst_object_unref(auditPad);
+        }
     }
     configureQueue(queue, 12000000000ULL);
     g_object_set(sink,
@@ -3199,6 +3594,25 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         releaseDvbServiceRelayPort(outputPort);
         error = "failed to link DVB service relay pipeline";
         return false;
+    }
+
+    // v155 exact byte correlation after the internal multicast receiver and
+    // before the custom framer/SPTS filtering. The probe is read-only and
+    // compares each reconstructed 188-byte packet with recent dvbsrc output.
+    {
+        GstPad* auditPad = gst_element_get_static_pad(inputQueue, "src");
+        if (auditPad) {
+            auto* auditContext = new DvbByteAuditContext();
+            auditContext->frontendKey = state->sharedDvbFrontendKey;
+            auditContext->streamId = state->config.id;
+            auditContext->stage = "internal-udp-recv";
+            auditContext->compareWithSourceHistory = true;
+            gst_pad_add_probe(
+                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                dvbByteAuditProbe, auditContext,
+                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+            gst_object_unref(auditPad);
+        }
     }
 
     // v152 passive stage-by-stage CC trace. The first probe observes the raw
