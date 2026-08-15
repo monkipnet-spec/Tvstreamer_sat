@@ -154,6 +154,7 @@ public:
     bool startStream(const StreamConfig& streamConfig, std::string* error = nullptr);
     bool restartStream(const StreamConfig& streamConfig, std::string* error = nullptr);
     bool stopStream(const std::string& id);
+    bool stopStreamAsync(const std::string& id);
     void stopAll();
     bool isStreamActive(const std::string& id);
     std::vector<std::string> activeStreams();

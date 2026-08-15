@@ -1,4 +1,8 @@
-# TVStreammerSAT5 — Release 22
+# TVStreammerSAT5 — Release 23
+
+### Async stop declaration build fix (v137)
+
+Release 23 fixes a C++ interface mismatch introduced by the asynchronous HTTP stop path: `StreamManager::stopStreamAsync(const std::string&)` was implemented in `StreamManager.cpp` and called by `HttpServer.cpp`, but was missing from the public `StreamManager` declaration in `StreamManager.h`. The method is now declared next to `stopStream()`. Runtime stop behaviour is unchanged; this release is a compile-only interface fix. DVB shared-frontend/SPTS, CA backends and the WISI `StableUdpOutput` path are unchanged.
 
 ### PhoenixSerialTransport lifecycle layer (v136)
 
@@ -45,7 +49,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 22 / v136.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 23 / v137.**
 
 
 ### Retry inactive/error streams cleanly (v129)
