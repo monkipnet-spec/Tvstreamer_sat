@@ -333,13 +333,26 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
 static void newcamd_close_reader(void* instance, const char* reader_key) {
     auto* inst = static_cast<NewcamdInstance*>(instance);
     if (!inst || !reader_key) return;
-    std::lock_guard<std::mutex> lock(inst->mutex);
+
+    std::unique_ptr<NewcamdSession> removedSession;
     const std::string clientKey = reader_key;
-    for (auto it = inst->servicesByStream.begin(); it != inst->servicesByStream.end();) {
-        if (it->second.clientKey == clientKey) it = inst->servicesByStream.erase(it);
-        else ++it;
+    {
+        std::lock_guard<std::mutex> lock(inst->mutex);
+        for (auto it = inst->servicesByStream.begin(); it != inst->servicesByStream.end();) {
+            if (it->second.clientKey == clientKey) it = inst->servicesByStream.erase(it);
+            else ++it;
+        }
+        auto sessionIt = inst->sessionsByClient.find(clientKey);
+        if (sessionIt != inst->sessionsByClient.end()) {
+            removedSession = std::move(sessionIt->second);
+            inst->sessionsByClient.erase(sessionIt);
+        }
     }
-    inst->sessionsByClient.erase(clientKey);
+
+    // Destruction disconnects the TCP client and joins its receiver. The
+    // receiver callback also takes inst->mutex, so destruction/join must occur
+    // after the plugin mutex is released.
+    removedSession.reset();
 }
 
 static int newcamd_start_service(void* instance, const char* reader_key, const struct tvs_ca_service_info_v1* service, char* error, size_t error_size) {

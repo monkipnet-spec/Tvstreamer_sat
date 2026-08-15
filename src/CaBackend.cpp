@@ -309,7 +309,13 @@ bool CaBackendManager::startService(const StreamConfig& stream,
                                     std::string* error) {
     if (error) error->clear();
     std::lock_guard<std::mutex> lock(mutex_);
-    if (sessions_.count(stream.id)) return true;
+    if (auto existing = sessions_.find(stream.id); existing != sessions_.end()) {
+        if (existing->second.stopping) {
+            if (error) *error = "CA backend session is still stopping: " + stream.id;
+            return false;
+        }
+        return true;
+    }
 
     const std::string backendId = reader.backendId.empty() ? "passthrough" : reader.backendId;
     LoadedBackend* backend = findBackendLocked(backendId);
@@ -367,46 +373,90 @@ bool CaBackendManager::startService(const StreamConfig& stream,
 void CaBackendManager::markServiceActive(const std::string& streamId) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto found = sessions_.find(streamId);
-    if (found == sessions_.end()) return;
+    if (found == sessions_.end() || found->second.stopping) return;
     found->second.active = true;
     if (found->second.status == "BACKEND_RESERVED") found->second.status = "BACKEND_ACTIVE";
 }
 
 void CaBackendManager::stopService(const std::string& streamId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto found = sessions_.find(streamId);
-    if (found == sessions_.end()) return;
-    ServiceSession session = found->second;
-    sessions_.erase(found);
+    ServiceSession session;
+    const tvs_ca_backend_api_v1* api = nullptr;
+    void* instance = nullptr;
+    bool builtin = true;
+    bool closeReader = false;
 
-    LoadedBackend* backend = findBackendLocked(session.backendId);
-    if (!backend) return;
-    if (!backend->builtin && backend->api && backend->api->stop_service) {
-        backend->api->stop_service(backend->instance, streamId.c_str());
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = sessions_.find(streamId);
+        if (found == sessions_.end()) return;
+        if (found->second.stopping) return;
+
+        // Keep the session registered while plugin teardown is in progress.
+        // This prevents configure() from unloading the shared object while a
+        // stop_service()/close_reader() call is executing outside mutex_.
+        found->second.stopping = true;
+        found->second.active = false;
+        found->second.status = "STOPPING";
+        session = found->second;
+
+        LoadedBackend* backend = findBackendLocked(session.backendId);
+        if (!backend) {
+            sessions_.erase(found);
+            return;
+        }
+        builtin = backend->builtin;
+        api = backend->api;
+        instance = backend->instance;
+
+        // Update only the reference counter while holding mutex_.  The plugin
+        // close_reader callback can block on I/O or join a worker thread, so it
+        // must never execute under the global CaBackendManager lock.
+        auto readerRef = backend->readerRefs.find(session.readerKey);
+        if (readerRef != backend->readerRefs.end()) {
+            if (readerRef->second > 1) {
+                --readerRef->second;
+            } else {
+                backend->readerRefs.erase(readerRef);
+                closeReader = true;
+            }
+        }
     }
-    releaseReaderLocked(*backend, session.readerKey);
+
+    // External plugin code is deliberately called with mutex_ released.  A
+    // broken or slow backend may delay this stop thread, but /api/state and
+    // other manager snapshots remain responsive and report STOPPING.
+    if (!builtin && api && api->stop_service) {
+        api->stop_service(instance, streamId.c_str());
+    }
+    if (closeReader && !builtin && api && api->close_reader) {
+        api->close_reader(instance, session.readerKey.c_str());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto found = sessions_.find(streamId);
+        if (found != sessions_.end() && found->second.stopping) {
+            sessions_.erase(found);
+        }
+    }
+
     std::cerr << "CA backend service stopped: stream=" << streamId
               << " client=" << session.readerKey
               << " backend=" << session.backendId << std::endl;
 }
 
 void CaBackendManager::stopAll() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<ServiceSession> sessions;
-    sessions.reserve(sessions_.size());
-    for (const auto& [id, session] : sessions_) {
-        (void)id;
-        sessions.push_back(session);
-    }
-    sessions_.clear();
-
-    for (const auto& session : sessions) {
-        LoadedBackend* backend = findBackendLocked(session.backendId);
-        if (!backend) continue;
-        if (!backend->builtin && backend->api && backend->api->stop_service) {
-            backend->api->stop_service(backend->instance, session.streamId.c_str());
+    std::vector<std::string> streamIds;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        streamIds.reserve(sessions_.size());
+        for (const auto& [id, session] : sessions_) {
+            (void)session;
+            streamIds.push_back(id);
         }
-        releaseReaderLocked(*backend, session.readerKey);
+    }
+    for (const auto& id : streamIds) {
+        stopService(id);
     }
 }
 
@@ -416,6 +466,7 @@ bool CaBackendManager::processTransport(const std::string& streamId, uint8_t* da
     auto sessionIt = sessions_.find(streamId);
     if (sessionIt == sessions_.end()) return true;
     ServiceSession& session = sessionIt->second;
+    if (session.stopping) return true;
     ++session.calls;
     session.bytes += size;
     if ((size % 188u) != 0u) {
@@ -479,23 +530,22 @@ Json::Value CaBackendManager::backendToJsonLocked(const LoadedBackend& backend) 
     item["reader_reconnect"] = (backend.capabilities & TVS_CA_CAP_READER_RECONNECT) != 0;
     item["load_error"] = backend.loadError;
     item["open_clients"] = Json::UInt(backend.readerRefs.size());
-    if (!backend.builtin && backend.api && backend.api->status_json) {
-        const char* status = backend.api->status_json(backend.instance);
-        if (status && *status) {
-            Json::Value parsed;
-            Json::CharReaderBuilder builder;
-            std::string errors;
-            std::istringstream input(status);
-            if (Json::parseFromStream(builder, input, &parsed, &errors)) item["plugin_status"] = parsed;
-            else item["plugin_status_text"] = status;
-        }
-    }
+    // Do not call backend->status_json() from the HTTP snapshot path. Plugin
+    // callbacks may wait on network/worker locks; dashboard state must remain
+    // available even when a backend is unhealthy.
+    item["plugin_status_deferred"] = !backend.builtin && backend.api && backend.api->status_json;
     return item;
 }
 
 Json::Value CaBackendManager::streamState(const std::string& streamId) const {
-    std::lock_guard<std::mutex> lock(mutex_);
     Json::Value result;
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        result["managed"] = true;
+        result["busy"] = true;
+        result["status"] = "BACKEND_BUSY";
+        return result;
+    }
     auto found = sessions_.find(streamId);
     if (found == sessions_.end()) {
         result["managed"] = false;
@@ -508,6 +558,7 @@ Json::Value CaBackendManager::streamState(const std::string& streamId) const {
     result["backend_id"] = session.backendId;
     result["client"] = session.readerKey;
     result["active"] = session.active;
+    result["stopping"] = session.stopping;
     result["passthrough"] = session.passthrough;
     result["status"] = session.status;
     result["calls"] = Json::UInt64(session.calls);
@@ -531,10 +582,21 @@ Json::Value CaBackendManager::streamState(const std::string& streamId) const {
 }
 
 Json::Value CaBackendManager::snapshot() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     Json::Value root;
     std::string directory = kDefaultPluginDirectory;
     if (const char* env = std::getenv("TVSTREAMMERSAT5_CA_PLUGIN_DIR")) if (*env) directory = env;
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        root["abi_version"] = Json::UInt(TVS_CA_BACKEND_ABI_V1);
+        root["plugin_directory"] = directory;
+        root["network_ca_server"] = false;
+        root["external_key_export"] = false;
+        root["raw_control_word_api"] = false;
+        root["busy"] = true;
+        root["status"] = "BACKEND_BUSY";
+        root["backends"] = Json::Value(Json::arrayValue);
+        return root;
+    }
     root["abi_version"] = Json::UInt(TVS_CA_BACKEND_ABI_V1);
     root["plugin_directory"] = directory;
     root["network_ca_server"] = false;

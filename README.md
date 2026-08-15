@@ -1,4 +1,8 @@
-# TVStreammerSAT5 — Release 32
+# TVStreammerSAT5 — Release 33
+
+### CA/Newcamd shutdown deadlock fix (v148)
+
+Release 33 fixes the verified deadlock where stopping a Newcamd-backed stream could block `CaBackendManager`/`CardManager` snapshots and make `/api/state` time out, causing dashboard tiles to disappear even though they remained saved in `tvstreammersat5-config.json`. Newcamd reader destruction now happens outside the plugin mutex, TCP shutdown wakes the blocking receiver before `join()`, CA plugin teardown no longer runs under the global CA manager lock, and dashboard CA snapshots use non-blocking/fail-open state reads. Stable UDP/WISI and DVB transport code are unchanged.
 
 ### DVB scan → tile frontend handoff (v146)
 

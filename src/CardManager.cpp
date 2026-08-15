@@ -244,17 +244,32 @@ Json::Value CardManager::slotToJson(const ServiceSlot& slot) const {
     item["average_latency_ms"] = slot.averageLatencyMs;
     item["last_transaction_at"] = isoTime(slot.lastTransactionAt);
     item["backend_id"] = slot.backendId;
-    item["backend"] = CaBackendManager::instance().streamState(slot.streamId);
     return item;
 }
 
 Json::Value CardManager::snapshot() const {
     std::vector<CamClientConfig> clients;
+    std::vector<ServiceSlot> slots;
     {
         std::lock_guard<std::mutex> configLock(configMutex_);
         clients = clients_;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    bool cardManagerBusy = false;
+    {
+        // Never wait behind a slow CAM start/stop while serving /api/state.
+        // A busy snapshot returns the configured clients and marks runtime
+        // slot telemetry as temporarily unavailable instead of blocking HTTP.
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock()) {
+            slots.reserve(slotsByStream_.size());
+            for (const auto& [streamId, slot] : slotsByStream_) {
+                (void)streamId;
+                slots.push_back(slot);
+            }
+        } else {
+            cardManagerBusy = true;
+        }
+    }
 
     Json::Value root;
     root["mode"] = "cam-client+plugin-backend";
@@ -263,17 +278,20 @@ Json::Value CardManager::snapshot() const {
     root["external_key_export"] = false;
     root["default_max_services"] = kDefaultMaxServices;
     root["max_configurable_services"] = kMaxConfigurableServices;
-    root["reserved_services"] = Json::UInt(slotsByStream_.size());
+    root["reserved_services"] = Json::UInt(slots.size());
+    root["busy"] = cardManagerBusy;
+    if (cardManagerBusy) root["status"] = "CARD_MANAGER_BUSY";
 
     Json::Value clientList(Json::arrayValue);
     for (const auto& client : clients) {
         Json::Value item = clientStatusJson(client);
         Json::Value services(Json::arrayValue);
         unsigned active = 0;
-        for (const auto& [streamId, slot] : slotsByStream_) {
-            (void)streamId;
+        for (const auto& slot : slots) {
             if (slot.clientId != client.id) continue;
-            services.append(slotToJson(slot));
+            Json::Value service = slotToJson(slot);
+            service["backend"] = CaBackendManager::instance().streamState(slot.streamId);
+            services.append(service);
             if (slot.active) ++active;
         }
         const unsigned maxServices = item.get("max_services", kDefaultMaxServices).asUInt();
@@ -289,22 +307,49 @@ Json::Value CardManager::snapshot() const {
 }
 
 Json::Value CardManager::streamState(const std::string& streamId) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    Json::Value result;
-    const auto found = slotsByStream_.find(streamId);
-    if (found == slotsByStream_.end()) {
+    ServiceSlot slot;
+    bool foundSlot = false;
+    bool cardManagerBusy = false;
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            cardManagerBusy = true;
+        } else {
+            const auto found = slotsByStream_.find(streamId);
+            if (found != slotsByStream_.end()) {
+                slot = found->second;
+                foundSlot = true;
+            }
+        }
+    }
+
+    // Query the backend only after CardManager::mutex_ is released. The CA
+    // manager uses a non-blocking snapshot path, so a backend teardown cannot
+    // make the dashboard disappear.
+    const Json::Value backendState = CaBackendManager::instance().streamState(streamId);
+    if (cardManagerBusy) {
+        Json::Value result;
+        result["managed"] = true;
+        result["busy"] = true;
+        result["status"] = "CARD_MANAGER_BUSY";
+        result["backend"] = backendState;
+        result["native_card_backend"] = backendState.get("native_plugin", false).asBool();
+        return result;
+    }
+    if (!foundSlot) {
+        Json::Value result;
         result["managed"] = false;
         result["status"] = "UNBOUND";
-        result["backend"] = CaBackendManager::instance().streamState(streamId);
+        result["backend"] = backendState;
         result["native_card_backend"] = false;
         return result;
     }
-    result = slotToJson(found->second);
+
+    Json::Value result = slotToJson(slot);
     result["managed"] = true;
-    const Json::Value backendState = CaBackendManager::instance().streamState(streamId);
     result["backend"] = backendState;
     result["native_card_backend"] = backendState.get("native_plugin", false).asBool();
-    result["client_display_name"] = found->second.clientName;
-    result["backend_id"] = found->second.backendId;
+    result["client_display_name"] = slot.clientName;
+    result["backend_id"] = slot.backendId;
     return result;
 }

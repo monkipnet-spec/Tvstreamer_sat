@@ -422,8 +422,19 @@ void NewcamdClient::disconnect() {
     running_ = false;
     authenticated_ = false;
     if (socket_) {
+        // Wake a synchronous receive before joining the receiver thread.
+        // close() alone is not a reliable cross-thread interruption for an
+        // already-blocked read on every Linux/socket path.
         boost::system::error_code ignored;
+        socket_->cancel(ignored);
+        socket_->shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
         socket_->close(ignored);
     }
-    if (receiver_thread_.joinable()) receiver_thread_.join();
+    if (receiver_thread_.joinable()) {
+        if (receiver_thread_.get_id() == std::this_thread::get_id()) {
+            receiver_thread_.detach();
+        } else {
+            receiver_thread_.join();
+        }
+    }
 }

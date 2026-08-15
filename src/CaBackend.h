@@ -78,6 +78,7 @@ private:
         std::string readerKey;
         std::string backendId;
         bool active = false;
+        bool stopping = false;
         bool passthrough = true;
         uint64_t calls = 0;
         uint64_t bytes = 0;
