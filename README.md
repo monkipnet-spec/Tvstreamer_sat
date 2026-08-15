@@ -1,4 +1,8 @@
-# TVStreammerSAT5 — Release 24
+# TVStreammerSAT5 — Release 25
+
+### Final DVB remap continuity guard (v139)
+
+Release 25 adds a second, final continuity-counter guard for packet-level DVB remap. v138 normalized CC in the per-service relay immediately after PAT/PMT/SDT and PID rewriting and substantially reduced analyzer errors, but the remapped SPTS still crossed the localhost relay, optional CA hook and the main output pipeline before StableUdpOutput. v139 normalizes the final MPEG-TS sequence once more on the output queue directly before the Stable UDP sink. It covers PAT/CAT/SDT/PMT plus media PIDs, increments CC only for packets carrying payload, and keeps adaptation-only packets on the current counter. The guard is enabled only for shared-DVB streams with Remap ON. Remap OFF and StableUdpOutput/WISI/PCR logic are unchanged.
 
 
 ### DVB remap continuity-counter repair (v138)
@@ -56,7 +60,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 24 / v138.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 25 / v139.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -453,7 +457,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 24
+Description=TVStreammerSAT5 Release 25
 After=network-online.target
 Wants=network-online.target
 

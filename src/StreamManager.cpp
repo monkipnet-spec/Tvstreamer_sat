@@ -201,6 +201,88 @@ struct DvbSingleProgramPsiContext {
     bool remapContinuityAnnounced = false;
 };
 
+// Final continuity guard for DVB packet-level remap.  The service relay already
+// regenerates CC after PID/SID rewriting, but the selected SPTS still crosses
+// the localhost relay, optional CA backend and the main pipeline before it
+// reaches StableUdpOutput.  Repair the final transport sequence immediately
+// before the output sink so PAT/CAT/SDT/PMT and media PIDs share one clean CC
+// domain at the actual network output.  This is enabled only for DVB remap.
+struct DvbRemapFinalContinuityContext {
+    std::string streamId;
+    size_t branchIndex = 0;
+    std::array<uint8_t, 8192> continuity {};
+    std::array<bool, 8192> continuityValid {};
+    uint64_t repairedPackets = 0;
+    uint64_t invalidPackets = 0;
+    bool announced = false;
+};
+
+GstPadProbeReturn dvbRemapFinalContinuityProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<DvbRemapFinalContinuityContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+
+    GstBuffer* original = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!original) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = gst_buffer_make_writable(original);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (buffer != original) GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
+
+    const size_t packetCount = map.size / kTsPacketSize;
+    for (size_t index = 0; index < packetCount; ++index) {
+        uint8_t* packet = map.data + index * kTsPacketSize;
+        if (packet[0] != 0x47) {
+            ++ctx->invalidPackets;
+            continue;
+        }
+
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        if (pid >= 0x1FFF) continue; // NULL PID has its own shaper sequence.
+
+        const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
+        if (adaptationControl == 0) {
+            ++ctx->invalidPackets;
+            continue;
+        }
+
+        const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+        const uint8_t incomingCc = static_cast<uint8_t>(packet[3] & 0x0F);
+        uint8_t outputCc = incomingCc;
+
+        if (hasPayload) {
+            if (ctx->continuityValid[pid]) {
+                outputCc = static_cast<uint8_t>((ctx->continuity[pid] + 1) & 0x0F);
+            }
+            ctx->continuity[pid] = outputCc;
+            ctx->continuityValid[pid] = true;
+        } else if (ctx->continuityValid[pid]) {
+            // ISO/IEC 13818-1: adaptation-only packets do not advance CC.
+            outputCc = ctx->continuity[pid];
+        } else {
+            ctx->continuity[pid] = outputCc;
+            ctx->continuityValid[pid] = true;
+        }
+
+        if (outputCc != incomingCc) ++ctx->repairedPackets;
+        packet[3] = static_cast<uint8_t>((packet[3] & 0xF0) | (outputCc & 0x0F));
+    }
+
+    gst_buffer_unmap(buffer, &map);
+
+    if (!ctx->announced) {
+        std::cerr << "DVB remap final continuity guard: stream=" << ctx->streamId
+                  << " branch=" << ctx->branchIndex
+                  << " stage=pre-output-sink all-pids=normalized"
+                  << " payload-aware adaptation-only=no-increment"
+                  << std::endl;
+        ctx->announced = true;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 struct SharedDvbPidStatsContext {
     std::string stage = "dvbsrc-src";
     std::string label;
@@ -5422,6 +5504,31 @@ bool StreamManager::buildPassthroughPipeline(
 
     configureOutputQueue(queue, cfg);
     configureCbrPacer(pacer, cfg);
+
+    // The service-relay remapper runs before the localhost UDP hop and before
+    // an optional CA backend.  Normalize the final MPEG-TS continuity once
+    // more at the last in-process point before StableUdpOutput.  This keeps
+    // Remap OFF byte-for-byte unchanged and does not alter WISI timing/PCR.
+    const bool finalDvbRemapContinuity = directStableUdpTs &&
+        state->dvbTsRemapApplied && cfg.remapEnabled;
+    if (finalDvbRemapContinuity) {
+        GstPad* queueSrcPad = gst_element_get_static_pad(queue, "src");
+        if (!queueSrcPad) {
+            std::cerr << "DVB remap final continuity guard: failed to get output queue src pad"
+                      << std::endl;
+            return false;
+        }
+        auto* continuityContext = new DvbRemapFinalContinuityContext();
+        continuityContext->streamId = state->config.id;
+        continuityContext->branchIndex = branchIndex;
+        gst_pad_add_probe(
+            queueSrcPad,
+            GST_PAD_PROBE_TYPE_BUFFER,
+            dvbRemapFinalContinuityProbe,
+            continuityContext,
+            [](gpointer data) { delete static_cast<DvbRemapFinalContinuityContext*>(data); });
+        gst_object_unref(queueSrcPad);
+    }
 
     if (directStableUdpTs) {
         std::cerr << "Stable UDP passthrough: direct MPEG-TS -> WISI reservoir"
