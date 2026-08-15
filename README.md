@@ -1,8 +1,9 @@
 # TVStreammerSAT5 — Release 23
 
-### Async stop declaration build fix (v137)
 
-Release 23 fixes a C++ interface mismatch introduced by the asynchronous HTTP stop path: `StreamManager::stopStreamAsync(const std::string&)` was implemented in `StreamManager.cpp` and called by `HttpServer.cpp`, but was missing from the public `StreamManager` declaration in `StreamManager.h`. The method is now declared next to `stopStream()`. Runtime stop behaviour is unchanged; this release is a compile-only interface fix. DVB shared-frontend/SPTS, CA backends and the WISI `StableUdpOutput` path are unchanged.
+### Build hotfix: stopStreamAsync declaration (v137)
+
+Release 23 fixes a C++ interface mismatch introduced by the asynchronous stream-stop path: `StreamManager::stopStreamAsync(const std::string&)` was implemented in `StreamManager.cpp` and used by `HttpServer.cpp`, but was missing from the public declaration in `StreamManager.h`. The declaration is now present, so the existing asynchronous stop implementation compiles without changing its runtime behavior. No DVB, WISI, CA/Newcamd, Phoenix, remap or streaming logic is changed by this hotfix.
 
 ### PhoenixSerialTransport lifecycle layer (v136)
 
