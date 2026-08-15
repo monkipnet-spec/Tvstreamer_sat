@@ -2610,6 +2610,7 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
     state->sharedDvbFrontendKey.clear();
     state->sharedDvbMulticastAddress.clear();
     state->sharedDvbMulticastPort = 0;
+    state->sharedDvbServicePids.clear();
 }
 
 bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error) {
@@ -2623,6 +2624,9 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         if (error.empty()) error = "invalid DVB URI for service relay";
         return false;
     }
+    const std::string servicePidFilter = state->sharedDvbServicePids.empty()
+        ? params.pids
+        : state->sharedDvbServicePids;
 
     const uint32_t remapOutputSid = state->config.serviceId
         ? state->config.serviceId
@@ -2719,7 +2723,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             psiContext->requestedAudioPid = dvbPacketPidRemap
                 ? static_cast<uint16_t>(state->config.audioPid & 0x1FFFU)
                 : 0;
-            configureServicePidFilter(*psiContext, params.pids);
+            configureServicePidFilter(*psiContext, servicePidFilter);
             if (!psiContext->filterPids) {
                 std::cerr << "Shared DVB service relay warning: stream=" << state->config.id
                           << " SID=" << state->config.inputServiceId
@@ -2822,6 +2826,19 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
             std::cerr << "Shared DVB service PID auto-resolve failed for SID=" << state->config.inputServiceId
                       << ": " << resolveError << "; continuing without PID compaction" << std::endl;
         }
+    }
+
+    state->sharedDvbServicePids = params.pids;
+    if (!state->config.conditionalAccessClient.empty() &&
+        state->config.inputServiceId > 0 &&
+        !params.pids.empty() && params.pids != "8192") {
+        DvbSatelliteParams frontendParams = params;
+        frontendParams.pids = "8192";
+        state->runtimeConfig.inputUri = DvbSatellite::buildUri(frontendParams);
+        std::cerr << "Shared DVB CA frontend full-TS capture: stream=" << state->config.id
+                  << " SID=" << state->config.inputServiceId
+                  << " software_service_pids=" << state->sharedDvbServicePids
+                  << " reason=avoid-hardware-pid-filter-loss-for-scrambled-service" << std::endl;
     }
 
     if (!acquireSharedDvbFrontend(state, error)) return false;
