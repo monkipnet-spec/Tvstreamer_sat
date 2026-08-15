@@ -2776,7 +2776,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     if (state->config.inputServiceId > 0) {
-        GstPad* psiPad = gst_element_get_static_pad(inputQueue, "src");
+        GstPad* psiPad = gst_element_get_static_pad(parse, "src");
         if (psiPad) {
             auto* psiContext = new DvbSingleProgramPsiContext();
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
