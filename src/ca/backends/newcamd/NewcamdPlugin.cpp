@@ -111,6 +111,7 @@ struct ServiceBinding {
     ControlWordSlot odd;
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
+    uint64_t generation = 0;
 
     // Diagnostic-only MPEG-TS framing counters. These counters never modify
     // TS payload or CA state; they are used to correlate PES corruption with
@@ -136,6 +137,7 @@ struct ServiceBinding {
 
 struct NewcamdSession {
     std::unique_ptr<NewcamdClient> client;
+    std::mutex ioMutex;
     bool connected = false;
     std::string lastError;
 
@@ -149,8 +151,9 @@ struct NewcamdSession {
 
 struct NewcamdInstance {
     std::mutex mutex;
-    std::map<std::string, std::unique_ptr<NewcamdSession>> sessionsByClient;
+    std::map<std::string, std::shared_ptr<NewcamdSession>> sessionsByClient;
     std::map<std::string, ServiceBinding> servicesByStream;
+    uint64_t nextServiceGeneration = 0;
 };
 
 void write_error(char* error, size_t error_size, const std::string& message) {
@@ -311,7 +314,7 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         return TVS_CA_RESULT_ERROR;
     }
 
-    auto session = std::make_unique<NewcamdSession>();
+    auto session = std::make_shared<NewcamdSession>();
     session->client = std::make_unique<NewcamdClient>(
         config.get("host", "127.0.0.1").asString(),
         config.get("port", 15000).asInt(),
@@ -350,7 +353,7 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         session->connected = true;
         session->lastError = session->client->last_error();
         std::lock_guard<std::mutex> lock(inst->mutex);
-        inst->sessionsByClient[clientKey] = std::move(session);
+        inst->sessionsByClient[clientKey] = session;
         return TVS_CA_RESULT_OK;
     }
 
@@ -363,7 +366,7 @@ static void newcamd_close_reader(void* instance, const char* reader_key) {
     auto* inst = static_cast<NewcamdInstance*>(instance);
     if (!inst || !reader_key) return;
 
-    std::unique_ptr<NewcamdSession> removedSession;
+    std::shared_ptr<NewcamdSession> removedSession;
     const std::string clientKey = reader_key;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
@@ -399,6 +402,8 @@ static int newcamd_start_service(void* instance, const char* reader_key, const s
     auto& binding = inst->servicesByStream.try_emplace(service->stream_id).first->second;
     binding.clientKey = reader_key;
     binding.serviceId = service->service_id <= 0xFFFF ? static_cast<uint16_t>(service->service_id) : 0;
+    binding.generation = ++inst->nextServiceGeneration;
+    if (binding.generation == 0) binding.generation = ++inst->nextServiceGeneration;
     return TVS_CA_RESULT_OK;
 }
 
@@ -413,18 +418,33 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     auto* inst = static_cast<NewcamdInstance*>(instance);
     if (!inst || !stream_id || !data || !result) return TVS_CA_RESULT_PASSTHROUGH;
 
-    std::lock_guard<std::mutex> instanceLock(inst->mutex);
+    struct EcmTask {
+        EcmDescriptor descriptor;
+        std::vector<uint8_t> section;
+    };
+    struct EcmResult {
+        bool success = false;
+        uint16_t messageId = 0;
+        std::string error;
+    };
+
+    std::unique_lock<std::mutex> instanceLock(inst->mutex);
     auto serviceIt = inst->servicesByStream.find(stream_id);
     if (serviceIt == inst->servicesByStream.end()) return TVS_CA_RESULT_PASSTHROUGH;
     ServiceBinding& binding = serviceIt->second;
-    auto sessionIt = inst->sessionsByClient.find(binding.clientKey);
+    const uint64_t bindingGeneration = binding.generation;
+    const std::string clientKey = binding.clientKey;
+    const uint16_t serviceId = binding.serviceId;
+
+    auto sessionIt = inst->sessionsByClient.find(clientKey);
     if (sessionIt == inst->sessionsByClient.end() || !sessionIt->second) return TVS_CA_RESULT_PASSTHROUGH;
-    NewcamdSession* session = sessionIt->second.get();
+    std::shared_ptr<NewcamdSession> session = sessionIt->second;
     if (!session->connected || !session->client) return TVS_CA_RESULT_PASSTHROUGH;
 
     bool changed = false;
     bool waitingForKey = false;
     bool sawEcm = false;
+    std::vector<EcmTask> pendingEcms;
 
     ++binding.diagCalls;
     const size_t bufferRemainder = size % kTsPacketSize;
@@ -438,14 +458,18 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         }
 
         result->packets_seen++;
-        const uint16_t pid = parse_pid(packet);
         const bool tei = (packet[1] & 0x80) != 0;
+        if (tei) {
+            ++binding.diagTeiPackets;
+            continue;
+        }
+
+        const uint16_t pid = parse_pid(packet);
         const bool payloadStart = (packet[1] & 0x40) != 0;
         const uint8_t scramblingControl = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
         const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
         const uint8_t continuityCounter = static_cast<uint8_t>(packet[3] & 0x0F);
 
-        if (tei) ++binding.diagTeiPackets;
         if (scramblingControl != 0) ++binding.diagScrambledPackets;
 
         size_t diagnosticPayloadSize = 0;
@@ -480,7 +504,7 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
                     binding.diagSampleCc = continuityCounter;
                     binding.diagSamplePusi = payloadStart;
-                    binding.diagSampleTei = tei;
+                    binding.diagSampleTei = false;
                 }
             }
         }
@@ -503,14 +527,7 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                         sawEcm = true;
                         const std::string signature = ecm_signature(section);
                         if (binding.sentEcms.insert(signature).second) {
-                            const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
-                            uint16_t messageId = 0;
-                            if (session->client->send_ecm(binding.serviceId, ecm.caid, ecm.provid, section, &messageId)) {
-                                ++binding.ecmRequests;
-                                if (messageId != 0) binding.pendingEcmIds.insert(messageId);
-                            } else {
-                                session->lastError = session->client->last_error();
-                            }
+                            pendingEcms.push_back({descriptor_for_pid(binding, pid), section});
                             if (binding.sentEcms.size() > 128) binding.sentEcms.clear();
                         }
                     }
@@ -540,6 +557,8 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             waitingForKey = true;
             continue;
         }
+
+        // Keep the existing CA payload transform unchanged in this reliability-only release.
         const size_t decryptSize = scrambledPayloadSize & ~static_cast<size_t>(7);
         if (decryptSize == 0) {
             waitingForKey = true;
@@ -551,50 +570,121 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         changed = true;
     }
 
+    if (!pendingEcms.empty()) {
+        instanceLock.unlock();
+
+        std::vector<EcmResult> ecmResults;
+        ecmResults.reserve(pendingEcms.size());
+        {
+            // Network requests may block. Serialize them per session, but never
+            // hold the global plugin mutex while waiting on external I/O.
+            std::lock_guard<std::mutex> ioLock(session->ioMutex);
+            for (const auto& task : pendingEcms) {
+                EcmResult ecmResult;
+                if (session->client && session->client->send_ecm(
+                        serviceId,
+                        task.descriptor.caid,
+                        task.descriptor.provid,
+                        task.section,
+                        &ecmResult.messageId)) {
+                    ecmResult.success = true;
+                } else if (session->client) {
+                    ecmResult.error = session->client->last_error();
+                } else {
+                    ecmResult.error = "Newcamd session closed";
+                }
+                ecmResults.push_back(std::move(ecmResult));
+            }
+        }
+
+        instanceLock.lock();
+
+        // References obtained before unlock are no longer trusted. Re-resolve
+        // the binding and session and only apply results to the same generation.
+        serviceIt = inst->servicesByStream.find(stream_id);
+        if (serviceIt == inst->servicesByStream.end() ||
+            serviceIt->second.generation != bindingGeneration ||
+            serviceIt->second.clientKey != clientKey) {
+            instanceLock.unlock();
+            return changed ? TVS_CA_RESULT_OK : TVS_CA_RESULT_PASSTHROUGH;
+        }
+
+        auto currentSessionIt = inst->sessionsByClient.find(clientKey);
+        if (currentSessionIt == inst->sessionsByClient.end() ||
+            currentSessionIt->second != session) {
+            instanceLock.unlock();
+            return changed ? TVS_CA_RESULT_OK : TVS_CA_RESULT_PASSTHROUGH;
+        }
+
+        ServiceBinding& currentBinding = serviceIt->second;
+        for (const auto& ecmResult : ecmResults) {
+            if (ecmResult.success) {
+                ++currentBinding.ecmRequests;
+                if (ecmResult.messageId != 0) currentBinding.pendingEcmIds.insert(ecmResult.messageId);
+            } else if (!ecmResult.error.empty()) {
+                session->lastError = ecmResult.error;
+            }
+        }
+    }
+
+    // Re-resolve the binding even when no network I/O was queued, so the rest
+    // of the function uses one explicit current reference.
+    serviceIt = inst->servicesByStream.find(stream_id);
+    if (serviceIt == inst->servicesByStream.end() ||
+        serviceIt->second.generation != bindingGeneration ||
+        serviceIt->second.clientKey != clientKey) {
+        instanceLock.unlock();
+        return changed ? TVS_CA_RESULT_OK : TVS_CA_RESULT_PASSTHROUGH;
+    }
+    ServiceBinding& currentBinding = serviceIt->second;
+
     const uint64_t diagNowMs = monotonic_ms();
-    if (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000) {
-        binding.diagLastLogMs = diagNowMs;
+    if (currentBinding.diagLastLogMs == 0 || diagNowMs - currentBinding.diagLastLogMs >= 1000) {
+        currentBinding.diagLastLogMs = diagNowMs;
         std::cerr
             << "CA TS DIAG: stream=" << stream_id
-            << " calls=" << binding.diagCalls
+            << " calls=" << currentBinding.diagCalls
             << " buffer_size=" << size
             << " remainder=" << bufferRemainder
-            << " unaligned_buffers=" << binding.diagUnalignedBuffers
-            << " bad_sync=" << binding.diagBadSyncPackets
-            << " tei=" << binding.diagTeiPackets
-            << " bad_afc=" << binding.diagBadAdaptationPackets
-            << " payload_packets=" << binding.diagPayloadPackets
-            << " nonmod8=" << binding.diagNonModulo8Payloads
-            << " scrambled=" << binding.diagScrambledPackets
-            << " scrambled_nonmod8=" << binding.diagScrambledNonModulo8Payloads
-            << " sample_pid=" << binding.diagSamplePid
-            << " sample_sc=" << static_cast<unsigned>(binding.diagSampleScrambling)
-            << " sample_afc=" << static_cast<unsigned>(binding.diagSampleAdaptation)
-            << " sample_payload=" << binding.diagSamplePayload
-            << " sample_mod8=" << (binding.diagSamplePayload % 8)
-            << " sample_cc=" << static_cast<unsigned>(binding.diagSampleCc)
-            << " sample_pusi=" << (binding.diagSamplePusi ? 1 : 0)
-            << " sample_tei=" << (binding.diagSampleTei ? 1 : 0)
+            << " unaligned_buffers=" << currentBinding.diagUnalignedBuffers
+            << " bad_sync=" << currentBinding.diagBadSyncPackets
+            << " tei=" << currentBinding.diagTeiPackets
+            << " bad_afc=" << currentBinding.diagBadAdaptationPackets
+            << " payload_packets=" << currentBinding.diagPayloadPackets
+            << " nonmod8=" << currentBinding.diagNonModulo8Payloads
+            << " scrambled=" << currentBinding.diagScrambledPackets
+            << " scrambled_nonmod8=" << currentBinding.diagScrambledNonModulo8Payloads
+            << " sample_pid=" << currentBinding.diagSamplePid
+            << " sample_sc=" << static_cast<unsigned>(currentBinding.diagSampleScrambling)
+            << " sample_afc=" << static_cast<unsigned>(currentBinding.diagSampleAdaptation)
+            << " sample_payload=" << currentBinding.diagSamplePayload
+            << " sample_mod8=" << (currentBinding.diagSamplePayload % 8)
+            << " sample_cc=" << static_cast<unsigned>(currentBinding.diagSampleCc)
+            << " sample_pusi=" << (currentBinding.diagSamplePusi ? 1 : 0)
+            << " sample_tei=" << (currentBinding.diagSampleTei ? 1 : 0)
             << std::endl;
     }
 
+    int returnCode = TVS_CA_RESULT_PASSTHROUGH;
     if (changed) {
         write_status(result, "BACKEND_ACTIVE");
-        return TVS_CA_RESULT_OK;
-    }
-    if (waitingForKey) {
+        returnCode = TVS_CA_RESULT_OK;
+    } else if (waitingForKey) {
         const std::string detail = session->lastError.empty() ? "WAITING_FOR_CW" : "WAITING_FOR_CW: " + session->lastError;
         write_status(result, detail);
-        return TVS_CA_RESULT_RETRY;
-    }
-    if (sawEcm) {
+        returnCode = TVS_CA_RESULT_RETRY;
+    } else if (sawEcm) {
         write_status(result, "ECM_SEEN_NO_CW");
-        return TVS_CA_RESULT_RETRY;
+        returnCode = TVS_CA_RESULT_RETRY;
+    } else {
+        write_status(result, "NO_SCRAMBLED_PAYLOAD");
     }
-    write_status(result, "NO_SCRAMBLED_PAYLOAD");
-    return TVS_CA_RESULT_PASSTHROUGH;
-}
 
+    // Never allow the last session reference to be destroyed while holding the
+    // global mutex: destruction may stop/join the receiver thread.
+    instanceLock.unlock();
+    return returnCode;
+}
 static const char* newcamd_status_json(void* instance) {
     static thread_local std::string status;
     auto* inst = static_cast<NewcamdInstance*>(instance);
