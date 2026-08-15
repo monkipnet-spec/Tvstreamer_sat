@@ -246,7 +246,8 @@ class StableUdpSender {
 public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
-          mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate) {
+          mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
+          normalizeOutputContinuity(cfg.remapEnabled) {
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
@@ -454,6 +455,7 @@ private:
             std::array<guint8, kUdpPayloadSize> datagram {};
             const FillCounts filled = fillDatagram(
                 datagram.data(), nextSendNanoseconds, activeBitrate);
+            normalizeFinalDatagramContinuity(datagram.data());
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
             totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
@@ -573,12 +575,25 @@ private:
     }
 
     void queueChunk(TimedChunk chunk) {
-        if (chunk.bytes.empty()) {
+        if (chunk.bytes.empty() && inputRemainder.empty()) {
             return;
         }
 
+        // Gst/UDP buffers are usually 7x188, but remap/probe/queue boundaries
+        // are not guaranteed to preserve a whole TS packet in every GstBuffer.
+        // Keep a short tail and join it with the next chunk instead of dropping
+        // it. Dropping that tail created real packet loss and analyzer CC errors
+        // on PAT/CAT/SDT/PMT/audio/video even after counter normalization.
+        std::vector<guint8> bytes;
+        bytes.reserve(inputRemainder.size() + chunk.bytes.size());
+        bytes.insert(bytes.end(), inputRemainder.begin(), inputRemainder.end());
+        bytes.insert(bytes.end(), chunk.bytes.begin(), chunk.bytes.end());
+        inputRemainder.clear();
+
+        if (bytes.empty()) return;
+
         std::size_t offset = 0;
-        while (offset < chunk.bytes.size() && chunk.bytes[offset] != 0x47) {
+        while (offset < bytes.size() && bytes[offset] != 0x47) {
             ++offset;
         }
         if (offset > 0) {
@@ -587,8 +602,8 @@ private:
             queueSpace.notify_all();
         }
 
-        while (offset + kTsPacketSize <= chunk.bytes.size()) {
-            if (chunk.bytes[offset] != 0x47) {
+        while (offset + kTsPacketSize <= bytes.size()) {
+            if (bytes[offset] != 0x47) {
                 ++offset;
                 bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
                 ++resyncDiscardedBytes;
@@ -596,8 +611,11 @@ private:
                 continue;
             }
 
-            if (offset + kTsPacketSize * 2 <= chunk.bytes.size() &&
-                chunk.bytes[offset + kTsPacketSize] != 0x47) {
+            // If another full packet is available, validate its sync byte.
+            // When only one full packet plus a partial tail remains, keep the
+            // complete packet and carry the tail into the next GstBuffer.
+            if (offset + kTsPacketSize * 2 <= bytes.size() &&
+                bytes[offset + kTsPacketSize] != 0x47) {
                 ++offset;
                 bufferedBytes.fetch_sub(1, std::memory_order_relaxed);
                 ++resyncDiscardedBytes;
@@ -606,18 +624,25 @@ private:
             }
 
             TimedTsPacket packet;
-            std::copy_n(chunk.bytes.data() + offset, kTsPacketSize, packet.bytes.data());
+            std::copy_n(bytes.data() + offset, kTsPacketSize, packet.bytes.data());
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
         }
 
-        if (offset < chunk.bytes.size()) {
-            const std::size_t trailing = chunk.bytes.size() - offset;
-            bufferedBytes.fetch_sub(trailing, std::memory_order_relaxed);
-            resyncDiscardedBytes.fetch_add(trailing, std::memory_order_relaxed);
-            queueSpace.notify_all();
+        if (offset < bytes.size()) {
+            inputRemainder.assign(bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.end());
+            if (inputRemainder.size() >= kTsPacketSize) {
+                // Defensive bound: a valid remainder must be shorter than one
+                // TS packet. Resync rather than allowing an unbounded tail.
+                const std::size_t discard = inputRemainder.size() - (kTsPacketSize - 1);
+                inputRemainder.erase(inputRemainder.begin(),
+                    inputRemainder.begin() + static_cast<std::ptrdiff_t>(discard));
+                bufferedBytes.fetch_sub(discard, std::memory_order_relaxed);
+                resyncDiscardedBytes.fetch_add(discard, std::memory_order_relaxed);
+                queueSpace.notify_all();
+            }
         }
     }
 
@@ -886,6 +911,53 @@ private:
         nullContinuityCounter = static_cast<guint8>((nullContinuityCounter + 1) & 0x0F);
     }
 
+    void normalizeFinalDatagramContinuity(guint8* data) {
+        if (!normalizeOutputContinuity || !data) return;
+
+        for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
+            guint8* packet = data + slot * kTsPacketSize;
+            if (packet[0] != 0x47) continue;
+            const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+            if (pid >= 0x1FFF) continue;
+            const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+            if (adaptationControl == 0) continue;
+
+            bool discontinuity = false;
+            if ((adaptationControl == 2 || adaptationControl == 3) &&
+                packet[4] > 0 && packet[4] <= 183) {
+                discontinuity = (packet[5] & 0x80) != 0;
+            }
+            const guint8 incoming = static_cast<guint8>(packet[3] & 0x0F);
+            if (discontinuity) {
+                finalContinuity[pid] = incoming;
+                finalContinuityValid[pid] = true;
+                continue;
+            }
+
+            const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+            guint8 output = incoming;
+            if (hasPayload) {
+                if (finalContinuityValid[pid]) {
+                    output = static_cast<guint8>((finalContinuity[pid] + 1) & 0x0F);
+                }
+                finalContinuity[pid] = output;
+                finalContinuityValid[pid] = true;
+            } else if (finalContinuityValid[pid]) {
+                output = finalContinuity[pid];
+            } else {
+                finalContinuity[pid] = output;
+                finalContinuityValid[pid] = true;
+            }
+            packet[3] = static_cast<guint8>((packet[3] & 0xF0) | (output & 0x0F));
+        }
+
+        if (!finalContinuityAnnounced) {
+            std::cerr << "UDP final TS continuity guard: remap=on stage=pre-send"
+                      << " all-pids=normalized after-PCR-insertion" << std::endl;
+            finalContinuityAnnounced = true;
+        }
+    }
+
     void sendDatagram(const guint8* data, std::size_t size) {
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
         const socklen_t destinationSize = sizeof(destinationAddress);
@@ -956,6 +1028,10 @@ private:
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
     uint64_t configuredTargetBitrate = 0;
+    bool normalizeOutputContinuity = false;
+    std::array<guint8, 8192> finalContinuity {};
+    std::array<bool, 8192> finalContinuityValid {};
+    bool finalContinuityAnnounced = false;
     std::atomic<uint64_t> transportBitrate{0};
     sockaddr_in destinationAddress {};
 
@@ -967,6 +1043,7 @@ private:
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
     std::deque<TimedTsPacket> realPackets;
+    std::vector<guint8> inputRemainder;
     uint64_t firstChunkArrivalNanoseconds = 0;
 
     uint64_t estimatedInputBitrate = 0;

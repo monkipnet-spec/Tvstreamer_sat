@@ -1,19 +1,25 @@
-# TVStreammerSAT5 — Release 25
+# TVStreammerSAT5 — Release 26
+
+### Remap transport/CBR/SDT final-output repair (v140)
+
+Release 26 fixes three issues observed on the remapped DVB output. StableUdpOutput now preserves incomplete MPEG-TS packet tails across GstBuffer boundaries instead of discarding them, eliminating real packet loss that appeared as CC errors after remap. For Remap ON, a final continuity pass is also performed on the finished 7x188 datagram after periodic-PCR insertion and immediately before sendto(); the five-second WISI startup reservoir, 20 ms PCR cadence and pacing are unchanged.
+
+DVB Remap now reapplies the configured output Service Name and Provider to the final SDT immediately before StableUdpOutput and logs the exact configured SID/service/provider values. The web editor CBR checkbox is now authoritative for UDP: checking it selects UDP CBR, unchecking selects UDP VBR, and Target bitrate is enabled only for CBR. Saving an active stream continues to hard-restart it through the existing config-save path so the new mode and PSI metadata take effect.
+
+Expected diagnostics include `DVB final SDT remap: ...`, `UDP final TS continuity guard: remap=on stage=pre-send ...`, and `Unified UDP periodic-PCR reservoir TS shaper: mode=CBR target_bitrate=...` when CBR is enabled.
 
 ### Final DVB remap continuity guard (v139)
 
-Release 25 adds a second, final continuity-counter guard for packet-level DVB remap. v138 normalized CC in the per-service relay immediately after PAT/PMT/SDT and PID rewriting and substantially reduced analyzer errors, but the remapped SPTS still crossed the localhost relay, optional CA hook and the main output pipeline before StableUdpOutput. v139 normalizes the final MPEG-TS sequence once more on the output queue directly before the Stable UDP sink. It covers PAT/CAT/SDT/PMT plus media PIDs, increments CC only for packets carrying payload, and keeps adaptation-only packets on the current counter. The guard is enabled only for shared-DVB streams with Remap ON. Remap OFF and StableUdpOutput/WISI/PCR logic are unchanged.
-
+Release 25 added a pre-output continuity guard for packet-level DVB remap. v140 keeps it as an earlier validation stage and adds the definitive post-PCR/pre-send guard.
 
 ### DVB remap continuity-counter repair (v138)
 
-Release 24 fixes the continuity-counter corruption seen when DVB packet-level remap is enabled. Remap creates a new logical SPTS by rewriting SID/PAT/PMT/SDT and optionally renaming the selected video/audio PIDs. The previous path preserved the old MPTS continuity-counter nibble, which can become discontinuous on the final output PID and is visible in analyzers as repeated `CC` errors on PAT/CAT/SDT/audio/video.
-
-With remap enabled, the service relay now regenerates one payload-aware continuity sequence per final output PID after all SID/PID/PSI rewriting. Payload packets increment modulo 16, adaptation-only packets reuse the previous payload CC, and a packet carrying the discontinuity indicator starts a new sequence. Remap OFF remains byte-for-byte unchanged. No `tsdemux`/`mpegtsmux` stage is reintroduced. `StableUdpOutput.cpp`, the exact 5-second WISI startup reservoir, 20 ms periodic PCR mode, shared DVB frontend and CA backend are unchanged. Expected diagnostic: `DVB remap continuity: SID=... output_pid_cc=normalized payload-aware adaptation-only=no-increment`.
+Release 24 regenerated continuity counters after packet-level SID/PID/PSI rewriting.
 
 ### Build hotfix: stopStreamAsync declaration (v137)
 
-Release 23 fixes a C++ interface mismatch introduced by the asynchronous stream-stop path: `StreamManager::stopStreamAsync(const std::string&)` was implemented in `StreamManager.cpp` and used by `HttpServer.cpp`, but was missing from the public declaration in `StreamManager.h`. The declaration is now present, so the existing asynchronous stop implementation compiles without changing its runtime behavior. No DVB, WISI, CA/Newcamd, Phoenix, remap or streaming logic is changed by this hotfix.
+Release 23 declared the existing `StreamManager::stopStreamAsync()` implementation in the public class interface.
+
 
 ### PhoenixSerialTransport lifecycle layer (v136)
 
@@ -60,7 +66,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 25 / v139.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 26 / v140.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -457,7 +463,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 25
+Description=TVStreammerSAT5 Release 26
 After=network-online.target
 Wants=network-online.target
 
