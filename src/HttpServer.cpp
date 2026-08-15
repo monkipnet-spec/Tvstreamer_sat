@@ -2182,20 +2182,11 @@ function restoreStreamButton(button, text) {
   button.disabled = false;
   if (text) button.textContent = text;
 }
-function saveLanguagePreference(sourceState=state) {
-  if (!Array.isArray(sourceState.streams)) return;
+function saveLanguagePreference() {
   fetch('/api/save-config', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({
-      login: sourceState.login,
-      server_name: sourceState.server_name,
-      telegram_token: sourceState.telegram_token,
-      telegram_chat_id: sourceState.telegram_chat_id,
-      http_port: sourceState.http_port,
-      language,
-      streams: sourceState.streams
-    })
+    body:JSON.stringify({language})
   }).catch(()=>{});
 }
 function fetchState() {

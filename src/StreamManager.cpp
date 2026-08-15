@@ -472,6 +472,33 @@ std::string popGstPipelineError(GstBus* bus, const std::string& fallback) {
     return result;
 }
 
+bool waitForGstStartup(GstElement* pipeline, GstBus* bus,
+                       GstStateChangeReturn stateResult, GstClockTime timeout,
+                       const std::string& fallback, std::string& error) {
+    error.clear();
+    if (stateResult == GST_STATE_CHANGE_FAILURE) {
+        error = popGstPipelineError(bus, fallback);
+        return false;
+    }
+    if (stateResult != GST_STATE_CHANGE_ASYNC || !pipeline) {
+        return true;
+    }
+
+    const GstStateChangeReturn waitResult =
+        gst_element_get_state(pipeline, nullptr, nullptr, timeout);
+    if (waitResult == GST_STATE_CHANGE_FAILURE) {
+        error = popGstPipelineError(bus, fallback);
+        return false;
+    }
+    if (waitResult == GST_STATE_CHANGE_ASYNC) {
+        error = popGstPipelineError(bus, fallback);
+        if (error == fallback) {
+            error += ": timed out waiting for PLAYING";
+        }
+        return false;
+    }
+    return true;
+}
 uint32_t mpeg2SectionCrc32(const uint8_t* data, size_t size) {
     uint32_t crc = 0xFFFFFFFFU;
     for (size_t i = 0; i < size; ++i) {
@@ -2420,8 +2447,10 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     shared->source = source;
     shared->bus = gst_element_get_bus(pipeline);
     const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateResult == GST_STATE_CHANGE_FAILURE) {
-        error = popGstPipelineError(shared->bus, "failed to start shared DVB frontend");
+    std::string startupError;
+    if (!waitForGstStartup(pipeline, shared->bus, stateResult, 8 * GST_SECOND,
+            "failed to start shared DVB frontend", startupError)) {
+        error = startupError;
         std::ostringstream context;
         context << " [device=/dev/dvb/adapter" << params.adapter
                 << "/frontend" << params.frontend
@@ -6139,6 +6168,10 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
+                const bool dvbStartupTimedOut =
+                    DvbSatellite::isDvbUri(state->primaryInputUri) &&
+                    state->lastInputBytesSeen == 0 &&
+                    state->inputBytes.load(std::memory_order_relaxed) == 0;
                 const bool isDvb = DvbSatellite::isDvbUri(state->activeInputUri);
                 Json::Value dvbStats;
                 bool dvbLocked = false;
@@ -6166,6 +6199,24 @@ void StreamManager::monitorBus(const std::string& id) {
                         telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
                             "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
                             "\nURL: " + state->activeInputUri);
+                }
+                if (dvbStartupTimedOut) {
+                    if (dvbLocked) {
+                        state->statusMessage = "error: DVB LOCK - no service data";
+                        if (state->config.inputServiceId > 0) {
+                            state->statusMessage += " (SID " + std::to_string(state->config.inputServiceId) + ")";
+                        }
+                    } else {
+                        state->statusMessage = "error: DVB startup timed out without input signal";
+                    }
+                    state->active = false;
+                    state->running = false;
+                    if (state->pipeline) {
+                        gst_element_set_state(state->pipeline, GST_STATE_NULL);
+                    }
+                    releaseSharedDvbInput(state);
+                    CardManager::instance().releaseService(id);
+                    return;
                 }
             }
         }
