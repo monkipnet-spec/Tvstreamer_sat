@@ -95,6 +95,8 @@ struct StreamState {
     std::atomic<uint64_t> outputBitrate{0};
     std::atomic<uint64_t> inputBytes{0};
     std::atomic<uint64_t> outputBytes{0};
+    std::atomic<uint64_t> stableUdpNetworkBytes{0};
+    std::atomic<bool> stableUdpNetworkTelemetry{false};
     std::atomic<uint64_t> inputCcErrors{0};
     std::atomic<uint64_t> inputCcErrorsDelta{0};
     std::atomic<uint64_t> outputCcErrors{0};
@@ -111,6 +113,7 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastBitrateSample = std::chrono::steady_clock::now();
     uint64_t lastInputBytesSample = 0;
     uint64_t lastOutputBytesSample = 0;
+    uint64_t lastStableUdpNetworkBytesSample = 0;
     uint64_t lastInputCcErrorsSample = 0;
     uint64_t lastOutputCcErrorsSample = 0;
     uint64_t lastOutputTsPayloadPacketsSample = 0;
@@ -173,7 +176,7 @@ private:
     bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
-    GstElement* createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
+    GstElement* createOutputSink(StreamState* state, const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
     GstElement* createExternalSrtOutputPipeline(const StreamConfig& cfg, std::string& error);
     bool startExternalSrtOutputs(StreamState* state, std::string& error);
     void stopExternalSrtOutputs(StreamState* state);

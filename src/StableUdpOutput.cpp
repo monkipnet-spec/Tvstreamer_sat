@@ -244,8 +244,9 @@ void clearPcrFlag(std::array<guint8, kTsPacketSize>& packet) {
 
 class StableUdpSender {
 public:
-    StableUdpSender(const StreamConfig& cfg, std::string& error)
-        : mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate) {
+    StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
+        : networkBytes(networkBytesCounter),
+          mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate) {
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
@@ -891,6 +892,8 @@ private:
         const ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
         if (sent < 0) {
             std::cerr << "UDP send failed: " << std::strerror(errno) << std::endl;
+        } else if (networkBytes) {
+            networkBytes->fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
         }
     }
 
@@ -948,6 +951,7 @@ private:
         ready = false;
     }
 
+    std::atomic<uint64_t>* networkBytes = nullptr;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
@@ -1031,7 +1035,8 @@ GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
     const std::string& sinkName,
-    std::string& error) {
+    std::string& error,
+    std::atomic<uint64_t>* networkBytes) {
     const UdpShapingMode mode = udpShapingMode(config);
     if (mode == UdpShapingMode::Cbr && config.targetBitrate == 0) {
         error = "UDP CBR target_bitrate must be greater than zero";
@@ -1049,7 +1054,7 @@ GstElement* createSink(
         return nullptr;
     }
 
-    auto* sender = new StableUdpSender(config, error);
+    auto* sender = new StableUdpSender(config, error, networkBytes);
     if (!sender->isReady()) {
         delete sender;
         gst_bin_remove(GST_BIN(pipeline), sink);

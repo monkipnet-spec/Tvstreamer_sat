@@ -2916,7 +2916,7 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
     // This is important for subscriber monitoring: caller-connecting,
     // caller-added, caller-removed and caller-rejected are connected in one
     // common place and feed the same active-session table.
-    GstElement* sink = createOutputSink(cfg, pipeline, "transcoded_srt_sink");
+    GstElement* sink = createOutputSink(nullptr, cfg, pipeline, "transcoded_srt_sink");
     if (!sink) {
         error = "failed to create monitored SRT output sink";
         gst_object_unref(pipeline);
@@ -4212,6 +4212,9 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->runtimeConfig;
     state->outputContexts.clear();
+    state->stableUdpNetworkTelemetry.store(false, std::memory_order_relaxed);
+    state->stableUdpNetworkBytes = 0;
+    state->lastStableUdpNetworkBytesSample = 0;
 
     GstElement* newPipeline = createPipeline(state);
     if (!newPipeline) {
@@ -4236,6 +4239,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->statusMessage = useBackup ? "running on backup" : "running on primary";
     state->inputBytes = 0;
     state->outputBytes = 0;
+    state->stableUdpNetworkBytes = 0;
     state->inputCcErrors = 0;
     state->inputCcErrorsDelta = 0;
     state->outputCcErrors = 0;
@@ -4253,6 +4257,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
+    state->lastStableUdpNetworkBytesSample = 0;
     state->lastInputCcErrorsSample = 0;
     state->lastOutputCcErrorsSample = 0;
     state->lastInputBytesSeen = 0;
@@ -4364,6 +4369,10 @@ bool StreamManager::restartTranscodedInput(
     }
 
     if (stableUdpRelay) {
+        state->stableUdpNetworkTelemetry.store(false, std::memory_order_relaxed);
+        state->stableUdpNetworkBytes = 0;
+        state->lastStableUdpNetworkBytesSample = 0;
+
         std::string relayError;
         GstElement* relayPipeline = createTranscodedUdpRelayPipeline(state, relayError);
         if (!relayPipeline) {
@@ -4403,6 +4412,7 @@ bool StreamManager::restartTranscodedInput(
 
     state->inputBytes = 0;
     state->outputBytes = 0;
+    state->stableUdpNetworkBytes = 0;
     state->inputCcErrors = 0;
     state->inputCcErrorsDelta = 0;
     state->outputCcErrors = 0;
@@ -4420,6 +4430,7 @@ bool StreamManager::restartTranscodedInput(
     state->outputBitrate = initialConfiguredOutputBitrate(state->config);
     state->lastInputBytesSample = 0;
     state->lastOutputBytesSample = 0;
+    state->lastStableUdpNetworkBytesSample = 0;
     state->lastInputCcErrorsSample = 0;
     state->lastOutputCcErrorsSample = 0;
     state->lastInputBytesSeen = 0;
@@ -5122,7 +5133,7 @@ bool StreamManager::buildPassthroughPipeline(
     GstElement* pacer = cbrPacingActive
         ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str())
         : nullptr;
-    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
+    GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
 
     if ((!directStableUdpTs && !tsparse) || !queue || !sink || (cbrPacingActive && !pacer)) {
         return false;
@@ -5172,7 +5183,7 @@ bool StreamManager::buildRemapPipeline(
     const bool cbrActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     GstElement* pacer = cbrActive ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str()) : nullptr;
-    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
+    GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
         (cbrActive && !pacer)) {
         return false;
@@ -5308,7 +5319,7 @@ bool StreamManager::buildRtmpOutputPipeline(
     GstElement* demux = gst_element_factory_make("tsdemux", branchName("rtmp_ts_demux", branchIndex).c_str());
     GstElement* mux = gst_element_factory_make("flvmux", branchName("rtmp_flv_mux", branchIndex).c_str());
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
-    GstElement* sink = createOutputSink(cfg, pipeline, branchName("output_sink", branchIndex));
+    GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink) {
         return false;
     }
@@ -5348,7 +5359,7 @@ bool StreamManager::buildRtmpOutputPipeline(
     return true;
 }
 
-GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName) {
+GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName) {
     const std::string type = outputType(cfg);
     const auto outputProtocol = tvs::stream_protocols::outputKind(cfg);
     if (outputProtocol == tvs::stream_protocols::OutputProtocolKind::Unknown) {
@@ -5360,9 +5371,18 @@ GstElement* StreamManager::createOutputSink(const StreamConfig& cfg, GstElement*
         // uses Target bitrate with NULL padding; VBR follows the measured source
         // rate with the same startup reservoir, packetization and periodic PCR.
         std::string error;
-        GstElement* sink = StableUdpOutput::createSink(pipeline, cfg, sinkName, error);
+        const bool claimNetworkTelemetry = state &&
+            !state->stableUdpNetworkTelemetry.load(std::memory_order_relaxed);
+        std::atomic<uint64_t>* networkBytes = claimNetworkTelemetry
+            ? &state->stableUdpNetworkBytes
+            : nullptr;
+        GstElement* sink = StableUdpOutput::createSink(pipeline, cfg, sinkName, error, networkBytes);
         if (!sink) {
             std::cerr << error << std::endl;
+        } else if (claimNetworkTelemetry) {
+            state->stableUdpNetworkBytes = 0;
+            state->lastStableUdpNetworkBytesSample = 0;
+            state->stableUdpNetworkTelemetry.store(true, std::memory_order_relaxed);
         }
         return sink;
     }
@@ -5893,6 +5913,7 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 
     uint64_t currentInputBytes = state->inputBytes.load();
     uint64_t currentOutputBytes = state->outputBytes.load();
+    uint64_t currentStableUdpNetworkBytes = state->stableUdpNetworkBytes.load();
     uint64_t currentInputCcErrors = state->inputCcErrors.load();
     uint64_t currentOutputCcErrors = state->outputCcErrors.load();
     uint64_t currentOutputTsPayloadPackets = state->outputTsPayloadPackets.load();
@@ -5900,6 +5921,7 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
     uint64_t currentOutputTsClearPesStarts = state->outputTsClearPesStarts.load();
     uint64_t inputDelta = currentInputBytes - state->lastInputBytesSample;
     uint64_t outputDelta = currentOutputBytes - state->lastOutputBytesSample;
+    uint64_t stableUdpNetworkDelta = currentStableUdpNetworkBytes - state->lastStableUdpNetworkBytesSample;
     uint64_t inputCcDelta = currentInputCcErrors - state->lastInputCcErrorsSample;
     uint64_t outputCcDelta = currentOutputCcErrors - state->lastOutputCcErrorsSample;
     uint64_t outputTsPayloadDelta = currentOutputTsPayloadPackets - state->lastOutputTsPayloadPacketsSample;
@@ -5909,9 +5931,12 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 
     state->inputBitrate = static_cast<uint64_t>((inputDelta * 8) / seconds);
     const uint64_t measuredOutputBitrate = static_cast<uint64_t>((outputDelta * 8) / seconds);
+    const uint64_t measuredStableUdpNetworkBitrate = static_cast<uint64_t>((stableUdpNetworkDelta * 8) / seconds);
     state->outputBitrate = udpCbrOutputEnabled(state->config) && state->config.targetBitrate > 0
         ? state->config.targetBitrate
-        : measuredOutputBitrate;
+        : (state->stableUdpNetworkTelemetry.load(std::memory_order_relaxed)
+            ? measuredStableUdpNetworkBitrate
+            : measuredOutputBitrate);
     state->inputCcErrorsDelta = inputCcDelta;
     state->outputCcErrorsDelta = outputCcDelta;
     state->outputTsPayloadPacketsDelta = outputTsPayloadDelta;
@@ -5920,6 +5945,7 @@ void StreamManager::updateBitrateEstimates(StreamState* state) {
 
     state->lastInputBytesSample = currentInputBytes;
     state->lastOutputBytesSample = currentOutputBytes;
+    state->lastStableUdpNetworkBytesSample = currentStableUdpNetworkBytes;
     state->lastInputCcErrorsSample = currentInputCcErrors;
     state->lastOutputCcErrorsSample = currentOutputCcErrors;
     state->lastOutputTsPayloadPacketsSample = currentOutputTsPayloadPackets;
