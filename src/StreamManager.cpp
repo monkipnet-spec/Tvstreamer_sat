@@ -3029,11 +3029,17 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
     GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
     GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
+    // The shared transponder UDP source may deliver arbitrary byte-sized GstBuffers
+    // (8192 bytes is common).  PID/PSI filtering below operates on complete 188-byte
+    // MPEG-TS packets, so normalize the byte stream first instead of truncating the
+    // partial packet at each GstBuffer boundary.
+    GstElement* tsAlign = gst_element_factory_make("tsparse", "shared_transponder_ts_align");
     GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
-    if (!pipeline || !source || !inputQueue || !outputQueue || !sink ||
+    if (!pipeline || !source || !inputQueue || !tsAlign || !outputQueue || !sink ||
         !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
+        !addElementOrFail(pipeline, tsAlign) || !addElementOrFail(pipeline, outputQueue) ||
+        !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
             gst_object_unref(pipeline);
@@ -3056,6 +3062,11 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     setStringPropertyIfPresent(source, "multicast-iface", "lo");
     configureQueue(inputQueue, 12000000000ULL);
     configureQueue(outputQueue, 8000000000ULL);
+    // alignment=7 gives complete 7x188-byte MPEG-TS buffers (1316 bytes) after
+    // reassembly across arbitrary udpsrc/GstBuffer boundaries.  No remuxing and no
+    // timestamp smoothing are performed here; payload bytes remain unchanged.
+    setIntPropertyIfPresent(tsAlign, "alignment", 7);
+    setBooleanPropertyIfPresent(tsAlign, "set-timestamps", FALSE);
     g_object_set(sink,
         "host", "127.0.0.1",
         "port", static_cast<gint>(outputPort),
@@ -3065,7 +3076,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
 
-    if (!gst_element_link_many(source, inputQueue, outputQueue, sink, nullptr)) {
+    if (!gst_element_link_many(source, inputQueue, tsAlign, outputQueue, sink, nullptr)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         releaseDvbServiceRelayPort(outputPort);
@@ -3086,8 +3097,24 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
+    // Observe the exact stream after tsparse has reconstructed complete TS packets
+    // but before PID/PSI filtering.  This should remain CC-clean even when DVB_RAW
+    // arrives in 8192-byte chunks.
+    {
+        GstPad* alignedCcPad = gst_element_get_static_pad(tsAlign, "src");
+        if (alignedCcPad) {
+            auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_ALIGNED");
+            gst_pad_add_probe(alignedCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                tsCcStageProbe, ccContext,
+                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+            gst_object_unref(alignedCcPad);
+        }
+    }
+
     if (state->config.inputServiceId > 0) {
-        GstPad* psiPad = gst_element_get_static_pad(inputQueue, "src");
+        // Run packet filtering only after tsparse has reassembled complete 188-byte
+        // packets.  This is the v153 fix for lost tails at 8192-byte buffer boundaries.
+        GstPad* psiPad = gst_element_get_static_pad(tsAlign, "src");
         if (psiPad) {
             auto* psiContext = new DvbSingleProgramPsiContext();
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
@@ -3176,6 +3203,10 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             gst_object_unref(statsPad);
         }
     }
+
+    std::cerr << "DVB service relay TS framing: stream=" << state->config.id
+              << " stage=pre-spts-filter tsparse_alignment=7 packet_size=188"
+              << " partial-buffer-tail=preserved" << std::endl;
 
     relay->pipeline = pipeline;
     relay->bus = gst_element_get_bus(pipeline);
