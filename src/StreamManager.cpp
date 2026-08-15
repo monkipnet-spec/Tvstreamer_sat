@@ -193,6 +193,12 @@ struct DvbSingleProgramPsiContext {
     size_t patSectionExpected = 0;
     std::vector<uint8_t> pmtSectionBuffer;
     size_t pmtSectionExpected = 0;
+
+    // Remapping creates a new logical SPTS. Regenerate continuity counters
+    // on final output PIDs instead of inheriting unrelated MPTS sequences.
+    std::array<uint8_t, 8192> remapContinuity {};
+    std::array<bool, 8192> remapContinuityValid {};
+    bool remapContinuityAnnounced = false;
 };
 
 struct SharedDvbPidStatsContext {
@@ -868,6 +874,57 @@ void rewriteDvbRemapPacketPid(uint8_t* packet, const DvbSingleProgramPsiContext&
     }
 }
 
+void normalizeDvbRemapContinuity(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
+    if (!packet || !ctx || !ctx->remapEnabled || packet[0] != 0x47) return;
+
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid >= 0x1FFF) return;
+
+    const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
+    if (adaptationControl == 0) {
+        ctx->remapContinuityValid[pid] = false;
+        return;
+    }
+
+    bool discontinuity = false;
+    if ((adaptationControl == 2 || adaptationControl == 3) &&
+        packet[4] > 0 && packet[4] <= 183) {
+        discontinuity = (packet[5] & 0x80) != 0;
+    }
+
+    const uint8_t sourceCc = static_cast<uint8_t>(packet[3] & 0x0F);
+    if (discontinuity) {
+        ctx->remapContinuity[pid] = sourceCc;
+        ctx->remapContinuityValid[pid] = true;
+        return;
+    }
+
+    const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+    uint8_t outputCc = sourceCc;
+    if (hasPayload) {
+        if (ctx->remapContinuityValid[pid]) {
+            outputCc = static_cast<uint8_t>((ctx->remapContinuity[pid] + 1) & 0x0F);
+        }
+        ctx->remapContinuity[pid] = outputCc;
+        ctx->remapContinuityValid[pid] = true;
+    } else if (ctx->remapContinuityValid[pid]) {
+        // Adaptation-only packets must not advance the payload CC.
+        outputCc = ctx->remapContinuity[pid];
+    } else {
+        ctx->remapContinuity[pid] = outputCc;
+        ctx->remapContinuityValid[pid] = true;
+    }
+
+    packet[3] = static_cast<uint8_t>((packet[3] & 0xF0) | (outputCc & 0x0F));
+
+    if (!ctx->remapContinuityAnnounced) {
+        std::cerr << "DVB remap continuity: SID=" << ctx->serviceId
+                  << " output_pid_cc=normalized payload-aware adaptation-only=no-increment"
+                  << std::endl;
+        ctx->remapContinuityAnnounced = true;
+    }
+}
+
 void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
     if (!packet || ctx.pmtPid == 0 || ctx.pmtPid >= 0x1FFF) return;
     const uint8_t continuity = static_cast<uint8_t>(packet[3] & 0x0F);
@@ -1069,6 +1126,13 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 
         if (pid != 0x0000 && pid != 0x0011 && pid != ctx->pmtPid) {
             rewriteDvbRemapPacketPid(packet, *ctx);
+        }
+
+        // Remap creates a new logical SPTS. Normalize continuity only after
+        // all PID/SID/PSI rewriting, using the final output PID. Remap OFF
+        // remains byte-for-byte unchanged.
+        if (ctx->remapEnabled) {
+            normalizeDvbRemapContinuity(packet, ctx);
         }
 
         if (writeOffset != offset) {

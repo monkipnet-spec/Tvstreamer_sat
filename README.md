@@ -1,5 +1,11 @@
-# TVStreammerSAT5 — Release 23
+# TVStreammerSAT5 — Release 24
 
+
+### DVB remap continuity-counter repair (v138)
+
+Release 24 fixes the continuity-counter corruption seen when DVB packet-level remap is enabled. Remap creates a new logical SPTS by rewriting SID/PAT/PMT/SDT and optionally renaming the selected video/audio PIDs. The previous path preserved the old MPTS continuity-counter nibble, which can become discontinuous on the final output PID and is visible in analyzers as repeated `CC` errors on PAT/CAT/SDT/audio/video.
+
+With remap enabled, the service relay now regenerates one payload-aware continuity sequence per final output PID after all SID/PID/PSI rewriting. Payload packets increment modulo 16, adaptation-only packets reuse the previous payload CC, and a packet carrying the discontinuity indicator starts a new sequence. Remap OFF remains byte-for-byte unchanged. No `tsdemux`/`mpegtsmux` stage is reintroduced. `StableUdpOutput.cpp`, the exact 5-second WISI startup reservoir, 20 ms periodic PCR mode, shared DVB frontend and CA backend are unchanged. Expected diagnostic: `DVB remap continuity: SID=... output_pid_cc=normalized payload-aware adaptation-only=no-increment`.
 
 ### Build hotfix: stopStreamAsync declaration (v137)
 
@@ -50,7 +56,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 23 / v137.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 24 / v138.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -447,7 +453,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 22
+Description=TVStreammerSAT5 Release 24
 After=network-online.target
 Wants=network-online.target
 
