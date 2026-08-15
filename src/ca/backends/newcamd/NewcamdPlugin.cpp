@@ -97,6 +97,29 @@ struct ControlWordSlot {
     ControlWordSlot& operator=(const ControlWordSlot&) = delete;
 };
 
+struct CaPidDiag {
+    uint64_t scrambledSeen = 0;
+    uint64_t transformedEven = 0;
+    uint64_t transformedOdd = 0;
+    uint64_t passthroughReservedSc = 0;
+    uint64_t passthroughNoPayload = 0;
+    uint64_t passthroughNoEvenState = 0;
+    uint64_t passthroughNoOddState = 0;
+    uint64_t outputScrambled = 0;
+    uint64_t outputScrambledEven = 0;
+    uint64_t outputScrambledOdd = 0;
+    uint64_t paritySwitches = 0;
+    uint8_t lastScramblingControl = 0;
+    uint8_t lastSwitchFrom = 0;
+    uint8_t lastSwitchTo = 0;
+    uint8_t lastSwitchCc = 0;
+    bool lastSwitchPusi = false;
+    uint64_t lastEvenUpdates = 0;
+    uint64_t lastOddUpdates = 0;
+    uint64_t packetsSinceEvenUpdate = 0;
+    uint64_t packetsSinceOddUpdate = 0;
+};
+
 struct ServiceBinding {
     std::string clientKey;
     uint16_t serviceId = 0;
@@ -133,6 +156,10 @@ struct ServiceBinding {
     uint8_t diagSampleCc = 0;
     bool diagSamplePusi = false;
     bool diagSampleTei = false;
+
+    // Diagnostic-only per-PID CA state/parity counters. No key material or
+    // payload bytes are logged, and these counters do not change CA behavior.
+    std::map<uint16_t, CaPidDiag> caPidDiag;
 };
 
 struct NewcamdSession {
@@ -540,7 +567,36 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             continue;
         }
         result->packets_scrambled++;
+
+        CaPidDiag& pidDiag = binding.caPidDiag[pid];
+        ++pidDiag.scrambledSeen;
+
+        if (pidDiag.lastEvenUpdates != binding.even.updates) {
+            pidDiag.lastEvenUpdates = binding.even.updates;
+            pidDiag.packetsSinceEvenUpdate = 0;
+        }
+        if (pidDiag.lastOddUpdates != binding.odd.updates) {
+            pidDiag.lastOddUpdates = binding.odd.updates;
+            pidDiag.packetsSinceOddUpdate = 0;
+        }
+        ++pidDiag.packetsSinceEvenUpdate;
+        ++pidDiag.packetsSinceOddUpdate;
+
+        if ((scramblingControl == 2 || scramblingControl == 3) &&
+            (pidDiag.lastScramblingControl == 2 || pidDiag.lastScramblingControl == 3) &&
+            pidDiag.lastScramblingControl != scramblingControl) {
+            ++pidDiag.paritySwitches;
+            pidDiag.lastSwitchFrom = pidDiag.lastScramblingControl;
+            pidDiag.lastSwitchTo = scramblingControl;
+            pidDiag.lastSwitchCc = continuityCounter;
+            pidDiag.lastSwitchPusi = payloadStart;
+        }
+        if (scramblingControl == 2 || scramblingControl == 3) {
+            pidDiag.lastScramblingControl = scramblingControl;
+        }
+
         if (scramblingControl == 1) {
+            ++pidDiag.passthroughReservedSc;
             waitingForKey = true;
             continue;
         }
@@ -548,12 +604,15 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         size_t scrambledPayloadSize = 0;
         uint8_t* scrambledPayload = ts_payload_mut(packet, &scrambledPayloadSize);
         if (!scrambledPayload || scrambledPayloadSize < 8) {
+            ++pidDiag.passthroughNoPayload;
             waitingForKey = true;
             continue;
         }
 
         ControlWordSlot& slot = scramblingControl == 3 ? binding.odd : binding.even;
         if (!slot.valid || !slot.key) {
+            if (scramblingControl == 3) ++pidDiag.passthroughNoOddState;
+            else ++pidDiag.passthroughNoEvenState;
             waitingForKey = true;
             continue;
         }
@@ -567,7 +626,23 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         dvbcsa_decrypt(slot.key, scrambledPayload, decryptSize);
         packet[3] &= 0x3F;
         result->packets_changed++;
+        if (scramblingControl == 3) ++pidDiag.transformedOdd;
+        else ++pidDiag.transformedEven;
         changed = true;
+    }
+
+    // Diagnostic-only post-transform scan: count packets that are still marked
+    // scrambled as they leave this CA hook. This does not modify the buffer.
+    for (size_t offset = 0; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
+        const uint8_t* packet = data + offset;
+        if (packet[0] != 0x47 || (packet[1] & 0x80) != 0) continue;
+        const uint8_t outputSc = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
+        if (outputSc == 0) continue;
+        const uint16_t outputPid = parse_pid(packet);
+        CaPidDiag& outputDiag = binding.caPidDiag[outputPid];
+        ++outputDiag.outputScrambled;
+        if (outputSc == 2) ++outputDiag.outputScrambledEven;
+        else if (outputSc == 3) ++outputDiag.outputScrambledOdd;
     }
 
     if (!pendingEcms.empty()) {
@@ -663,6 +738,33 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             << " sample_pusi=" << (currentBinding.diagSamplePusi ? 1 : 0)
             << " sample_tei=" << (currentBinding.diagSampleTei ? 1 : 0)
             << std::endl;
+
+        for (const auto& [diagPid, d] : currentBinding.caPidDiag) {
+            if (d.scrambledSeen == 0 && d.outputScrambled == 0) continue;
+            std::cerr
+                << "CA PARITY DIAG: stream=" << stream_id
+                << " pid=" << diagPid
+                << " scrambled_seen=" << d.scrambledSeen
+                << " transformed_even=" << d.transformedEven
+                << " transformed_odd=" << d.transformedOdd
+                << " passthrough_reserved_sc=" << d.passthroughReservedSc
+                << " passthrough_no_payload=" << d.passthroughNoPayload
+                << " passthrough_no_even_state=" << d.passthroughNoEvenState
+                << " passthrough_no_odd_state=" << d.passthroughNoOddState
+                << " out_scrambled=" << d.outputScrambled
+                << " out_scrambled_even=" << d.outputScrambledEven
+                << " out_scrambled_odd=" << d.outputScrambledOdd
+                << " parity_switches=" << d.paritySwitches
+                << " last_switch=" << static_cast<unsigned>(d.lastSwitchFrom)
+                << "->" << static_cast<unsigned>(d.lastSwitchTo)
+                << " last_switch_cc=" << static_cast<unsigned>(d.lastSwitchCc)
+                << " last_switch_pusi=" << (d.lastSwitchPusi ? 1 : 0)
+                << " even_updates=" << currentBinding.even.updates
+                << " odd_updates=" << currentBinding.odd.updates
+                << " packets_since_even_update=" << d.packetsSinceEvenUpdate
+                << " packets_since_odd_update=" << d.packetsSinceOddUpdate
+                << std::endl;
+        }
     }
 
     int returnCode = TVS_CA_RESULT_PASSTHROUGH;
