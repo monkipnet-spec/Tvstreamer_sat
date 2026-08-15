@@ -2749,13 +2749,11 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
     GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
     GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
-    GstElement* parse = gst_element_factory_make("tsparse", "shared_service_tsparse");
     GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
-    if (!pipeline || !source || !inputQueue || !parse || !outputQueue || !sink ||
+    if (!pipeline || !source || !inputQueue || !outputQueue || !sink ||
         !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, parse) || !addElementOrFail(pipeline, outputQueue) ||
-        !addElementOrFail(pipeline, sink)) {
+        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
             gst_object_unref(pipeline);
@@ -2777,8 +2775,6 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     if (caps) gst_caps_unref(caps);
     setStringPropertyIfPresent(source, "multicast-iface", "lo");
     configureQueue(inputQueue, 12000000000ULL);
-    configureTsPacketAlignment(parse);
-    setBooleanPropertyIfPresent(parse, "set-timestamps", FALSE);
     configureQueue(outputQueue, 8000000000ULL);
     g_object_set(sink,
         "host", "127.0.0.1",
@@ -2789,7 +2785,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
 
-    if (!gst_element_link_many(source, inputQueue, parse, outputQueue, sink, nullptr)) {
+    if (!gst_element_link_many(source, inputQueue, outputQueue, sink, nullptr)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         releaseDvbServiceRelayPort(outputPort);
