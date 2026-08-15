@@ -2549,8 +2549,32 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             "failed to start shared DVB frontend", startupError);
         return std::pair<bool, std::string>(ok, startupError);
     };
+    const auto startWithCurrentPidsRetry = [&](const char* mode) {
+        std::string lastError;
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            auto result = startWithCurrentPids();
+            if (result.first) {
+                if (attempt > 1) {
+                    std::cerr << "Shared DVB frontend startup retry succeeded: stream="
+                              << state->config.id << " mode=" << mode
+                              << " attempt=" << attempt << std::endl;
+                }
+                return result;
+            }
+            lastError = result.second;
+            if (attempt < 3) {
+                std::cerr << "Shared DVB frontend startup retry: stream=" << state->config.id
+                          << " mode=" << mode
+                          << " attempt=" << attempt
+                          << " error=" << lastError << std::endl;
+                resetFailedStart();
+                std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            }
+        }
+        return std::pair<bool, std::string>(false, lastError);
+    };
 
-    auto [started, startupError] = startWithCurrentPids();
+    auto [started, startupError] = startWithCurrentPidsRetry(frontendPids == "8192" ? "full-ts" : "service-pids");
     if (!started && preferFullTsCapture &&
         !serviceFrontendPids.empty() && serviceFrontendPids != "8192") {
         const std::string fullTsError = startupError;
@@ -2562,7 +2586,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                   << " SID=" << state->config.inputServiceId
                   << " retry_pids=" << frontendPids
                   << " full_ts_error=" << fullTsError << std::endl;
-        auto retry = startWithCurrentPids();
+        auto retry = startWithCurrentPidsRetry("service-pids");
         started = retry.first;
         startupError = retry.second;
         if (started) {
@@ -3649,9 +3673,9 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
     if (notifyManualStop) {
         notifyStreamState(
             stoppedConfig,
-            "⚪",
-            telegramText(configManager, "Поток остановлен", "Stream stopped"),
-            telegramText(configManager, "Остановлен вручную", "Stopped manually"));
+            "stop",
+            "Stream stopped",
+            "Stopped manually");
     } else {
         std::cerr << "Inactive stream state cleaned: " << id << std::endl;
     }
@@ -3660,6 +3684,75 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
 
 bool StreamManager::stopStream(const std::string& id) {
     return cleanupStreamState(id, true);
+}
+
+bool StreamManager::stopStreamAsync(const std::string& id) {
+    std::unique_ptr<StreamState> statePtr;
+    StreamConfig stoppedConfig;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = streams.find(id);
+        if (found == streams.end()) {
+            return false;
+        }
+
+        statePtr = std::move(found->second);
+        streams.erase(found);
+        stoppedConfig = statePtr->config;
+        statePtr->running = false;
+        statePtr->active = false;
+        statePtr->statusMessage = "stopping";
+
+        for (auto it = httpClients.begin(); it != httpClients.end();) {
+            if (it->second.streamId == id) {
+                it = httpClients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
+            if (it->second.streamId == id) {
+                it = adHocSessions.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    std::thread([this, id, statePtr = std::move(statePtr), stoppedConfig]() mutable {
+        auto& state = *statePtr;
+        stopExternalSrtOutputs(&state);
+        if (state.pipeline) {
+            gst_element_set_state(state.pipeline, GST_STATE_NULL);
+        }
+        if (state.busThread.joinable()) {
+            state.busThread.join();
+        }
+        if (state.gstTranscoder) {
+            state.gstTranscoder->stop();
+            state.gstTranscoder.reset();
+        }
+        if (state.bus) {
+            gst_object_unref(state.bus);
+            state.bus = nullptr;
+        }
+        if (state.pipeline) {
+            gst_element_get_state(state.pipeline, nullptr, nullptr, GST_SECOND);
+            gst_object_unref(state.pipeline);
+            state.pipeline = nullptr;
+        }
+        releaseSharedDvbInput(&state);
+        state.outputContexts.clear();
+        state.sourceContext.reset();
+        tvs::protocols::removeFifoRelay(stoppedConfig);
+        CardManager::instance().releaseService(id);
+        notifyStreamState(
+            stoppedConfig,
+            "stop",
+            "Stream stopped",
+            "Stopped manually");
+    }).detach();
+    return true;
 }
 
 bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string* error) {

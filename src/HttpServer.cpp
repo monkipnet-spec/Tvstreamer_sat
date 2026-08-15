@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <set>
 #include <thread>
@@ -34,6 +35,44 @@ namespace {
 constexpr const char* kProgramRelease = "Release 22";
 constexpr const char* kProgramVersion = "v136";
 
+struct CaDecodeUiMemory {
+    std::string state;
+    std::chrono::steady_clock::time_point holdUntil{};
+};
+
+std::mutex& caDecodeUiMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::string, CaDecodeUiMemory>& caDecodeUiMemory() {
+    static std::map<std::string, CaDecodeUiMemory> memory;
+    return memory;
+}
+
+std::string smoothCaDecodeState(const std::string& id, const std::string& rawState, bool active) {
+    if (id.empty() || rawState == "not_applicable" || !active) {
+        std::lock_guard<std::mutex> lock(caDecodeUiMutex());
+        caDecodeUiMemory().erase(id);
+        return active ? rawState : "offline";
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(caDecodeUiMutex());
+    auto& item = caDecodeUiMemory()[id];
+    if (rawState == "clear") {
+        item.state = "clear";
+        item.holdUntil = now + std::chrono::seconds(6);
+        return rawState;
+    }
+    if (item.state == "clear" && now < item.holdUntil &&
+        (rawState == "waiting" || rawState == "invalid" || rawState == "scrambled")) {
+        return "clear";
+    }
+    item.state = rawState;
+    item.holdUntil = now + std::chrono::seconds(2);
+    return rawState;
+}
 std::string queryValue(const std::string& target, const std::string& key) {
     const auto queryPos = target.find('?');
     if (queryPos == std::string::npos) {
@@ -847,19 +886,22 @@ std::string HttpServer::currentState() {
             item["ca_output_scrambled_percent"] = caPayloadPackets > 0
                 ? (100.0 * static_cast<double>(caScrambledPackets) / static_cast<double>(caPayloadPackets))
                 : 0.0;
+            std::string rawCaDecodeState;
+            const bool streamActive = streamState->active.load();
             if (cfg.conditionalAccessClient.empty()) {
-                item["ca_decode_state"] = "not_applicable";
-            } else if (!streamState->active.load()) {
-                item["ca_decode_state"] = "offline";
+                rawCaDecodeState = "not_applicable";
+            } else if (!streamActive) {
+                rawCaDecodeState = "offline";
             } else if (streamState->outputBitrate.load() == 0 || caPayloadPackets < 50) {
-                item["ca_decode_state"] = "waiting";
+                rawCaDecodeState = "waiting";
             } else if (caScrambledPackets > 0) {
-                item["ca_decode_state"] = "scrambled";
+                rawCaDecodeState = "scrambled";
             } else if (caClearPesStarts == 0) {
-                item["ca_decode_state"] = "invalid";
+                rawCaDecodeState = "invalid";
             } else {
-                item["ca_decode_state"] = "clear";
+                rawCaDecodeState = "clear";
             }
+            item["ca_decode_state"] = smoothCaDecodeState(cfg.id, rawCaDecodeState, streamActive);
             item["cc_errors"] = item["input_cc_errors"];
             item["cc_errors_total"] = item["input_cc_errors_total"];
         } else {
@@ -1660,7 +1702,7 @@ std::string HttpServer::handleStopStream(const std::string& body) {
             response["result"] = "error";
             response["error"] = "missing stream id";
         } else {
-            const bool stopped = streamManager.stopStream(id);
+            const bool stopped = streamManager.stopStreamAsync(id);
             const bool configured = std::any_of(
                 configManager.config.streams.begin(), configManager.config.streams.end(),
                 [&id](const StreamConfig& stream) { return stream.id == id; });
