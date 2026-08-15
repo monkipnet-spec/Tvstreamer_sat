@@ -1,4 +1,11 @@
-# TVStreammerSAT5 — Release 27
+# TVStreammerSAT5 — Release 28
+
+
+### Global stable-UDP continuity + DVB release barrier (v142)
+
+Release 28 applies the final post-PCR continuity normalizer to every StableUdpOutput stream, with Remap ON or OFF and for both IP and DVB inputs. The stable sender is itself a new paced transport domain (five-second reservoir, periodic PCR insertion and 7x188 UDP packetization), so limiting final CC repair to Remap ON left the non-remapped DVB path exposed to the same analyzer errors. SDT Service/Provider regeneration remains gated by Remap ON; only continuity normalization is global. `UDP shaper stats` therefore reports `final_cc_verify_errors` for non-remapped streams as well.
+
+The DVB frontend shutdown path now has an explicit release barrier. When the last consumer stops, the frontend key is marked `releasing` until GstDvbSrc has reached NULL and been unreffed. A new tile that immediately tunes the same physical frontend waits up to 2.5 seconds for that release instead of racing the old source and failing with `Device or resource busy`. If an already-running stream still owns the frontend on another transponder, the start is rejected before opening the device with a clear message: one physical frontend can share only the same transponder; another satellite/transponder needs the current consumer stopped or another physical frontend.
 
 
 ### Fast DVB release + unified post-remap normalization (v141)
@@ -76,7 +83,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 27 / v141.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 28 / v142.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -473,7 +480,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 27
+Description=TVStreammerSAT5 Release 28
 After=network-online.target
 Wants=network-online.target
 

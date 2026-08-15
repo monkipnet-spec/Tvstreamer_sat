@@ -368,7 +368,12 @@ public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
-          normalizeOutputContinuity(cfg.remapEnabled),
+          // StableUdpOutput creates a new paced UDP transport domain for every
+          // source, not only Remap ON. Normalize final CC for both IP and DVB
+          // inputs so periodic PCR insertion, reservoir pacing and upstream
+          // buffer boundaries cannot expose broken continuity at the receiver.
+          normalizeOutputContinuity(true),
+          remapPsiNormalization(cfg.remapEnabled),
           remapOutputServiceId(static_cast<uint16_t>(
               (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU)),
           remapServiceName(cfg.serviceName.empty() ? cfg.name : cfg.serviceName),
@@ -774,7 +779,7 @@ private:
     }
 
     void normalizeRemappedPsi(std::array<guint8, kTsPacketSize>& packet) {
-        if (!normalizeOutputContinuity || remapOutputServiceId == 0 ||
+        if (!remapPsiNormalization || remapOutputServiceId == 0 ||
             packet[0] != 0x47 || packetPid(packet) != 0x0011) {
             return;
         }
@@ -1122,10 +1127,11 @@ private:
         }
 
         if (!finalContinuityAnnounced) {
-            std::cerr << "UDP final TS continuity guard: remap=on stage=pre-send"
+            std::cerr << "UDP final TS continuity guard: scope=all-stable-udp stage=pre-send"
+                      << " remap=" << (remapPsiNormalization ? "on" : "off")
                       << " all-pids=normalized after-PCR-insertion"
                       << " discontinuity=absorbed-and-cleared"
-                      << " profile=ip-remux-equivalent"
+                      << " profile=single-output-transport-domain"
                       << std::endl;
             finalContinuityAnnounced = true;
         }
@@ -1236,7 +1242,8 @@ private:
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
     uint64_t configuredTargetBitrate = 0;
-    bool normalizeOutputContinuity = false;
+    bool normalizeOutputContinuity = true;
+    bool remapPsiNormalization = false;
     uint16_t remapOutputServiceId = 0;
     std::string remapServiceName;
     std::string remapServiceProvider;

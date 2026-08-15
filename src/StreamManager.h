@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <vector>
 
@@ -221,6 +222,11 @@ private:
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
     std::map<std::string, std::unique_ptr<SharedDvbFrontendState>> sharedDvbFrontends;
+    // When the last consumer stops, frontend shutdown happens on the stop
+    // thread. Keep a short release barrier so a new transponder cannot race
+    // the old GstDvbSrc while the kernel device is still closing.
+    std::set<std::string> releasingDvbFrontends;
+    std::condition_variable dvbReleaseCondition;
     std::set<uint16_t> dvbServiceRelayPorts;
     struct HttpClientSession {
         std::string streamId;

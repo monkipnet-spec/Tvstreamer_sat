@@ -2610,7 +2610,25 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     }
 
     {
-        std::lock_guard<std::mutex> lock(managerMutex);
+        std::unique_lock<std::mutex> lock(managerMutex);
+        if (releasingDvbFrontends.count(frontendKey) != 0) {
+            std::cerr << "DVB frontend release barrier: waiting for " << frontendKey
+                      << " before tuning a new stream" << std::endl;
+            const bool released = dvbReleaseCondition.wait_for(
+                lock,
+                std::chrono::milliseconds(2500),
+                [&]() { return releasingDvbFrontends.count(frontendKey) == 0; });
+            if (!released) {
+                std::ostringstream ss;
+                ss << "DVB adapter " << params.adapter << " frontend " << params.frontend
+                   << " is still being released by the previous stream; retry start. "
+                   << "A different transponder/satellite requires the previous tune to be fully stopped "
+                   << "or another physical frontend";
+                error = ss.str();
+                return false;
+            }
+            std::cerr << "DVB frontend release barrier cleared: " << frontendKey << std::endl;
+        }
         auto existing = sharedDvbFrontends.find(frontendKey);
         if (existing != sharedDvbFrontends.end()) {
             if (existing->second->tuningSignature != tuningSignature) {
@@ -2787,6 +2805,13 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         }
     }
     if (!started) {
+        if (startupError.find("Device or resource busy") != std::string::npos ||
+            startupError.find("resource busy") != std::string::npos) {
+            startupError +=
+                "; frontend is occupied. One physical DVB frontend can share channels only "
+                "from the same transponder. For another transponder/satellite stop the current "
+                "consumer first or select another adapter/frontend";
+        }
         error = startupError + appendStartupContext();
         resetFailedStart();
         if (shared->bus) {
@@ -2894,6 +2919,7 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
             } else {
                 released = std::move(found->second);
                 sharedDvbFrontends.erase(found);
+                releasingDvbFrontends.insert(key);
             }
         }
     }
@@ -2910,6 +2936,11 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
             std::chrono::steady_clock::now() - releaseStarted).count();
         std::cerr << "Shared DVB frontend stopped: " << key
                   << " adapter_release_ms=" << releaseMs << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(managerMutex);
+            releasingDvbFrontends.erase(key);
+        }
+        dvbReleaseCondition.notify_all();
     }
     state->sharedDvbInput = false;
     state->sharedDvbFrontendKey.clear();
