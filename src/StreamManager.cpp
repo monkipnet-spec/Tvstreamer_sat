@@ -994,8 +994,30 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
     GstMapInfo map{};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
 
+    size_t packetStart = 0;
+    const size_t maxSyncOffset = std::min<size_t>(kTsPacketSize, map.size);
+    bool aligned = map.size >= kTsPacketSize && map.data[0] == 0x47;
+    if (aligned && map.size >= kTsPacketSize * 2 && map.data[kTsPacketSize] != 0x47) {
+        aligned = false;
+    }
+    if (!aligned) {
+        bool found = false;
+        for (size_t candidate = 0; candidate < maxSyncOffset; ++candidate) {
+            if (map.data[candidate] != 0x47) continue;
+            if (candidate + kTsPacketSize >= map.size || map.data[candidate + kTsPacketSize] == 0x47) {
+                packetStart = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            gst_buffer_unmap(buffer, &map);
+            return GST_PAD_PROBE_OK;
+        }
+    }
+
     size_t writeOffset = 0;
-    for (size_t offset = 0; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
+    for (size_t offset = packetStart; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
         uint8_t* packet = map.data + offset;
         if (packet[0] != 0x47) continue;
         discoverSelectedPmtFromPacket(packet, ctx);
@@ -2776,7 +2798,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     if (state->config.inputServiceId > 0) {
-        GstPad* psiPad = gst_element_get_static_pad(parse, "src");
+        GstPad* psiPad = gst_element_get_static_pad(inputQueue, "src");
         if (psiPad) {
             auto* psiContext = new DvbSingleProgramPsiContext();
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
