@@ -1,4 +1,14 @@
-# TVStreammerSAT5 — Release 26
+# TVStreammerSAT5 — Release 27
+
+
+### Fast DVB release + unified post-remap normalization (v141)
+
+Release 27 makes DVB adapter release start immediately when a tile is stopped. The main stream pipeline is put into NULL and the shared physical frontend is released before waiting for bus threads, external outputs or transcoders. The localhost service relay is torn down afterwards. When other channels still share the same frontend, the PID union is now shrunk live without the old READY→PLAYING cycle and its 2-second wait; the tuner therefore stays on-air for the remaining services without blocking tile shutdown. For the last consumer, the DVB release wait is bounded to 250 ms and the log reports `adapter_release_ms=...`.
+
+Startup logging now begins with the product name, release/version and support email, for example `TVStreammerSAT5 Release 27 / v141 | support=monkipnet@gmail.com`. Version strings are centralized in `src/AppVersion.h` so the HTTP API/About dialog and startup log use the same version.
+
+Generic IP remap already receives a fresh MPEG-TS continuity/PSI domain from `mpegtsmux`. DVB packet-level remap cannot safely be routed through that same demux/remux path for scrambled/private streams, so v141 applies the equivalent final normalization after packet reassembly and immediately before network send: upstream discontinuity flags are absorbed and cleared, CC is regenerated for every final PID after periodic-PCR insertion, an internal verifier checks the exact datagrams being sent, and SDT Service/Provider is regenerated from the configured remap metadata. `UDP shaper stats` now exposes `final_cc_verify_errors`, `final_cc_rewrites`, `final_cc_discontinuities_cleared` and `final_sdt_rewrites`. A non-zero analyzer CC count with `final_cc_verify_errors=0` means packets were lost after `sendto()` (network/receiver path), not inside the remapper.
+
 
 ### Remap transport/CBR/SDT final-output repair (v140)
 
@@ -66,7 +76,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 26 / v140.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 27 / v141.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -463,7 +473,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 26
+Description=TVStreammerSAT5 Release 27
 After=network-online.target
 Wants=network-online.target
 

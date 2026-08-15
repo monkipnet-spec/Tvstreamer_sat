@@ -242,12 +242,137 @@ void clearPcrFlag(std::array<guint8, kTsPacketSize>& packet) {
     packet[5] = static_cast<guint8>(packet[5] & ~0x10U);
 }
 
+uint32_t mpeg2SectionCrc32(const guint8* data, std::size_t size) {
+    uint32_t crc = 0xFFFFFFFFU;
+    for (std::size_t i = 0; i < size; ++i) {
+        crc ^= static_cast<uint32_t>(data[i]) << 24;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80000000U)
+                ? (crc << 1) ^ 0x04C11DB7U
+                : (crc << 1);
+        }
+    }
+    return crc;
+}
+
+std::vector<guint8> dvbUtf8Text(const std::string& value, std::size_t maxBytes) {
+    std::vector<guint8> out;
+    if (value.empty() || maxBytes < 2) return out;
+    out.push_back(0x15); // DVB UTF-8 selector
+    const std::size_t copy = std::min(maxBytes - 1, value.size());
+    out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
+    return out;
+}
+
+const guint8* tsPayloadStart(
+    const std::array<guint8, kTsPacketSize>& packet,
+    std::size_t& available,
+    bool requirePusi = false) {
+    available = 0;
+    if (packet[0] != 0x47) return nullptr;
+    if (requirePusi && (packet[1] & 0x40U) == 0) return nullptr;
+
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+    if (adaptationControl == 0 || adaptationControl == 2) return nullptr;
+    std::size_t offset = 4;
+    if (adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (5 + adaptationLength > kTsPacketSize) return nullptr;
+        offset = 5 + adaptationLength;
+    }
+    if (offset >= kTsPacketSize) return nullptr;
+
+    if (packet[1] & 0x40U) {
+        const std::size_t pointer = packet[offset];
+        offset += 1 + pointer;
+        if (offset >= kTsPacketSize) return nullptr;
+    } else if (requirePusi) {
+        return nullptr;
+    }
+
+    available = kTsPacketSize - offset;
+    return packet.data() + offset;
+}
+
+void writeRemappedSdtPacket(
+    std::array<guint8, kTsPacketSize>& packet,
+    uint16_t serviceId,
+    const std::string& serviceName,
+    const std::string& serviceProvider,
+    uint16_t transportStreamId,
+    uint16_t originalNetworkId,
+    guint8 version) {
+    if (serviceId == 0) return;
+
+    const guint8 continuity = static_cast<guint8>(packet[3] & 0x0F);
+    packet.fill(0xFF);
+    packet[0] = 0x47;
+    packet[1] = 0x40; // PUSI + PID 0x0011
+    packet[2] = 0x11;
+    packet[3] = static_cast<guint8>(0x10 | continuity);
+    packet[4] = 0x00; // pointer_field
+
+    const std::string nameText = serviceName.empty()
+        ? ("Service " + std::to_string(serviceId))
+        : serviceName;
+    auto provider = dvbUtf8Text(serviceProvider, 48);
+    auto name = dvbUtf8Text(nameText, 80);
+    while (provider.size() + name.size() > 140) {
+        if (name.size() > 2) name.pop_back();
+        else if (provider.size() > 2) provider.pop_back();
+        else break;
+    }
+
+    const std::size_t descriptorPayloadLength = 3 + provider.size() + name.size();
+    const std::size_t descriptorTotalLength = 2 + descriptorPayloadLength;
+    const uint16_t sectionLength =
+        static_cast<uint16_t>(8 + 5 + descriptorTotalLength + 4);
+
+    guint8* section = packet.data() + 5;
+    section[0] = 0x42;
+    section[1] = static_cast<guint8>(0xF0 | ((sectionLength >> 8) & 0x0F));
+    section[2] = static_cast<guint8>(sectionLength & 0xFF);
+    section[3] = static_cast<guint8>(transportStreamId >> 8);
+    section[4] = static_cast<guint8>(transportStreamId & 0xFF);
+    section[5] = static_cast<guint8>(0xC1 | ((version & 0x1F) << 1));
+    section[6] = 0x00;
+    section[7] = 0x00;
+    section[8] = static_cast<guint8>(originalNetworkId >> 8);
+    section[9] = static_cast<guint8>(originalNetworkId & 0xFF);
+    section[10] = 0xFF;
+
+    std::size_t pos = 11;
+    section[pos++] = static_cast<guint8>(serviceId >> 8);
+    section[pos++] = static_cast<guint8>(serviceId & 0xFF);
+    section[pos++] = 0xFC;
+    const uint16_t loopLength = static_cast<uint16_t>(descriptorTotalLength);
+    section[pos++] = static_cast<guint8>(0x80 | ((loopLength >> 8) & 0x0F));
+    section[pos++] = static_cast<guint8>(loopLength & 0xFF);
+    section[pos++] = 0x48;
+    section[pos++] = static_cast<guint8>(descriptorPayloadLength);
+    section[pos++] = 0x01;
+    section[pos++] = static_cast<guint8>(provider.size());
+    for (guint8 byte : provider) section[pos++] = byte;
+    section[pos++] = static_cast<guint8>(name.size());
+    for (guint8 byte : name) section[pos++] = byte;
+
+    const uint32_t crc = mpeg2SectionCrc32(section, pos);
+    section[pos++] = static_cast<guint8>((crc >> 24) & 0xFF);
+    section[pos++] = static_cast<guint8>((crc >> 16) & 0xFF);
+    section[pos++] = static_cast<guint8>((crc >> 8) & 0xFF);
+    section[pos++] = static_cast<guint8>(crc & 0xFF);
+}
+
 class StableUdpSender {
 public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
-          normalizeOutputContinuity(cfg.remapEnabled) {
+          normalizeOutputContinuity(cfg.remapEnabled),
+          remapOutputServiceId(static_cast<uint16_t>(
+              (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU)),
+          remapServiceName(cfg.serviceName.empty() ? cfg.name : cfg.serviceName),
+          remapServiceProvider(cfg.serviceProvider) {
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
@@ -456,6 +581,7 @@ private:
             const FillCounts filled = fillDatagram(
                 datagram.data(), nextSendNanoseconds, activeBitrate);
             normalizeFinalDatagramContinuity(datagram.data());
+            verifyFinalDatagramContinuity(datagram.data());
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
             totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
@@ -625,6 +751,7 @@ private:
 
             TimedTsPacket packet;
             std::copy_n(bytes.data() + offset, kTsPacketSize, packet.bytes.data());
+            normalizeRemappedPsi(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             realPackets.push_back(std::move(packet));
@@ -643,6 +770,47 @@ private:
                 resyncDiscardedBytes.fetch_add(discard, std::memory_order_relaxed);
                 queueSpace.notify_all();
             }
+        }
+    }
+
+    void normalizeRemappedPsi(std::array<guint8, kTsPacketSize>& packet) {
+        if (!normalizeOutputContinuity || remapOutputServiceId == 0 ||
+            packet[0] != 0x47 || packetPid(packet) != 0x0011) {
+            return;
+        }
+
+        // Generic IP remap passes through mpegtsmux, which regenerates a clean
+        // SDT. DVB packet-level remap cannot use tsdemux/mpegtsmux safely for
+        // scrambled/private streams, so reproduce that final normalization here
+        // after TS packet reassembly and before the WISI reservoir.
+        std::size_t available = 0;
+        const guint8* section = tsPayloadStart(packet, available, true);
+        if (section && available >= 11 &&
+            (section[0] == 0x42 || section[0] == 0x46)) {
+            sdtTransportStreamId =
+                static_cast<uint16_t>((section[3] << 8) | section[4]);
+            sdtVersion = static_cast<guint8>((section[5] >> 1) & 0x1F);
+            sdtOriginalNetworkId =
+                static_cast<uint16_t>((section[8] << 8) | section[9]);
+        }
+
+        writeRemappedSdtPacket(
+            packet,
+            remapOutputServiceId,
+            remapServiceName,
+            remapServiceProvider,
+            sdtTransportStreamId,
+            sdtOriginalNetworkId,
+            sdtVersion);
+        ++finalSdtRewrites;
+
+        if (!finalSdtAnnounced) {
+            std::cerr << "UDP remap PSI normalizer: SID=" << remapOutputServiceId
+                      << " service=\"" << remapServiceName << "\""
+                      << " provider=\"" << remapServiceProvider << "\""
+                      << " SDT=regenerated profile=ip-remux-equivalent"
+                      << std::endl;
+            finalSdtAnnounced = true;
         }
     }
 
@@ -922,18 +1090,18 @@ private:
             const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
             if (adaptationControl == 0) continue;
 
-            bool discontinuity = false;
+            // IP remap through mpegtsmux creates a fresh transport continuity
+            // domain.  For DVB packet-level remap do the same: an upstream
+            // discontinuity flag must not reset the newly-normalized output CC.
+            // Clear the flag after absorbing it into the new transport domain.
             if ((adaptationControl == 2 || adaptationControl == 3) &&
-                packet[4] > 0 && packet[4] <= 183) {
-                discontinuity = (packet[5] & 0x80) != 0;
-            }
-            const guint8 incoming = static_cast<guint8>(packet[3] & 0x0F);
-            if (discontinuity) {
-                finalContinuity[pid] = incoming;
-                finalContinuityValid[pid] = true;
-                continue;
+                packet[4] > 0 && packet[4] <= 183 &&
+                (packet[5] & 0x80U) != 0) {
+                packet[5] = static_cast<guint8>(packet[5] & ~0x80U);
+                ++finalDiscontinuitiesCleared;
             }
 
+            const guint8 incoming = static_cast<guint8>(packet[3] & 0x0F);
             const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
             guint8 output = incoming;
             if (hasPayload) {
@@ -948,13 +1116,47 @@ private:
                 finalContinuity[pid] = output;
                 finalContinuityValid[pid] = true;
             }
+
+            if (output != incoming) ++finalContinuityRewrites;
             packet[3] = static_cast<guint8>((packet[3] & 0xF0) | (output & 0x0F));
         }
 
         if (!finalContinuityAnnounced) {
             std::cerr << "UDP final TS continuity guard: remap=on stage=pre-send"
-                      << " all-pids=normalized after-PCR-insertion" << std::endl;
+                      << " all-pids=normalized after-PCR-insertion"
+                      << " discontinuity=absorbed-and-cleared"
+                      << " profile=ip-remux-equivalent"
+                      << std::endl;
             finalContinuityAnnounced = true;
+        }
+    }
+
+    void verifyFinalDatagramContinuity(const guint8* data) {
+        if (!normalizeOutputContinuity || !data) return;
+
+        for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
+            const guint8* packet = data + slot * kTsPacketSize;
+            if (packet[0] != 0x47) continue;
+            const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+            if (pid >= 0x1FFF) continue;
+            const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+            if (adaptationControl == 0) continue;
+
+            const guint8 cc = static_cast<guint8>(packet[3] & 0x0F);
+            const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+            if (!finalVerifyContinuityValid[pid]) {
+                finalVerifyContinuity[pid] = cc;
+                finalVerifyContinuityValid[pid] = true;
+                continue;
+            }
+
+            const guint8 expected = hasPayload
+                ? static_cast<guint8>((finalVerifyContinuity[pid] + 1) & 0x0F)
+                : finalVerifyContinuity[pid];
+            if (cc != expected) {
+                ++finalContinuityVerifyErrors;
+            }
+            if (hasPayload) finalVerifyContinuity[pid] = cc;
         }
     }
 
@@ -1012,6 +1214,12 @@ private:
                   << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " clock_resets=" << schedulerResets.load(std::memory_order_relaxed)
                   << " resync_bytes=" << resyncDiscardedBytes.load(std::memory_order_relaxed)
+                  << " final_cc_rewrites=" << finalContinuityRewrites.load(std::memory_order_relaxed)
+                  << " final_cc_discontinuities_cleared="
+                  << finalDiscontinuitiesCleared.load(std::memory_order_relaxed)
+                  << " final_cc_verify_errors="
+                  << finalContinuityVerifyErrors.load(std::memory_order_relaxed)
+                  << " final_sdt_rewrites=" << finalSdtRewrites.load(std::memory_order_relaxed)
                   << std::endl;
     }
 
@@ -1029,9 +1237,22 @@ private:
     UdpShapingMode mode = UdpShapingMode::Cbr;
     uint64_t configuredTargetBitrate = 0;
     bool normalizeOutputContinuity = false;
+    uint16_t remapOutputServiceId = 0;
+    std::string remapServiceName;
+    std::string remapServiceProvider;
+    uint16_t sdtTransportStreamId = 1;
+    uint16_t sdtOriginalNetworkId = 1;
+    guint8 sdtVersion = 0;
+    bool finalSdtAnnounced = false;
     std::array<guint8, 8192> finalContinuity {};
     std::array<bool, 8192> finalContinuityValid {};
+    std::array<guint8, 8192> finalVerifyContinuity {};
+    std::array<bool, 8192> finalVerifyContinuityValid {};
     bool finalContinuityAnnounced = false;
+    std::atomic<uint64_t> finalContinuityRewrites{0};
+    std::atomic<uint64_t> finalDiscontinuitiesCleared{0};
+    std::atomic<uint64_t> finalContinuityVerifyErrors{0};
+    std::atomic<uint64_t> finalSdtRewrites{0};
     std::atomic<uint64_t> transportBitrate{0};
     sockaddr_in destinationAddress {};
 

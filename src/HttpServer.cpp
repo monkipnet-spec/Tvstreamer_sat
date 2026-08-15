@@ -1,4 +1,5 @@
 #include "HttpServer.h"
+#include "AppVersion.h"
 
 #include "utils.h"
 #include "TranscoderModule.h"
@@ -32,8 +33,8 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = "Release 26";
-constexpr const char* kProgramVersion = "v140";
+constexpr const char* kProgramRelease = tvs::app::kProgramRelease;
+constexpr const char* kProgramVersion = tvs::app::kProgramVersion;
 
 struct CaDecodeUiMemory {
     std::string state;
@@ -2869,7 +2870,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 26'} / ${state.program_version||'v140'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 27'} / ${state.program_version||'v141'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

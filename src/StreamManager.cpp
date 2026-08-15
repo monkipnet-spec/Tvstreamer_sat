@@ -44,6 +44,7 @@ constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
+constexpr GstClockTime kFastDvbReleaseWait = 250 * GST_MSECOND;
 constexpr const char* kTestPatternUri = "test://bars";
 
 class CardReservationGuard {
@@ -2879,7 +2880,7 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
                 std::string pidError;
                 if (!applySharedDvbPids(
                         *found->second, activeConsumers, activeFilterCount,
-                        pidError, true, found->second->fullTsCapture)) {
+                        pidError, false, found->second->fullTsCapture)) {
                     std::cerr << "Shared DVB PID filter shrink failed: " << key
                               << " error=" << pidError << std::endl;
                 }
@@ -2888,7 +2889,8 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
                           << " consumers=" << found->second->consumers
                           << " pid_services=" << found->second->consumerPids.size()
                           << " pid_filters=" << activeFilterCount
-                          << " pids=" << found->second->requestedPids << std::endl;
+                          << " pids=" << found->second->requestedPids
+                          << " pid_update=live-no-ready-cycle" << std::endl;
             } else {
                 released = std::move(found->second);
                 sharedDvbFrontends.erase(found);
@@ -2896,13 +2898,18 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
         }
     }
     if (released) {
+        const auto releaseStarted = std::chrono::steady_clock::now();
         if (released->pipeline) {
             gst_element_set_state(released->pipeline, GST_STATE_NULL);
-            gst_element_get_state(released->pipeline, nullptr, nullptr, GST_SECOND);
+            gst_element_get_state(
+                released->pipeline, nullptr, nullptr, kFastDvbReleaseWait);
         }
         if (released->bus) gst_object_unref(released->bus);
         if (released->pipeline) gst_object_unref(released->pipeline);
-        std::cerr << "Shared DVB frontend stopped: " << key << std::endl;
+        const auto releaseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - releaseStarted).count();
+        std::cerr << "Shared DVB frontend stopped: " << key
+                  << " adapter_release_ms=" << releaseMs << std::endl;
     }
     state->sharedDvbInput = false;
     state->sharedDvbFrontendKey.clear();
@@ -3108,7 +3115,7 @@ void StreamManager::stopDvbServiceRelay(StreamState* state) {
     auto relay = std::move(state->dvbServiceRelay);
     if (relay->pipeline) {
         gst_element_set_state(relay->pipeline, GST_STATE_NULL);
-        gst_element_get_state(relay->pipeline, nullptr, nullptr, GST_SECOND);
+        gst_element_get_state(relay->pipeline, nullptr, nullptr, kFastDvbReleaseWait);
     }
     if (relay->bus) gst_object_unref(relay->bus);
     if (relay->pipeline) gst_object_unref(relay->pipeline);
@@ -3183,8 +3190,11 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
 
 void StreamManager::releaseSharedDvbInput(StreamState* state) {
     if (!state) return;
-    stopDvbServiceRelay(state);
+    // Free the physical frontend before tearing down the localhost relay.  The
+    // relay does not own /dev/dvb, so there is no reason to keep the tuner open
+    // while the rest of the stream cleanup waits on buses/threads.
     releaseSharedDvbFrontend(state);
+    stopDvbServiceRelay(state);
     state->runtimeConfig = state->config;
 }
 
@@ -3837,10 +3847,13 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
     }
 
     auto& state = *statePtr;
-    stopExternalSrtOutputs(&state);
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
+    // Release DVB immediately after shutdown starts; do not wait for output
+    // threads/transcoders before returning the adapter to the kernel.
+    releaseSharedDvbInput(&state);
+    stopExternalSrtOutputs(&state);
     if (state.busThread.joinable()) {
         state.busThread.join();
     }
@@ -3857,7 +3870,6 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
         gst_object_unref(state.pipeline);
         state.pipeline = nullptr;
     }
-    releaseSharedDvbInput(&state);
     state.outputContexts.clear();
     state.sourceContext.reset();
     tvs::protocols::removeFifoRelay(stoppedConfig);
@@ -3914,10 +3926,13 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
 
     std::thread([this, id, statePtr = std::move(statePtr), stoppedConfig]() mutable {
         auto& state = *statePtr;
-        stopExternalSrtOutputs(&state);
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
+        // Fast stop path: the adapter is released before the detached cleanup
+        // waits for the main bus thread, external outputs or transcoder.
+        releaseSharedDvbInput(&state);
+        stopExternalSrtOutputs(&state);
         if (state.busThread.joinable()) {
             state.busThread.join();
         }
@@ -3934,7 +3949,6 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
             gst_object_unref(state.pipeline);
             state.pipeline = nullptr;
         }
-        releaseSharedDvbInput(&state);
         state.outputContexts.clear();
         state.sourceContext.reset();
         tvs::protocols::removeFifoRelay(stoppedConfig);
@@ -3976,10 +3990,11 @@ void StreamManager::stopAll() {
 
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
-        stopExternalSrtOutputs(&state);
         if (state.pipeline) {
             gst_element_set_state(state.pipeline, GST_STATE_NULL);
         }
+        releaseSharedDvbInput(&state);
+        stopExternalSrtOutputs(&state);
         if (state.busThread.joinable()) {
             state.busThread.join();
         }
@@ -3993,7 +4008,6 @@ void StreamManager::stopAll() {
         if (state.pipeline) {
             gst_object_unref(state.pipeline);
         }
-        releaseSharedDvbInput(&state);
         state.outputContexts.clear();
         state.sourceContext.reset();
         tvs::protocols::removeFifoRelay(state.config);

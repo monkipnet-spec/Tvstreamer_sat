@@ -7,8 +7,13 @@
 #include "TelegramNotifier.h"
 #include "StreamManager.h"
 #include "HttpServer.h"
+#include "AppVersion.h"
 
 int main() {
+    std::cerr << tvs::app::kProductName
+              << " " << tvs::app::kProgramRelease
+              << " / " << tvs::app::kProgramVersion
+              << " | support=" << tvs::app::kSupportEmail << std::endl;
     std::cerr << "main() entered" << std::endl;
 
     // Initialize GStreamer before HttpServer is created. The web UI queries
