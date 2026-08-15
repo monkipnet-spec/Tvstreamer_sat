@@ -3101,7 +3101,8 @@ function satelliteTunePayload() {
     lnb_lof1_mhz:Number(document.getElementById('satLof1')?.value || 9750),
     lnb_lof2_mhz:Number(document.getElementById('satLof2')?.value || 10600),
     lnb_slof_mhz:Number(document.getElementById('satSlof')?.value || 11700),
-    stream_id:Number(document.getElementById('satStreamId')?.value ?? -1)
+    stream_id:Number(document.getElementById('satStreamId')?.value ?? -1),
+    hold_lock:!!document.getElementById('satHoldLock')?.checked
   };
 }
 function updateSatelliteMeters(data={}) {
@@ -3206,8 +3207,9 @@ async function startSatelliteScan() {
   satelliteScanning = true;
   clearInterval(satelliteSignalTimer);
   satelliteSignalTimer = null;
+  const holdLock = !!document.getElementById('satHoldLock')?.checked;
   if (button) button.disabled = true;
-  if (status) status.textContent = 'Сканирование транспондера...';
+  if (status) status.textContent = holdLock ? 'Сканирование транспондера, удержание LOCK...' : 'Сканирование транспондера...';
   while (satelliteSignalPending) await new Promise(resolve=>setTimeout(resolve, 80));
   try {
     const response = await fetch('/api/dvb-scan', {
@@ -3232,7 +3234,9 @@ async function startSatelliteScan() {
   } finally {
     satelliteScanning = false;
     if (button) button.disabled = false;
-    if (document.getElementById('satFrequency')) scheduleSatelliteSignalPolling();
+    if (document.getElementById('satFrequency')) {
+      window.setTimeout(() => { if (document.getElementById('satFrequency')) scheduleSatelliteSignalPolling(); }, holdLock ? 1200 : 0);
+    }
   }
 }
 async function saveSelectedSatelliteChannels() {
@@ -3291,6 +3295,7 @@ function openAddChannelModal() {
       <div class="sat-field"><label>LNB LOF2, MHz</label><input id="satLof2" type="number" value="10600" onchange="updateSatelliteSignal()" /></div>
       <div class="sat-field"><label>LNB SLOF, MHz</label><input id="satSlof" type="number" value="11700" onchange="updateSatelliteSignal()" /></div>
       <div class="sat-field"><label>ISI / Stream ID</label><input id="satStreamId" type="number" min="-1" max="255" value="-1" onchange="updateSatelliteSignal()" /></div>
+      <div class="sat-field wide"><label>Сканирование</label><div class="checkbox-inline"><input id="satHoldLock" type="checkbox" checked /><span>Удерживать LOCK</span></div></div>
     </div>
     <div id="satDeviceInfo" class="sat-scan-status" style="margin-top:8px">Поиск DVB frontend...</div>
     <div class="cam-panel">

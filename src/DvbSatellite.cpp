@@ -940,7 +940,11 @@ Json::Value scan(const Json::Value& request) {
         result["error"] = error;
         return result;
     }
-    Json::Value result = runTune(params, true, 6500);
+    const bool holdLock = request.get("hold_lock", false).asBool();
+    const int timeoutMs = holdLock ? 18000 : 6500;
+    Json::Value result = runTune(params, true, timeoutMs);
+    result["hold_lock"] = holdLock;
+    result["scan_timeout_ms"] = timeoutMs;
     result["input_uri"] = buildUri(params);
     result["frequency_mhz"] = static_cast<double>(params.frequencyKHz) / 1000.0;
     result["symbol_rate"] = params.symbolRateK;
