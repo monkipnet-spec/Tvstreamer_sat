@@ -326,6 +326,134 @@ GstPadProbeReturn dvbRemapFinalContinuityProbe(
     return GST_PAD_PROBE_OK;
 }
 
+
+// Shared DVB UDP is a byte stream from the application's point of view: a
+// GstBuffer may end in the middle of a 188-byte MPEG-TS packet.  Keep the tail
+// and prepend it to the next buffer before any PID/PSI filtering.  Unlike
+// tsparse this helper does not parse programs, drop packets, alter timestamps,
+// rewrite CC/PCR, or touch payload bytes; it only restores packet boundaries.
+struct SharedDvbTsFramerContext {
+    std::string streamId;
+    std::vector<uint8_t> remainder;
+    uint64_t buffers = 0;
+    uint64_t framedPackets = 0;
+    uint64_t droppedPrefixBytes = 0;
+    uint64_t resyncs = 0;
+    bool announced = false;
+};
+
+bool sharedDvbLooksAligned(const uint8_t* data, size_t size, size_t candidate) {
+    if (!data || candidate >= size || data[candidate] != 0x47) return false;
+    // Validate up to two following packet boundaries when they are present.
+    for (size_t step = 1; step <= 2; ++step) {
+        const size_t next = candidate + step * kTsPacketSize;
+        if (next >= size) break;
+        if (data[next] != 0x47) return false;
+    }
+    return true;
+}
+
+GstPadProbeReturn sharedDvbTsFramerProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<SharedDvbTsFramerContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+
+    GstBuffer* original = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!original) return GST_PAD_PROBE_OK;
+
+    GstBuffer* buffer = gst_buffer_make_writable(original);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (buffer != original) GST_PAD_PROBE_INFO_DATA(info) = buffer;
+    ++ctx->buffers;
+
+    if (!ctx->remainder.empty()) {
+        const gsize prefixSize = static_cast<gsize>(ctx->remainder.size());
+        gpointer prefixData = g_malloc(prefixSize);
+        if (!prefixData) return GST_PAD_PROBE_OK;
+        std::memcpy(prefixData, ctx->remainder.data(), prefixSize);
+        GstMemory* prefixMemory = gst_memory_new_wrapped(
+            static_cast<GstMemoryFlags>(0),
+            prefixData,
+            prefixSize,
+            0,
+            prefixSize,
+            prefixData,
+            g_free);
+        if (!prefixMemory) {
+            g_free(prefixData);
+            return GST_PAD_PROBE_OK;
+        }
+        gst_buffer_prepend_memory(buffer, prefixMemory);
+        ctx->remainder.clear();
+    }
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+
+    size_t packetStart = std::string::npos;
+    if (map.size > 0 && sharedDvbLooksAligned(map.data, map.size, 0)) {
+        packetStart = 0;
+    } else {
+        const size_t searchLimit = std::min<size_t>(map.size, kTsPacketSize);
+        for (size_t candidate = 1; candidate < searchLimit; ++candidate) {
+            if (sharedDvbLooksAligned(map.data, map.size, candidate)) {
+                packetStart = candidate;
+                break;
+            }
+        }
+    }
+
+    if (packetStart == std::string::npos) {
+        // Not enough bytes to establish a boundary, or a transient damaged
+        // fragment.  Preserve at most two packet lengths so the next buffer can
+        // establish alignment without unbounded growth.
+        const size_t keep = std::min<size_t>(map.size, kTsPacketSize * 2 - 1);
+        ctx->remainder.assign(map.data + (map.size - keep), map.data + map.size);
+        gst_buffer_unmap(buffer, &map);
+        return GST_PAD_PROBE_DROP;
+    }
+
+    if (packetStart > 0) {
+        ctx->droppedPrefixBytes += packetStart;
+        ++ctx->resyncs;
+    }
+
+    size_t framedBytes = 0;
+    size_t pos = packetStart;
+    while (pos + kTsPacketSize <= map.size) {
+        if (map.data[pos] != 0x47) break;
+        framedBytes += kTsPacketSize;
+        pos += kTsPacketSize;
+    }
+
+    const size_t tailStart = packetStart + framedBytes;
+    if (tailStart < map.size) {
+        ctx->remainder.assign(map.data + tailStart, map.data + map.size);
+    } else {
+        ctx->remainder.clear();
+    }
+    gst_buffer_unmap(buffer, &map);
+
+    if (framedBytes == 0) return GST_PAD_PROBE_DROP;
+
+    // The buffer now contains only complete TS packets.  gst_buffer_resize()
+    // trims the optional resync prefix and the saved partial tail without
+    // copying or changing any packet bytes.
+    gst_buffer_resize(
+        buffer,
+        static_cast<gssize>(packetStart),
+        static_cast<gssize>(framedBytes));
+    ctx->framedPackets += framedBytes / kTsPacketSize;
+
+    if (!ctx->announced) {
+        std::cerr << "DVB service relay TS framer active: stream=" << ctx->streamId
+                  << " packet_size=188 mode=persistent-remainder"
+                  << " parser=none payload=passthrough" << std::endl;
+        ctx->announced = true;
+    }
+    return GST_PAD_PROBE_OK;
+}
+
 struct SharedDvbPidStatsContext {
     std::string stage = "dvbsrc-src";
     std::string label;
@@ -3029,17 +3157,11 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
     GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
     GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
-    // The shared transponder UDP source may deliver arbitrary byte-sized GstBuffers
-    // (8192 bytes is common).  PID/PSI filtering below operates on complete 188-byte
-    // MPEG-TS packets, so normalize the byte stream first instead of truncating the
-    // partial packet at each GstBuffer boundary.
-    GstElement* tsAlign = gst_element_factory_make("tsparse", "shared_transponder_ts_align");
     GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
     GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
-    if (!pipeline || !source || !inputQueue || !tsAlign || !outputQueue || !sink ||
+    if (!pipeline || !source || !inputQueue || !outputQueue || !sink ||
         !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, tsAlign) || !addElementOrFail(pipeline, outputQueue) ||
-        !addElementOrFail(pipeline, sink)) {
+        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
         if (pipeline) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
             gst_object_unref(pipeline);
@@ -3062,11 +3184,6 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     setStringPropertyIfPresent(source, "multicast-iface", "lo");
     configureQueue(inputQueue, 12000000000ULL);
     configureQueue(outputQueue, 8000000000ULL);
-    // alignment=7 gives complete 7x188-byte MPEG-TS buffers (1316 bytes) after
-    // reassembly across arbitrary udpsrc/GstBuffer boundaries.  No remuxing and no
-    // timestamp smoothing are performed here; payload bytes remain unchanged.
-    setIntPropertyIfPresent(tsAlign, "alignment", 7);
-    setBooleanPropertyIfPresent(tsAlign, "set-timestamps", FALSE);
     g_object_set(sink,
         "host", "127.0.0.1",
         "port", static_cast<gint>(outputPort),
@@ -3076,7 +3193,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
     setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
 
-    if (!gst_element_link_many(source, inputQueue, tsAlign, outputQueue, sink, nullptr)) {
+    if (!gst_element_link_many(source, inputQueue, outputQueue, sink, nullptr)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         releaseDvbServiceRelayPort(outputPort);
@@ -3097,11 +3214,24 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
-    // Observe the exact stream after tsparse has reconstructed complete TS packets
-    // but before PID/PSI filtering.  This should remain CC-clean even when DVB_RAW
-    // arrives in 8192-byte chunks.
+    // Reassemble 188-byte transport packets across arbitrary GstBuffer boundaries.
+    // The raw trace above is intentionally registered first, so DVB_RAW still sees
+    // the original 8192-byte chunks while every downstream stage sees framed TS.
     {
-        GstPad* alignedCcPad = gst_element_get_static_pad(tsAlign, "src");
+        GstPad* framerPad = gst_element_get_static_pad(inputQueue, "src");
+        if (framerPad) {
+            auto* framerContext = new SharedDvbTsFramerContext();
+            framerContext->streamId = state->config.id;
+            gst_pad_add_probe(framerPad, GST_PAD_PROBE_TYPE_BUFFER,
+                sharedDvbTsFramerProbe, framerContext,
+                [](gpointer data) { delete static_cast<SharedDvbTsFramerContext*>(data); });
+            gst_object_unref(framerPad);
+        }
+    }
+
+    // The sink pad is after the custom framer and before PID/PSI filtering.
+    {
+        GstPad* alignedCcPad = gst_element_get_static_pad(outputQueue, "sink");
         if (alignedCcPad) {
             auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_ALIGNED");
             gst_pad_add_probe(alignedCcPad, GST_PAD_PROBE_TYPE_BUFFER,
@@ -3112,9 +3242,8 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     if (state->config.inputServiceId > 0) {
-        // Run packet filtering only after tsparse has reassembled complete 188-byte
-        // packets.  This is the v153 fix for lost tails at 8192-byte buffer boundaries.
-        GstPad* psiPad = gst_element_get_static_pad(tsAlign, "src");
+        // Filter only complete 188-byte packets produced by the custom framer.
+        GstPad* psiPad = gst_element_get_static_pad(outputQueue, "sink");
         if (psiPad) {
             auto* psiContext = new DvbSingleProgramPsiContext();
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
@@ -3205,8 +3334,8 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     std::cerr << "DVB service relay TS framing: stream=" << state->config.id
-              << " stage=pre-spts-filter tsparse_alignment=7 packet_size=188"
-              << " partial-buffer-tail=preserved" << std::endl;
+              << " stage=pre-spts-filter custom_framer=188"
+              << " partial-buffer-tail=preserved parser=none" << std::endl;
 
     relay->pipeline = pipeline;
     relay->bus = gst_element_get_bus(pipeline);
