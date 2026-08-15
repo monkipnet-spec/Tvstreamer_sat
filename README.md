@@ -1,4 +1,11 @@
-# TVStreammerSAT5 — Release 28
+# TVStreammerSAT5 — Release 29
+
+
+### Selected-PMT PCR lock + wire-rate diagnostics (v143)
+
+Release 29 fixes StableUdpOutput PCR selection for shared DVB inputs. During the five-second reservoir warmup the shared frontend can briefly expose PCR-bearing packets from other services before the selected-service PID filter is fully healed. Previous releases locked the periodic 20 ms PCR generator to the first PCR packet seen, which could select the wrong service (for example `pcr_pid=461` while SID 470 PMT declares PCR PID 471). StableUdpOutput now reads the selected program PMT, accepts its declared PCR PID as authoritative, and locks/strips PCR only on that PID. The exact five-second WISI startup reservoir, 7x188 UDP packetization and final all-PID continuity normalization are unchanged.
+
+`UDP shaper stats` also reports `wire=`, `sent_datagrams=` and `send_errors=`. `real=` remains the useful non-NULL TS bitrate, while `wire=` is the actual UDP MPEG-TS payload bitrate accepted by `sendto()`. This makes receiver/network loss directly distinguishable from application-side continuity errors. `ts_missing=` continues to mean GstBuffer PTS/DTS metadata was absent; it is not a lost-TS-packet counter.
 
 
 ### Global stable-UDP continuity + DVB release barrier (v142)
@@ -83,7 +90,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 28 / v142.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 29 / v143.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -480,7 +487,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 28
+Description=TVStreammerSAT5 Release 29
 After=network-online.target
 Wants=network-online.target
 

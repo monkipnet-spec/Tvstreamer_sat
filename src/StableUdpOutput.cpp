@@ -376,6 +376,10 @@ public:
           remapPsiNormalization(cfg.remapEnabled),
           remapOutputServiceId(static_cast<uint16_t>(
               (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU)),
+          expectedProgramId(static_cast<uint16_t>(
+              ((cfg.remapEnabled
+                    ? (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId)
+                    : (cfg.inputServiceId ? cfg.inputServiceId : cfg.serviceId))) & 0xFFFFU)),
           remapServiceName(cfg.serviceName.empty() ? cfg.name : cfg.serviceName),
           remapServiceProvider(cfg.serviceProvider) {
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
@@ -644,7 +648,8 @@ private:
             // sufficient to lock the periodic 20 ms output PCR generator.
             std::size_t startupPcrPackets = 0;
             for (const auto& packet : realPackets) {
-                if (packet.hasPcr) {
+                if (packet.hasPcr &&
+                    (!declaredPcrPidValid || packet.pid == declaredPcrPid)) {
                     ++startupPcrPackets;
                 }
             }
@@ -757,6 +762,7 @@ private:
             TimedTsPacket packet;
             std::copy_n(bytes.data() + offset, kTsPacketSize, packet.bytes.data());
             normalizeRemappedPsi(packet.bytes);
+            observeDeclaredPcrFromPmt(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             realPackets.push_back(std::move(packet));
@@ -816,6 +822,42 @@ private:
                       << " SDT=regenerated profile=ip-remux-equivalent"
                       << std::endl;
             finalSdtAnnounced = true;
+        }
+    }
+
+    void observeDeclaredPcrFromPmt(const std::array<guint8, kTsPacketSize>& packet) {
+        if (packet[0] != 0x47) return;
+
+        std::size_t available = 0;
+        const guint8* section = tsPayloadStart(packet, available, true);
+        if (!section || available < 12 || section[0] != 0x02) return; // PMT
+
+        const uint16_t sectionLength = static_cast<uint16_t>(
+            ((section[1] & 0x0F) << 8) | section[2]);
+        const std::size_t totalSectionBytes = static_cast<std::size_t>(sectionLength) + 3U;
+        if (sectionLength < 9 || totalSectionBytes > available) {
+            // The service PMTs used by the DVB relay normally fit in one TS
+            // packet. Do not guess from a truncated section; a later repeated
+            // PMT will be observed again.
+            return;
+        }
+
+        const uint16_t programNumber = static_cast<uint16_t>(
+            (static_cast<uint16_t>(section[3]) << 8) | section[4]);
+        if (expectedProgramId != 0 && programNumber != expectedProgramId) return;
+
+        const uint16_t pcrPid = static_cast<uint16_t>(
+            (static_cast<uint16_t>(section[8] & 0x1F) << 8) | section[9]);
+        if (pcrPid >= 0x1FFF) return;
+
+        if (!declaredPcrPidValid || declaredPcrPid != pcrPid || declaredPcrProgram != programNumber) {
+            declaredPcrPid = pcrPid;
+            declaredPcrProgram = programNumber;
+            declaredPcrPidValid = true;
+            std::cerr << "UDP PCR selector: program=" << declaredPcrProgram
+                      << " declared_pcr_pid=" << declaredPcrPid
+                      << " source=PMT first-PCR-lock=disabled"
+                      << std::endl;
         }
     }
 
@@ -1009,22 +1051,31 @@ private:
 
                 if (packet.hasPcr) {
                     if (!periodicPcrInitialized) {
-                        // Lock the generated PCR clock to the first PCR emitted
-                        // by mpegtsmux. From this point onward PCR cadence is
-                        // generated independently of source packet bursts.
-                        periodicPcrPid = packet.pid;
-                        periodicPcrOriginTicks = packet.sourcePcrTicks;
-                        periodicPcrOriginNanoseconds = slotTime;
-                        nextPeriodicPcrNanoseconds =
-                            slotTime + kPeriodicPcrIntervalNanoseconds;
-                        periodicPcrInitialized = true;
-                        writePcr(packet.bytes, periodicPcrOriginTicks);
-                        ++rewrittenPcrPackets;
-                    } else {
-                        // Original PCR-bearing packets are still useful TS
-                        // packets, but their irregular PCR occurrences would
-                        // reintroduce 80-100+ ms gaps. Keep the packet and turn
-                        // the PCR bytes into adaptation stuffing.
+                        // Never lock the WISI output clock to an arbitrary PCR
+                        // seen during shared-DVB full-TS warmup.  The PMT for the
+                        // selected service is authoritative.  v142 could lock to
+                        // another service (for example PID 461 while SID 470
+                        // declares PCR PID 471), after which periodic PCR was
+                        // emitted forever on the wrong PID.
+                        const bool selectedPcr = declaredPcrPidValid &&
+                            packet.pid == declaredPcrPid;
+                        if (selectedPcr) {
+                            periodicPcrPid = declaredPcrPid;
+                            periodicPcrOriginTicks = packet.sourcePcrTicks;
+                            periodicPcrOriginNanoseconds = slotTime;
+                            nextPeriodicPcrNanoseconds =
+                                slotTime + kPeriodicPcrIntervalNanoseconds;
+                            periodicPcrInitialized = true;
+                            writePcr(packet.bytes, periodicPcrOriginTicks);
+                            ++rewrittenPcrPackets;
+                            std::cerr << "UDP PCR lock: program=" << declaredPcrProgram
+                                      << " pcr_pid=" << periodicPcrPid
+                                      << " source=selected-PMT" << std::endl;
+                        }
+                    } else if (packet.pid == periodicPcrPid) {
+                        // Strip only source PCR on the selected PCR PID. PCRs
+                        // from an unrelated warmup packet are not allowed to
+                        // redefine or disturb the selected service clock.
                         clearPcrFlag(packet.bytes);
                         ++strippedSourcePcrPackets;
                     }
@@ -1171,8 +1222,19 @@ private:
         const socklen_t destinationSize = sizeof(destinationAddress);
         const ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
         if (sent < 0) {
+            ++sendErrors;
             std::cerr << "UDP send failed: " << std::strerror(errno) << std::endl;
-        } else if (networkBytes) {
+            return;
+        }
+        if (static_cast<std::size_t>(sent) != size) {
+            ++sendErrors;
+            std::cerr << "UDP partial datagram send: requested=" << size
+                      << " sent=" << sent << std::endl;
+            return;
+        }
+        ++sentDatagrams;
+        sentBytes.fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
+        if (networkBytes) {
             networkBytes->fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
         }
     }
@@ -1191,6 +1253,10 @@ private:
         const uint64_t realBitrate = elapsed > 0
             ? multiplyDivide(real * kTsPacketSize * 8ULL, 1000000000ULL, elapsed)
             : 0;
+        const uint64_t sentBytesNow = sentBytes.load(std::memory_order_relaxed);
+        const uint64_t wireBitrate = elapsed > 0
+            ? multiplyDivide(sentBytesNow * 8ULL, 1000000000ULL, elapsed)
+            : 0;
 
         std::cerr << "UDP shaper stats: mode=" << shapingModeName(mode)
                   << " configured_target=" << configuredTargetBitrate
@@ -1198,6 +1264,9 @@ private:
                   << " real=" << realBitrate
                   << " input_est=" << inputBitrateEstimate.load(std::memory_order_relaxed)
                   << " real_pace=" << realPaceBitrate.load(std::memory_order_relaxed)
+                  << " wire=" << wireBitrate
+                  << " sent_datagrams=" << sentDatagrams.load(std::memory_order_relaxed)
+                  << " send_errors=" << sendErrors.load(std::memory_order_relaxed)
                   << " buffered=" << bufferedBytes.load(std::memory_order_relaxed) << "B"
                   << " buffer_ms=" << reservoirMilliseconds.load(std::memory_order_relaxed)
                   << " target_buffer=" << targetReservoirBytes.load(std::memory_order_relaxed) << "B"
@@ -1207,6 +1276,8 @@ private:
                   << " pcr_source_stripped=" << strippedSourcePcrPackets.load(std::memory_order_relaxed)
                   << " pcr_missed_intervals=" << missedPeriodicPcrIntervals.load(std::memory_order_relaxed)
                   << " pcr_pid=" << periodicPcrPid
+                  << " pcr_declared=" << (declaredPcrPidValid ? declaredPcrPid : 0x1FFF)
+                  << " pcr_program=" << declaredPcrProgram
                   << " timing=reservoir_rate_controller_periodic_pcr"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
@@ -1245,6 +1316,10 @@ private:
     bool normalizeOutputContinuity = true;
     bool remapPsiNormalization = false;
     uint16_t remapOutputServiceId = 0;
+    uint16_t expectedProgramId = 0;
+    uint16_t declaredPcrPid = 0x1FFF;
+    uint16_t declaredPcrProgram = 0;
+    bool declaredPcrPidValid = false;
     std::string remapServiceName;
     std::string remapServiceProvider;
     uint16_t sdtTransportStreamId = 1;
@@ -1298,6 +1373,9 @@ private:
     std::atomic<uint64_t> reservoirMilliseconds{0};
     std::atomic<uint64_t> targetReservoirBytes{0};
     std::atomic<uint64_t> totalDatagrams{0};
+    std::atomic<uint64_t> sentDatagrams{0};
+    std::atomic<uint64_t> sentBytes{0};
+    std::atomic<uint64_t> sendErrors{0};
     std::atomic<uint64_t> totalRealPackets{0};
     std::atomic<uint64_t> totalNullPackets{0};
     std::atomic<uint64_t> rewrittenPcrPackets{0};
