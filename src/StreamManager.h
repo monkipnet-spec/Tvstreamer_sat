@@ -57,6 +57,7 @@ struct SharedDvbFrontendState {
     size_t consumers = 0;
     std::map<std::string, std::set<uint16_t>> consumerPids;
     std::string requestedPids;
+    bool fullTsCapture = false;
 };
 
 struct DvbServiceRelayState {
@@ -88,6 +89,7 @@ struct StreamState {
     uint16_t sharedDvbMulticastPort = 0;
     std::string sharedDvbServiceRelayUri;
     std::string sharedDvbServicePids;
+    bool sharedDvbPreferFullTsCapture = false;
     bool dvbTsRemapApplied = false;
     std::unique_ptr<DvbServiceRelayState> dvbServiceRelay;
     // Runtime PAT result used only when input_service_id=0 (Auto).

@@ -20,6 +20,7 @@
 #include <sstream>
 #include <functional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <glib.h>
@@ -351,7 +352,14 @@ bool buildSharedDvbPids(
     const std::map<std::string, std::set<uint16_t>>& consumers,
     std::string& requestedPids,
     size_t& filterCount,
-    std::string& error) {
+    std::string& error,
+    bool forceFullTransportStream = false) {
+    if (forceFullTransportStream) {
+        requestedPids = "8192";
+        filterCount = 1;
+        return true;
+    }
+
     constexpr size_t kMaxDvbSrcFilters = 32;
     std::set<uint16_t> unionPids;
     bool fullTransportStream = false;
@@ -385,9 +393,14 @@ bool applySharedDvbPids(
     const std::map<std::string, std::set<uint16_t>>& consumers,
     size_t& filterCount,
     std::string& error,
-    bool restartSource = false) {
+    bool restartSource = false,
+    bool forceFullTransportStream = false) {
     std::string requestedPids;
-    if (!buildSharedDvbPids(consumers, requestedPids, filterCount, error)) return false;
+    if (!buildSharedDvbPids(
+            consumers, requestedPids, filterCount, error,
+            forceFullTransportStream)) {
+        return false;
+    }
     if (shared.source && requestedPids != shared.requestedPids) {
         if (restartSource && shared.pipeline) {
             if (gst_element_set_state(shared.pipeline, GST_STATE_READY) ==
@@ -2364,6 +2377,14 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             initialConsumers, frontendPids, pidFilterCount, error)) {
         return false;
     }
+    const std::string serviceFrontendPids = frontendPids;
+    const size_t servicePidFilterCount = pidFilterCount;
+    const bool preferFullTsCapture = state->sharedDvbPreferFullTsCapture &&
+        !servicePids.empty() && serviceFrontendPids != "8192";
+    if (preferFullTsCapture) {
+        frontendPids = "8192";
+        pidFilterCount = 1;
+    }
     const std::string device = "/dev/dvb/adapter" + std::to_string(params.adapter) +
                                "/frontend" + std::to_string(params.frontend);
     if (!std::filesystem::exists(device)) {
@@ -2392,7 +2413,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             activeConsumers[consumerId] = servicePids;
             size_t activeFilterCount = 0;
             if (!applySharedDvbPids(
-                    *existing->second, activeConsumers, activeFilterCount, error)) {
+                    *existing->second, activeConsumers, activeFilterCount, error,
+                    false, existing->second->fullTsCapture)) {
                 return false;
             }
             ++existing->second->consumers;
@@ -2479,11 +2501,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     shared->pipeline = pipeline;
     shared->source = source;
     shared->bus = gst_element_get_bus(pipeline);
-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    std::string startupError;
-    if (!waitForGstStartup(pipeline, shared->bus, stateResult, 8 * GST_SECOND,
-            "failed to start shared DVB frontend", startupError)) {
-        error = startupError;
+
+    const auto appendStartupContext = [&]() {
         std::ostringstream context;
         context << " [device=/dev/dvb/adapter" << params.adapter
                 << "/frontend" << params.frontend
@@ -2491,9 +2510,49 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                 << " symbol_rate=" << params.symbolRateK
                 << " polarity=" << params.polarity
                 << "; check device existence, permissions, adapter use and signal]";
-        error += context.str();
+        return context.str();
+    };
+    const auto resetFailedStart = [&]() {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
+    };
+    const auto startWithCurrentPids = [&]() {
+        const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        std::string startupError;
+        const bool ok = waitForGstStartup(
+            pipeline, shared->bus, stateResult, 8 * GST_SECOND,
+            "failed to start shared DVB frontend", startupError);
+        return std::pair<bool, std::string>(ok, startupError);
+    };
+
+    auto [started, startupError] = startWithCurrentPids();
+    if (!started && preferFullTsCapture &&
+        !serviceFrontendPids.empty() && serviceFrontendPids != "8192") {
+        const std::string fullTsError = startupError;
+        resetFailedStart();
+        frontendPids = serviceFrontendPids;
+        pidFilterCount = servicePidFilterCount;
+        g_object_set(source, "pids", frontendPids.c_str(), nullptr);
+        std::cerr << "Shared DVB CA frontend full-TS rejected: stream=" << state->config.id
+                  << " SID=" << state->config.inputServiceId
+                  << " retry_pids=" << frontendPids
+                  << " full_ts_error=" << fullTsError << std::endl;
+        auto retry = startWithCurrentPids();
+        started = retry.first;
+        startupError = retry.second;
+        if (started) {
+            std::cerr << "Shared DVB CA frontend fallback active: stream=" << state->config.id
+                      << " SID=" << state->config.inputServiceId
+                      << " pids=" << frontendPids
+                      << " reason=full-ts-not-supported-by-driver" << std::endl;
+        } else {
+            startupError = "full-TS failed: " + fullTsError +
+                "; service PID fallback failed: " + startupError;
+        }
+    }
+    if (!started) {
+        error = startupError + appendStartupContext();
+        resetFailedStart();
         if (shared->bus) {
             gst_object_unref(shared->bus);
             shared->bus = nullptr;
@@ -2502,6 +2561,9 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         shared->pipeline = nullptr;
         return false;
     }
+
+    shared->requestedPids = frontendPids;
+    shared->fullTsCapture = preferFullTsCapture && frontendPids == "8192";
 
     state->sharedDvbInput = true;
     state->sharedDvbFrontendKey = frontendKey;
@@ -2528,7 +2590,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             activeConsumers[consumerId] = servicePids;
             size_t activeFilterCount = 0;
             if (!applySharedDvbPids(
-                    *existing->second, activeConsumers, activeFilterCount, error)) {
+                    *existing->second, activeConsumers, activeFilterCount, error,
+                    false, existing->second->fullTsCapture)) {
                 gst_element_set_state(shared->pipeline, GST_STATE_NULL);
                 gst_element_get_state(shared->pipeline, nullptr, nullptr, GST_SECOND);
                 if (shared->bus) gst_object_unref(shared->bus);
@@ -2581,7 +2644,7 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
                 std::string pidError;
                 if (!applySharedDvbPids(
                         *found->second, activeConsumers, activeFilterCount,
-                        pidError, true)) {
+                        pidError, true, found->second->fullTsCapture)) {
                     std::cerr << "Shared DVB PID filter shrink failed: " << key
                               << " error=" << pidError << std::endl;
                 }
@@ -2611,6 +2674,7 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
     state->sharedDvbMulticastAddress.clear();
     state->sharedDvbMulticastPort = 0;
     state->sharedDvbServicePids.clear();
+    state->sharedDvbPreferFullTsCapture = false;
 }
 
 bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error) {
@@ -2805,6 +2869,8 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
         return false;
     }
     state->runtimeConfig = state->config;
+    state->sharedDvbServicePids.clear();
+    state->sharedDvbPreferFullTsCapture = false;
     if (state->config.testPattern || !DvbSatellite::isDvbUri(state->config.inputUri)) return true;
 
     DvbSatelliteParams params;
@@ -2829,16 +2895,14 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
     }
 
     state->sharedDvbServicePids = params.pids;
-    if (!state->config.conditionalAccessClient.empty() &&
+    state->sharedDvbPreferFullTsCapture = !state->config.conditionalAccessClient.empty() &&
         state->config.inputServiceId > 0 &&
-        !params.pids.empty() && params.pids != "8192") {
-        DvbSatelliteParams frontendParams = params;
-        frontendParams.pids = "8192";
-        state->runtimeConfig.inputUri = DvbSatellite::buildUri(frontendParams);
-        std::cerr << "Shared DVB CA frontend full-TS capture: stream=" << state->config.id
+        !params.pids.empty() && params.pids != "8192";
+    if (state->sharedDvbPreferFullTsCapture) {
+        std::cerr << "Shared DVB CA frontend full-TS preferred: stream=" << state->config.id
                   << " SID=" << state->config.inputServiceId
                   << " software_service_pids=" << state->sharedDvbServicePids
-                  << " reason=avoid-hardware-pid-filter-loss-for-scrambled-service" << std::endl;
+                  << " fallback=service-pid-filter" << std::endl;
     }
 
     if (!acquireSharedDvbFrontend(state, error)) return false;
