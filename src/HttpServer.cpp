@@ -1661,8 +1661,17 @@ std::string HttpServer::handleStopStream(const std::string& body) {
             response["error"] = "missing stream id";
         } else {
             const bool stopped = streamManager.stopStream(id);
-            response["result"] = stopped ? "ok" : "error";
-            if (!stopped) response["error"] = "stream is not active: " + id;
+            const bool configured = std::any_of(
+                configManager.config.streams.begin(), configManager.config.streams.end(),
+                [&id](const StreamConfig& stream) { return stream.id == id; });
+            if (stopped || configured) {
+                response["result"] = "ok";
+                response["already_stopped"] = !stopped;
+                response["status"] = "stopped";
+            } else {
+                response["result"] = "error";
+                response["error"] = "stream is not configured: " + id;
+            }
             response["stream_id"] = id;
         }
     }
@@ -2177,6 +2186,17 @@ function setStreamStatusMessage(id, message, level='info') {
   target.title = message || '';
   target.dataset.level = level;
 }
+function markStreamStoppedInUi(id, message='stopped') {
+  const stream = streamById(id);
+  if (!stream) return;
+  stream.active = false;
+  stream.status = message;
+  stream.using_backup = false;
+  stream.bitrate_in_kbps = 0;
+  stream.bitrate_out_kbps = 0;
+  if (stream.conditional_access_client) stream.ca_decode_state = 'offline';
+  render(false);
+}
 function restoreStreamButton(button, text) {
   if (!button) return;
   button.disabled = false;
@@ -2571,11 +2591,17 @@ async function toggleStream(id, active, button=null) {
   try {
     const data = await fetchJson(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}, active ? 15000 : 45000);
     if (data.result === 'error') throw new Error(data.error || (active ? 'Stop failed' : 'Start failed'));
+    if (active) markStreamStoppedInUi(id, data.already_stopped ? 'stopped' : 'stopping');
     setStreamStatusMessage(id, active ? 'Stop command accepted' : 'Start command accepted', 'ok');
   } catch (error) {
     const message = error?.message || String(error);
-    setStreamStatusMessage(id, message, 'error');
-    uiError(message);
+    if (active && message.includes('stream is not active')) {
+      markStreamStoppedInUi(id, 'stopped');
+      setStreamStatusMessage(id, 'Already stopped', 'ok');
+    } else {
+      setStreamStatusMessage(id, message, 'error');
+      uiError(message);
+    }
   } finally {
     clearTimeout(restoreTimer);
     streamActionBusy.delete(id);
