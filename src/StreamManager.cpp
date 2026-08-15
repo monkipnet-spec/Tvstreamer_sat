@@ -2609,6 +2609,19 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
+    // Use the same per-frontend tune gate as /api/dvb-signal and /api/dvb-scan.
+    // This closes the race where the Add Channel modal successfully scans a
+    // tuner, then its background signal probe still owns dvbsrc while the newly
+    // created tile immediately tries to open the same frontend.
+    const auto frontendTuneWaitStarted = std::chrono::steady_clock::now();
+    auto frontendTuneGuard = DvbSatellite::acquireFrontendTuneGuard(params);
+    const auto frontendTuneWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - frontendTuneWaitStarted).count();
+    if (frontendTuneWaitMs >= 10) {
+        std::cerr << "DVB stream startup waited for scan/signal frontend gate: "
+                  << frontendKey << " wait_ms=" << frontendTuneWaitMs << std::endl;
+    }
+
     {
         std::unique_lock<std::mutex> lock(managerMutex);
         if (releasingDvbFrontends.count(frontendKey) != 0) {

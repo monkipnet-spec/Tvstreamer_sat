@@ -1,4 +1,9 @@
-# TVStreammerSAT5 — Release 31
+# TVStreammerSAT5 — Release 32
+
+### DVB scan → tile frontend handoff (v146)
+
+Release 32 fixes the race after a successful DVB-S/S2 scan where the Add Channel modal could immediately restart `/api/dvb-signal`, reopening the same `dvbsrc` just as the newly saved tile tried to start. Scan/signal probes and real shared-DVB stream startup now use the same per-adapter/frontend tune gate. The modal no longer restarts periodic signal polling after a completed scan, saving selected channels explicitly stops probing, and the scan pipeline keeps the frontend gate for a short driver-settle interval after transitioning to NULL. This does not change Stable UDP/WISI packetization, the exact 5-second startup reservoir, periodic PCR, CBR/VBR shaping, remap, or CA behavior.
+
 
 
 ### DVB adapter selection integrity (v145)

@@ -841,6 +841,11 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
 
     resetTunePipeline(pipeline);
     gst_object_unref(pipeline);
+    // Keep the per-frontend tune guard for a short driver-settle window after
+    // dvbsrc has closed the device. Some DVB drivers release frontend/demux
+    // ownership just after the NULL transition; without this handoff window a
+    // stream started immediately after a scan can see a transient EBUSY.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
 
     result["locked"] = stats.locked;
     result["signal"] = stats.signalPercent;
@@ -893,6 +898,10 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
 } // namespace
 
 namespace DvbSatellite {
+
+std::unique_lock<std::mutex> acquireFrontendTuneGuard(const DvbSatelliteParams& params) {
+    return std::unique_lock<std::mutex>(frontendTuneMutex(params));
+}
 
 bool isDvbUri(const std::string& uri) {
     return lower(uri).rfind("dvb://", 0) == 0;

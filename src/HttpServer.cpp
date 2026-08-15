@@ -2873,7 +2873,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 31'} / ${state.program_version||'v145'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 32'} / ${state.program_version||'v146'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -3380,12 +3380,20 @@ async function startSatelliteScan() {
   } finally {
     satelliteScanning = false;
     if (button) button.disabled = false;
-    if (document.getElementById('satFrequency')) {
-      window.setTimeout(() => { if (document.getElementById('satFrequency')) scheduleSatelliteSignalPolling(); }, holdLock ? 1200 : 0);
-    }
+    // Do not restart background /api/dvb-signal polling after a scan. The scan
+    // already produced the final signal/quality snapshot. Reopening dvbsrc here
+    // can race the Start button of a newly saved tile and make the real stream
+    // fail with gst_base_src_start()/EBUSY. Changing tuner parameters still
+    // performs an explicit one-shot signal update.
+    clearInterval(satelliteSignalTimer);
+    satelliteSignalTimer = null;
   }
 }
 async function saveSelectedSatelliteChannels() {
+  // Stop and abort modal probing before saving. The server-side stream startup
+  // uses the same frontend gate, so even an already-dispatched probe must finish
+  // and release dvbsrc before the tile can acquire the tuner.
+  stopSatelliteSignalPolling();
   const selected = [...document.querySelectorAll('.sat-service-check:checked')]
     .map(input => satelliteServices[Number(input.dataset.index)])
     .filter(Boolean);

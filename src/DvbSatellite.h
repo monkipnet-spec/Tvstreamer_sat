@@ -4,6 +4,7 @@
 #include <jsoncpp/json/json.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 struct DvbSatelliteParams {
@@ -31,6 +32,9 @@ bool parseUri(const std::string& uri, DvbSatelliteParams& params, std::string& e
 std::string buildUri(const DvbSatelliteParams& params);
 
 bool configureSource(GstElement* source, const DvbSatelliteParams& params, std::string& error);
+// Serialize short-lived scan/signal pipelines with a real stream startup on the
+// same physical frontend. The guard is released automatically when destroyed.
+std::unique_lock<std::mutex> acquireFrontendTuneGuard(const DvbSatelliteParams& params);
 Json::Value adapters();
 Json::Value scan(const Json::Value& request);
 Json::Value signal(const Json::Value& request);
