@@ -177,6 +177,7 @@ struct DvbSingleProgramPsiContext {
     uint16_t requestedAudioPid = 0;
     uint16_t inputVideoPid = 0;
     uint16_t inputAudioPid = 0;
+    bool remapPmtRewritten = false;
     bool remapAnnounced = false;
     // When the physical DVB frontend is shared, every service sees the full
     // transponder. Compact the buffer to the PID set discovered by the channel
@@ -584,6 +585,10 @@ void parsePatForSelectedPmt(const uint8_t* section, size_t total, DvbSingleProgr
         if (program == ctx->serviceId && mappedPid > 0 && mappedPid < 0x1FFF) {
             if (ctx->pmtPid != mappedPid) {
                 ctx->pmtPid = mappedPid;
+                ctx->inputVideoPid = 0;
+                ctx->inputAudioPid = 0;
+                ctx->remapPmtRewritten = false;
+                ctx->remapAnnounced = false;
                 ctx->allowedPids[mappedPid] = true;
                 ctx->pmtSectionBuffer.clear();
                 ctx->pmtSectionExpected = 0;
@@ -621,7 +626,13 @@ void discoverSelectedPmtFromPacket(const uint8_t* packet, DvbSingleProgramPsiCon
     // present in saved pids even if PAT was too large or delayed.
     if (pid != 0x0000 && section[0] == 0x02 && available >= 8) {
         const uint16_t program = static_cast<uint16_t>((section[3] << 8) | section[4]);
-        if (program == ctx->serviceId) ctx->pmtPid = pid;
+        if (program == ctx->serviceId && ctx->pmtPid != pid) {
+            ctx->pmtPid = pid;
+            ctx->inputVideoPid = 0;
+            ctx->inputAudioPid = 0;
+            ctx->remapPmtRewritten = false;
+            ctx->remapAnnounced = false;
+        }
     }
 }
 
@@ -708,7 +719,18 @@ void healAllowedPidsFromSelectedPmt(uint8_t* packet, DvbSingleProgramPsiContext*
     }
 }
 uint16_t advertisedDvbServiceId(const DvbSingleProgramPsiContext& ctx) {
+    if (!ctx.remapEnabled || ctx.outputServiceId == 0) return ctx.serviceId;
+    return (ctx.remapPmtRewritten || ctx.outputServiceId == ctx.serviceId)
+        ? ctx.outputServiceId
+        : ctx.serviceId;
+}
+
+uint16_t requestedDvbServiceId(const DvbSingleProgramPsiContext& ctx) {
     return ctx.remapEnabled && ctx.outputServiceId > 0 ? ctx.outputServiceId : ctx.serviceId;
+}
+
+bool isValidDvbElementaryPid(uint32_t pid) {
+    return pid >= 0x20 && pid < 0x1FFF;
 }
 
 bool isDvbVideoStreamType(uint8_t streamType) {
@@ -771,7 +793,7 @@ void rewriteDvbRemapPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
         pos += 5 + esInfoLength;
     }
 
-    const uint16_t outputSid = advertisedDvbServiceId(*ctx);
+    const uint16_t outputSid = requestedDvbServiceId(*ctx);
     section[3] = static_cast<uint8_t>(outputSid >> 8);
     section[4] = static_cast<uint8_t>(outputSid & 0xFF);
 
@@ -802,18 +824,25 @@ void rewriteDvbRemapPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
     section[total - 3] = static_cast<uint8_t>((crc >> 16) & 0xFF);
     section[total - 2] = static_cast<uint8_t>((crc >> 8) & 0xFF);
     section[total - 1] = static_cast<uint8_t>(crc & 0xFF);
+    ctx->remapPmtRewritten = true;
 
-    if (!ctx->remapAnnounced && ctx->inputVideoPid && ctx->inputAudioPid) {
+    if (!ctx->remapAnnounced) {
+        const bool pidRemap = ctx->requestedVideoPid && ctx->requestedAudioPid;
         std::cerr << "DVB TS remap: SID=" << ctx->serviceId << "->" << outputSid
-                  << " video=" << ctx->inputVideoPid << "->" << ctx->requestedVideoPid
-                  << " audio=" << ctx->inputAudioPid << "->" << ctx->requestedAudioPid
-                  << " mode=packet-pid-rewrite-no-demux-no-remux" << std::endl;
+                  << " mode=" << (pidRemap ? "packet-av-pid-rewrite-no-demux-no-remux"
+                                             : "packet-sid-only-no-demux-no-remux");
+        if (pidRemap) {
+            std::cerr << " video=" << ctx->inputVideoPid << "->" << ctx->requestedVideoPid
+                      << " audio=" << ctx->inputAudioPid << "->" << ctx->requestedAudioPid;
+        }
+        std::cerr << std::endl;
         ctx->remapAnnounced = true;
     }
 }
 
 void rewriteDvbRemapPacketPid(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
     if (!packet || !ctx.remapEnabled || packet[0] != 0x47) return;
+    if (!ctx.remapPmtRewritten || !ctx.requestedVideoPid || !ctx.requestedAudioPid) return;
     uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
     uint16_t mapped = pid;
     if (ctx.inputVideoPid && pid == ctx.inputVideoPid && ctx.requestedVideoPid) mapped = ctx.requestedVideoPid;
@@ -962,7 +991,11 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 
         healAllowedPidsFromSelectedPmt(packet, ctx);
 
-        const bool filterReady = !ctx->filterPids || ctx->pidSelfHealAnnounced;
+        const bool remapPidMappingPending = ctx->remapEnabled &&
+            (ctx->requestedVideoPid || ctx->requestedAudioPid) &&
+            !ctx->remapPmtRewritten;
+        const bool filterReady = !ctx->filterPids ||
+            (ctx->pidSelfHealAnnounced && !remapPidMappingPending);
         if (ctx->filterPids && !filterReady && !ctx->pidFilterWarmupAnnounced) {
             std::cerr << "DVB SPTS PID filter warmup: SID=" << ctx->serviceId
                       << " saved_pid_filter=pending-pmt full-ts-pass-until-healed" << std::endl;
@@ -2591,13 +2624,23 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         return false;
     }
 
+    const uint32_t remapOutputSid = state->config.serviceId
+        ? state->config.serviceId
+        : state->config.inputServiceId;
+    const bool remapVideoPidValid = isValidDvbElementaryPid(state->config.videoPid);
+    const bool remapAudioPidValid = isValidDvbElementaryPid(state->config.audioPid);
+    const bool remapPidFieldsConfigured = state->config.videoPid != 0 || state->config.audioPid != 0;
+    const bool dvbPacketPidRemap = state->config.remapEnabled &&
+        remapVideoPidValid && remapAudioPidValid &&
+        state->config.videoPid != state->config.audioPid;
+
     if (state->config.remapEnabled) {
-        const uint32_t vpid = state->config.videoPid;
-        const uint32_t apid = state->config.audioPid;
-        const uint32_t sid = state->config.serviceId;
-        if (sid == 0 || sid > 0xFFFF || vpid < 0x20 || vpid >= 0x1FFF ||
-            apid < 0x20 || apid >= 0x1FFF || vpid == apid) {
-            error = "DVB remap requires valid non-zero output SID and distinct V-PID/A-PID (32..8190)";
+        if (remapOutputSid == 0 || remapOutputSid > 0xFFFF) {
+            error = "DVB remap requires a valid output SID or input SID (1..65535)";
+            return false;
+        }
+        if (remapPidFieldsConfigured && !dvbPacketPidRemap) {
+            error = "DVB remap PID mode requires distinct V-PID/A-PID (32..8190); clear both for SID-only remap";
             return false;
         }
     }
@@ -2669,9 +2712,13 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             psiContext->serviceName = state->config.serviceName;
             psiContext->serviceProvider = state->config.serviceProvider;
             psiContext->remapEnabled = state->config.remapEnabled;
-            psiContext->outputServiceId = static_cast<uint16_t>((state->config.serviceId ? state->config.serviceId : state->config.inputServiceId) & 0xFFFFU);
-            psiContext->requestedVideoPid = static_cast<uint16_t>(state->config.videoPid & 0x1FFFU);
-            psiContext->requestedAudioPid = static_cast<uint16_t>(state->config.audioPid & 0x1FFFU);
+            psiContext->outputServiceId = static_cast<uint16_t>(remapOutputSid & 0xFFFFU);
+            psiContext->requestedVideoPid = dvbPacketPidRemap
+                ? static_cast<uint16_t>(state->config.videoPid & 0x1FFFU)
+                : 0;
+            psiContext->requestedAudioPid = dvbPacketPidRemap
+                ? static_cast<uint16_t>(state->config.audioPid & 0x1FFFU)
+                : 0;
             configureServicePidFilter(*psiContext, params.pids);
             if (!psiContext->filterPids) {
                 std::cerr << "Shared DVB service relay warning: stream=" << state->config.id
@@ -2727,7 +2774,10 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
               << " transponder=udp://@" << state->sharedDvbMulticastAddress
               << ":" << state->sharedDvbMulticastPort
               << " service=" << state->sharedDvbServiceRelayUri
-              << " mode=PID-passthrough-no-remux" << std::endl;
+              << " mode=" << (state->config.remapEnabled
+                    ? (dvbPacketPidRemap ? "PID-passthrough-dvb-remap-av-pids"
+                                         : "PID-passthrough-dvb-remap-sid-only")
+                    : "PID-passthrough-no-remux") << std::endl;
     return true;
 }
 
