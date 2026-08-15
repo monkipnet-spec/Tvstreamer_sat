@@ -1,4 +1,5 @@
 #include "StableUdpOutput.h"
+#include "TsCcStageTrace.h"
 
 #include <gst/app/gstappsink.h>
 
@@ -367,6 +368,7 @@ class StableUdpSender {
 public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
+          preSendCcTrace(cfg.id, "PRE_SEND"),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // StableUdpOutput creates a new paced UDP transport domain for every
           // source, not only Remap ON. Normalize final CC for both IP and DVB
@@ -1218,6 +1220,9 @@ private:
     }
 
     void sendDatagram(const guint8* data, std::size_t size) {
+        // Passive v152 checkpoint after PCR insertion/final CC normalization
+        // and immediately before the kernel sendto() call. No bytes are changed.
+        preSendCcTrace.inspect(data, size);
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
         const socklen_t destinationSize = sizeof(destinationAddress);
         const ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
@@ -1309,6 +1314,7 @@ private:
     }
 
     std::atomic<uint64_t>* networkBytes = nullptr;
+    TsCcStageTrace preSendCcTrace;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;

@@ -1,6 +1,7 @@
 #include "StreamManager.h"
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
+#include "TsCcStageTrace.h"
 #include "UdpInput.h"
 #include "DvbSatellite.h"
 #include "CardManager.h"
@@ -1274,6 +1275,24 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
     return GST_PAD_PROBE_OK;
 }
 
+
+struct TsCcStageProbeContext {
+    explicit TsCcStageProbeContext(std::string streamId, std::string stage)
+        : trace(std::move(streamId), std::move(stage)) {}
+    TsCcStageTrace trace;
+};
+
+GstPadProbeReturn tsCcStageProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<TsCcStageProbeContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = gst_pad_probe_info_get_buffer(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+    ctx->trace.inspect(map.data, map.size);
+    gst_buffer_unmap(buffer, &map);
+    return GST_PAD_PROBE_OK;
+}
 
 struct CaBackendTsProbeContext {
     std::string streamId;
@@ -3054,6 +3073,19 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         return false;
     }
 
+    // v152 passive stage-by-stage CC trace. The first probe observes the raw
+    // shared transponder before SPTS filtering/remap. It never rewrites bytes.
+    {
+        GstPad* rawCcPad = gst_element_get_static_pad(inputQueue, "src");
+        if (rawCcPad) {
+            auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_RAW");
+            gst_pad_add_probe(rawCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                tsCcStageProbe, ccContext,
+                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+            gst_object_unref(rawCcPad);
+        }
+    }
+
     if (state->config.inputServiceId > 0) {
         GstPad* psiPad = gst_element_get_static_pad(inputQueue, "src");
         if (psiPad) {
@@ -3085,6 +3117,19 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
+    // This probe is registered before the CA hook, therefore it sees the
+    // selected SPTS after PID/PSI filtering but before any CA transformation.
+    {
+        GstPad* preCaCcPad = gst_element_get_static_pad(outputQueue, "src");
+        if (preCaCcPad) {
+            auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
+            gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                tsCcStageProbe, ccContext,
+                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+            gst_object_unref(preCaCcPad);
+        }
+    }
+
     if (!state->config.conditionalAccessClient.empty()) {
         GstPad* caPad = gst_element_get_static_pad(outputQueue, "src");
         if (caPad) {
@@ -3100,6 +3145,19 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             std::cerr << "CA backend transport hook attached: stream=" << state->config.id
                       << " cam_client=" << state->config.conditionalAccessClient
                       << " stage=selected-dvb-spts" << std::endl;
+        }
+    }
+
+    // Registered after the CA probe, so this observes the exact TS leaving
+    // the CA hook. Comparing SPTS_PRE_CA and POST_CA isolates any CC change.
+    {
+        GstPad* postCaCcPad = gst_element_get_static_pad(outputQueue, "src");
+        if (postCaCcPad) {
+            auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
+            gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                tsCcStageProbe, ccContext,
+                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+            gst_object_unref(postCaCcPad);
         }
     }
 
@@ -5643,6 +5701,17 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     if (directStableUdpTs) {
+        // Last passive GStreamer-side checkpoint immediately before the
+        // StableUdpOutput appsink/WISI reservoir. When a final remap continuity
+        // guard exists, this probe is registered after it and sees its output.
+        GstPad* preWisiCcPad = gst_element_get_static_pad(queue, "src");
+        if (preWisiCcPad) {
+            auto* ccContext = new TsCcStageProbeContext(state->config.id, "PRE_WISI");
+            gst_pad_add_probe(preWisiCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                tsCcStageProbe, ccContext,
+                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+            gst_object_unref(preWisiCcPad);
+        }
         std::cerr << "Stable UDP passthrough: direct MPEG-TS -> WISI reservoir"
                   << " timestamp_tsparse=off smoothing=off"
                   << " packetization=preserve-upstream" << std::endl;
