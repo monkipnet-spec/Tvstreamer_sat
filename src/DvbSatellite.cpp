@@ -13,7 +13,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string_view>
@@ -684,10 +686,61 @@ bool waitForTune(GstElement* pipeline, GstElement* sink, const DvbSatelliteParam
     return receivedData || bestStats.locked;
 }
 
+std::mutex& frontendTuneMutex(const DvbSatelliteParams& params) {
+    // The web scan modal polls /api/dvb-signal and /api/dvb-scan can be
+    // requested from the same or another browser.  Serialize tune pipelines
+    // per physical frontend so a signal probe cannot overlap the scan/open
+    // sequence and transiently produce EBUSY.
+    static std::array<std::mutex, 32 * 32> locks;
+    const int adapter = std::clamp(params.adapter, 0, 31);
+    const int frontend = std::clamp(params.frontend, 0, 31);
+    return locks[static_cast<std::size_t>(adapter * 32 + frontend)];
+}
+
+std::string takePipelineError(GstElement* pipeline, GstClockTime timeout) {
+    if (!pipeline) return {};
+    GstBus* bus = gst_element_get_bus(pipeline);
+    if (!bus) return {};
+    GstMessage* message = gst_bus_timed_pop_filtered(bus, timeout, GST_MESSAGE_ERROR);
+    if (!message) {
+        gst_object_unref(bus);
+        return {};
+    }
+
+    GError* gstError = nullptr;
+    gchar* debug = nullptr;
+    gst_message_parse_error(message, &gstError, &debug);
+    std::string error = gstError && gstError->message
+        ? std::string(gstError->message)
+        : std::string("DVB frontend could not start tuning");
+    if (gstError) g_error_free(gstError);
+    if (debug) g_free(debug);
+    gst_message_unref(message);
+    gst_object_unref(bus);
+    return error;
+}
+
+void resetTunePipeline(GstElement* pipeline) {
+    if (!pipeline) return;
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    // Wait for dvbsrc to actually close /dev/dvb before another attempt.
+    gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
+}
+
 Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int timeoutMs) {
     Json::Value result;
     const std::string device = frontendPath(params);
+    result["adapter"] = params.adapter;
+    result["frontend"] = params.frontend;
     result["device"] = device;
+    std::cerr << "DVB " << (collectServices ? "scan" : "signal")
+              << " tune request: adapter=" << params.adapter
+              << " frontend=" << params.frontend
+              << " device=" << device
+              << " frequency_khz=" << params.frequencyKHz
+              << " symbol_rate=" << params.symbolRateK
+              << " polarity=" << params.polarity
+              << std::endl;
     if (!std::filesystem::exists(device)) {
         result["error"] = "DVB frontend not found: " + device;
         return result;
@@ -737,20 +790,56 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
         return result;
     }
 
-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateResult == GST_STATE_CHANGE_FAILURE) {
-        result["error"] = "DVB frontend could not start tuning";
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        return result;
-    }
+    std::unique_lock<std::mutex> frontendLock(frontendTuneMutex(params));
 
     PsiScanner scanner;
     FrontendStats stats;
     std::string tuneError;
-    const bool tuned = waitForTune(pipeline, sink, params, timeoutMs, collectServices ? &scanner : nullptr, stats, tuneError);
+    bool tuned = false;
+    constexpr int kTuneStartupAttempts = 3;
+    constexpr auto kTuneRetryDelay = std::chrono::milliseconds(700);
 
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+    for (int attempt = 1; attempt <= kTuneStartupAttempts; ++attempt) {
+        PsiScanner attemptScanner;
+        FrontendStats attemptStats;
+        std::string attemptError;
+
+        const GstStateChangeReturn stateResult =
+            gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        if (stateResult == GST_STATE_CHANGE_FAILURE) {
+            attemptError = takePipelineError(pipeline, 250 * GST_MSECOND);
+            if (attemptError.empty()) attemptError = "DVB frontend could not start tuning";
+        } else {
+            tuned = waitForTune(
+                pipeline, sink, params, timeoutMs,
+                collectServices ? &attemptScanner : nullptr,
+                attemptStats, attemptError);
+        }
+
+        scanner = std::move(attemptScanner);
+        stats = attemptStats;
+        tuneError = attemptError;
+
+        // A normal no-lock/no-data result is not an open/start failure. Do not
+        // triple the scan timeout in that case. Retry only GStreamer/frontend
+        // startup failures (notably the transient EBUSY observed right after
+        // a previous DVB pipeline has been stopped).
+        if (tuned || tuneError.empty()) break;
+
+        resetTunePipeline(pipeline);
+        if (attempt < kTuneStartupAttempts) {
+            std::cerr << "DVB " << (collectServices ? "scan" : "signal")
+                      << " startup retry: adapter=" << params.adapter
+                      << " frontend=" << params.frontend
+                      << " attempt=" << attempt
+                      << " error=" << tuneError << std::endl;
+            std::this_thread::sleep_for(kTuneRetryDelay);
+            tuneError.clear();
+            continue;
+        }
+    }
+
+    resetTunePipeline(pipeline);
     gst_object_unref(pipeline);
 
     result["locked"] = stats.locked;
@@ -887,6 +976,22 @@ bool configureSource(GstElement* source, const DvbSatelliteParams& params, std::
         "stats-reporting-interval", 20U,
         "tuning-timeout", static_cast<guint64>(5000000),
         nullptr);
+
+    gint configuredAdapter = -1;
+    gint configuredFrontend = -1;
+    g_object_get(source,
+        "adapter", &configuredAdapter,
+        "frontend", &configuredFrontend,
+        nullptr);
+    if (configuredAdapter != params.adapter || configuredFrontend != params.frontend) {
+        std::ostringstream mismatch;
+        mismatch << "dvbsrc adapter/frontend mismatch: requested "
+                 << params.adapter << ':' << params.frontend
+                 << " but element reports "
+                 << configuredAdapter << ':' << configuredFrontend;
+        error = mismatch.str();
+        return false;
+    }
     gst_util_set_object_arg(G_OBJECT(source), "delsys", params.deliverySystem.c_str());
     gst_util_set_object_arg(G_OBJECT(source), "modulation", params.modulation.c_str());
     gst_util_set_object_arg(G_OBJECT(source), "code-rate-hp", params.fec.c_str());

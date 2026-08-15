@@ -2176,8 +2176,11 @@ let subscribersModalOpen = false;
 let subscriberFormBaseline = '';
 let satelliteSignalTimer = null;
 let satelliteSignalPending = false;
+let satelliteSignalController = null;
 let satelliteScanning = false;
+let satelliteTuneGeneration = 0;
 let satelliteServices = [];
+let satelliteLastScan = null;
 let dvbAdapters = [];
 let camClientsLoaded = false;
 let caManagerState = {clients:[]};
@@ -2870,7 +2873,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 29'} / ${state.program_version||'v143'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 31'} / ${state.program_version||'v145'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -3194,25 +3197,77 @@ function updateSatelliteMeters(data={}) {
 function stopSatelliteSignalPolling() {
   clearInterval(satelliteSignalTimer);
   satelliteSignalTimer = null;
+  ++satelliteTuneGeneration;
+  if (satelliteSignalController) satelliteSignalController.abort();
+  satelliteSignalController = null;
   satelliteSignalPending = false;
   satelliteScanning = false;
 }
+function resetSatelliteServicesForTuneChange() {
+  satelliteServices = [];
+  satelliteLastScan = null;
+  const services = document.getElementById('satServices');
+  const count = document.getElementById('satFoundCount');
+  if (count) count.textContent = '0';
+  if (services) services.innerHTML = '<div class="sat-empty">Параметры тюнера изменены. Выполните сканирование заново.</div>';
+}
+function satelliteAdapterChanged() {
+  ++satelliteTuneGeneration;
+  if (satelliteSignalController) satelliteSignalController.abort();
+  satelliteSignalController = null;
+  satelliteSignalPending = false;
+  refreshSatelliteFrontendOptions();
+  resetSatelliteServicesForTuneChange();
+  const adapter = Number(document.getElementById('satAdapter')?.value || 0);
+  const frontend = Number(document.getElementById('satFrontend')?.value || 0);
+  const info = document.getElementById('satDeviceInfo');
+  if (info) info.textContent = `Выбран /dev/dvb/adapter${adapter}/frontend${frontend}`;
+  updateSatelliteSignal();
+}
+function satelliteFrontendChanged() {
+  ++satelliteTuneGeneration;
+  if (satelliteSignalController) satelliteSignalController.abort();
+  satelliteSignalController = null;
+  satelliteSignalPending = false;
+  resetSatelliteServicesForTuneChange();
+  const adapter = Number(document.getElementById('satAdapter')?.value || 0);
+  const frontend = Number(document.getElementById('satFrontend')?.value || 0);
+  const info = document.getElementById('satDeviceInfo');
+  if (info) info.textContent = `Выбран /dev/dvb/adapter${adapter}/frontend${frontend}`;
+  updateSatelliteSignal();
+}
 async function updateSatelliteSignal() {
   if (satelliteScanning || satelliteSignalPending || !document.getElementById('satFrequency')) return;
+  const generation = satelliteTuneGeneration;
+  const payload = satelliteTunePayload();
+  const controller = new AbortController();
+  satelliteSignalController = controller;
   satelliteSignalPending = true;
   try {
     const response = await fetch('/api/dvb-signal', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(satelliteTunePayload())
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal:controller.signal
     });
     const data = await response.json();
+    if (generation !== satelliteTuneGeneration || controller !== satelliteSignalController) return;
     updateSatelliteMeters(data);
     const info = document.getElementById('satDeviceInfo');
-    if (info && data.error && !data.locked) info.textContent = data.error;
+    if (info) {
+      const actualAdapter = Number(data.adapter ?? payload.adapter);
+      const actualFrontend = Number(data.frontend ?? payload.frontend);
+      const device = data.device || `/dev/dvb/adapter${actualAdapter}/frontend${actualFrontend}`;
+      info.textContent = data.error && !data.locked
+        ? `${device}: ${data.error}`
+        : `${device}${data.locked ? ' · LOCK' : ''}`;
+    }
   } catch (error) {
+    if (error?.name === 'AbortError') return;
     const info = document.getElementById('satDeviceInfo');
-    if (info) info.textContent = 'Ошибка чтения DVB frontend';
+    if (info && generation === satelliteTuneGeneration) info.textContent = 'Ошибка чтения DVB frontend';
   } finally {
-    satelliteSignalPending = false;
+    if (controller === satelliteSignalController) {
+      satelliteSignalController = null;
+      satelliteSignalPending = false;
+    }
   }
 }
 function scheduleSatelliteSignalPolling() {
@@ -3226,19 +3281,28 @@ async function loadSatelliteAdapters() {
     const response = await fetch('/api/dvb-adapters', {cache:'no-store'});
     const data = await response.json();
     await loadCamClients();
+    const adapterBeforeLoad = Number(document.getElementById('satAdapter')?.value || 0);
+    const frontendBeforeLoad = Number(document.getElementById('satFrontend')?.value || 0);
     dvbAdapters = Array.isArray(data.adapters) ? data.adapters : [];
     if (!data.dvbsrc_available) {
-      refreshSatelliteAdapterOptions();
+      refreshSatelliteAdapterOptions(adapterBeforeLoad, frontendBeforeLoad);
       if (info) info.textContent = 'GStreamer dvbsrc не найден. Установите gstreamer1.0-plugins-bad.';
       return;
     }
     if (!dvbAdapters.length) {
-      refreshSatelliteAdapterOptions();
+      refreshSatelliteAdapterOptions(adapterBeforeLoad, frontendBeforeLoad);
       if (info) info.textContent = 'DVB frontend не обнаружен в /dev/dvb.';
       return;
     }
-    refreshSatelliteAdapterOptions(Number(dvbAdapters[0].adapter || 0), Number(dvbAdapters[0].frontend || 0));
-    if (info) info.textContent = `Доступные DVB frontend: ${dvbAdapters.map(item=>item.device).join(', ')}`;
+    const adapters = [...new Set(dvbAdapters.map(item => Number(item.adapter)).filter(Number.isFinite))];
+    const preferredAdapter = adapters.includes(adapterBeforeLoad)
+      ? adapterBeforeLoad
+      : Number(dvbAdapters[0].adapter || 0);
+    const preferredFrontend = dvbAdapters.some(item => Number(item.adapter) === preferredAdapter && Number(item.frontend) === frontendBeforeLoad)
+      ? frontendBeforeLoad
+      : Number((dvbAdapters.find(item => Number(item.adapter) === preferredAdapter) || dvbAdapters[0]).frontend || 0);
+    refreshSatelliteAdapterOptions(preferredAdapter, preferredFrontend);
+    if (info) info.textContent = `Выбран /dev/dvb/adapter${preferredAdapter}/frontend${preferredFrontend} · доступно: ${dvbAdapters.map(item=>item.device).join(', ')}`;
     updateSatelliteSignal();
   } catch (error) {
     dvbAdapters = [];
@@ -3276,25 +3340,38 @@ async function startSatelliteScan() {
   satelliteScanning = true;
   clearInterval(satelliteSignalTimer);
   satelliteSignalTimer = null;
-  const holdLock = !!document.getElementById('satHoldLock')?.checked;
+  ++satelliteTuneGeneration;
+  const generation = satelliteTuneGeneration;
+  if (satelliteSignalController) satelliteSignalController.abort();
+  satelliteSignalController = null;
+  satelliteSignalPending = false;
+  const payload = satelliteTunePayload();
+  const holdLock = !!payload.hold_lock;
   if (button) button.disabled = true;
-  if (status) status.textContent = holdLock ? 'Сканирование транспондера, удержание LOCK...' : 'Сканирование транспондера...';
-  while (satelliteSignalPending) await new Promise(resolve=>setTimeout(resolve, 80));
+  if (status) status.textContent = `Сканирование /dev/dvb/adapter${payload.adapter}/frontend${payload.frontend}${holdLock ? ' · удержание LOCK' : ''}...`;
   try {
     const response = await fetch('/api/dvb-scan', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(satelliteTunePayload())
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
     });
     const data = await response.json();
+    if (generation !== satelliteTuneGeneration) return;
+    const actualAdapter = Number(data.adapter ?? payload.adapter);
+    const actualFrontend = Number(data.frontend ?? payload.frontend);
+    if (actualAdapter !== payload.adapter || actualFrontend !== payload.frontend) {
+      throw new Error(`DVB scan adapter mismatch: requested ${payload.adapter}:${payload.frontend}, server used ${actualAdapter}:${actualFrontend}`);
+    }
     updateSatelliteMeters(data);
     satelliteServices = Array.isArray(data.services) ? data.services : [];
+    satelliteLastScan = {adapter:actualAdapter, frontend:actualFrontend, device:data.device || `/dev/dvb/adapter${actualAdapter}/frontend${actualFrontend}`};
     renderSatelliteServices();
     if (status) {
       const caCount = satelliteServices.filter(service=>service.scrambled === true).length;
       const pendingCount = satelliteServices.filter(service=>service.pmt_ready === false).length;
       const ftaCount = satelliteServices.filter(service=>service.scrambled !== true && service.pmt_ready !== false).length;
+      const scanDevice = satelliteLastScan?.device || `/dev/dvb/adapter${payload.adapter}/frontend${payload.frontend}`;
       status.textContent = data.error && !satelliteServices.length
-        ? data.error
-        : `Найдено: ${satelliteServices.length} · FTA: ${ftaCount} · Код.: ${caCount}${pendingCount ? ` · PMT: ${pendingCount} не готово` : ''}${data.error ? ` (${data.error})` : ''}`;
+        ? `${scanDevice}: ${data.error}`
+        : `${scanDevice} · Найдено: ${satelliteServices.length} · FTA: ${ftaCount} · Код.: ${caCount}${pendingCount ? ` · PMT: ${pendingCount} не готово` : ''}${data.error ? ` (${data.error})` : ''}`;
     }
   } catch (error) {
     satelliteServices = [];
@@ -3351,8 +3428,8 @@ function openAddChannelModal() {
       <span id="satLock" class="sat-lock">NO LOCK</span>
     </div>
     <div class="sat-form">
-      <div class="sat-field"><label>Adapter</label><select id="satAdapter" onchange="refreshSatelliteFrontendOptions(); updateSatelliteSignal()"><option value="0">Adapter 0</option></select></div>
-      <div class="sat-field"><label>Frontend</label><select id="satFrontend" onchange="updateSatelliteSignal()"><option value="0">Frontend 0</option></select></div>
+      <div class="sat-field"><label>Adapter</label><select id="satAdapter" onchange="satelliteAdapterChanged()"><option value="0">Adapter 0</option></select></div>
+      <div class="sat-field"><label>Frontend</label><select id="satFrontend" onchange="satelliteFrontendChanged()"><option value="0">Frontend 0</option></select></div>
       <div class="sat-field"><label>Частота, MHz</label><input id="satFrequency" type="number" min="900" max="14000" step="0.001" value="11727" onchange="updateSatelliteSignal()" /></div>
       <div class="sat-field"><label>Symbol Rate, kSym/s</label><input id="satSymbolRate" type="number" min="100" max="60000" step="1" value="27500" onchange="updateSatelliteSignal()" /></div>
       <div class="sat-field"><label>Поляризация</label><select id="satPolarity" onchange="updateSatelliteSignal()"><option value="H">H — Horizontal</option><option value="V">V — Vertical</option></select></div>

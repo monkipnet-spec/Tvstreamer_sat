@@ -1,4 +1,18 @@
-# TVStreammerSAT5 — Release 29
+# TVStreammerSAT5 — Release 31
+
+
+### DVB adapter selection integrity (v145)
+
+Release 31 fixes the Add Channel DVB-S/S2 modal so changing Adapter/Frontend cannot leave an older `/api/dvb-signal` request active or later replace the selected device with the first enumerated adapter. Adapter changes now abort stale signal polling, clear scan results from the previous tuner, preserve the user's currently selected adapter across asynchronous adapter-list refresh, and snapshot the selected adapter/frontend for the scan request. The server echoes the actual adapter/frontend/device used; the UI rejects a mismatched response and shows the exact `/dev/dvb/adapterN/frontendM` being scanned. DvbSatellite also logs every signal/scan tune request and verifies that the `dvbsrc` element accepted the requested adapter/frontend properties.
+
+This release changes only DVB scan/signal adapter selection and diagnostics. Shared DVB streaming, WISI five-second reservoir, selected-PMT PCR, final continuity normalization, CBR/VBR shaping and CA backend remain unchanged.
+
+
+### DVB scan frontend serialization + startup retry (v144)
+
+Release 30 fixes the Add Channel DVB-S/S2 scan path that could show a frontend as free and then immediately fail with `DVB frontend could not start tuning`. The dashboard/shared-stream path already had a three-attempt dvbsrc startup retry and was observed to recover on attempt 2, while `DvbSatellite::runTune()` used by `/api/dvb-signal` and `/api/dvb-scan` performed only one PLAYING transition and returned immediately on a transient frontend-open failure. v144 serializes scan/signal tune pipelines per physical adapter/frontend, waits for dvbsrc to reach NULL before reusing the device, and retries true GStreamer/frontend startup failures up to three times with a 700 ms gap. A normal NO LOCK/no-signal timeout is not retried, so scan timeout behavior is unchanged.
+
+This release changes only the scan/signal tuning path. Shared DVB streaming, the five-second WISI reservoir, selected-PMT PCR lock, final CC normalization, CBR/VBR shaping, CA backend and service-relay packet handling are unchanged.
 
 
 ### Selected-PMT PCR lock + wire-rate diagnostics (v143)
@@ -90,7 +104,7 @@ The outgoing-interface selector is restored for both the regular stream editor a
 
 DVB shared-frontend handling, SPTS/PAT/SDT filtering, packet-level DVB remap, Phoenix/CardManager, decode telemetry and StableUdpOutput/WISI five-second reservoir are unchanged.
 
-TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 29 / v143.**
+TVStreammerSAT5 is an IPTV stream router, monitor and transcoder with a built-in web control panel. **Current program version: Release 30 / v144.**
 
 
 ### Retry inactive/error streams cleanly (v129)
@@ -487,7 +501,7 @@ Example `/etc/systemd/system/tvstreammersat5.service`:
 
 ```ini
 [Unit]
-Description=TVStreammerSAT5 Release 29
+Description=TVStreammerSAT5 Release 30
 After=network-online.target
 Wants=network-online.target
 
