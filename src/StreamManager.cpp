@@ -196,7 +196,8 @@ struct DvbSingleProgramPsiContext {
 };
 
 struct SharedDvbPidStatsContext {
-    std::string frontendKey;
+    std::string stage = "dvbsrc-src";
+    std::string label;
     std::array<uint64_t, 8192> packets {};
     uint64_t totalPackets = 0;
     std::vector<uint8_t> remainder;
@@ -265,7 +266,8 @@ GstPadProbeReturn sharedDvbPidStatsProbe(
             ctx->packets[pid] * kTsPacketSize * 8.0 / seconds / 1000.0);
         present << pid << '=' << kbps;
     }
-    std::cerr << "Shared DVB PID stats: stage=dvbsrc-src frontend=" << ctx->frontendKey
+    std::cerr << "Shared DVB PID stats: stage=" << ctx->stage
+              << " label=" << ctx->label
               << " total=" << totalKbps << "kbps"
               << " present=" << (first ? "none" : present.str()) << std::endl;
     ctx->packets.fill(0);
@@ -2468,7 +2470,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     GstPad* statsPad = gst_element_get_static_pad(source, "src");
     if (statsPad) {
         auto* statsContext = new SharedDvbPidStatsContext();
-        statsContext->frontendKey = frontendKey;
+        statsContext->stage = "dvbsrc-src";
+        statsContext->label = frontendKey;
         gst_pad_add_probe(
             statsPad,
             GST_PAD_PROBE_TYPE_BUFFER,
@@ -2773,7 +2776,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     }
 
     if (state->config.inputServiceId > 0) {
-        GstPad* psiPad = gst_element_get_static_pad(parse, "src");
+        GstPad* psiPad = gst_element_get_static_pad(inputQueue, "src");
         if (psiPad) {
             auto* psiContext = new DvbSingleProgramPsiContext();
             psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
@@ -2818,6 +2821,22 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
             std::cerr << "CA backend transport hook attached: stream=" << state->config.id
                       << " cam_client=" << state->config.conditionalAccessClient
                       << " stage=selected-dvb-spts" << std::endl;
+        }
+    }
+
+    {
+        GstPad* statsPad = gst_element_get_static_pad(outputQueue, "src");
+        if (statsPad) {
+            auto* statsContext = new SharedDvbPidStatsContext();
+            statsContext->stage = "service-relay-output";
+            statsContext->label = state->config.id;
+            gst_pad_add_probe(
+                statsPad,
+                GST_PAD_PROBE_TYPE_BUFFER,
+                sharedDvbPidStatsProbe,
+                statsContext,
+                [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
+            gst_object_unref(statsPad);
         }
     }
 
