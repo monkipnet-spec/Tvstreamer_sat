@@ -1,0 +1,8 @@
+OSCam-mini vendored source directory
+
+Upstream: https://github.com/gfto/oscam.git
+Required local build features: MODULE_NEWCAMD, READER_IRDETO, READER_VIACCESS, CARDREADER_PHOENIX.
+
+This directory is intentionally built from a source snapshot copied here by
+scripts/vendor_oscam_mini.sh or scripts/vendor_oscam_mini.ps1. Once vendored,
+there is no network access during cmake/build/install.

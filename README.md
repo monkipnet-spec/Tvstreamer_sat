@@ -1223,3 +1223,27 @@ The external transcoder command is now logged before process startup, and early 
 - Fixed a v130 browser-side regression where stream tiles disappeared from the dashboard because `render()` called an undefined `escapeHtmlValue()` helper while building the new compact status line.
 - Added the missing HTML escaping helper and use it for the runtime status and stream title so text cannot break tile markup.
 - This release changes only dashboard rendering/version metadata. DVB shared-frontends, SPTS filtering, packet-level DVB remap and the five-second WISI UDP reservoir/shaper are unchanged from v130.
+
+## OSCam-mini — локальный Newcamd/Phoenix модуль
+
+В проект встроен отдельный модуль `OscamMiniManager` и vendored-код OSCam в `third_party/oscam-mini`. Обычная команда `cmake --build build` автоматически собирает минимальный `oscam-mini` только с Newcamd, Phoenix, Irdeto и Viaccess. Сетевое скачивание OSCam во время серверной сборки не используется.
+
+Сборка OSCam запускается CMake через `/usr/bin/env bash scripts/build_oscam_mini.sh`, поэтому потеря executable-bit у `.sh` после распаковки архива в Windows больше не приводит к `Permission denied`.
+
+Рабочие конфиги хранятся только в `/opt/TVStreammerSAT5/oscam-mini/config`. Старый OSCam-конфиг не импортируется. При установке существующие `oscam.conf`, `oscam.server` и `oscam.user` сохраняются.
+
+Диагностическая сборка только OSCam-mini:
+
+```bash
+rm -rf build/oscam-mini
+cmake --build build --target oscam-mini -j1
+```
+
+После успешной сборки должен существовать `build/oscam-mini/oscam-mini`. Затем:
+
+```bash
+sudo cmake --install build
+sudo /opt/TVStreammerSAT5/oscam-mini/install_oscam_mini.sh
+```
+
+Подробности: `OSCAM_MINI.md`.

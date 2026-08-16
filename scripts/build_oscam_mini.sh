@@ -1,29 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 SRC="${1:?vendored source directory is required}"
 OUT="${2:?output directory is required}"
 WORK="$OUT/src"
+BUILD="$OUT/cmake-build"
 BIN_OUT="$OUT/oscam-mini"
 
-for cmd in make gcc; do command -v "$cmd" >/dev/null || { echo "Missing $cmd" >&2; exit 1; }; done
-[[ -f "$SRC/config.sh" && -f "$SRC/Makefile" ]] || {
-  echo "OSCam source is not vendored in $SRC" >&2
-  echo "Run scripts/vendor_oscam_mini.sh (or .ps1 on Windows), commit third_party/oscam-mini, then build again." >&2
+for cmd in cmake gcc make; do
+  command -v "$cmd" >/dev/null || { echo "Missing build dependency: $cmd" >&2; exit 1; }
+done
+
+if [[ ! -f "$SRC/config.sh" || ! -f "$SRC/CMakeLists.txt" ]]; then
+  echo "ERROR: OSCam source is incomplete in: $SRC" >&2
+  echo "Expected at least config.sh and CMakeLists.txt." >&2
+  echo "Commit the complete third_party/oscam-mini tree to the repository." >&2
   exit 2
-}
-rm -rf "$WORK"
+fi
+
+rm -rf "$WORK" "$BUILD"
 mkdir -p "$OUT"
 cp -a "$SRC" "$WORK"
 mkdir -p "$WORK/Distribution" "$WORK/webif"
+chmod +x "$WORK/config.sh"
+
 cd "$WORK"
-chmod +x ./config.sh
 ./config.sh --disable all
 ./config.sh --enable MODULE_NEWCAMD READER_IRDETO READER_VIACCESS CARDREADER_PHOENIX
+
 printf '\nEnabled OSCam-mini modules:\n'
 ./config.sh --show-enabled all
-make clean
-make -j"$(nproc)"
-BIN="$(find Distribution -maxdepth 1 -type f -perm -111 -name 'oscam*' | head -n1)"
-[[ -n "$BIN" ]] || { echo "OSCam binary not found" >&2; exit 3; }
-install -m0755 "$BIN" "$BIN_OUT"
+
+# Build via OSCam's CMakeLists instead of relying on the upstream root Makefile.
+# This also avoids failures when an archive was unpacked through Windows and file
+# permissions or the Makefile were lost.
+cmake -S "$WORK" -B "$BUILD" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCS_CONFDIR=/opt/TVStreammerSAT5/oscam-mini/config
+cmake --build "$BUILD" --target oscam -j"$(nproc)"
+
+if [[ ! -x "$BUILD/oscam" ]]; then
+  echo "ERROR: OSCam binary was not produced at $BUILD/oscam" >&2
+  exit 3
+fi
+
+install -m0755 "$BUILD/oscam" "$BIN_OUT"
 echo "OSCam-mini built: $BIN_OUT"
