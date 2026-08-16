@@ -5,7 +5,6 @@
 #include "TranscoderModule.h"
 #include "DvbSatellite.h"
 #include "CardManager.h"
-#include "OscamMiniManager.h"
 #include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
@@ -457,15 +456,6 @@ void HttpServer::handleSession(tcp::socket socket) {
                 }
             } else if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
-            } else if (target == "/oscam-mini") {
-                res.set(http::field::content_type, "text/html; charset=UTF-8");
-                res.body() = OscamMiniManager::instance().renderPage();
-            } else if (target == "/api/oscam-mini/status") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = OscamMiniManager::instance().statusJson();
-            } else if (target == "/api/oscam-mini/settings") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = OscamMiniManager::instance().settingsJson();
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
@@ -495,13 +485,7 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = "Not Found";
             }
         } else if (req.method() == http::verb::post) {
-            if (target == "/api/oscam-mini/save") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = OscamMiniManager::instance().saveSettingsJson(req.body());
-            } else if (target == "/api/oscam-mini/action") {
-                res.set(http::field::content_type, "application/json");
-                res.body() = OscamMiniManager::instance().serviceActionJson(req.body());
-            } else if (target == "/api/save-config") {
+            if (target == "/api/save-config") {
                 handleSaveConfig(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
@@ -1892,7 +1876,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile.error{border-color:#fb5f5f}
 .tile .top{display:flex;align-items:flex-start;justify-content:space-between;gap:4px;padding-right:64px;min-height:27px}
 .tile .tile-actions{position:absolute;top:8px;right:8px;display:flex;align-items:center;gap:5px;z-index:2}
-.tile .delete-button{position:static;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-size:12px;line-height:16px;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
+.tile .delete-button{display:inline-flex;align-items:center;justify-content:center;position:static;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;line-height:1;cursor:pointer;box-shadow:0 3px 8px rgba(0,0,0,.24)}
 .tile .delete-button:hover{background:#f0444d;transform:scale(1.08)}
 .tile .title{font-size:11px;font-weight:700;line-height:1.2;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tile .badge{position:static;transform:none;padding:2px 5px;background:rgba(20,161,255,.14);color:#7dd1ff;border-radius:999px;font-size:9px;line-height:12px;text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
@@ -1931,8 +1915,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .modal.quality-open,.modal.stream-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal.active{display:flex}
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
-.modal-close{position:absolute;top:10px;right:10px;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;font-size:18px;line-height:28px;cursor:pointer;z-index:2}
-.modal-close:hover{background:rgba(255,95,95,.3);color:#fff}
+.modal-close{display:inline-flex;align-items:center;justify-content:center;position:absolute;top:8px;right:8px;width:20px;height:20px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:700;line-height:1;cursor:pointer;z-index:20;box-shadow:0 2px 7px rgba(0,0,0,.28)}
+.modal-close:hover{background:#f0444d;transform:scale(1.08)}
 .modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.network-modal{width:min(620px,100%)}
@@ -2058,8 +2042,10 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .cam-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.cam-head strong{color:#e9ddff}.cam-list{display:grid;gap:6px}.cam-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.cam-row .cam-name{font-weight:800;color:#fff}.cam-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.cam-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.cam-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.cam-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.cam-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.cam-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.cam-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.cam-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.cam-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.cam-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls select{max-width:210px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls input[type=checkbox]{margin:0}.cam-controls button{padding:4px 8px;font-size:.68rem}.cam-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cam-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.cam-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
 @media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.cam-row{grid-template-columns:78px minmax(120px,1fr)}.cam-row .cam-state{grid-column:1/-1;justify-self:start}.cam-controls{gap:7px}.cam-activation-detail{flex-basis:100%}.cam-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
 @media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}.ui-toast-stack{position:fixed;right:18px;bottom:18px;z-index:30000;display:grid;gap:8px;width:min(520px,calc(100vw - 36px));pointer-events:none}
-.ui-toast{padding:11px 14px;border:1px solid rgba(255,95,95,.42);border-radius:9px;background:#2a1820;color:#ffd9dd;box-shadow:0 12px 30px rgba(0,0,0,.32);font-size:.82rem;line-height:1.4;pointer-events:auto;animation:ui-toast-in .16s ease-out}
+.ui-toast{position:relative;padding:11px 38px 11px 14px;border:1px solid rgba(255,95,95,.42);border-radius:9px;background:#2a1820;color:#ffd9dd;box-shadow:0 12px 30px rgba(0,0,0,.32);font-size:.82rem;line-height:1.4;pointer-events:auto;animation:ui-toast-in .16s ease-out}
 .ui-toast.ok{border-color:rgba(23,194,97,.42);background:#14251d;color:#c8f7d7}
+.ui-toast-close{display:inline-flex;align-items:center;justify-content:center;position:absolute;top:6px;right:6px;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;line-height:1;cursor:pointer}
+.ui-toast-close:hover{background:#f0444d;transform:scale(1.08)}
 @keyframes ui-toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 
 </style>
@@ -2092,7 +2078,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
 <button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
-<a class="system-menu-item" href="/oscam-mini" style="text-decoration:none">OSCam-mini</a>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
 </details>
@@ -2214,7 +2199,20 @@ function uiError(message) {
   }
   const toast = document.createElement('div');
   toast.className = 'ui-toast';
-  toast.textContent = text;
+  const message = document.createElement('span');
+  message.textContent = text;
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'ui-toast-close';
+  close.setAttribute('aria-label', t('close'));
+  close.title = t('close');
+  close.textContent = '×';
+  close.addEventListener('click', () => {
+    toast.remove();
+    if (!stack.children.length) stack.remove();
+  });
+  toast.appendChild(message);
+  toast.appendChild(close);
   stack.appendChild(toast);
   window.setTimeout(() => {
     toast.remove();
@@ -2599,7 +2597,7 @@ function render(force=false) {
       </div>
       <div class="tile-actions">
         <div class="badge">${outputs.length > 1 ? outputBadgeText(stream) : bitrateMode}</div>
-        <button class="delete-button" title="РЈРґР°Р»РёС‚СЊ РїРѕС‚РѕРє" aria-label="РЈРґР°Р»РёС‚СЊ РїРѕС‚РѕРє" data-stream-action="delete" data-stream-id="${escapeHtmlValue(stream.id)}">Г—</button>
+        <button class="delete-button" title="${t('delete')}" aria-label="${t('delete')}" data-stream-action="delete" data-stream-id="${escapeHtmlValue(stream.id)}">×</button>
       </div>
       <div class="dvb-meters${stream.dvb_input ? '' : ' placeholder'}" title="${stream.dvb_input ? 'DVB Signal / Quality' : ''}">
         <div class="dvb-meter"><span data-role="dvb-signal-fill" class="dvb-meter-fill"></span><b data-role="dvb-signal-label" class="dvb-meter-label">S —</b></div>
