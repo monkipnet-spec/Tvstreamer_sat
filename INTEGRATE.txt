@@ -1,0 +1,22 @@
+1. Add this source inside add_executable(TVStreammerSAT5 ...):
+    src/OscamMiniManager.cpp
+
+2. Add near the end of top-level CMakeLists.txt:
+    include(${CMAKE_SOURCE_DIR}/cmake/OscamMini.cmake)
+
+3. In src/HttpServer.cpp add:
+    #include "OscamMiniManager.h"
+
+4. GET routes:
+    /oscam-mini
+    /api/oscam-mini/status
+    /api/oscam-mini/settings
+
+5. POST routes:
+    /api/oscam-mini/save
+    /api/oscam-mini/action
+
+Use OscamMiniManager::instance() methods matching route names.
+
+Normal project build will then also build:
+    build/oscam-mini/oscam-mini

@@ -2,6 +2,7 @@
 Description=TVStreammerSAT5 OSCam-mini
 After=network.target
 Conflicts=oscam.service
+
 [Service]
 Type=simple
 User=root
@@ -12,5 +13,6 @@ Restart=on-failure
 RestartSec=2
 Nice=5
 LimitNOFILE=1024
+
 [Install]
 WantedBy=multi-user.target
