@@ -5,6 +5,7 @@
 #include "TranscoderModule.h"
 #include "DvbSatellite.h"
 #include "CardManager.h"
+#include "OscamMiniManager.h"
 #include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
@@ -456,6 +457,15 @@ void HttpServer::handleSession(tcp::socket socket) {
                 }
             } else if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
+            } else if (target == "/oscam-mini") {
+                res.set(http::field::content_type, "text/html; charset=UTF-8");
+                res.body() = OscamMiniManager::instance().renderPage();
+            } else if (target == "/api/oscam-mini/status") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().statusJson();
+            } else if (target == "/api/oscam-mini/settings") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().settingsJson();
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
@@ -485,7 +495,13 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = "Not Found";
             }
         } else if (req.method() == http::verb::post) {
-            if (target == "/api/save-config") {
+            if (target == "/api/oscam-mini/save") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().saveSettingsJson(req.body());
+            } else if (target == "/api/oscam-mini/action") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().serviceActionJson(req.body());
+            } else if (target == "/api/save-config") {
                 handleSaveConfig(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
@@ -1911,10 +1927,10 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .tile .controls .copy-button.copy-error{background:rgba(255,184,77,.24);color:#ffe0a3;box-shadow:0 0 0 2px rgba(255,184,77,.22)}
 .tile .controls .quality-button{background:rgba(57,189,248,.14);color:#bdefff;box-shadow:inset 0 0 0 1px rgba(57,189,248,.2)}
 .tile .controls .quality-button:hover{background:rgba(57,189,248,.24)}
-.modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(8,10,15,.78);display:none;align-items:center;justify-content:center;padding:12px;z-index:20;box-sizing:border-box}
+.modal{position:fixed;top:var(--header-height,58px);left:0;right:0;bottom:0;background:rgba(8,10,15,.78);display:none;align-items:flex-start;justify-content:center;padding:12px;overflow:auto;z-index:20;box-sizing:border-box}
 .modal.quality-open,.modal.stream-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal.active{display:flex}
-.modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:92%;overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08)}
+.modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:calc(100vh - var(--header-height,58px) - 24px);overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08);box-sizing:border-box;margin:0 auto}
 .modal-close{display:inline-flex;align-items:center;justify-content:center;position:absolute;top:8px;right:8px;width:20px;height:20px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:700;line-height:1;cursor:pointer;z-index:20;box-shadow:0 2px 7px rgba(0,0,0,.28)}
 .modal-close:hover{background:#f0444d;transform:scale(1.08)}
 .modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
@@ -2077,6 +2093,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
 <button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
+<button class="system-menu-item" onclick="window.location.href='/oscam-mini';closeSystemMenu()">OSCam-mini</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
@@ -2199,8 +2216,8 @@ function uiError(message) {
   }
   const toast = document.createElement('div');
   toast.className = 'ui-toast';
-  const message = document.createElement('span');
-  message.textContent = text;
+  const messageEl = document.createElement('span');
+  messageEl.textContent = text;
   const close = document.createElement('button');
   close.type = 'button';
   close.className = 'ui-toast-close';
@@ -2211,7 +2228,7 @@ function uiError(message) {
     toast.remove();
     if (!stack.children.length) stack.remove();
   });
-  toast.appendChild(message);
+  toast.appendChild(messageEl);
   toast.appendChild(close);
   stack.appendChild(toast);
   window.setTimeout(() => {
@@ -2888,7 +2905,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 40'} / ${state.program_version||'v155'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 40'} / ${state.program_version||'v160'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
