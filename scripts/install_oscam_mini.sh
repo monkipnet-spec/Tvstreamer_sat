@@ -20,10 +20,16 @@ for f in oscam.conf oscam.server oscam.user; do
   fi
 done
 
-install -m0644 "$UNIT_SRC" "$UNIT_DST"
+# cmake --install already installs the unit to /etc/systemd/system. Keep this
+# fallback so older installations can still be repaired by running this script.
+if [[ ! -f "$UNIT_DST" ]]; then
+  [[ -f "$UNIT_SRC" ]] || { echo "Missing systemd unit: $UNIT_SRC" >&2; exit 3; }
+  install -m0644 "$UNIT_SRC" "$UNIT_DST"
+fi
+
 systemctl daemon-reload
 
-# The legacy OSCam must not hold the same Phoenix device at the same time.
+# Legacy OSCam must not own the same Phoenix devices at the same time.
 if systemctl list-unit-files oscam.service >/dev/null 2>&1; then
   systemctl disable --now oscam.service || true
 fi

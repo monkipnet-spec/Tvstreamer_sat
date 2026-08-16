@@ -1,6 +1,17 @@
 [account]
-user = tvstreamer
-pwd = tvstreamer
-group = 1,2
+user = irdeto_user
+pwd = change_me
+group = 1
 au = 1
+caid = 0652
+ident = 0652:000000
+allowedprotocols = newcamd
+
+[account]
+user = viaccess_user
+pwd = change_me
+group = 2
+au = 1
+caid = 0500
+ident = 0500:051200
 allowedprotocols = newcamd

@@ -1,2029 +1,0 @@
-[1mdiff --git a/src/CaBackend.cpp b/src/CaBackend.cpp[m
-[1mindex 6041d19..b1f29f2 100644[m
-[1m--- a/src/CaBackend.cpp[m
-[1m+++ b/src/CaBackend.cpp[m
-[36m@@ -1,8 +1,8 @@[m
- #include "CaBackend.h"[m
- [m
- #include <algorithm>[m
-[31m-#include <chrono>[m
-[31m-#include <cctype>[m
-[32m+[m[32m#include <chrono>[m[41m[m
-[32m+[m[32m#include <cctype>[m[41m[m
- #include <cstdlib>[m
- #include <cstring>[m
- #include <dlfcn.h>[m
-[36m@@ -12,12 +12,12 @@[m
- [m
- namespace {[m
- [m
-[31m-std::string lowerAscii(std::string value) {[m
-[31m-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {[m
-[31m-        return static_cast<char>(std::tolower(ch));[m
-[31m-    });[m
-[31m-    return value;[m
-[31m-}[m
-[32m+[m[32mstd::string lowerAscii(std::string value) {[m[41m[m
-[32m+[m[32m    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {[m[41m[m
-[32m+[m[32m        return static_cast<char>(std::tolower(ch));[m[41m[m
-[32m+[m[32m    });[m[41m[m
-[32m+[m[32m    return value;[m[41m[m
-[32m+[m[32m}[m[41m[m
- void writeError(char* buffer, size_t size, const std::string& text) {[m
-     if (!buffer || size == 0) return;[m
-     const size_t count = std::min(size - 1, text.size());[m
-[36m@@ -180,14 +180,14 @@[m [mvoid CaBackendManager::loadPluginsLocked() {[m
- [m
-     std::sort(files.begin(), files.end());[m
-     files.erase(std::unique(files.begin(), files.end()), files.end());[m
-[31m-    std::set<std::string> loadedPluginFilenames;[m
-[31m-    for (const auto& path : files) {[m
-[31m-        const std::string filename = lowerAscii(std::filesystem::path(path).filename().string());[m
-[31m-        if (!filename.empty() && loadedPluginFilenames.count(filename)) {[m
-[31m-            std::cerr << "CA backend plugin duplicate filename ignored: " << path << std::endl;[m
-[31m-            continue;[m
-[31m-        }[m
-[31m-        if (loadPluginFileLocked(path) && !filename.empty()) loadedPluginFilenames.insert(filename);[m
-[32m+[m[32m    std::set<std::string> loadedPluginFilenames;[m[41m[m
-[32m+[m[32m    for (const auto& path : files) {[m[41m[m
-[32m+[m[32m        const std::string filename = lowerAscii(std::filesystem::path(path).filename().string());[m[41m[m
-[32m+[m[32m        if (!filename.empty() && loadedPluginFilenames.count(filename)) {[m[41m[m
-[32m+[m[32m            std::cerr << "CA backend plugin duplicate filename ignored: " << path << std::endl;[m[41m[m
-[32m+[m[32m            continue;[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        if (loadPluginFileLocked(path) && !filename.empty()) loadedPluginFilenames.insert(filename);[m[41m[m
-     }[m
- }[m
- [m
-[36m@@ -244,7 +244,7 @@[m [mbool CaBackendManager::loadPluginFileLocked(const std::string& path) {[m
-     std::cerr << "CA backend plugin loaded: id=" << id[m
-               << " path=" << path[m
-               << " capabilities=0x" << std::hex << api->capabilities << std::dec << std::endl;[m
-[31m-    return true;[m
-[32m+[m[32m    return true;[m[41m[m
- }[m
- [m
- CaBackendManager::LoadedBackend* CaBackendManager::findBackendLocked(const std::string& id) {[m
-[36m@@ -269,7 +269,7 @@[m [mbool CaBackendManager::ensureReaderOpenLocked(LoadedBackend& backend,[m
-         ++refs->second;[m
-         return true;[m
-     }[m
-[31m-[m
-[32m+[m[41m[m
-     tvs_ca_reader_info_v1 info{};[m
-     info.reader_key = reader.key.c_str();[m
-     info.device = reader.device.c_str();[m
-[1mdiff --git a/src/ConfigManager.cpp b/src/ConfigManager.cpp[m
-[1mindex 05bb5e9..be21426 100644[m
-[1m--- a/src/ConfigManager.cpp[m
-[1m+++ b/src/ConfigManager.cpp[m
-[36m@@ -1,142 +1,142 @@[m
-[31m-#include "ConfigManager.h"[m
-[31m-[m
-[31m-#include <algorithm>[m
-[31m-#include <fstream>[m
-[31m-#include <iostream>[m
-[31m-#include <sstream>[m
-[31m-#include <chrono>[m
-[31m-#include <ctime>[m
-[31m-#include <iomanip>[m
-[31m-[m
-[31m-StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {[m
-[31m-    StreamOutputConfig output;[m
-[31m-    output.outputType = root.get("output_type", "udp-cbr").asString();[m
-[31m-    output.outputMode = root.get("output_mode", "listener").asString();[m
-[31m-    output.outputHost = root.get("output_host", "127.0.0.1").asString();[m
-[31m-    output.outputPort = root.get("output_port", 1234).asInt();[m
-[31m-    return output;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value StreamOutputConfig::toJson() const {[m
-[31m-    Json::Value root;[m
-[31m-    root["output_type"] = outputType;[m
-[31m-    root["output_mode"] = outputMode;[m
-[31m-    root["output_host"] = outputHost;[m
-[31m-    root["output_port"] = outputPort;[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[31m-StreamConfig StreamConfig::fromJson(const Json::Value& root) {[m
-[31m-    StreamConfig config;[m
-[31m-    config.id = root.get("id", "").asString();[m
-[31m-    config.name = root.get("name", "").asString();[m
-[31m-    config.inputUri = root.get("input_uri", "").asString();[m
-[31m-    config.backupInputUri = root.get("backup_input_uri", "").asString();[m
-[31m-    config.backupInputType = root.get("backup_input_type", "").asString();[m
-[31m-    if (config.backupInputType.empty()) {[m
-[31m-        const std::string backupUri = config.backupInputUri;[m
-[31m-        config.backupInputType =[m
-[31m-            backupUri.empty()[m
-[31m-                ? "url"[m
-[31m-                : (backupUri.rfind("file://", 0) == 0 || backupUri.find("://") == std::string::npos[m
-[31m-                ? "file"[m
-[31m-                : "url");[m
-[31m-    }[m
-[31m-    config.backupFileLoop = root.get("backup_file_loop", false).asBool();[m
-[31m-    config.outputType = root.get("output_type", "udp-cbr").asString();[m
-[31m-    config.outputMode = root.get("output_mode", "listener").asString();[m
-[31m-    config.outputHost = root.get("output_host", "127.0.0.1").asString();[m
-[31m-    config.outputPort = root.get("output_port", 1234).asInt();[m
-[31m-    config.interfaceAddress = root.get("interface_address", "").asString();[m
-[31m-    config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");[m
-[31m-    config.inputInterfaceAddress = root.get("input_interface_address", "").asString();[m
-[31m-    config.inputMode = root.get("input_mode", "auto").asString();[m
-[31m-    config.testPattern = root.get("test_pattern", false).asBool();[m
-[31m-    config.autoStart = root.get("auto_start", false).asBool();[m
-[31m-    config.remapEnabled = root.get("remap_enabled", false).asBool();[m
-[31m-    config.cbr = root.get("cbr", true).asBool();[m
-[31m-    config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();[m
-[31m-    config.transcodeEnabled = root.get("transcode_enabled", false).asBool();[m
-[31m-    config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();[m
-[31m-    config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();[m
-[31m-    config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();[m
-[31m-    if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3" &&[m
-[31m-        config.transcodeAudioCodec != "copy") {[m
-[31m-        config.transcodeAudioCodec = "aac";[m
-[31m-    }[m
-[31m-    config.transcodeAudioBitrate = root.get("transcode_audio_bitrate", Json::UInt64(192000)).asUInt64();[m
-[31m-    config.transcodeAudioBitrate = std::clamp<uint64_t>(config.transcodeAudioBitrate, 64000, 320000);[m
-[31m-    config.audioPid = root.get("audio_pid", 0).asUInt();[m
-[31m-    config.videoPid = root.get("video_pid", 0).asUInt();[m
-[31m-    config.serviceId = root.get("service_id", 1).asUInt();[m
-[31m-    // input_service_id=0 means automatic PAT-based service detection.[m
-[31m-    // Existing configurations that predate input_service_id keep their previous[m
-[31m-    // explicit behaviour by inheriting service_id; newly created streams use 0.[m
-[31m-    config.inputServiceId = root.isMember("input_service_id")[m
-[31m-        ? root.get("input_service_id", 0).asUInt()[m
-[31m-        : config.serviceId;[m
-[31m-    config.serviceName = root.get("service_name", "").asString();[m
-[31m-    config.serviceProvider = root.get("service_provider", "").asString();[m
-[31m-    config.conditionalAccessClient = root.get("conditional_access_client", "").asString();[m
-[31m-    if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {[m
-[31m-        const auto primary = StreamOutputConfig::fromJson(root["outputs"][0]);[m
-[31m-        config.outputType = primary.outputType;[m
-[31m-        config.outputMode = primary.outputMode;[m
-[31m-        config.outputHost = primary.outputHost;[m
-[31m-        config.outputPort = primary.outputPort;[m
-[31m-        for (Json::ArrayIndex i = 1; i < root["outputs"].size(); ++i) {[m
-[31m-            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(root["outputs"][i]));[m
-[31m-        }[m
-[31m-    } else if (root.isMember("additional_outputs") && root["additional_outputs"].isArray()) {[m
-[31m-        for (const auto& item : root["additional_outputs"]) {[m
-[31m-            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(item));[m
-[31m-        }[m
-[31m-    }[m
-[31m-    return config;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value StreamConfig::toJson() const {[m
-[31m-    Json::Value root;[m
-[31m-    root["id"] = id;[m
-[31m-    root["name"] = name;[m
-[31m-    root["input_uri"] = inputUri;[m
-[31m-    root["backup_input_uri"] = backupInputUri;[m
-[31m-    root["backup_input_type"] = backupInputType;[m
-[31m-    root["backup_file_loop"] = backupFileLoop;[m
-[31m-    root["output_type"] = outputType;[m
-[31m-    root["output_mode"] = outputMode;[m
-[31m-    root["output_host"] = outputHost;[m
-[31m-    root["output_port"] = outputPort;[m
-[31m-    root["interface_address"] = interfaceAddress;[m
-[31m-    if (inputInterfaceAddressConfigured) {[m
-[31m-        root["input_interface_address"] = inputInterfaceAddress;[m
-[31m-    }[m
-[31m-    root["input_mode"] = inputMode;[m
-[31m-    root["test_pattern"] = testPattern;[m
-[31m-    root["auto_start"] = autoStart;[m
-[31m-    root["remap_enabled"] = remapEnabled;[m
-[31m-    root["cbr"] = cbr;[m
-[31m-    root["target_bitrate"] = Json::UInt64(targetBitrate);[m
-[31m-    root["transcode_enabled"] = transcodeEnabled;[m
-[31m-    root["transcode_resolution"] = transcodeResolution;[m
-[31m-    root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);[m
-[31m-    root["transcode_audio_codec"] = transcodeAudioCodec;[m
-[31m-    root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);[m
-[31m-    root["audio_pid"] = audioPid;[m
-[31m-    root["video_pid"] = videoPid;[m
-[31m-    root["input_service_id"] = inputServiceId;[m
-[31m-    root["service_id"] = serviceId;[m
-[31m-    root["service_name"] = serviceName;[m
-[31m-    root["service_provider"] = serviceProvider;[m
-[31m-    root["conditional_access_client"] = conditionalAccessClient;[m
-[31m-    Json::Value extraOutputs(Json::arrayValue);[m
-[31m-    for (const auto& output : additionalOutputs) {[m
-[31m-        extraOutputs.append(output.toJson());[m
-[31m-    }[m
-[31m-    root["additional_outputs"] = extraOutputs;[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[32m+[m[32m#include "ConfigManager.h"[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m#include <algorithm>[m[41m[m
-[32m+[m[32m#include <fstream>[m[41m[m
-[32m+[m[32m#include <iostream>[m[41m[m
-[32m+[m[32m#include <sstream>[m[41m[m
-[32m+[m[32m#include <chrono>[m[41m[m
-[32m+[m[32m#include <ctime>[m[41m[m
-[32m+[m[32m#include <iomanip>[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mStreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {[m[41m[m
-[32m+[m[32m    StreamOutputConfig output;[m[41m[m
-[32m+[m[32m    output.outputType = root.get("output_type", "udp-cbr").asString();[m[41m[m
-[32m+[m[32m    output.outputMode = root.get("output_mode", "listener").asString();[m[41m[m
-[32m+[m[32m    output.outputHost = root.get("output_host", "127.0.0.1").asString();[m[41m[m
-[32m+[m[32m    output.outputPort = root.get("output_port", 1234).asInt();[m[41m[m
-[32m+[m[32m    return output;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mJson::Value StreamOutputConfig::toJson() const {[m[41m[m
-[32m+[m[32m    Json::Value root;[m[41m[m
-[32m+[m[32m    root["output_type"] = outputType;[m[41m[m
-[32m+[m[32m    root["output_mode"] = outputMode;[m[41m[m
-[32m+[m[32m    root["output_host"] = outputHost;[m[41m[m
-[32m+[m[32m    root["output_port"] = outputPort;[m[41m[m
-[32m+[m[32m    return root;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mStreamConfig StreamConfig::fromJson(const Json::Value& root) {[m[41m[m
-[32m+[m[32m    StreamConfig config;[m[41m[m
-[32m+[m[32m    config.id = root.get("id", "").asString();[m[41m[m
-[32m+[m[32m    config.name = root.get("name", "").asString();[m[41m[m
-[32m+[m[32m    config.inputUri = root.get("input_uri", "").asString();[m[41m[m
-[32m+[m[32m    config.backupInputUri = root.get("backup_input_uri", "").asString();[m[41m[m
-[32m+[m[32m    config.backupInputType = root.get("backup_input_type", "").asString();[m[41m[m
-[32m+[m[32m    if (config.backupInputType.empty()) {[m[41m[m
-[32m+[m[32m        const std::string backupUri = config.backupInputUri;[m[41m[m
-[32m+[m[32m        config.backupInputType =[m[41m[m
-[32m+[m[32m            backupUri.empty()[m[41m[m
-[32m+[m[32m                ? "url"[m[41m[m
-[32m+[m[32m                : (backupUri.rfind("file://", 0) == 0 || backupUri.find("://") == std::string::npos[m[41m[m
-[32m+[m[32m                ? "file"[m[41m[m
-[32m+[m[32m                : "url");[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    config.backupFileLoop = root.get("backup_file_loop", false).asBool();[m[41m[m
-[32m+[m[32m    config.outputType = root.get("output_type", "udp-cbr").asString();[m[41m[m
-[32m+[m[32m    config.outputMode = root.get("output_mode", "listener").asString();[m[41m[m
-[32m+[m[32m    config.outputHost = root.get("output_host", "127.0.0.1").asString();[m[41m[m
-[32m+[m[32m    config.outputPort = root.get("output_port", 1234).asInt();[m[41m[m
-[32m+[m[32m    config.interfaceAddress = root.get("interface_address", "").asString();[m[41m[m
-[32m+[m[32m    config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");[m[41m[m
-[32m+[m[32m    config.inputInterfaceAddress = root.get("input_interface_address", "").asString();[m[41m[m
-[32m+[m[32m    config.inputMode = root.get("input_mode", "auto").asString();[m[41m[m
-[32m+[m[32m    config.testPattern = root.get("test_pattern", false).asBool();[m[41m[m
-[32m+[m[32m    config.autoStart = root.get("auto_start", false).asBool();[m[41m[m
-[32m+[m[32m    config.remapEnabled = root.get("remap_enabled", false).asBool();[m[41m[m
-[32m+[m[32m    config.cbr = root.get("cbr", true).asBool();[m[41m[m
-[32m+[m[32m    config.targetBitrate = root.get("target_bitrate", Json::UInt64(2000000)).asUInt64();[m[41m[m
-[32m+[m[32m    config.transcodeEnabled = root.get("transcode_enabled", false).asBool();[m[41m[m
-[32m+[m[32m    config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();[m[41m[m
-[32m+[m[32m    config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();[m[41m[m
-[32m+[m[32m    config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();[m[41m[m
-[32m+[m[32m    if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3" &&[m[41m[m
-[32m+[m[32m        config.transcodeAudioCodec != "copy") {[m[41m[m
-[32m+[m[32m        config.transcodeAudioCodec = "aac";[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    config.transcodeAudioBitrate = root.get("transcode_audio_bitrate", Json::UInt64(192000)).asUInt64();[m[41m[m
-[32m+[m[32m    config.transcodeAudioBitrate = std::clamp<uint64_t>(config.transcodeAudioBitrate, 64000, 320000);[m[41m[m
-[32m+[m[32m    config.audioPid = root.get("audio_pid", 0).asUInt();[m[41m[m
-[32m+[m[32m    config.videoPid = root.get("video_pid", 0).asUInt();[m[41m[m
-[32m+[m[32m    config.serviceId = root.get("service_id", 1).asUInt();[m[41m[m
-[32m+[m[32m    // input_service_id=0 means automatic PAT-based service detection.[m[41m[m
-[32m+[m[32m    // Existing configurations that predate input_service_id keep their previous[m[41m[m
-[32m+[m[32m    // explicit behaviour by inheriting service_id; newly created streams use 0.[m[41m[m
-[32m+[m[32m    config.inputServiceId = root.isMember("input_service_id")[m[41m[m
-[32m+[m[32m        ? root.get("input_service_id", 0).asUInt()[m[41m[m
-[32m+[m[32m        : config.serviceId;[m[41m[m
-[32m+[m[32m    config.serviceName = root.get("service_name", "").asString();[m[41m[m
-[32m+[m[32m    config.serviceProvider = root.get("service_provider", "").asString();[m[41m[m
-[32m+[m[32m    config.conditionalAccessClient = root.get("conditional_access_client", "").asString();[m[41m[m
-[32m+[m[32m    if (root.isMember("outputs") && root["outputs"].isArray() && root["outputs"].size() > 0) {[m[41m[m
-[32m+[m[32m        const auto primary = StreamOutputConfig::fromJson(root["outputs"][0]);[m[41m[m
-[32m+[m[32m        config.outputType = primary.outputType;[m[41m[m
-[32m+[m[32m        config.outputMode = primary.outputMode;[m[41m[m
-[32m+[m[32m        config.outputHost = primary.outputHost;[m[41m[m
-[32m+[m[32m        config.outputPort = primary.outputPort;[m[41m[m
-[32m+[m[32m        for (Json::ArrayIndex i = 1; i < root["outputs"].size(); ++i) {[m[41m[m
-[32m+[m[32m            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(root["outputs"][i]));[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m    } else if (root.isMember("additional_outputs") && root["additional_outputs"].isArray()) {[m[41m[m
-[32m+[m[32m        for (const auto& item : root["additional_outputs"]) {[m[41m[m
-[32m+[m[32m            config.additionalOutputs.push_back(StreamOutputConfig::fromJson(item));[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return config;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mJson::Value StreamConfig::toJson() const {[m[41m[m
-[32m+[m[32m    Json::Value root;[m[41m[m
-[32m+[m[32m    root["id"] = id;[m[41m[m
-[32m+[m[32m    root["name"] = name;[m[41m[m
-[32m+[m[32m    root["input_uri"] = inputUri;[m[41m[m
-[32m+[m[32m    root["backup_input_uri"] = backupInputUri;[m[41m[m
-[32m+[m[32m    root["backup_input_type"] = backupInputType;[m[41m[m
-[32m+[m[32m    root["backup_file_loop"] = backupFileLoop;[m[41m[m
-[32m+[m[32m    root["output_type"] = outputType;[m[41m[m
-[32m+[m[32m    root["output_mode"] = outputMode;[m[41m[m
-[32m+[m[32m    root["output_host"] = outputHost;[m[41m[m
-[32m+[m[32m    root["output_port"] = outputPort;[m[41m[m
-[32m+[m[32m    root["interface_address"] = interfaceAddress;[m[41m[m
-[32m+[m[32m    if (inputInterfaceAddressConfigured) {[m[41m[m
-[32m+[m[32m        root["input_interface_address"] = inputInterfaceAddress;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    root["input_mode"] = inputMode;[m[41m[m
-[32m+[m[32m    root["test_pattern"] = testPattern;[m[41m[m
-[32m+[m[32m    root["auto_start"] = autoStart;[m[41m[m
-[32m+[m[32m    root["remap_enabled"] = remapEnabled;[m[41m[m
-[32m+[m[32m    root["cbr"] = cbr;[m[41m[m
-[32m+[m[32m    root["target_bitrate"] = Json::UInt64(targetBitrate);[m[41m[m
-[32m+[m[32m    root["transcode_enabled"] = transcodeEnabled;[m[41m[m
-[32m+[m[32m    root["transcode_resolution"] = transcodeResolution;[m[41m[m
-[32m+[m[32m    root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);[m[41m[m
-[32m+[m[32m    root["transcode_audio_codec"] = transcodeAudioCodec;[m[41m[m
-[32m+[m[32m    root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);[m[41m[m
-[32m+[m[32m    root["audio_pid"] = audioPid;[m[41m[m
-[32m+[m[32m    root["video_pid"] = videoPid;[m[41m[m
-[32m+[m[32m    root["input_service_id"] = inputServiceId;[m[41m[m
-[32m+[m[32m    root["service_id"] = serviceId;[m[41m[m
-[32m+[m[32m    root["service_name"] = serviceName;[m[41m[m
-[32m+[m[32m    root["service_provider"] = serviceProvider;[m[41m[m
-[32m+[m[32m    root["conditional_access_client"] = conditionalAccessClient;[m[41m[m
-[32m+[m[32m    Json::Value extraOutputs(Json::arrayValue);[m[41m[m
-[32m+[m[32m    for (const auto& output : additionalOutputs) {[m[41m[m
-[32m+[m[32m        extraOutputs.append(output.toJson());[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    root["additional_outputs"] = extraOutputs;[m[41m[m
-[32m+[m[32m    return root;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
- CamClientConfig CamClientConfig::fromJson(const Json::Value& root) {[m
-     CamClientConfig config;[m
-     config.id = root.get("id", "").asString();[m
-[36m@@ -157,7 +157,7 @@[m [mJson::Value CamClientConfig::toJson() const {[m
-     root["backend_id"] = backendId.empty() ? "newcamd" : backendId;[m
-     root["backend_config"] = backendConfig.empty() ? "{}" : backendConfig;[m
-     return root;[m
-[31m-}[m
-[32m+[m[32m}[m[41m[m
- Json::Value AppConfig::toJson() const {[m
-     Json::Value root;[m
-     root["login"] = login;[m
-[36m@@ -199,134 +199,134 @@[m [mAppConfig AppConfig::fromJson(const Json::Value& root) {[m
-         }[m
-     }[m
-     return config;[m
-[31m-}[m
-[31m-[m
-[31m-ConfigManager::ConfigManager() {[m
-[31m-    configPath = std::filesystem::current_path() / "tvstreammersat5-config.json";[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value SubscriberConfig::toJson() const {[m
-[31m-    Json::Value root;[m
-[31m-    root["name"] = name;[m
-[31m-    root["primary_ip"] = primaryIp;[m
-[31m-    root["backup_ip"] = backupIp;[m
-[31m-    root["added_at"] = addedAt;[m
-[31m-    root["enabled"] = enabled;[m
-[31m-    Json::Value streams(Json::arrayValue);[m
-[31m-    for (const auto& id : streamIds) streams.append(id);[m
-[31m-    root["stream_ids"] = streams;[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[31m-SubscriberConfig SubscriberConfig::fromJson(const Json::Value& root) {[m
-[31m-    SubscriberConfig subscriber;[m
-[31m-    subscriber.name = root.get("name", "").asString();[m
-[31m-    subscriber.primaryIp = root.get("primary_ip", "").asString();[m
-[31m-    subscriber.backupIp = root.get("backup_ip", "").asString();[m
-[31m-    subscriber.addedAt = root.get("added_at", "").asString();[m
-[31m-    subscriber.enabled = root.get("enabled", true).asBool();[m
-[31m-    if (root["stream_ids"].isArray()) {[m
-[31m-        for (const auto& id : root["stream_ids"]) {[m
-[31m-            subscriber.streamIds.push_back(id.asString());[m
-[31m-        }[m
-[31m-    }[m
-[31m-    return subscriber;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value SubscriberListConfig::toJson() const {[m
-[31m-    Json::Value root;[m
-[31m-    root["filtering_enabled"] = filteringEnabled;[m
-[31m-    Json::Value list(Json::arrayValue);[m
-[31m-    for (const auto& subscriber : subscribers) {[m
-[31m-        list.append(subscriber.toJson());[m
-[31m-    }[m
-[31m-    root["subscribers"] = list;[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[31m-SubscriberListConfig SubscriberListConfig::fromJson(const Json::Value& root) {[m
-[31m-    SubscriberListConfig config;[m
-[31m-    config.filteringEnabled = root.get("filtering_enabled", false).asBool();[m
-[31m-    if (root["subscribers"].isArray()) {[m
-[31m-        for (const auto& item : root["subscribers"]) {[m
-[31m-            config.subscribers.push_back(SubscriberConfig::fromJson(item));[m
-[31m-        }[m
-[31m-    }[m
-[31m-    return config;[m
-[31m-}[m
-[31m-[m
-[31m-bool ConfigManager::load() {[m
-[31m-    if (!std::filesystem::exists(configPath)) {[m
-[31m-        std::cerr << "Config file not found, creating default configuration: " << configPath << std::endl;[m
-[31m-        AppConfig defaultConfig;[m
-[31m-        {[m
-[31m-            std::lock_guard<std::mutex> lock(fileMutex);[m
-[31m-            config = defaultConfig;[m
-[31m-        }[m
-[31m-        if (!save()) return false;[m
-[31m-        return loadSubscribers();[m
-[31m-    }[m
-[31m-[m
-[31m-    {[m
-[31m-        std::lock_guard<std::mutex> lock(fileMutex);[m
-[31m-        std::ifstream input(configPath);[m
-[31m-        if (!input.is_open()) {[m
-[31m-            return false;[m
-[31m-        }[m
-[31m-        Json::Value root;[m
-[31m-        Json::CharReaderBuilder readerBuilder;[m
-[31m-        std::string errs;[m
-[31m-        bool ok = Json::parseFromStream(readerBuilder, input, &root, &errs);[m
-[31m-        if (!ok) {[m
-[31m-            std::cerr << "Failed to parse config: " << errs << std::endl;[m
-[31m-            return false;[m
-[31m-        }[m
-[31m-        config = AppConfig::fromJson(root);[m
-[31m-    }[m
-[31m-    return loadSubscribers();[m
-[31m-}[m
-[31m-[m
-[31m-bool ConfigManager::loadSubscribers() {[m
-[31m-    const auto path = std::filesystem::current_path() / "tvstreammersat5-subscribers.json";[m
-[31m-    if (!std::filesystem::exists(path)) {[m
-[31m-        subscribers = SubscriberListConfig{};[m
-[31m-        return saveSubscribers();[m
-[31m-    }[m
-[31m-    std::lock_guard<std::mutex> lock(fileMutex);[m
-[31m-    std::ifstream input(path);[m
-[31m-    if (!input.is_open()) return false;[m
-[31m-    Json::Value root;[m
-[31m-    Json::CharReaderBuilder readerBuilder;[m
-[31m-    std::string errs;[m
-[31m-    if (!Json::parseFromStream(readerBuilder, input, &root, &errs)) {[m
-[31m-        std::cerr << "Failed to parse subscribers config: " << errs << std::endl;[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    subscribers = SubscriberListConfig::fromJson(root);[m
-[31m-    return true;[m
-[31m-}[m
-[31m-[m
-[31m-bool ConfigManager::save() {[m
-[31m-    std::lock_guard<std::mutex> lock(fileMutex);[m
-[31m-    std::ofstream output(configPath);[m
-[31m-    if (!output.is_open()) {[m
-[31m-        std::cerr << "Unable to open config file for writing: " << configPath << std::endl;[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    Json::StreamWriterBuilder writer;[m
-[31m-    writer["indentation"] = "  ";[m
-[31m-    std::string str = Json::writeString(writer, config.toJson());[m
-[31m-    output << str;[m
-[31m-    return true;[m
-[31m-}[m
-[31m-[m
-[31m-bool ConfigManager::saveSubscribers() {[m
-[31m-    std::lock_guard<std::mutex> lock(fileMutex);[m
-[31m-    const auto path = std::filesystem::current_path() / "tvstreammersat5-subscribers.json";[m
-[31m-    std::ofstream output(path);[m
-[31m-    if (!output.is_open()) return false;[m
-[31m-    Json::StreamWriterBuilder writer;[m
-[31m-    writer["indentation"] = "  ";[m
-[31m-    output << Json::writeString(writer, subscribers.toJson());[m
-[31m-    return true;[m
-[31m-}[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mConfigManager::ConfigManager() {[m[41m[m
-[32m+[m[32m    configPath = std::filesystem::current_path() / "tvstreammersat5-config.json";[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mJson::Value SubscriberConfig::toJson() const {[m[41m[m
-[32m+[m[32m    Json::Value root;[m[41m[m
-[32m+[m[32m    root["name"] = name;[m[41m[m
-[32m+[m[32m    root["primary_ip"] = primaryIp;[m[41m[m
-[32m+[m[32m    root["backup_ip"] = backupIp;[m[41m[m
-[32m+[m[32m    root["added_at"] = addedAt;[m[41m[m
-[32m+[m[32m    root["enabled"] = enabled;[m[41m[m
-[32m+[m[32m    Json::Value streams(Json::arrayValue);[m[41m[m
-[32m+[m[32m    for (const auto& id : streamIds) streams.append(id);[m[41m[m
-[32m+[m[32m    root["stream_ids"] = streams;[m[41m[m
-[32m+[m[32m    return root;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mSubscriberConfig SubscriberConfig::fromJson(const Json::Value& root) {[m[41m[m
-[32m+[m[32m    SubscriberConfig subscriber;[m[41m[m
-[32m+[m[32m    subscriber.name = root.get("name", "").asString();[m[41m[m
-[32m+[m[32m    subscriber.primaryIp = root.get("primary_ip", "").asString();[m[41m[m
-[32m+[m[32m    subscriber.backupIp = root.get("backup_ip", "").asString();[m[41m[m
-[32m+[m[32m    subscriber.addedAt = root.get("added_at", "").asString();[m[41m[m
-[32m+[m[32m    subscriber.enabled = root.get("enabled", true).asBool();[m[41m[m
-[32m+[m[32m    if (root["stream_ids"].isArray()) {[m[41m[m
-[32m+[m[32m        for (const auto& id : root["stream_ids"]) {[m[41m[m
-[32m+[m[32m            subscriber.streamIds.push_back(id.asString());[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return subscriber;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mJson::Value SubscriberListConfig::toJson() const {[m[41m[m
-[32m+[m[32m    Json::Value root;[m[41m[m
-[32m+[m[32m    root["filtering_enabled"] = filteringEnabled;[m[41m[m
-[32m+[m[32m    Json::Value list(Json::arrayValue);[m[41m[m
-[32m+[m[32m    for (const auto& subscriber : subscribers) {[m[41m[m
-[32m+[m[32m        list.append(subscriber.toJson());[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    root["subscribers"] = list;[m[41m[m
-[32m+[m[32m    return root;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mSubscriberListConfig SubscriberListConfig::fromJson(const Json::Value& root) {[m[41m[m
-[32m+[m[32m    SubscriberListConfig config;[m[41m[m
-[32m+[m[32m    config.filteringEnabled = root.get("filtering_enabled", false).asBool();[m[41m[m
-[32m+[m[32m    if (root["subscribers"].isArray()) {[m[41m[m
-[32m+[m[32m        for (const auto& item : root["subscribers"]) {[m[41m[m
-[32m+[m[32m            config.subscribers.push_back(SubscriberConfig::fromJson(item));[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return config;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool ConfigManager::load() {[m[41m[m
-[32m+[m[32m    if (!std::filesystem::exists(configPath)) {[m[41m[m
-[32m+[m[32m        std::cerr << "Config file not found, creating default configuration: " << configPath << std::endl;[m[41m[m
-[32m+[m[32m        AppConfig defaultConfig;[m[41m[m
-[32m+[m[32m        {[m[41m[m
-[32m+[m[32m            std::lock_guard<std::mutex> lock(fileMutex);[m[41m[m
-[32m+[m[32m            config = defaultConfig;[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        if (!save()) return false;[m[41m[m
-[32m+[m[32m        return loadSubscribers();[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    {[m[41m[m
-[32m+[m[32m        std::lock_guard<std::mutex> lock(fileMutex);[m[41m[m
-[32m+[m[32m        std::ifstream input(configPath);[m[41m[m
-[32m+[m[32m        if (!input.is_open()) {[m[41m[m
-[32m+[m[32m            return false;[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        Json::Value root;[m[41m[m
-[32m+[m[32m        Json::CharReaderBuilder readerBuilder;[m[41m[m
-[32m+[m[32m        std::string errs;[m[41m[m
-[32m+[m[32m        bool ok = Json::parseFromStream(readerBuilder, input, &root, &errs);[m[41m[m
-[32m+[m[32m        if (!ok) {[m[41m[m
-[32m+[m[32m            std::cerr << "Failed to parse config: " << errs << std::endl;[m[41m[m
-[32m+[m[32m            return false;[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        config = AppConfig::fromJson(root);[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return loadSubscribers();[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool ConfigManager::loadSubscribers() {[m[41m[m
-[32m+[m[32m    const auto path = std::filesystem::current_path() / "tvstreammersat5-subscribers.json";[m[41m[m
-[32m+[m[32m    if (!std::filesystem::exists(path)) {[m[41m[m
-[32m+[m[32m        subscribers = SubscriberListConfig{};[m[41m[m
-[32m+[m[32m        return saveSubscribers();[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    std::lock_guard<std::mutex> lock(fileMutex);[m[41m[m
-[32m+[m[32m    std::ifstream input(path);[m[41m[m
-[32m+[m[32m    if (!input.is_open()) return false;[m[41m[m
-[32m+[m[32m    Json::Value root;[m[41m[m
-[32m+[m[32m    Json::CharReaderBuilder readerBuilder;[m[41m[m
-[32m+[m[32m    std::string errs;[m[41m[m
-[32m+[m[32m    if (!Json::parseFromStream(readerBuilder, input, &root, &errs)) {[m[41m[m
-[32m+[m[32m        std::cerr << "Failed to parse subscribers config: " << errs << std::endl;[m[41m[m
-[32m+[m[32m        return false;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    subscribers = SubscriberListConfig::fromJson(root);[m[41m[m
-[32m+[m[32m    return true;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool ConfigManager::save() {[m[41m[m
-[32m+[m[32m    std::lock_guard<std::mutex> lock(fileMutex);[m[41m[m
-[32m+[m[32m    std::ofstream output(configPath);[m[41m[m
-[32m+[m[32m    if (!output.is_open()) {[m[41m[m
-[32m+[m[32m        std::cerr << "Unable to open config file for writing: " << configPath << std::endl;[m[41m[m
-[32m+[m[32m        return false;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    Json::StreamWriterBuilder writer;[m[41m[m
-[32m+[m[32m    writer["indentation"] = "  ";[m[41m[m
-[32m+[m[32m    std::string str = Json::writeString(writer, config.toJson());[m[41m[m
-[32m+[m[32m    output << str;[m[41m[m
-[32m+[m[32m    return true;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool ConfigManager::saveSubscribers() {[m[41m[m
-[32m+[m[32m    std::lock_guard<std::mutex> lock(fileMutex);[m[41m[m
-[32m+[m[32m    const auto path = std::filesystem::current_path() / "tvstreammersat5-subscribers.json";[m[41m[m
-[32m+[m[32m    std::ofstream output(path);[m[41m[m
-[32m+[m[32m    if (!output.is_open()) return false;[m[41m[m
-[32m+[m[32m    Json::StreamWriterBuilder writer;[m[41m[m
-[32m+[m[32m    writer["indentation"] = "  ";[m[41m[m
-[32m+[m[32m    output << Json::writeString(writer, subscribers.toJson());[m[41m[m
-[32m+[m[32m    return true;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[1mdiff --git a/src/ConfigManager.h b/src/ConfigManager.h[m
-[1mindex 8eca1ca..981cd69 100644[m
-[1m--- a/src/ConfigManager.h[m
-[1m+++ b/src/ConfigManager.h[m
-[36m@@ -1,60 +1,60 @@[m
-[31m-#pragma once[m
-[31m-[m
-[31m-#include <jsoncpp/json/json.h>[m
-[31m-#include <filesystem>[m
-[31m-#include <mutex>[m
-[31m-#include <string>[m
-[31m-#include <vector>[m
-[31m-[m
-[31m-struct StreamOutputConfig {[m
-[31m-    std::string outputType = "udp-cbr";[m
-[31m-    std::string outputMode = "listener";[m
-[31m-    std::string outputHost = "127.0.0.1";[m
-[31m-    int outputPort = 1234;[m
-[31m-[m
-[31m-    Json::Value toJson() const;[m
-[31m-    static StreamOutputConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-struct StreamConfig {[m
-[31m-    std::string id;[m
-[31m-    std::string name;[m
-[31m-    std::string inputUri;[m
-[31m-    std::string backupInputUri;[m
-[31m-    std::string backupInputType = "url";[m
-[31m-    bool backupFileLoop = false;[m
-[31m-    std::string outputType = "udp-cbr";[m
-[31m-    std::string outputMode = "listener";[m
-[31m-    std::string outputHost = "127.0.0.1";[m
-[31m-    int outputPort = 1234;[m
-[31m-    std::string interfaceAddress;[m
-[31m-    std::string inputInterfaceAddress;[m
-[31m-    bool inputInterfaceAddressConfigured = false;[m
-[31m-    std::string inputMode = "auto";[m
-[31m-    bool testPattern = false;[m
-[31m-    bool autoStart = false;[m
-[31m-    bool remapEnabled = false;[m
-[31m-    bool cbr = true;[m
-[31m-    uint64_t targetBitrate = 2000000;[m
-[31m-    bool transcodeEnabled = false;[m
-[31m-    std::string transcodeResolution = "1920x1080";[m
-[31m-    uint64_t transcodeVideoBitrate = 6000000;[m
-[31m-    std::string transcodeAudioCodec = "aac";[m
-[31m-    uint64_t transcodeAudioBitrate = 192000;[m
-[31m-    uint32_t audioPid = 0;[m
-[31m-    uint32_t videoPid = 0;[m
-[31m-    uint32_t inputServiceId = 0;[m
-[31m-    uint32_t serviceId = 1;[m
-[31m-    std::string serviceName;[m
-[31m-    std::string serviceProvider;[m
-[31m-    std::string conditionalAccessClient;[m
-[31m-    std::vector<StreamOutputConfig> additionalOutputs;[m
-[31m-[m
-[31m-    Json::Value toJson() const;[m
-[31m-    static StreamConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-[m
-[32m+[m[32m#pragma once[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m#include <jsoncpp/json/json.h>[m[41m[m
-[32m+[m[32m#include <filesystem>[m[41m[m
-[32m+[m[32m#include <mutex>[m[41m[m
-[32m+[m[32m#include <string>[m[41m[m
-[32m+[m[32m#include <vector>[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct StreamOutputConfig {[m[41m[m
-[32m+[m[32m    std::string outputType = "udp-cbr";[m[41m[m
-[32m+[m[32m    std::string outputMode = "listener";[m[41m[m
-[32m+[m[32m    std::string outputHost = "127.0.0.1";[m[41m[m
-[32m+[m[32m    int outputPort = 1234;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    Json::Value toJson() const;[m[41m[m
-[32m+[m[32m    static StreamOutputConfig fromJson(const Json::Value& root);[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct StreamConfig {[m[41m[m
-[32m+[m[32m    std::string id;[m[41m[m
-[32m+[m[32m    std::string name;[m[41m[m
-[32m+[m[32m    std::string inputUri;[m[41m[m
-[32m+[m[32m    std::string backupInputUri;[m[41m[m
-[32m+[m[32m    std::string backupInputType = "url";[m[41m[m
-[32m+[m[32m    bool backupFileLoop = false;[m[41m[m
-[32m+[m[32m    std::string outputType = "udp-cbr";[m[41m[m
-[32m+[m[32m    std::string outputMode = "listener";[m[41m[m
-[32m+[m[32m    std::string outputHost = "127.0.0.1";[m[41m[m
-[32m+[m[32m    int outputPort = 1234;[m[41m[m
-[32m+[m[32m    std::string interfaceAddress;[m[41m[m
-[32m+[m[32m    std::string inputInterfaceAddress;[m[41m[m
-[32m+[m[32m    bool inputInterfaceAddressConfigured = false;[m[41m[m
-[32m+[m[32m    std::string inputMode = "auto";[m[41m[m
-[32m+[m[32m    bool testPattern = false;[m[41m[m
-[32m+[m[32m    bool autoStart = false;[m[41m[m
-[32m+[m[32m    bool remapEnabled = false;[m[41m[m
-[32m+[m[32m    bool cbr = true;[m[41m[m
-[32m+[m[32m    uint64_t targetBitrate = 2000000;[m[41m[m
-[32m+[m[32m    bool transcodeEnabled = false;[m[41m[m
-[32m+[m[32m    std::string transcodeResolution = "1920x1080";[m[41m[m
-[32m+[m[32m    uint64_t transcodeVideoBitrate = 6000000;[m[41m[m
-[32m+[m[32m    std::string transcodeAudioCodec = "aac";[m[41m[m
-[32m+[m[32m    uint64_t transcodeAudioBitrate = 192000;[m[41m[m
-[32m+[m[32m    uint32_t audioPid = 0;[m[41m[m
-[32m+[m[32m    uint32_t videoPid = 0;[m[41m[m
-[32m+[m[32m    uint32_t inputServiceId = 0;[m[41m[m
-[32m+[m[32m    uint32_t serviceId = 1;[m[41m[m
-[32m+[m[32m    std::string serviceName;[m[41m[m
-[32m+[m[32m    std::string serviceProvider;[m[41m[m
-[32m+[m[32m    std::string conditionalAccessClient;[m[41m[m
-[32m+[m[32m    std::vector<StreamOutputConfig> additionalOutputs;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    Json::Value toJson() const;[m[41m[m
-[32m+[m[32m    static StreamConfig fromJson(const Json::Value& root);[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[41m[m
- struct CamClientConfig {[m
-     std::string id;[m
-     std::string name;[m
-[36m@@ -64,55 +64,55 @@[m [mstruct CamClientConfig {[m
- [m
-     Json::Value toJson() const;[m
-     static CamClientConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-struct AppConfig {[m
-[31m-    std::string login = "admin";[m
-[31m-    std::string password = "admin";[m
-[31m-    std::string serverName = "TVStreammerSAT5";[m
-[31m-    int httpPort = 9000;[m
-[31m-    std::string language = "en";[m
-[31m-    std::string telegramToken;[m
-[31m-    std::string telegramChatId;[m
-[31m-    std::vector<StreamConfig> streams;[m
-[31m-    std::vector<CamClientConfig> camClients;[m
-[31m-[m
-[31m-    Json::Value toJson() const;[m
-[31m-    static AppConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-struct SubscriberConfig {[m
-[31m-    std::string name;[m
-[31m-    std::string primaryIp;[m
-[31m-    std::string backupIp;[m
-[31m-    std::string addedAt;[m
-[31m-    bool enabled = true;[m
-[31m-    std::vector<std::string> streamIds;[m
-[31m-[m
-[31m-    Json::Value toJson() const;[m
-[31m-    static SubscriberConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-struct SubscriberListConfig {[m
-[31m-    bool filteringEnabled = false;[m
-[31m-    std::vector<SubscriberConfig> subscribers;[m
-[31m-[m
-[31m-    Json::Value toJson() const;[m
-[31m-    static SubscriberListConfig fromJson(const Json::Value& root);[m
-[31m-};[m
-[31m-[m
-[31m-class ConfigManager {[m
-[31m-public:[m
-[31m-    ConfigManager();[m
-[31m-    bool load();[m
-[31m-    bool save();[m
-[31m-    bool loadSubscribers();[m
-[31m-    bool saveSubscribers();[m
-[31m-[m
-[31m-    AppConfig config;[m
-[31m-    SubscriberListConfig subscribers;[m
-[31m-[m
-[31m-private:[m
-[31m-    std::filesystem::path configPath;[m
-[31m-    std::mutex fileMutex;[m
-[31m-};[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct AppConfig {[m[41m[m
-[32m+[m[32m    std::string login = "admin";[m[41m[m
-[32m+[m[32m    std::string password = "admin";[m[41m[m
-[32m+[m[32m    std::string serverName = "TVStreammerSAT5";[m[41m[m
-[32m+[m[32m    int httpPort = 9000;[m[41m[m
-[32m+[m[32m    std::string language = "en";[m[41m[m
-[32m+[m[32m    std::string telegramToken;[m[41m[m
-[32m+[m[32m    std::string telegramChatId;[m[41m[m
-[32m+[m[32m    std::vector<StreamConfig> streams;[m[41m[m
-[32m+[m[32m    std::vector<CamClientConfig> camClients;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    Json::Value toJson() const;[m[41m[m
-[32m+[m[32m    static AppConfig fromJson(const Json::Value& root);[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct SubscriberConfig {[m[41m[m
-[32m+[m[32m    std::string name;[m[41m[m
-[32m+[m[32m    std::string primaryIp;[m[41m[m
-[32m+[m[32m    std::string backupIp;[m[41m[m
-[32m+[m[32m    std::string addedAt;[m[41m[m
-[32m+[m[32m    bool enabled = true;[m[41m[m
-[32m+[m[32m    std::vector<std::string> streamIds;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    Json::Value toJson() const;[m[41m[m
-[32m+[m[32m    static SubscriberConfig fromJson(const Json::Value& root);[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct SubscriberListConfig {[m[41m[m
-[32m+[m[32m    bool filteringEnabled = false;[m[41m[m
-[32m+[m[32m    std::vector<SubscriberConfig> subscribers;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    Json::Value toJson() const;[m[41m[m
-[32m+[m[32m    static SubscriberListConfig fromJson(const Json::Value& root);[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mclass ConfigManager {[m[41m[m
-[32m+[m[32mpublic:[m[41m[m
-[32m+[m[32m    ConfigManager();[m[41m[m
-[32m+[m[32m    bool load();[m[41m[m
-[32m+[m[32m    bool save();[m[41m[m
-[32m+[m[32m    bool loadSubscribers();[m[41m[m
-[32m+[m[32m    bool saveSubscribers();[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    AppConfig config;[m[41m[m
-[32m+[m[32m    SubscriberListConfig subscribers;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mprivate:[m[41m[m
-[32m+[m[32m    std::filesystem::path configPath;[m[41m[m
-[32m+[m[32m    std::mutex fileMutex;[m[41m[m
-[32m+[m[32m};[m[41m[m
-[1mdiff --git a/src/DvbSatellite.cpp b/src/DvbSatellite.cpp[m
-[1mindex 8fe9990..4c67c0e 100644[m
-[1m--- a/src/DvbSatellite.cpp[m
-[1m+++ b/src/DvbSatellite.cpp[m
-[36m@@ -1,1019 +1,1019 @@[m
-[31m-#include "DvbSatellite.h"[m
-[31m-[m
-[31m-#include <gst/app/gstappsink.h>[m
-[31m-#include <glib.h>[m
-[31m-#include <linux/dvb/frontend.h>[m
-[31m-[m
-[31m-#include <algorithm>[m
-[31m-#include <array>[m
-[31m-#include <chrono>[m
-[31m-#include <cmath>[m
-[31m-#include <cctype>[m
-[31m-#include <cerrno>[m
-[31m-#include <cstring>[m
-[31m-#include <fcntl.h>[m
-[31m-#include <filesystem>[m
-[31m-#include <map>[m
-[31m-#include <set>[m
-[31m-#include <sstream>[m
-[31m-#include <string_view>[m
-[31m-#include <sys/ioctl.h>[m
-[31m-#include <thread>[m
-[31m-#include <unistd.h>[m
-[31m-#include <vector>[m
-[31m-[m
-[31m-namespace {[m
-[31m-[m
-[31m-struct DvbService {[m
-[31m-    uint16_t serviceId = 0;[m
-[31m-    uint16_t pmtPid = 0;[m
-[31m-    uint16_t pcrPid = 0x1FFF;[m
-[31m-    uint8_t serviceType = 0;[m
-[31m-    bool scrambled = false;[m
-[31m-    bool pmtParsed = false;[m
-[31m-    std::vector<uint16_t> streamPids;[m
-[31m-    std::vector<uint16_t> caPids;      // compatibility: ECM + EMM[m
-[31m-    std::vector<uint16_t> ecmPids;[m
-[31m-    std::vector<uint16_t> emmPids;[m
-[31m-    std::string name;[m
-[31m-    std::string provider;[m
-[31m-};[m
-[31m-[m
-[31m-struct FrontendStats {[m
-[31m-    bool available = false;[m
-[31m-    bool locked = false;[m
-[31m-    int signalPercent = 0;[m
-[31m-    int qualityPercent = 0;[m
-[31m-    double signalDb = 0.0;[m
-[31m-    double cnrDb = 0.0;[m
-[31m-    bool hasSignalDb = false;[m
-[31m-    bool hasCnrDb = false;[m
-[31m-};[m
-[31m-[m
-[31m-std::string lower(std::string value) {[m
-[31m-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {[m
-[31m-        return static_cast<char>(std::tolower(c));[m
-[31m-    });[m
-[31m-    return value;[m
-[31m-}[m
-[31m-[m
-[31m-std::string upper(std::string value) {[m
-[31m-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {[m
-[31m-        return static_cast<char>(std::toupper(c));[m
-[31m-    });[m
-[31m-    return value;[m
-[31m-}[m
-[31m-[m
-[31m-std::string percentEncode(const std::string& value) {[m
-[31m-    std::ostringstream out;[m
-[31m-    const char hex[] = "0123456789ABCDEF";[m
-[31m-    for (unsigned char c : value) {[m
-[31m-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {[m
-[31m-            out << static_cast<char>(c);[m
-[31m-        } else {[m
-[31m-            out << '%' << hex[c >> 4] << hex[c & 0x0F];[m
-[31m-        }[m
-[31m-    }[m
-[31m-    return out.str();[m
-[31m-}[m
-[31m-[m
-[31m-int fromHex(char c) {[m
-[31m-    if (c >= '0' && c <= '9') return c - '0';[m
-[31m-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;[m
-[31m-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;[m
-[31m-    return -1;[m
-[31m-}[m
-[31m-[m
-[31m-std::string percentDecode(const std::string& value) {[m
-[31m-    std::string result;[m
-[31m-    result.reserve(value.size());[m
-[31m-    for (size_t i = 0; i < value.size(); ++i) {[m
-[31m-        if (value[i] == '%' && i + 2 < value.size()) {[m
-[31m-            const int hi = fromHex(value[i + 1]);[m
-[31m-            const int lo = fromHex(value[i + 2]);[m
-[31m-            if (hi >= 0 && lo >= 0) {[m
-[31m-                result.push_back(static_cast<char>((hi << 4) | lo));[m
-[31m-                i += 2;[m
-[31m-                continue;[m
-[31m-            }[m
-[31m-        }[m
-[31m-        if (value[i] == '+') result.push_back(' ');[m
-[31m-        else result.push_back(value[i]);[m
-[31m-    }[m
-[31m-    return result;[m
-[31m-}[m
-[31m-[m
-[31m-std::map<std::string, std::string> parseQuery(const std::string& uri) {[m
-[31m-    std::map<std::string, std::string> values;[m
-[31m-    const auto pos = uri.find('?');[m
-[31m-    if (pos == std::string::npos) return values;[m
-[31m-    std::string_view query(uri.data() + pos + 1, uri.size() - pos - 1);[m
-[31m-    size_t start = 0;[m
-[31m-    while (start <= query.size()) {[m
-[31m-        const size_t end = query.find('&', start);[m
-[31m-        const std::string_view item = query.substr(start, end == std::string_view::npos ? query.size() - start : end - start);[m
-[31m-        const size_t eq = item.find('=');[m
-[31m-        if (eq != std::string_view::npos) {[m
-[31m-            values[percentDecode(std::string(item.substr(0, eq)))] = percentDecode(std::string(item.substr(eq + 1)));[m
-[31m-        }[m
-[31m-        if (end == std::string_view::npos) break;[m
-[31m-        start = end + 1;[m
-[31m-    }[m
-[31m-    return values;[m
-[31m-}[m
-[31m-[m
-[31m-bool parseInt(const std::map<std::string, std::string>& query, const std::string& key, int& value) {[m
-[31m-    const auto found = query.find(key);[m
-[31m-    if (found == query.end() || found->second.empty()) return true;[m
-[31m-    try {[m
-[31m-        size_t used = 0;[m
-[31m-        const int parsed = std::stoi(found->second, &used);[m
-[31m-        if (used != found->second.size()) return false;[m
-[31m-        value = parsed;[m
-[31m-        return true;[m
-[31m-    } catch (...) {[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-}[m
-[31m-[m
-[31m-bool parseUInt(const std::map<std::string, std::string>& query, const std::string& key, uint32_t& value) {[m
-[31m-    const auto found = query.find(key);[m
-[31m-    if (found == query.end() || found->second.empty()) return true;[m
-[31m-    try {[m
-[31m-        size_t used = 0;[m
-[31m-        const unsigned long parsed = std::stoul(found->second, &used);[m
-[31m-        if (used != found->second.size() || parsed > 0xFFFFFFFFUL) return false;[m
-[31m-        value = static_cast<uint32_t>(parsed);[m
-[31m-        return true;[m
-[31m-    } catch (...) {[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-}[m
-[31m-[m
-[31m-DvbSatelliteParams paramsFromJson(const Json::Value& root, std::string& error) {[m
-[31m-    DvbSatelliteParams params;[m
-[31m-    params.adapter = std::clamp(root.get("adapter", 0).asInt(), 0, 31);[m
-[31m-    params.frontend = std::clamp(root.get("frontend", 0).asInt(), 0, 31);[m
-[31m-[m
-[31m-    const double frequencyMHz = root.get("frequency_mhz", 11727.0).asDouble();[m
-[31m-    if (!std::isfinite(frequencyMHz) || frequencyMHz < 900.0 || frequencyMHz > 14000.0) {[m
-[31m-        error = "Frequency must be specified in MHz (900..14000)";[m
-[31m-        return params;[m
-[31m-    }[m
-[31m-    params.frequencyKHz = static_cast<uint32_t>(std::llround(frequencyMHz * 1000.0));[m
-[31m-    params.symbolRateK = root.get("symbol_rate", 27500).asUInt();[m
-[31m-    if (params.symbolRateK < 100 || params.symbolRateK > 60000) {[m
-[31m-        error = "Symbol rate must be in kSym/s (100..60000)";[m
-[31m-        return params;[m
-[31m-    }[m
-[31m-[m
-[31m-    params.polarity = upper(root.get("polarity", "H").asString());[m
-[31m-    if (params.polarity != "H" && params.polarity != "V") {[m
-[31m-        error = "Polarity must be H or V";[m
-[31m-        return params;[m
-[31m-    }[m
-[31m-    params.deliverySystem = lower(root.get("delivery_system", "dvb-s2").asString());[m
-[31m-    if (params.deliverySystem != "dvb-s" && params.deliverySystem != "dvb-s2") {[m
-[31m-        error = "Delivery system must be dvb-s or dvb-s2";[m
-[31m-        return params;[m
-[31m-    }[m
-[31m-    params.modulation = lower(root.get("modulation", "auto").asString());[m
-[31m-    static const std::set<std::string> allowedModulations = {"auto", "qpsk", "8psk", "16apsk", "32apsk"};[m
-[31m-    if (!allowedModulations.count(params.modulation)) params.modulation = "auto";[m
-[31m-    params.fec = lower(root.get("fec", "auto").asString());[m
-[31m-    static const std::set<std::string> allowedFec = {"auto", "1/2", "2/3", "3/4", "4/5", "5/6", "6/7", "7/8", "8/9", "9/10", "3/5", "2/5"};[m
-[31m-    if (!allowedFec.count(params.fec)) params.fec = "auto";[m
-[31m-    params.diseqcSource = std::clamp(root.get("diseqc_source", -1).asInt(), -1, 7);[m
-[31m-    params.lnbLof1KHz = root.get("lnb_lof1_mhz", 9750).asUInt() * 1000U;[m
-[31m-    params.lnbLof2KHz = root.get("lnb_lof2_mhz", 10600).asUInt() * 1000U;[m
-[31m-    params.lnbSlofKHz = root.get("lnb_slof_mhz", 11700).asUInt() * 1000U;[m
-[31m-    params.streamId = std::clamp(root.get("stream_id", -1).asInt(), -1, 255);[m
-[31m-    return params;[m
-[31m-}[m
-[31m-[m
-[31m-std::string frontendPath(const DvbSatelliteParams& params) {[m
-[31m-    return "/dev/dvb/adapter" + std::to_string(params.adapter) + "/frontend" + std::to_string(params.frontend);[m
-[31m-}[m
-[31m-[m
-[31m-int clampPercent(double value) {[m
-[31m-    return std::clamp(static_cast<int>(std::lround(value)), 0, 100);[m
-[31m-}[m
-[31m-[m
-[31m-bool readPropertyStat(int fd, uint32_t command, int& percent, double& db, bool& hasDb) {[m
-[31m-    dtv_property property{};[m
-[31m-    property.cmd = command;[m
-[31m-    dtv_properties properties{};[m
-[31m-    properties.num = 1;[m
-[31m-    properties.props = &property;[m
-[31m-    if (ioctl(fd, FE_GET_PROPERTY, &properties) != 0 || property.u.st.len < 1) return false;[m
-[31m-[m
-[31m-    const auto& stat = property.u.st.stat[0];[m
-[31m-    if (stat.scale == FE_SCALE_RELATIVE) {[m
-[31m-        percent = clampPercent(static_cast<double>(stat.uvalue) * 100.0 / 65535.0);[m
-[31m-        return true;[m
-[31m-    }[m
-[31m-    if (stat.scale == FE_SCALE_DECIBEL) {[m
-[31m-        db = static_cast<double>(stat.svalue) / 1000.0;[m
-[31m-        hasDb = true;[m
-[31m-        return true;[m
-[31m-    }[m
-[31m-    return false;[m
-[31m-}[m
-[31m-[m
-[31m-FrontendStats readFrontendStats(const DvbSatelliteParams& params) {[m
-[31m-    FrontendStats result;[m
-[31m-    const int fd = open(frontendPath(params).c_str(), O_RDONLY | O_NONBLOCK);[m
-[31m-    if (fd < 0) return result;[m
-[31m-    result.available = true;[m
-[31m-[m
-[31m-    fe_status_t status{};[m
-[31m-    if (ioctl(fd, FE_READ_STATUS, &status) == 0) result.locked = (status & FE_HAS_LOCK) != 0;[m
-[31m-[m
-[31m-    int signalRelative = -1;[m
-[31m-    int qualityRelative = -1;[m
-[31m-    readPropertyStat(fd, DTV_STAT_SIGNAL_STRENGTH, signalRelative, result.signalDb, result.hasSignalDb);[m
-[31m-    readPropertyStat(fd, DTV_STAT_CNR, qualityRelative, result.cnrDb, result.hasCnrDb);[m
-[31m-[m
-[31m-    if (signalRelative < 0) {[m
-[31m-        uint16_t legacy = 0;[m
-[31m-        if (ioctl(fd, FE_READ_SIGNAL_STRENGTH, &legacy) == 0) {[m
-[31m-            signalRelative = clampPercent(static_cast<double>(legacy) * 100.0 / 65535.0);[m
-[31m-        }[m
-[31m-    }[m
-[31m-    if (qualityRelative < 0) {[m
-[31m-        uint16_t legacy = 0;[m
-[31m-        if (ioctl(fd, FE_READ_SNR, &legacy) == 0) {[m
-[31m-            qualityRelative = clampPercent(static_cast<double>(legacy) * 100.0 / 65535.0);[m
-[31m-        }[m
-[31m-    }[m
-[31m-[m
-[31m-    if (signalRelative >= 0) result.signalPercent = signalRelative;[m
-[31m-    else if (result.hasSignalDb) result.signalPercent = clampPercent((result.signalDb + 100.0) * 1.5);[m
-[31m-[m
-[31m-    if (qualityRelative >= 0) result.qualityPercent = qualityRelative;[m
-[31m-    else if (result.hasCnrDb) result.qualityPercent = clampPercent(result.cnrDb * 100.0 / 18.0);[m
-[31m-[m
-[31m-    close(fd);[m
-[31m-    return result;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value statsToJson(const FrontendStats& stats) {[m
-[31m-    Json::Value root;[m
-[31m-    root["available"] = stats.available;[m
-[31m-    root["locked"] = stats.locked;[m
-[31m-    root["signal"] = stats.signalPercent;[m
-[31m-    root["quality"] = stats.qualityPercent;[m
-[31m-    if (stats.hasSignalDb) root["signal_db"] = stats.signalDb;[m
-[31m-    if (stats.hasCnrDb) root["cnr_db"] = stats.cnrDb;[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[31m-std::string decodeDvbText(const uint8_t* data, size_t size) {[m
-[31m-    if (!data || size == 0) return {};[m
-[31m-    while (size > 0 && *data < 0x20) {[m
-[31m-        ++data;[m
-[31m-        --size;[m
-[31m-    }[m
-[31m-    if (!size) return {};[m
-[31m-    std::string raw(reinterpret_cast<const char*>(data), size);[m
-[31m-    if (g_utf8_validate(raw.data(), static_cast<gssize>(raw.size()), nullptr)) return raw;[m
-[31m-[m
-[31m-    GError* error = nullptr;[m
-[31m-    gsize bytesRead = 0;[m
-[31m-    gsize bytesWritten = 0;[m
-[31m-    gchar* converted = g_convert(raw.data(), raw.size(), "UTF-8", "ISO_6937", &bytesRead, &bytesWritten, &error);[m
-[31m-    if (!converted) {[m
-[31m-        if (error) g_error_free(error);[m
-[31m-        error = nullptr;[m
-[31m-        converted = g_convert(raw.data(), raw.size(), "UTF-8", "ISO-8859-1", &bytesRead, &bytesWritten, &error);[m
-[31m-    }[m
-[31m-    std::string result = converted ? std::string(converted, bytesWritten) : raw;[m
-[31m-    if (converted) g_free(converted);[m
-[31m-    if (error) g_error_free(error);[m
-[31m-    return result;[m
-[31m-}[m
-[31m-[m
-[31m-class PsiScanner {[m
-[31m-public:[m
-[31m-    void feed(const uint8_t* data, size_t size) {[m
-[31m-        if (!data || !size) return;[m
-[31m-        remainder.insert(remainder.end(), data, data + size);[m
-[31m-        size_t offset = 0;[m
-[31m-        while (remainder.size() - offset >= 188) {[m
-[31m-            if (remainder[offset] != 0x47) {[m
-[31m-                const auto next = std::find(remainder.begin() + static_cast<std::ptrdiff_t>(offset + 1), remainder.end(), 0x47);[m
-[31m-                if (next == remainder.end()) {[m
-[31m-                    remainder.clear();[m
-[31m-                    return;[m
-[31m-                }[m
-[31m-                offset = static_cast<size_t>(std::distance(remainder.begin(), next));[m
-[31m-                continue;[m
-[31m-            }[m
-[31m-            parsePacket(remainder.data() + offset);[m
-[31m-            offset += 188;[m
-[31m-        }[m
-[31m-        if (offset) remainder.erase(remainder.begin(), remainder.begin() + static_cast<std::ptrdiff_t>(offset));[m
-[31m-    }[m
-[31m-[m
-[31m-    std::vector<DvbService> services() const {[m
-[31m-        std::vector<DvbService> result;[m
-[31m-        for (const auto& [sid, pmt] : programMap) {[m
-[31m-            DvbService item;[m
-[31m-            item.serviceId = sid;[m
-[31m-            item.pmtPid = pmt;[m
-[31m-            const auto meta = serviceMap.find(sid);[m
-[31m-            if (meta != serviceMap.end()) {[m
-[31m-                item = meta->second;[m
-[31m-                item.serviceId = sid;[m
-[31m-                item.pmtPid = pmt;[m
-[31m-            }[m
-[31m-            if (item.scrambled) {[m
-[31m-                for (uint16_t caPid : catCaPids) {[m
-[31m-                    if (std::find(item.emmPids.begin(), item.emmPids.end(), caPid) == item.emmPids.end())[m
-[31m-                        item.emmPids.push_back(caPid);[m
-[31m-                    if (std::find(item.caPids.begin(), item.caPids.end(), caPid) == item.caPids.end())[m
-[31m-                        item.caPids.push_back(caPid);[m
-[31m-                }[m
-[31m-            }[m
-[31m-            if (item.name.empty()) item.name = "Service " + std::to_string(sid);[m
-[31m-            result.push_back(std::move(item));[m
-[31m-        }[m
-[31m-        std::sort(result.begin(), result.end(), [](const DvbService& a, const DvbService& b) {[m
-[31m-            if (a.name != b.name) return a.name < b.name;[m
-[31m-            return a.serviceId < b.serviceId;[m
-[31m-        });[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-private:[m
-[31m-    struct SectionState {[m
-[31m-        std::vector<uint8_t> bytes;[m
-[31m-        size_t expected = 0;[m
-[31m-    };[m
-[31m-[m
-[31m-    bool isPmtPid(uint16_t pid) const {[m
-[31m-        for (const auto& [sid, pmtPid] : programMap) {[m
-[31m-            (void)sid;[m
-[31m-            if (pmtPid == pid) return true;[m
-[31m-        }[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-[m
-[31m-    void markPacketScrambled(uint16_t pid) {[m
-[31m-        for (auto& [sid, service] : serviceMap) {[m
-[31m-            (void)sid;[m
-[31m-            if (service.pcrPid == pid ||[m
-[31m-                std::find(service.streamPids.begin(), service.streamPids.end(), pid) != service.streamPids.end()) {[m
-[31m-                service.scrambled = true;[m
-[31m-            }[m
-[31m-        }[m
-[31m-    }[m
-[31m-[m
-[31m-    void parsePacket(const uint8_t* packet) {[m
-[31m-        if (packet[0] != 0x47 || (packet[1] & 0x80)) return;[m
-[31m-        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);[m
-[31m-        const uint8_t scrambling = static_cast<uint8_t>((packet[3] >> 6) & 0x03);[m
-[31m-        if (scrambling != 0) markPacketScrambled(pid);[m
-[31m-[m
-[31m-        if (pid != 0x0000 && pid != 0x0001 && pid != 0x0011 && !isPmtPid(pid)) return;[m
-[31m-        const bool payloadStart = (packet[1] & 0x40) != 0;[m
-[31m-        const uint8_t adaptation = static_cast<uint8_t>((packet[3] >> 4) & 0x03);[m
-[31m-        if (adaptation == 0 || adaptation == 2) return;[m
-[31m-        size_t offset = 4;[m
-[31m-        if (adaptation == 3) {[m
-[31m-            offset += static_cast<size_t>(packet[4]) + 1;[m
-[31m-            if (offset >= 188) return;[m
-[31m-        }[m
-[31m-        feedSection(pid, packet + offset, 188 - offset, payloadStart);[m
-[31m-    }[m
-[31m-[m
-[31m-    void feedSection(uint16_t pid, const uint8_t* payload, size_t size, bool payloadStart) {[m
-[31m-        if (!payload || !size) return;[m
-[31m-        SectionState& state = sections[pid];[m
-[31m-        size_t offset = 0;[m
-[31m-        if (payloadStart) {[m
-[31m-            const size_t pointer = payload[0];[m
-[31m-            offset = 1;[m
-[31m-            if (!state.bytes.empty() && pointer && offset + pointer <= size) {[m
-[31m-                appendSection(pid, state, payload + offset, pointer);[m
-[31m-            }[m
-[31m-            offset += pointer;[m
-[31m-            state.bytes.clear();[m
-[31m-            state.expected = 0;[m
-[31m-        }[m
-[31m-[m
-[31m-        while (offset < size) {[m
-[31m-            if (!state.bytes.empty()) {[m
-[31m-                if (state.expected == 0) {[m
-[31m-                    const size_t headerNeeded = state.bytes.size() < 3 ? 3 - state.bytes.size() : 0;[m
-[31m-                    const size_t takeHeader = std::min(headerNeeded, size - offset);[m
-[31m-                    state.bytes.insert(state.bytes.end(), payload + offset, payload + offset + takeHeader);[m
-[31m-                    offset += takeHeader;[m
-[31m-                    if (state.bytes.size() < 3) return;[m
-[31m-                    const size_t sectionLength = static_cast<size_t>(((state.bytes[1] & 0x0F) << 8) | state.bytes[2]);[m
-[31m-                    state.expected = 3 + sectionLength;[m
-[31m-                    if (state.expected < 8 || state.expected > 4096) {[m
-[31m-                        state.bytes.clear();[m
-[31m-                        state.expected = 0;[m
-[31m-                        return;[m
-[31m-                    }[m
-[31m-                }[m
-[31m-                const size_t needed = state.expected > state.bytes.size() ? state.expected - state.bytes.size() : 0;[m
-[31m-                const size_t take = std::min(needed, size - offset);[m
-[31m-                state.bytes.insert(state.bytes.end(), payload + offset, payload + offset + take);[m
-[31m-                offset += take;[m
-[31m-                if (state.expected && state.bytes.size() >= state.expected) {[m
-[31m-                    parseSection(pid, state.bytes.data(), state.expected);[m
-[31m-                    state.bytes.clear();[m
-[31m-                    state.expected = 0;[m
-[31m-                }[m
-[31m-                continue;[m
-[31m-            }[m
-[31m-            if (payload[offset] == 0xFF) return;[m
-[31m-            if (size - offset < 3) {[m
-[31m-                state.bytes.assign(payload + offset, payload + size);[m
-[31m-                state.expected = 0;[m
-[31m-                return;[m
-[31m-            }[m
-[31m-            const size_t sectionLength = static_cast<size_t>(((payload[offset + 1] & 0x0F) << 8) | payload[offset + 2]);[m
-[31m-            const size_t total = 3 + sectionLength;[m
-[31m-            if (total < 8 || total > 4096) return;[m
-[31m-            if (size - offset >= total) {[m
-[31m-                parseSection(pid, payload + offset, total);[m
-[31m-                offset += total;[m
-[31m-            } else {[m
-[31m-                state.bytes.assign(payload + offset, payload + size);[m
-[31m-                state.expected = total;[m
-[31m-                return;[m
-[31m-            }[m
-[31m-        }[m
-[31m-    }[m
-[31m-[m
-[31m-    void appendSection(uint16_t pid, SectionState& state, const uint8_t* data, size_t size) {[m
-[31m-        if (!state.bytes.empty() && state.expected) {[m
-[31m-            const size_t take = std::min(size, state.expected - state.bytes.size());[m
-[31m-            state.bytes.insert(state.bytes.end(), data, data + take);[m
-[31m-            if (state.bytes.size() >= state.expected) parseSection(pid, state.bytes.data(), state.expected);[m
-[31m-        }[m
-[31m-        state.bytes.clear();[m
-[31m-        state.expected = 0;[m
-[31m-    }[m
-[31m-[m
-[31m-    void parseSection(uint16_t pid, const uint8_t* section, size_t size) {[m
-[31m-        if (pid == 0x0000) parsePat(section, size);[m
-[31m-        else if (pid == 0x0001) parseCat(section, size);[m
-[31m-        else if (pid == 0x0011) parseSdt(section, size);[m
-[31m-        else if (isPmtPid(pid)) parsePmt(section, size);[m
-[31m-    }[m
-[31m-[m
-[31m-    void parsePat(const uint8_t* section, size_t size) {[m
-[31m-        if (size < 12 || section[0] != 0x00) return;[m
-[31m-        const size_t end = size >= 4 ? size - 4 : 0;[m
-[31m-        for (size_t pos = 8; pos + 4 <= end; pos += 4) {[m
-[31m-            const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);[m
-[31m-            const uint16_t pid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);[m
-[31m-            if (program != 0) {[m
-[31m-                programMap[program] = pid;[m
-[31m-                DvbService& service = serviceMap[program];[m
-[31m-                service.serviceId = program;[m
-[31m-                service.pmtPid = pid;[m
-[31m-            }[m
-[31m-        }[m
-[31m-    }[m
-[31m-[m
-[31m-    static bool collectCaDescriptors(const uint8_t* data, size_t size, std::vector<uint16_t>* caPids) {[m
-[31m-        bool found = false;[m
-[31m-        size_t pos = 0;[m
-[31m-        while (pos + 2 <= size) {[m
-[31m-            const uint8_t tag = data[pos];[m
-[31m-            const size_t length = data[pos + 1];[m
-[31m-            if (pos + 2 + length > size) break;[m
-[31m-            if (tag == 0x09) { // conditional_access_descriptor[m
-[31m-                found = true;[m
-[31m-                if (caPids && length >= 4) {[m
-[31m-                    const uint8_t* d = data + pos + 2;[m
-[31m-                    const uint16_t caPid = static_cast<uint16_t>(((d[2] & 0x1F) << 8) | d[3]);[m
-[31m-                    if (caPid < 0x1FFF &&[m
-[31m-                        std::find(caPids->begin(), caPids->end(), caPid) == caPids->end()) {[m
-[31m-                        caPids->push_back(caPid);[m
-[31m-                    }[m
-[31m-                }[m
-[31m-            }[m
-[31m-            pos += 2 + length;[m
-[31m-        }[m
-[31m-        return found;[m
-[31m-    }[m
-[31m-[m
-[31m-    void parseCat(const uint8_t* section, size_t size) {[m
-[31m-        if (size < 12 || section[0] != 0x01) return;[m
-[31m-        const size_t end = size >= 4 ? size - 4 : 0;[m
-[31m-        if (end <= 8) return;[m
-[31m-        std::vector<uint16_t> found;[m
-[31m-        collectCaDescriptors(section + 8, end - 8, &found);[m
-[31m-        for (uint16_t pid : found) catCaPids.insert(pid);[m
-[31m-    }[m
-[31m-[m
-[31m-    void parsePmt(const uint8_t* section, size_t size) {[m
-[31m-        if (size < 16 || section[0] != 0x02) return;[m
-[31m-        const uint16_t sid = static_cast<uint16_t>((section[3] << 8) | section[4]);[m
-[31m-        const size_t end = size >= 4 ? size - 4 : 0;[m
-[31m-        if (end <= 12) return;[m
-[31m-[m
-[31m-        DvbService& service = serviceMap[sid];[m
-[31m-        service.serviceId = sid;[m
-[31m-        if (const auto it = programMap.find(sid); it != programMap.end()) service.pmtPid = it->second;[m
-[31m-        service.pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);[m
-[31m-[m
-[31m-        const size_t programInfoLength = static_cast<size_t>(((section[10] & 0x0F) << 8) | section[11]);[m
-[31m-        size_t pos = 12;[m
-[31m-        if (pos + programInfoLength > end) return;[m
-[31m-        std::vector<uint16_t> programCaPids;[m
-[31m-        if (collectCaDescriptors(section + pos, programInfoLength, &programCaPids)) service.scrambled = true;[m
-[31m-        for (uint16_t caPid : programCaPids) {[m
-[31m-            if (std::find(service.ecmPids.begin(), service.ecmPids.end(), caPid) == service.ecmPids.end()) service.ecmPids.push_back(caPid);[m
-[31m-            if (std::find(service.caPids.begin(), service.caPids.end(), caPid) == service.caPids.end()) service.caPids.push_back(caPid);[m
-[31m-        }[m
-[31m-        pos += programInfoLength;[m
-[31m-[m
-[31m-        std::vector<uint16_t> streamPids;[m
-[31m-        while (pos + 5 <= end) {[m
-[31m-            const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);[m
-[31m-            const size_t esInfoLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);[m
-[31m-            pos += 5;[m
-[31m-            if (pos + esInfoLength > end) break;[m
-[31m-            std::vector<uint16_t> esCaPids;[m
-[31m-            if (collectCaDescriptors(section + pos, esInfoLength, &esCaPids)) service.scrambled = true;[m
-[31m-            for (uint16_t caPid : esCaPids) {[m
-[31m-                if (std::find(service.ecmPids.begin(), service.ecmPids.end(), caPid) == service.ecmPids.end()) service.ecmPids.push_back(caPid);[m
-[31m-                if (std::find(service.caPids.begin(), service.caPids.end(), caPid) == service.caPids.end()) service.caPids.push_back(caPid);[m
-[31m-            }[m
-[31m-            if (elementaryPid != 0x1FFF &&[m
-[31m-                std::find(streamPids.begin(), streamPids.end(), elementaryPid) == streamPids.end()) {[m
-[31m-                streamPids.push_back(elementaryPid);[m
-[31m-            }[m
-[31m-            pos += esInfoLength;[m
-[31m-        }[m
-[31m-        if (!streamPids.empty()) service.streamPids = std::move(streamPids);[m
-[31m-        service.pmtParsed = true;[m
-[31m-    }[m
-[31m-[m
-[31m-    void parseSdt(const uint8_t* section, size_t size) {[m
-[31m-        if (size < 15 || (section[0] != 0x42 && section[0] != 0x46)) return;[m
-[31m-        const size_t end = size >= 4 ? size - 4 : 0;[m
-[31m-        size_t pos = 11;[m
-[31m-        while (pos + 5 <= end) {[m
-[31m-            const uint16_t sid = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);[m
-[31m-            DvbService& service = serviceMap[sid];[m
-[31m-            service.serviceId = sid;[m
-[31m-            if ((section[pos + 3] & 0x10) != 0) service.scrambled = true; // free_CA_mode[m
-[31m-            const size_t descriptorLength = static_cast<size_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);[m
-[31m-            pos += 5;[m
-[31m-            const size_t descriptorEnd = std::min(end, pos + descriptorLength);[m
-[31m-            while (pos + 2 <= descriptorEnd) {[m
-[31m-                const uint8_t tag = section[pos];[m
-[31m-                const size_t length = section[pos + 1];[m
-[31m-                if (pos + 2 + length > descriptorEnd) break;[m
-[31m-                if (tag == 0x48 && length >= 3) {[m
-[31m-                    const uint8_t* descriptor = section + pos + 2;[m
-[31m-                    service.serviceType = descriptor[0];[m
-[31m-                    size_t inner = 1;[m
-[31m-                    if (inner < length) {[m
-[31m-                        const size_t providerLength = descriptor[inner++];[m
-[31m-                        if (inner + providerLength <= length) {[m
-[31m-                            service.provider = decodeDvbText(descriptor + inner, providerLength);[m
-[31m-                            inner += providerLength;[m
-[31m-                        }[m
-[31m-                    }[m
-[31m-                    if (inner < length) {[m
-[31m-                        const size_t nameLength = descriptor[inner++];[m
-[31m-                        if (inner + nameLength <= length) {[m
-[31m-                            service.name = decodeDvbText(descriptor + inner, nameLength);[m
-[31m-                        }[m
-[31m-                    }[m
-[31m-                } else if (tag == 0x09) {[m
-[31m-                    service.scrambled = true;[m
-[31m-                }[m
-[31m-                pos += 2 + length;[m
-[31m-            }[m
-[31m-            pos = descriptorEnd;[m
-[31m-        }[m
-[31m-    }[m
-[31m-[m
-[31m-    std::vector<uint8_t> remainder;[m
-[31m-    std::map<uint16_t, SectionState> sections;[m
-[31m-    std::map<uint16_t, uint16_t> programMap;[m
-[31m-    std::map<uint16_t, DvbService> serviceMap;[m
-[31m-    std::set<uint16_t> catCaPids;[m
-[31m-};[m
-[31m-[m
-[31m-std::string servicePidsString(const DvbService& service) {[m
-[31m-    // Never build a PSI-only service filter. If PMT/ES data has not arrived,[m
-[31m-    // keep the full transport stream so startup can retry PID discovery.[m
-[31m-    if (!service.pmtParsed || service.streamPids.empty()) return {};[m
-[31m-[m
-[31m-    std::set<uint16_t> pids = {0x0000, 0x0001, 0x0010, 0x0011, 0x0012, 0x0014};[m
-[31m-    if (service.pmtPid > 0 && service.pmtPid < 0x1FFF) pids.insert(service.pmtPid);[m
-[31m-    if (service.pcrPid < 0x1FFF) pids.insert(service.pcrPid);[m
-[31m-    for (uint16_t pid : service.streamPids) {[m
-[31m-        if (pid < 0x1FFF) pids.insert(pid);[m
-[31m-    }[m
-[31m-    for (uint16_t pid : service.caPids) {[m
-[31m-        if (pid < 0x1FFF) pids.insert(pid);[m
-[31m-    }[m
-[31m-    std::ostringstream out;[m
-[31m-    bool first = true;[m
-[31m-    for (uint16_t pid : pids) {[m
-[31m-        if (!first) out << ':';[m
-[31m-        first = false;[m
-[31m-        out << pid;[m
-[31m-    }[m
-[31m-    return out.str();[m
-[31m-}[m
-[31m-[m
-[31m-bool waitForTune(GstElement* pipeline, GstElement* sink, const DvbSatelliteParams& params,[m
-[31m-                 int timeoutMs, PsiScanner* scanner, FrontendStats& bestStats, std::string& error) {[m
-[31m-    GstBus* bus = gst_element_get_bus(pipeline);[m
-[31m-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);[m
-[31m-    auto lastStatsRead = std::chrono::steady_clock::time_point{};[m
-[31m-    bool receivedData = false;[m
-[31m-[m
-[31m-    while (std::chrono::steady_clock::now() < deadline) {[m
-[31m-        GstMessage* message = gst_bus_pop_filtered(bus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));[m
-[31m-        if (message) {[m
-[31m-            if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {[m
-[31m-                GError* gstError = nullptr;[m
-[31m-                gchar* debug = nullptr;[m
-[31m-                gst_message_parse_error(message, &gstError, &debug);[m
-[31m-                error = gstError ? gstError->message : "DVB tuning failed";[m
-[31m-                if (gstError) g_error_free(gstError);[m
-[31m-                if (debug) g_free(debug);[m
-[31m-                gst_message_unref(message);[m
-[31m-                gst_object_unref(bus);[m
-[31m-                return false;[m
-[31m-            }[m
-[31m-            gst_message_unref(message);[m
-[31m-        }[m
-[31m-[m
-[31m-        GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 150 * GST_MSECOND);[m
-[31m-        if (sample) {[m
-[31m-            receivedData = true;[m
-[31m-            if (scanner) {[m
-[31m-                GstBuffer* buffer = gst_sample_get_buffer(sample);[m
-[31m-                GstMapInfo map{};[m
-[31m-                if (buffer && gst_buffer_map(buffer, &map, GST_MAP_READ)) {[m
-[31m-                    scanner->feed(map.data, map.size);[m
-[31m-                    gst_buffer_unmap(buffer, &map);[m
-[31m-                }[m
-[31m-            }[m
-[31m-            gst_sample_unref(sample);[m
-[31m-        }[m
-[31m-[m
-[31m-        const auto now = std::chrono::steady_clock::now();[m
-[31m-        if (lastStatsRead.time_since_epoch().count() == 0 || now - lastStatsRead >= std::chrono::milliseconds(350)) {[m
-[31m-            FrontendStats stats = readFrontendStats(params);[m
-[31m-            bestStats.available = bestStats.available || stats.available;[m
-[31m-            if (stats.signalPercent >= bestStats.signalPercent) bestStats.signalPercent = stats.signalPercent;[m
-[31m-            if (stats.qualityPercent >= bestStats.qualityPercent) bestStats.qualityPercent = stats.qualityPercent;[m
-[31m-            bestStats.locked = bestStats.locked || stats.locked;[m
-[31m-            if (stats.hasSignalDb) bestStats.signalDb = stats.signalDb, bestStats.hasSignalDb = true;[m
-[31m-            if (stats.hasCnrDb) bestStats.cnrDb = stats.cnrDb, bestStats.hasCnrDb = true;[m
-[31m-            lastStatsRead = now;[m
-[31m-        }[m
-[31m-    }[m
-[31m-    gst_object_unref(bus);[m
-[31m-    return receivedData || bestStats.locked;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int timeoutMs) {[m
-[31m-    Json::Value result;[m
-[31m-    const std::string device = frontendPath(params);[m
-[31m-    result["device"] = device;[m
-[31m-    if (!std::filesystem::exists(device)) {[m
-[31m-        result["error"] = "DVB frontend not found: " + device;[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-    GstElement* pipeline = gst_pipeline_new("satellite_scan");[m
-[31m-    GstElement* source = gst_element_factory_make("dvbsrc", "satellite_source");[m
-[31m-    GstElement* queue = gst_element_factory_make("queue", "satellite_scan_queue");[m
-[31m-    GstElement* sink = gst_element_factory_make("appsink", "satellite_scan_sink");[m
-[31m-    if (!pipeline || !source || !queue || !sink) {[m
-[31m-        result["error"] = "GStreamer DVB plugin is unavailable (dvbsrc/appsink)";[m
-[31m-        if (pipeline) gst_object_unref(pipeline);[m
-[31m-        else {[m
-[31m-            if (source) gst_object_unref(source);[m
-[31m-            if (queue) gst_object_unref(queue);[m
-[31m-            if (sink) gst_object_unref(sink);[m
-[31m-        }[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-    std::string configureError;[m
-[31m-    if (!DvbSatellite::configureSource(source, params, configureError)) {[m
-[31m-        result["error"] = configureError;[m
-[31m-        gst_object_unref(pipeline);[m
-[31m-        gst_object_unref(source);[m
-[31m-        gst_object_unref(queue);[m
-[31m-        gst_object_unref(sink);[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-    g_object_set(sink,[m
-[31m-        "sync", FALSE,[m
-[31m-        "emit-signals", FALSE,[m
-[31m-        "max-buffers", 64U,[m
-[31m-        "drop", TRUE,[m
-[31m-        nullptr);[m
-[31m-    g_object_set(queue,[m
-[31m-        "max-size-buffers", 0U,[m
-[31m-        "max-size-bytes", 0U,[m
-[31m-        "max-size-time", static_cast<guint64>(2 * GST_SECOND),[m
-[31m-        nullptr);[m
-[31m-[m
-[31m-    gst_bin_add_many(GST_BIN(pipeline), source, queue, sink, nullptr);[m
-[31m-    if (!gst_element_link_many(source, queue, sink, nullptr)) {[m
-[31m-        result["error"] = "Failed to build DVB scan pipeline";[m
-[31m-        gst_object_unref(pipeline);[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);[m
-[31m-    if (stateResult == GST_STATE_CHANGE_FAILURE) {[m
-[31m-        result["error"] = "DVB frontend could not start tuning";[m
-[31m-        gst_element_set_state(pipeline, GST_STATE_NULL);[m
-[31m-        gst_object_unref(pipeline);[m
-[31m-        return result;[m
-[31m-    }[m
-[31m-[m
-[31m-    PsiScanner scanner;[m
-[31m-    FrontendStats stats;[m
-[31m-    std::string tuneError;[m
-[31m-    const bool tuned = waitForTune(pipeline, sink, params, timeoutMs, collectServices ? &scanner : nullptr, stats, tuneError);[m
-[31m-[m
-[31m-    gst_element_set_state(pipeline, GST_STATE_NULL);[m
-[31m-    gst_object_unref(pipeline);[m
-[31m-[m
-[31m-    result["locked"] = stats.locked;[m
-[31m-    result["signal"] = stats.signalPercent;[m
-[31m-    result["quality"] = stats.qualityPercent;[m
-[31m-    if (stats.hasSignalDb) result["signal_db"] = stats.signalDb;[m
-[31m-    if (stats.hasCnrDb) result["cnr_db"] = stats.cnrDb;[m
-[31m-    if (!tuneError.empty()) result["error"] = tuneError;[m
-[31m-    else if (!tuned) result["error"] = "No satellite signal / frontend lock";[m
-[31m-[m
-[31m-    if (collectServices) {[m
-[31m-        Json::Value services(Json::arrayValue);[m
-[31m-        for (const auto& service : scanner.services()) {[m
-[31m-            Json::Value item;[m
-[31m-            item["service_id"] = service.serviceId;[m
-[31m-            item["pmt_pid"] = service.pmtPid;[m
-[31m-            item["pcr_pid"] = service.pcrPid < 0x1FFF ? service.pcrPid : 0;[m
-[31m-            item["service_type"] = service.serviceType;[m
-[31m-            item["name"] = service.name;[m
-[31m-            item["provider"] = service.provider;[m
-[31m-            item["scrambled"] = service.scrambled;[m
-[31m-            const bool pmtReady = service.pmtParsed && !service.streamPids.empty();[m
-[31m-            item["pmt_ready"] = pmtReady;[m
-[31m-            item["access"] = service.scrambled ? "CA" : (pmtReady ? "FTA" : "UNKNOWN");[m
-[31m-            Json::Value streamPids(Json::arrayValue);[m
-[31m-            for (uint16_t pid : service.streamPids) streamPids.append(pid);[m
-[31m-            item["stream_pids"] = streamPids;[m
-[31m-            Json::Value caPids(Json::arrayValue);[m
-[31m-            for (uint16_t pid : service.caPids) caPids.append(pid);[m
-[31m-            item["ca_pids"] = caPids;[m
-[31m-            Json::Value ecmPids(Json::arrayValue);[m
-[31m-            for (uint16_t pid : service.ecmPids) ecmPids.append(pid);[m
-[31m-            item["ecm_pids"] = ecmPids;[m
-[31m-            Json::Value emmPids(Json::arrayValue);[m
-[31m-            for (uint16_t pid : service.emmPids) emmPids.append(pid);[m
-[31m-            item["emm_pids"] = emmPids;[m
-[31m-            item["emm_receive_enabled"] = service.scrambled && !service.emmPids.empty();[m
-[31m-            const std::string pids = servicePidsString(service);[m
-[31m-            item["service_pids"] = pids;[m
-[31m-            DvbSatelliteParams serviceParams = params;[m
-[31m-            serviceParams.pids = pids.empty() ? "8192" : pids;[m
-[31m-            item["input_uri"] = DvbSatellite::buildUri(serviceParams);[m
-[31m-            services.append(item);[m
-[31m-        }[m
-[31m-        result["services"] = services;[m
-[31m-        result["service_count"] = services.size();[m
-[31m-    }[m
-[31m-    return result;[m
-[31m-}[m
-[31m-[m
-[31m-} // namespace[m
-[31m-[m
-[31m-namespace DvbSatellite {[m
-[31m-[m
-[31m-bool isDvbUri(const std::string& uri) {[m
-[31m-    return lower(uri).rfind("dvb://", 0) == 0;[m
-[31m-}[m
-[31m-[m
-[31m-bool parseUri(const std::string& uri, DvbSatelliteParams& params, std::string& error) {[m
-[31m-    if (!isDvbUri(uri)) {[m
-[31m-        error = "Not a DVB URI";[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    const auto query = parseQuery(uri);[m
-[31m-    if (!parseInt(query, "adapter", params.adapter) ||[m
-[31m-        !parseInt(query, "frontend", params.frontend) ||[m
-[31m-        !parseUInt(query, "frequency_khz", params.frequencyKHz) ||[m
-[31m-        !parseUInt(query, "symbol_rate", params.symbolRateK) ||[m
-[31m-        !parseInt(query, "diseqc_source", params.diseqcSource) ||[m
-[31m-        !parseUInt(query, "lnb_lof1_khz", params.lnbLof1KHz) ||[m
-[31m-        !parseUInt(query, "lnb_lof2_khz", params.lnbLof2KHz) ||[m
-[31m-        !parseUInt(query, "lnb_slof_khz", params.lnbSlofKHz) ||[m
-[31m-        !parseInt(query, "stream_id", params.streamId)) {[m
-[31m-        error = "Invalid DVB URI numeric parameter";[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    if (const auto it = query.find("polarity"); it != query.end()) params.polarity = upper(it->second);[m
-[31m-    if (const auto it = query.find("delivery_system"); it != query.end()) params.deliverySystem = lower(it->second);[m
-[31m-    if (const auto it = query.find("modulation"); it != query.end()) params.modulation = lower(it->second);[m
-[31m-    if (const auto it = query.find("fec"); it != query.end()) params.fec = lower(it->second);[m
-[31m-    if (const auto it = query.find("pids"); it != query.end() && !it->second.empty()) params.pids = it->second;[m
-[31m-[m
-[31m-    if (params.frequencyKHz < 900000 || params.frequencyKHz > 14000000 ||[m
-[31m-        params.symbolRateK < 100 || params.symbolRateK > 60000 ||[m
-[31m-        (params.polarity != "H" && params.polarity != "V") ||[m
-[31m-        (params.deliverySystem != "dvb-s" && params.deliverySystem != "dvb-s2")) {[m
-[31m-        error = "Invalid DVB-S/S2 tuning parameters";[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    return true;[m
-[31m-}[m
-[31m-[m
-[31m-std::string buildUri(const DvbSatelliteParams& params) {[m
-[31m-    std::ostringstream uri;[m
-[31m-    uri << "dvb://satellite?adapter=" << params.adapter[m
-[31m-        << "&frontend=" << params.frontend[m
-[31m-        << "&frequency_khz=" << params.frequencyKHz[m
-[31m-        << "&symbol_rate=" << params.symbolRateK[m
-[31m-        << "&polarity=" << percentEncode(params.polarity)[m
-[31m-        << "&delivery_system=" << percentEncode(params.deliverySystem)[m
-[31m-        << "&modulation=" << percentEncode(params.modulation)[m
-[31m-        << "&fec=" << percentEncode(params.fec)[m
-[31m-        << "&diseqc_source=" << params.diseqcSource[m
-[31m-        << "&lnb_lof1_khz=" << params.lnbLof1KHz[m
-[31m-        << "&lnb_lof2_khz=" << params.lnbLof2KHz[m
-[31m-        << "&lnb_slof_khz=" << params.lnbSlofKHz[m
-[31m-        << "&stream_id=" << params.streamId[m
-[31m-        << "&pids=" << percentEncode(params.pids.empty() ? "8192" : params.pids);[m
-[31m-    return uri.str();[m
-[31m-}[m
-[31m-[m
-[31m-bool configureSource(GstElement* source, const DvbSatelliteParams& params, std::string& error) {[m
-[31m-    if (!source) {[m
-[31m-        error = "DVB source is null";[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-    const std::string factoryName = GST_OBJECT_NAME(source) ? GST_OBJECT_NAME(source) : "dvbsrc";[m
-[31m-    if (!g_object_class_find_property(G_OBJECT_GET_CLASS(source), "frequency")) {[m
-[31m-        error = factoryName + ": incompatible dvbsrc plugin";[m
-[31m-        return false;[m
-[31m-    }[m
-[31m-[m
-[31m-    g_object_set(source,[m
-[31m-        "adapter", params.adapter,[m
-[31m-        "frontend", params.frontend,[m
-[31m-        "frequency", params.frequencyKHz,[m
-[31m-        "symbol-rate", params.symbolRateK,[m
-[31m-        "polarity", params.polarity.c_str(),[m
-[31m-        "diseqc-source", params.diseqcSource,[m
-[31m-        "lnb-lof1", params.lnbLof1KHz,[m
-[31m-        "lnb-lof2", params.lnbLof2KHz,[m
-[31m-        "lnb-slof", params.lnbSlofKHz,[m
-[31m-        "pids", (params.pids.empty() ? "8192" : params.pids.c_str()),[m
-[31m-        "stats-reporting-interval", 20U,[m
-[31m-        "tuning-timeout", static_cast<guint64>(5000000),[m
-[31m-        nullptr);[m
-[31m-    gst_util_set_object_arg(G_OBJECT(source), "delsys", params.deliverySystem.c_str());[m
-[31m-    gst_util_set_object_arg(G_OBJECT(source), "modulation", params.modulation.c_str());[m
-[31m-    gst_util_set_object_arg(G_OBJECT(source), "code-rate-hp", params.fec.c_str());[m
-[31m-    gst_util_set_object_arg(G_OBJECT(source), "pilot", "auto");[m
-[31m-    gst_util_set_object_arg(G_OBJECT(source), "rolloff", "auto");[m
-[31m-    if (params.streamId >= 0 && g_object_class_find_property(G_OBJECT_GET_CLASS(source), "stream-id")) {[m
-[31m-        g_object_set(source, "stream-id", params.streamId, nullptr);[m
-[31m-    }[m
-[31m-    return true;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value adapters() {[m
-[31m-    Json::Value root;[m
-[31m-    Json::Value list(Json::arrayValue);[m
-[31m-    const std::filesystem::path base("/dev/dvb");[m
-[31m-    std::error_code ec;[m
-[31m-    if (std::filesystem::exists(base, ec) && !ec) {[m
-[31m-        for (const auto& adapterEntry : std::filesystem::directory_iterator(base, ec)) {[m
-[31m-            if (ec || !adapterEntry.is_directory()) continue;[m
-[31m-            const std::string adapterName = adapterEntry.path().filename().string();[m
-[31m-            if (adapterName.rfind("adapter", 0) != 0) continue;[m
-[31m-            int adapter = -1;[m
-[31m-            try { adapter = std::stoi(adapterName.substr(7)); } catch (...) { continue; }[m
-[31m-            for (const auto& frontendEntry : std::filesystem::directory_iterator(adapterEntry.path(), ec)) {[m
-[31m-                if (ec) break;[m
-[31m-                const std::string frontendName = frontendEntry.path().filename().string();[m
-[31m-                if (frontendName.rfind("frontend", 0) != 0) continue;[m
-[31m-                int frontend = -1;[m
-[31m-                try { frontend = std::stoi(frontendName.substr(8)); } catch (...) { continue; }[m
-[31m-                Json::Value item;[m
-[31m-                item["adapter"] = adapter;[m
-[31m-                item["frontend"] = frontend;[m
-[31m-                item["device"] = frontendEntry.path().string();[m
-[31m-                list.append(item);[m
-[31m-            }[m
-[31m-        }[m
-[31m-    }[m
-[31m-    root["adapters"] = list;[m
-[31m-    root["available"] = !list.empty();[m
-[31m-    GstElementFactory* dvbFactory = gst_element_factory_find("dvbsrc");[m
-[31m-    root["dvbsrc_available"] = dvbFactory != nullptr;[m
-[31m-    if (dvbFactory) gst_object_unref(dvbFactory);[m
-[31m-    return root;[m
-[31m-}[m
-[31m-[m
-[31m-Json::Value scan(const Json::Value& request) {[m
-[31m-    std::string error;[m
-[31m-    const DvbSatelliteParams params = paramsFromJson(request, error);[m
-[31m-    if (!error.empty()) {[m
-[31m-        Json::Value result;[m
-[31m-        result["error"] = error;[m
-[31m-        return result;[m
-[31m-    }[m
-[32m+[m[32m#include "DvbSatellite.h"[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m#include <gst/app/gstappsink.h>[m[41m[m
-[32m+[m[32m#include <glib.h>[m[41m[m
-[32m+[m[32m#include <linux/dvb/frontend.h>[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m#include <algorithm>[m[41m[m
-[32m+[m[32m#include <array>[m[41m[m
-[32m+[m[32m#include <chrono>[m[41m[m
-[32m+[m[32m#include <cmath>[m[41m[m
-[32m+[m[32m#include <cctype>[m[41m[m
-[32m+[m[32m#include <cerrno>[m[41m[m
-[32m+[m[32m#include <cstring>[m[41m[m
-[32m+[m[32m#include <fcntl.h>[m[41m[m
-[32m+[m[32m#include <filesystem>[m[41m[m
-[32m+[m[32m#include <map>[m[41m[m
-[32m+[m[32m#include <set>[m[41m[m
-[32m+[m[32m#include <sstream>[m[41m[m
-[32m+[m[32m#include <string_view>[m[41m[m
-[32m+[m[32m#include <sys/ioctl.h>[m[41m[m
-[32m+[m[32m#include <thread>[m[41m[m
-[32m+[m[32m#include <unistd.h>[m[41m[m
-[32m+[m[32m#include <vector>[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mnamespace {[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct DvbService {[m[41m[m
-[32m+[m[32m    uint16_t serviceId = 0;[m[41m[m
-[32m+[m[32m    uint16_t pmtPid = 0;[m[41m[m
-[32m+[m[32m    uint16_t pcrPid = 0x1FFF;[m[41m[m
-[32m+[m[32m    uint8_t serviceType = 0;[m[41m[m
-[32m+[m[32m    bool scrambled = false;[m[41m[m
-[32m+[m[32m    bool pmtParsed = false;[m[41m[m
-[32m+[m[32m    std::vector<uint16_t> streamPids;[m[41m[m
-[32m+[m[32m    std::vector<uint16_t> caPids;      // compatibility: ECM + EMM[m[41m[m
-[32m+[m[32m    std::vector<uint16_t> ecmPids;[m[41m[m
-[32m+[m[32m    std::vector<uint16_t> emmPids;[m[41m[m
-[32m+[m[32m    std::string name;[m[41m[m
-[32m+[m[32m    std::string provider;[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstruct FrontendStats {[m[41m[m
-[32m+[m[32m    bool available = false;[m[41m[m
-[32m+[m[32m    bool locked = false;[m[41m[m
-[32m+[m[32m    int signalPercent = 0;[m[41m[m
-[32m+[m[32m    int qualityPercent = 0;[m[41m[m
-[32m+[m[32m    double signalDb = 0.0;[m[41m[m
-[32m+[m[32m    double cnrDb = 0.0;[m[41m[m
-[32m+[m[32m    bool hasSignalDb = false;[m[41m[m
-[32m+[m[32m    bool hasCnrDb = false;[m[41m[m
-[32m+[m[32m};[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::string lower(std::string value) {[m[41m[m
-[32m+[m[32m    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {[m[41m[m
-[32m+[m[32m        return static_cast<char>(std::tolower(c));[m[41m[m
-[32m+[m[32m    });[m[41m[m
-[32m+[m[32m    return value;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::string upper(std::string value) {[m[41m[m
-[32m+[m[32m    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {[m[41m[m
-[32m+[m[32m        return static_cast<char>(std::toupper(c));[m[41m[m
-[32m+[m[32m    });[m[41m[m
-[32m+[m[32m    return value;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::string percentEncode(const std::string& value) {[m[41m[m
-[32m+[m[32m    std::ostringstream out;[m[41m[m
-[32m+[m[32m    const char hex[] = "0123456789ABCDEF";[m[41m[m
-[32m+[m[32m    for (unsigned char c : value) {[m[41m[m
-[32m+[m[32m        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {[m[41m[m
-[32m+[m[32m            out << static_cast<char>(c);[m[41m[m
-[32m+[m[32m        } else {[m[41m[m
-[32m+[m[32m            out << '%' << hex[c >> 4] << hex[c & 0x0F];[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return out.str();[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mint fromHex(char c) {[m[41m[m
-[32m+[m[32m    if (c >= '0' && c <= '9') return c - '0';[m[41m[m
-[32m+[m[32m    if (c >= 'a' && c <= 'f') return c - 'a' + 10;[m[41m[m
-[32m+[m[32m    if (c >= 'A' && c <= 'F') return c - 'A' + 10;[m[41m[m
-[32m+[m[32m    return -1;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::string percentDecode(const std::string& value) {[m[41m[m
-[32m+[m[32m    std::string result;[m[41m[m
-[32m+[m[32m    result.reserve(value.size());[m[41m[m
-[32m+[m[32m    for (size_t i = 0; i < value.size(); ++i) {[m[41m[m
-[32m+[m[32m        if (value[i] == '%' && i + 2 < value.size()) {[m[41m[m
-[32m+[m[32m            const int hi = fromHex(value[i + 1]);[m[41m[m
-[32m+[m[32m            const int lo = fromHex(value[i + 2]);[m[41m[m
-[32m+[m[32m            if (hi >= 0 && lo >= 0) {[m[41m[m
-[32m+[m[32m                result.push_back(static_cast<char>((hi << 4) | lo));[m[41m[m
-[32m+[m[32m                i += 2;[m[41m[m
-[32m+[m[32m                continue;[m[41m[m
-[32m+[m[32m            }[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        if (value[i] == '+') result.push_back(' ');[m[41m[m
-[32m+[m[32m        else result.push_back(value[i]);[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return result;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::map<std::string, std::string> parseQuery(const std::string& uri) {[m[41m[m
-[32m+[m[32m    std::map<std::string, std::string> values;[m[41m[m
-[32m+[m[32m    const auto pos = uri.find('?');[m[41m[m
-[32m+[m[32m    if (pos == std::string::npos) return values;[m[41m[m
-[32m+[m[32m    std::string_view query(uri.data() + pos + 1, uri.size() - pos - 1);[m[41m[m
-[32m+[m[32m    size_t start = 0;[m[41m[m
-[32m+[m[32m    while (start <= query.size()) {[m[41m[m
-[32m+[m[32m        const size_t end = query.find('&', start);[m[41m[m
-[32m+[m[32m        const std::string_view item = query.substr(start, end == std::string_view::npos ? query.size() - start : end - start);[m[41m[m
-[32m+[m[32m        const size_t eq = item.find('=');[m[41m[m
-[32m+[m[32m        if (eq != std::string_view::npos) {[m[41m[m
-[32m+[m[32m            values[percentDecode(std::string(item.substr(0, eq)))] = percentDecode(std::string(item.substr(eq + 1)));[m[41m[m
-[32m+[m[32m        }[m[41m[m
-[32m+[m[32m        if (end == std::string_view::npos) break;[m[41m[m
-[32m+[m[32m        start = end + 1;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    return values;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool parseInt(const std::map<std::string, std::string>& query, const std::string& key, int& value) {[m[41m[m
-[32m+[m[32m    const auto found = query.find(key);[m[41m[m
-[32m+[m[32m    if (found == query.end() || found->second.empty()) return true;[m[41m[m
-[32m+[m[32m    try {[m[41m[m
-[32m+[m[32m        size_t used = 0;[m[41m[m
-[32m+[m[32m        const int parsed = std::stoi(found->second, &used);[m[41m[m
-[32m+[m[32m        if (used != found->second.size()) return false;[m[41m[m
-[32m+[m[32m        value = parsed;[m[41m[m
-[32m+[m[32m        return true;[m[41m[m
-[32m+[m[32m    } catch (...) {[m[41m[m
-[32m+[m[32m        return false;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool parseUInt(const std::map<std::string, std::string>& query, const std::string& key, uint32_t& value) {[m[41m[m
-[32m+[m[32m    const auto found = query.find(key);[m[41m[m
-[32m+[m[32m    if (found == query.end() || found->second.empty()) return true;[m[41m[m
-[32m+[m[32m    try {[m[41m[m
-[32m+[m[32m        size_t used = 0;[m[41m[m
-[32m+[m[32m        const unsigned long parsed = std::stoul(found->second, &used);[m[41m[m
-[32m+[m[32m        if (used != found->second.size() || parsed > 0xFFFFFFFFUL) return false;[m[41m[m
-[32m+[m[32m        value = static_cast<uint32_t>(parsed);[m[41m[m
-[32m+[m[32m        return true;[m[41m[m
-[32m+[m[32m    } catch (...) {[m[41m[m
-[32m+[m[32m        return false;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mDvbSatelliteParams paramsFromJson(const Json::Value& root, std::string& error) {[m[41m[m
-[32m+[m[32m    DvbSatelliteParams params;[m[41m[m
-[32m+[m[32m    params.adapter = std::clamp(root.get("adapter", 0).asInt(), 0, 31);[m[41m[m
-[32m+[m[32m    params.frontend = std::clamp(root.get("frontend", 0).asInt(), 0, 31);[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    const double frequencyMHz = root.get("frequency_mhz", 11727.0).asDouble();[m[41m[m
-[32m+[m[32m    if (!std::isfinite(frequencyMHz) || frequencyMHz < 900.0 || frequencyMHz > 14000.0) {[m[41m[m
-[32m+[m[32m        error = "Frequency must be specified in MHz (900..14000)";[m[41m[m
-[32m+[m[32m        return params;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    params.frequencyKHz = static_cast<uint32_t>(std::llround(frequencyMHz * 1000.0));[m[41m[m
-[32m+[m[32m    params.symbolRateK = root.get("symbol_rate", 27500).asUInt();[m[41m[m
-[32m+[m[32m    if (params.symbolRateK < 100 || params.symbolRateK > 60000) {[m[41m[m
-[32m+[m[32m        error = "Symbol rate must be in kSym/s (100..60000)";[m[41m[m
-[32m+[m[32m        return params;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    params.polarity = upper(root.get("polarity", "H").asString());[m[41m[m
-[32m+[m[32m    if (params.polarity != "H" && params.polarity != "V") {[m[41m[m
-[32m+[m[32m        error = "Polarity must be H or V";[m[41m[m
-[32m+[m[32m        return params;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    params.deliverySystem = lower(root.get("delivery_system", "dvb-s2").asString());[m[41m[m
-[32m+[m[32m    if (params.deliverySystem != "dvb-s" && params.deliverySystem != "dvb-s2") {[m[41m[m
-[32m+[m[32m        error = "Delivery system must be dvb-s or dvb-s2";[m[41m[m
-[32m+[m[32m        return params;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    params.modulation = lower(root.get("modulation", "auto").asString());[m[41m[m
-[32m+[m[32m    static const std::set<std::string> allowedModulations = {"auto", "qpsk", "8psk", "16apsk", "32apsk"};[m[41m[m
-[32m+[m[32m    if (!allowedModulations.count(params.modulation)) params.modulation = "auto";[m[41m[m
-[32m+[m[32m    params.fec = lower(root.get("fec", "auto").asString());[m[41m[m
-[32m+[m[32m    static const std::set<std::string> allowedFec = {"auto", "1/2", "2/3", "3/4", "4/5", "5/6", "6/7", "7/8", "8/9", "9/10", "3/5", "2/5"};[m[41m[m
-[32m+[m[32m    if (!allowedFec.count(params.fec)) params.fec = "auto";[m[41m[m
-[32m+[m[32m    params.diseqcSource = std::clamp(root.get("diseqc_source", -1).asInt(), -1, 7);[m[41m[m
-[32m+[m[32m    params.lnbLof1KHz = root.get("lnb_lof1_mhz", 9750).asUInt() * 1000U;[m[41m[m
-[32m+[m[32m    params.lnbLof2KHz = root.get("lnb_lof2_mhz", 10600).asUInt() * 1000U;[m[41m[m
-[32m+[m[32m    params.lnbSlofKHz = root.get("lnb_slof_mhz", 11700).asUInt() * 1000U;[m[41m[m
-[32m+[m[32m    params.streamId = std::clamp(root.get("stream_id", -1).asInt(), -1, 255);[m[41m[m
-[32m+[m[32m    return params;[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mstd::string frontendPath(const DvbSatelliteParams& params) {[m[41m[m
-[32m+[m[32m    return "/dev/dvb/adapter" + std::to_string(params.adapter) + "/frontend" + std::to_string(params.frontend);[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mint clampPercent(double value) {[m[41m[m
-[32m+[m[32m    return std::clamp(static_cast<int>(std::lround(value)), 0, 100);[m[41m[m
-[32m+[m[32m}[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32mbool readPropertyStat(int fd, uint32_t command, int& percent, double& db, bool& hasDb) {[m[41m[m
-[32m+[m[32m    dtv_property property{};[m[41m[m
-[32m+[m[32m    property.cmd = command;[m[41m[m
-[32m+[m[32m    dtv_properties properties{};[m[41m[m
-[32m+[m[32m    properties.num = 1;[m[41m[m
-[32m+[m[32m    properties.props = &property;[m[41m[m
-[32m+[m[32m    if (ioctl(fd, FE_GET_PROPERTY, &properties) != 0 || property.u.st.len < 1) return false;[m[41m[m
-[32m+[m[41m[m
-[32m+[m[32m    const auto& stat = property.u.st.stat[0];[m[41m[m
-[32m+[m[32m    if (stat.scale == FE_SCALE_RELATIVE) {[m[41m[m
-[32m+[m[32m        percent = clampPercent(static_cast<double>(stat.uvalue) * 100.0 / 65535.0);[m[41m[m
-[32m+[m[32m        return true;[m[41m[m
-[32m+[m[32m    }[m[41m[m
-[32m+[m[32m    if (stat.scale == FE_SCALE_DECIBEL) {[m[41m[m
-[32m+[m[32m        db = static_cast<double>(

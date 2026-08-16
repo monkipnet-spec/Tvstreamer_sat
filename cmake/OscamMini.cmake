@@ -36,6 +36,10 @@ if(TVSTREAMMERSAT5_BUILD_OSCAM_MINI)
           DESTINATION /opt/TVStreammerSAT5/oscam-mini)
   install(FILES "${CMAKE_SOURCE_DIR}/packaging/oscam-mini/oscam-mini.service"
           DESTINATION /opt/TVStreammerSAT5/oscam-mini)
+  # Install the unit itself as part of cmake --install. The helper below only
+  # reloads systemd, disables legacy OSCam and enables/starts this service.
+  install(FILES "${CMAKE_SOURCE_DIR}/packaging/oscam-mini/oscam-mini.service"
+          DESTINATION /etc/systemd/system)
   install(DIRECTORY "${CMAKE_SOURCE_DIR}/packaging/oscam-mini/default-config/"
           DESTINATION /opt/TVStreammerSAT5/oscam-mini/default-config)
 endif()
