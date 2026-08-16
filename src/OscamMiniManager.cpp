@@ -553,7 +553,8 @@ Json::Value OscamMiniManager::statusLocked() {
 
     int rc = 0;
     const std::string active = trim(run("systemctl is-active " + std::string(kService), &rc));
-    result["service_active"] = active == "active";
+    const bool serviceActive = active == "active";
+    result["service_active"] = serviceActive;
     result["service_state"] = active.empty() ? "unknown" : active;
 
     Json::Value devices(Json::arrayValue);
@@ -561,13 +562,101 @@ Json::Value OscamMiniManager::statusLocked() {
         devices.append(device);
     }
     result["devices"] = devices;
-    result["process"] = trim(run("ps -C oscam-mini -o pid=,rss=,vsz=,%cpu=,cmd="));
 
-    std::string log = run("journalctl -u " + std::string(kService) + " -n 40 --no-pager -o cat");
-    if (log.size() > 16000) {
-        log = log.substr(log.size() - 16000);
+    const std::string process = trim(run("ps -C oscam-mini -o pid=,rss=,vsz=,%cpu=,cmd="));
+    result["process"] = process;
+
+    std::string pid;
+    if (serviceActive) {
+        pid = trim(run("systemctl show -p MainPID --value " + std::string(kService)));
+        if (pid == "0") {
+            pid.clear();
+        }
+    }
+
+    std::string logCommand = "journalctl -u " + std::string(kService) + " -n 120 --no-pager -o cat";
+    if (!pid.empty()) {
+        logCommand = "journalctl -u " + std::string(kService) + " _PID=" + pid + " -n 240 --no-pager -o cat";
+    }
+    std::string log = run(logCommand);
+    if (log.size() > 32000) {
+        log = log.substr(log.size() - 32000);
     }
     result["log"] = log;
+
+    const Settings settings = loadLocked();
+    const std::string established = serviceActive ? run("ss -Htan state established 2>/dev/null") : std::string();
+
+    Json::Value userActivity(Json::objectValue);
+    for (const auto& user : settings.users) {
+        Json::Value item;
+        std::string state = "down";
+        std::string detail = "OSCam-mini остановлен";
+
+        if (serviceActive) {
+            const std::string portToken = ":" + std::to_string(user.port);
+            if (established.find(portToken) != std::string::npos) {
+                state = "active";
+                detail = "Newcamd клиент подключён";
+            } else {
+                state = "idle";
+                detail = "Ожидание подключения";
+            }
+        }
+
+        item["state"] = state;
+        item["detail"] = detail;
+        item["port"] = user.port;
+        userActivity[user.user] = item;
+    }
+    result["user_activity"] = userActivity;
+
+    Json::Value readerActivity(Json::objectValue);
+    for (const auto& reader : settings.readers) {
+        Json::Value item;
+        std::string state = "down";
+        std::string detail = "OSCam-mini остановлен";
+
+        if (!reader.enabled) {
+            state = "disabled";
+            detail = "Ридер отключён";
+        } else if (serviceActive) {
+            const std::string readyNeedle = reader.label + " [irdeto] ready for requests";
+            const std::string readyMouseNeedle = reader.label + " [mouse] ready for requests";
+            const bool ready = log.find(readyNeedle) != std::string::npos
+                || log.find(readyMouseNeedle) != std::string::npos;
+            const bool initializing =
+                log.find(reader.label + " [mouse] card detected") != std::string::npos
+                || log.find(reader.label + " [mouse] detect irdeto card") != std::string::npos
+                || log.find(reader.label + " [mouse] found card system") != std::string::npos
+                || log.find(reader.label + " [irdeto] THIS WAS A SUCCESSFUL START ATTEMPT") != std::string::npos;
+            const bool error =
+                log.find(reader.label + " [mouse] Error activating card") != std::string::npos
+                || log.find(reader.label + " [mouse] ERROR") != std::string::npos
+                || log.find(reader.label + " [irdeto] ERROR") != std::string::npos
+                || log.find(reader.label + " [mouse] card initializing error") != std::string::npos;
+
+            if (ready) {
+                state = "active";
+                detail = "Карта готова";
+            } else if (error) {
+                state = "down";
+                detail = "Ошибка ридера";
+            } else if (initializing) {
+                state = "idle";
+                detail = "Инициализация карты";
+            } else {
+                state = "idle";
+                detail = "Ожидание карты";
+            }
+        }
+
+        item["state"] = state;
+        item["detail"] = detail;
+        item["device"] = reader.device;
+        readerActivity[reader.label] = item;
+    }
+    result["reader_activity"] = readerActivity;
     return result;
 }
 
@@ -721,7 +810,8 @@ std::string OscamMiniManager::renderPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>OSCam-mini</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0f1218;color:#eee;margin:0}.w{max-width:1320px;margin:auto;padding:16px}.c{background:#161b25;border:1px solid #2a3241;border-radius:18px;padding:20px;margin:14px 0}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}label{display:flex;flex-direction:column;gap:6px;font-size:14px;color:#c6d1e3}input,select{background:#0e131c;border:1px solid #334058;color:#fff;border-radius:10px;padding:11px;font-size:15px}button,a.btn{border:0;border-radius:10px;padding:11px 16px;background:#218cff;color:white;cursor:pointer;text-decoration:none;font-size:15px}.alt{background:#30394a!important}.danger{background:#56313a!important}.item{border-top:1px solid #30394a;padding-top:16px;margin-top:16px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1}.status-ok{color:#77e79d}.status-bad{color:#ff8b8b}.msg{margin-left:10px}.error{color:#ff8b8b}.success{color:#77e79d}pre{white-space:pre-wrap;background:#0b0f16;padding:12px;border-radius:10px;max-height:280px;overflow:auto}h2,h3{margin-top:0}.hint{color:#9ba9bd;font-size:13px;margin-top:8px}
+body{font-family:Arial,sans-serif;background:#0f1218;color:#eee;margin:0}.w{max-width:1320px;margin:auto;padding:16px}.c{background:#161b25;border:1px solid #2a3241;border-radius:18px;padding:20px;margin:14px 0}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}label{display:flex;flex-direction:column;gap:6px;font-size:14px;color:#c6d1e3}input,select{background:#0e131c;border:1px solid #334058;color:#fff;border-radius:10px;padding:11px;font-size:15px}button,a.btn{border:0;border-radius:10px;padding:11px 16px;background:#218cff;color:white;cursor:pointer;text-decoration:none;font-size:15px}.alt{background:#30394a!important}.danger{background:#56313a!important}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1}.status-ok{color:#77e79d}.status-bad{color:#ff8b8b}.msg{margin-left:10px}.error{color:#ff8b8b}.success{color:#77e79d}pre{white-space:pre-wrap;background:#0b0f16;padding:12px;border-radius:10px;max-height:280px;overflow:auto}h2,h3{margin-top:0}.hint{color:#9ba9bd;font-size:13px;margin-top:8px}
+.compact-item{border:1px solid #2c3546;border-radius:12px;margin-top:10px;overflow:hidden;background:#111722}.compact-head{display:grid;grid-template-columns:18px minmax(130px,1.2fr) minmax(120px,1fr) minmax(135px,1fr) minmax(90px,.7fr) 24px;gap:10px;align-items:center;width:100%;box-sizing:border-box;padding:11px 13px;background:#171e2a;color:#eef4ff;border:0;border-radius:0;text-align:left;cursor:pointer}.compact-head:hover{background:#1b2432}.compact-main{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.compact-sub{color:#aebbd0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.compact-status{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chev{font-size:18px;color:#91a0b7;transition:transform .15s ease}.compact-item.open .chev{transform:rotate(90deg)}.compact-body{display:none;padding:14px;border-top:1px solid #2c3546}.compact-item.open .compact-body{display:block}.dot{width:10px;height:10px;border-radius:50%;display:inline-block;box-shadow:0 0 0 2px rgba(255,255,255,.08)}.dot-active{background:#49d17d}.dot-idle{background:#e8b844}.dot-down{background:#e25d66}.dot-disabled{background:#798394}.activity-active{color:#65df92}.activity-idle{color:#e8c45d}.activity-down{color:#ef7b83}.activity-disabled{color:#929cac}@media(max-width:760px){.compact-head{grid-template-columns:18px 1fr 24px}.compact-head .hide-small{display:none}}
 </style>
 </head>
 <body><div class="w">
@@ -732,31 +822,53 @@ body{font-family:Arial,sans-serif;background:#0f1218;color:#eee;margin:0}.w{max-
   <h3>Newcamd</h3>
   <div class="g"><label>Bind IP<input id="bind_ip"></label><label>DES key<input id="key"></label></div>
   <div class="row" style="margin-top:16px"><h3 style="margin:0">Пользователи / порты</h3><button onclick="addUser()">+ Пользователь</button></div>
-  <div class="hint">Для каждого пользователя задаются свой порт, CAID, Provider и группы. Строка port= в oscam.conf формируется автоматически.</div>
+  <div class="hint">Строка пользователя свернута по умолчанию. Нажмите на неё, чтобы открыть настройки.</div>
   <div id="users"></div>
 </div>
 
-<div class="c"><div class="row"><h3 style="margin:0">Phoenix / Smartmouse</h3><button onclick="addReader()">+ Ридер</button></div><div id="readers"></div></div>
+<div class="c"><div class="row"><h3 style="margin:0">Phoenix / Smartmouse</h3><button onclick="addReader()">+ Ридер</button></div><div class="hint">Зелёный — карта готова, жёлтый — инициализация/ожидание, красный — неактивен или ошибка.</div><div id="readers"></div></div>
 <div class="c"><button onclick="save()">Сохранить и перезапустить</button><span id="msg" class="msg"></span></div>
 <div class="c"><h3>Процесс / журнал</h3><pre id="proc"></pre><pre id="log"></pre></div>
 </div>
 <script>
 let devices=[];
+let lastStatus={};
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function api(url,opt){const r=await fetch(url,opt);let data;try{data=await r.json()}catch(e){throw new Error(await r.text()||('HTTP '+r.status))}return data}
+function stateClass(s){return ['active','idle','down','disabled'].includes(s)?s:'down'}
+function activityDot(s){s=stateClass(s);return `<span class="dot dot-${s}"></span>`}
+function toggleItem(head){head.closest('.compact-item').classList.toggle('open')}
 
-function userHtml(u={},i=0){return `<div class="item user"><div class="g">
-<label>Пользователь<input class="user-name" value="${esc(u.user||('user'+(i+1)))}"></label>
+function userHtml(u={},i=0){const name=u.user||('user'+(i+1));return `<div class="compact-item user" data-user="${esc(name)}">
+<button type="button" class="compact-head" onclick="toggleItem(this)">
+<span class="activity-dot">${activityDot('down')}</span>
+<span class="compact-main user-summary-name">${esc(name)}</span>
+<span class="compact-sub hide-small user-summary-endpoint">${esc(u.port||11220+i)} · ${esc(u.caid||'0652')}:${esc(u.provider||'000000')}</span>
+<span class="compact-sub hide-small user-summary-groups">group ${esc(u.groups||'1')}</span>
+<span class="compact-status hide-small activity-text">неактивен</span>
+<span class="chev">›</span>
+</button>
+<div class="compact-body"><div class="g">
+<label>Пользователь<input class="user-name" value="${esc(name)}"></label>
 <label>Пароль<input class="user-pass" type="password" value="${esc(u.password||'')}"></label>
 <label>Порт<input class="user-port" type="number" min="1" max="65535" value="${esc(u.port||11220+i)}"></label>
 <label>CAID<input class="user-caid" maxlength="4" value="${esc(u.caid||'0652')}"></label>
 <label>Provider<input class="user-provider" maxlength="6" value="${esc(u.provider||'000000')}"></label>
 <label>Группы<input class="user-groups" value="${esc(u.groups||'1')}" placeholder="6,12"></label>
-</div><div class="row" style="margin-top:10px"><label style="flex-direction:row;align-items:center"><input class="user-au" type="checkbox" ${u.au!==false?'checked':''}> AU/EMM</label><button class="danger" onclick="this.closest('.user').remove()">Удалить пользователя</button></div></div>`}
-function addUser(u={}){const box=document.createElement('div');box.innerHTML=userHtml(u,document.querySelectorAll('.user').length);users.append(...box.childNodes)}
+</div><div class="row" style="margin-top:10px"><label style="flex-direction:row;align-items:center"><input class="user-au" type="checkbox" ${u.au!==false?'checked':''}> AU/EMM</label><button class="danger" onclick="this.closest('.user').remove()">Удалить пользователя</button></div></div></div>`}
+function addUser(u={}){const box=document.createElement('div');box.innerHTML=userHtml(u,document.querySelectorAll('.user').length);users.append(...box.childNodes);applyActivity(lastStatus)}
 
-function readerHtml(r={},i=0){const opts=['',...devices];if(r.device&&!opts.includes(r.device))opts.push(r.device);const options=opts.map(d=>`<option value="${esc(d)}" ${d===r.device?'selected':''}>${esc(d)}</option>`).join('');return `<div class="item reader"><div class="g">
-<label>Имя<input class="reader-label" value="${esc(r.label||('Reader'+(i+1)))}"></label>
+function readerHtml(r={},i=0){const label=r.label||('Reader'+(i+1));const opts=['',...devices];if(r.device&&!opts.includes(r.device))opts.push(r.device);const options=opts.map(d=>`<option value="${esc(d)}" ${d===r.device?'selected':''}>${esc(d)}</option>`).join('');return `<div class="compact-item reader" data-reader="${esc(label)}">
+<button type="button" class="compact-head" onclick="toggleItem(this)">
+<span class="activity-dot">${activityDot('down')}</span>
+<span class="compact-main reader-summary-label">${esc(label)}</span>
+<span class="compact-sub hide-small reader-summary-device">${esc(r.device||'устройство не выбрано')}</span>
+<span class="compact-sub hide-small reader-summary-ca">CAID ${esc(r.caid||'0652')} · group ${esc(r.group||1)}</span>
+<span class="compact-status hide-small activity-text">неактивен</span>
+<span class="chev">›</span>
+</button>
+<div class="compact-body"><div class="g">
+<label>Имя<input class="reader-label" value="${esc(label)}"></label>
 <label>Устройство<select class="reader-device">${options}</select></label>
 <label>CAID<input class="reader-caid" maxlength="4" value="${esc(r.caid||'0652')}"></label>
 <label>Протокол<select class="reader-protocol"><option value="mouse" ${r.protocol==='mouse'?'selected':''}>mouse</option><option value="phoenix" ${r.protocol==='phoenix'?'selected':''}>phoenix</option></select></label>
@@ -768,15 +880,20 @@ function readerHtml(r={},i=0){const opts=['',...devices];if(r.device&&!opts.incl
 <label>AU Provider<input class="reader-auprovid" maxlength="6" value="${esc(r.auprovid||'')}" placeholder="000652"></label>
 <label>EMM cache<input class="reader-emmcache" value="${esc(r.emmcache||'1,3,2,0')}" placeholder="1,3,2,0"></label>
 <label style="grid-column:1/-1">RSAKey<input class="reader-rsakey" autocomplete="off" value="${esc(r.rsakey||'')}" placeholder="HEX RSA key"></label>
-</div><div class="row" style="margin-top:10px"><button class="danger" onclick="this.closest('.reader').remove()">Удалить ридер</button></div></div>`}
-function addReader(r={}){const box=document.createElement('div');box.innerHTML=readerHtml(r,document.querySelectorAll('.reader').length);readers.append(...box.childNodes)}
+</div><div class="row" style="margin-top:10px"><button class="danger" onclick="this.closest('.reader').remove()">Удалить ридер</button></div></div></div>`}
+function addReader(r={}){const box=document.createElement('div');box.innerHTML=readerHtml(r,document.querySelectorAll('.reader').length);readers.append(...box.childNodes);applyActivity(lastStatus)}
 
-async function loadAll(){try{const st=await api('/api/oscam-mini/status');devices=st.devices||[];state.textContent=st.service_active?'● работает':'● '+(st.service_state||'остановлен');state.className=st.service_active?'status-ok':'status-bad';proc.textContent=st.process||'процесс не запущен';log.textContent=st.log||'';const s=await api('/api/oscam-mini/settings');bind_ip.value=s.bind_ip||'127.0.0.1';key.value=s.key||'';users.innerHTML='';(s.users||[]).forEach(addUser);readers.innerHTML='';(s.readers||[]).forEach(addReader)}catch(e){msg.textContent=e.message;msg.className='msg error'}}
+function setActivity(el,info){if(!el)return;const s=stateClass(info?.state||'down');const dot=el.querySelector('.activity-dot');const txt=el.querySelector('.activity-text');if(dot)dot.innerHTML=activityDot(s);if(txt){txt.textContent=info?.detail||'неактивен';txt.className=`compact-status hide-small activity-text activity-${s}`}}
+function applyActivity(st){lastStatus=st||{};document.querySelectorAll('.user').forEach(el=>setActivity(el,(st.user_activity||{})[el.dataset.user]));document.querySelectorAll('.reader').forEach(el=>setActivity(el,(st.reader_activity||{})[el.dataset.reader]))}
+async function refreshStatus(){try{const st=await api('/api/oscam-mini/status');lastStatus=st;state.textContent=st.service_active?'● работает':'● '+(st.service_state||'остановлен');state.className=st.service_active?'status-ok':'status-bad';proc.textContent=st.process||'процесс не запущен';log.textContent=st.log||'';applyActivity(st)}catch(e){}}
+
+async function loadAll(){try{const st=await api('/api/oscam-mini/status');lastStatus=st;devices=st.devices||[];state.textContent=st.service_active?'● работает':'● '+(st.service_state||'остановлен');state.className=st.service_active?'status-ok':'status-bad';proc.textContent=st.process||'процесс не запущен';log.textContent=st.log||'';const s=await api('/api/oscam-mini/settings');bind_ip.value=s.bind_ip||'127.0.0.1';key.value=s.key||'';users.innerHTML='';(s.users||[]).forEach(addUser);readers.innerHTML='';(s.readers||[]).forEach(addReader);applyActivity(st)}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 
 async function save(){const userRows=[...document.querySelectorAll('.user')].map(e=>({user:e.querySelector('.user-name').value,password:e.querySelector('.user-pass').value,port:+e.querySelector('.user-port').value,caid:e.querySelector('.user-caid').value.trim(),provider:e.querySelector('.user-provider').value.trim(),groups:e.querySelector('.user-groups').value.trim(),au:e.querySelector('.user-au').checked}));const readerRows=[...document.querySelectorAll('.reader')].map(e=>({label:e.querySelector('.reader-label').value,device:e.querySelector('.reader-device').value,caid:e.querySelector('.reader-caid').value.trim(),protocol:e.querySelector('.reader-protocol').value,detect:'cd',mhz:+e.querySelector('.reader-mhz').value,cardmhz:+e.querySelector('.reader-cardmhz').value,group:+e.querySelector('.reader-group').value,ident:e.querySelector('.reader-ident').value.trim(),boxkey:e.querySelector('.reader-boxkey').value.trim(),rsakey:e.querySelector('.reader-rsakey').value.trim(),auprovid:e.querySelector('.reader-auprovid').value.trim(),emmcache:e.querySelector('.reader-emmcache').value.trim(),enabled:true}));const body={bind_ip:bind_ip.value.trim(),key:key.value.trim(),keepalive:true,users:userRows,readers:readerRows};msg.textContent='Сохранение…';msg.className='msg';try{const x=await api('/api/oscam-mini/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});msg.textContent=x.ok?'Сохранено и перезапущено':(x.error||'Ошибка');msg.className=x.ok?'msg success':'msg error';await loadAll()}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 
 async function act(action){try{const x=await api('/api/oscam-mini/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});if(!x.ok){msg.textContent=x.error||'Ошибка';msg.className='msg error'}await loadAll()}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 loadAll();
+setInterval(refreshStatus,3000);
 </script>
 </body></html>)HTML";
 }

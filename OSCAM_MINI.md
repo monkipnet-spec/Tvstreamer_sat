@@ -109,3 +109,16 @@ The module provides service controls, multiple Newcamd endpoints/accounts, Phoen
 
 ### Irdeto reader keys
 OSCam-mini reader settings support optional `boxkey`, `rsakey`, `auprovid` and editable `emmcache`. Existing runtime values are loaded from `/opt/TVStreammerSAT5/oscam-mini/config/oscam.server` and preserved when saving through the web UI. Real card keys are intentionally not stored in repository default configs.
+
+## Compact activity rows
+
+Newcamd users and Phoenix/Smartmouse readers are shown collapsed to one line by default.
+Click a row to expand/collapse its settings.
+
+Activity indicator:
+- green: Newcamd user has an established TCP connection, or reader reached `ready for requests`;
+- yellow: OSCam-mini is running but the user is waiting for a connection, or reader is initializing/waiting for the card;
+- red: OSCam-mini is stopped or the reader reports an error;
+- gray: reader is disabled.
+
+The status endpoint exposes `user_activity` and `reader_activity` and the page refreshes these indicators every 3 seconds without rebuilding the form.
