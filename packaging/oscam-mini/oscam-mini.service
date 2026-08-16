@@ -1,0 +1,16 @@
+[Unit]
+Description=TVStreammerSAT5 OSCam-mini
+After=network.target
+Conflicts=oscam.service
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/TVStreammerSAT5/oscam-mini
+ExecStart=/opt/TVStreammerSAT5/oscam-mini/oscam-mini -c /opt/TVStreammerSAT5/oscam-mini/config
+Restart=on-failure
+RestartSec=2
+Nice=5
+LimitNOFILE=1024
+[Install]
+WantedBy=multi-user.target
