@@ -383,7 +383,10 @@ OscamMiniManager::Settings OscamMiniManager::loadLocked() {
         reader.cardmhz = getInt(entry, "cardmhz", 600);
         reader.group = getInt(entry, "group", 1);
         reader.ident = getValue(entry, "ident", "");
-        reader.emmcache = getValue(entry, "emmcache", "1,3,2");
+        reader.boxkey = getValue(entry, "boxkey", "");
+        reader.rsakey = getValue(entry, "rsakey", "");
+        reader.auprovid = getValue(entry, "auprovid", "");
+        reader.emmcache = getValue(entry, "emmcache", "1,3,2,0");
         reader.enabled = !isTrue(getValue(entry, "disable", "0"));
         settings.readers.push_back(reader);
     }
@@ -495,18 +498,39 @@ bool OscamMiniManager::saveLocked(const Settings& settings, std::string& error) 
             error = "Поддерживаются только mouse/phoenix: " + reader.label;
             return false;
         }
+        if (!reader.boxkey.empty() && !isHex(reader.boxkey, 16)) {
+            error = "BoxKey ридера " + reader.label + " должен содержать 16 HEX-символов";
+            return false;
+        }
+        if (!reader.rsakey.empty() && (reader.rsakey.size() < 32 || (reader.rsakey.size() % 2) != 0 || !std::all_of(reader.rsakey.begin(), reader.rsakey.end(), [](unsigned char c) { return std::isxdigit(c) != 0; }))) {
+            error = "RSAKey ридера " + reader.label + " должен содержать HEX-строку чётной длины";
+            return false;
+        }
+        if (!reader.auprovid.empty() && !isHex(reader.auprovid, 6)) {
+            error = "AU Provider ридера " + reader.label + " должен содержать 6 HEX-символов";
+            return false;
+        }
 
         server << "[reader]\n"
                << "label = " << safeIni(reader.label) << "\n"
                << "protocol = " << safeIni(reader.protocol) << "\n"
                << "device = " << safeIni(reader.device) << "\n"
-               << "caid = " << safeIni(reader.caid) << "\n"
-               << "detect = " << safeIni(reader.detect) << "\n"
+               << "caid = " << safeIni(reader.caid) << "\n";
+        if (!reader.boxkey.empty()) {
+            server << "boxkey = " << safeIni(reader.boxkey) << "\n";
+        }
+        if (!reader.rsakey.empty()) {
+            server << "rsakey = " << safeIni(reader.rsakey) << "\n";
+        }
+        server << "detect = " << safeIni(reader.detect) << "\n"
                << "mhz = " << reader.mhz << "\n"
                << "cardmhz = " << reader.cardmhz << "\n"
                << "group = " << reader.group << "\n";
         if (!reader.ident.empty()) {
             server << "ident = " << safeIni(reader.ident) << "\n";
+        }
+        if (!reader.auprovid.empty()) {
+            server << "auprovid = " << safeIni(reader.auprovid) << "\n";
         }
         if (!reader.emmcache.empty()) {
             server << "emmcache = " << safeIni(reader.emmcache) << "\n";
@@ -587,6 +611,9 @@ std::string OscamMiniManager::settingsJson() {
         value["cardmhz"] = reader.cardmhz;
         value["group"] = reader.group;
         value["ident"] = reader.ident;
+        value["boxkey"] = reader.boxkey;
+        value["rsakey"] = reader.rsakey;
+        value["auprovid"] = reader.auprovid;
         value["emmcache"] = reader.emmcache;
         value["enabled"] = reader.enabled;
         readersJson.append(value);
@@ -638,7 +665,10 @@ std::string OscamMiniManager::saveSettingsJson(const std::string& body) {
             reader.cardmhz = item.get("cardmhz", 600).asInt();
             reader.group = item.get("group", 1).asInt();
             reader.ident = item.get("ident", "").asString();
-            reader.emmcache = item.get("emmcache", "1,3,2").asString();
+            reader.boxkey = item.get("boxkey", "").asString();
+            reader.rsakey = item.get("rsakey", "").asString();
+            reader.auprovid = item.get("auprovid", "").asString();
+            reader.emmcache = item.get("emmcache", "1,3,2,0").asString();
             reader.enabled = item.get("enabled", true).asBool();
             settings.readers.push_back(reader);
         }
@@ -734,12 +764,16 @@ function readerHtml(r={},i=0){const opts=['',...devices];if(r.device&&!opts.incl
 <label>Card MHz<input class="reader-cardmhz" type="number" value="${esc(r.cardmhz||600)}"></label>
 <label>Group<input class="reader-group" type="number" min="1" max="64" value="${esc(r.group||1)}"></label>
 <label>Ident<input class="reader-ident" value="${esc(r.ident||'')}"></label>
+<label>BoxKey<input class="reader-boxkey" autocomplete="off" value="${esc(r.boxkey||'')}" placeholder="16 HEX"></label>
+<label>AU Provider<input class="reader-auprovid" maxlength="6" value="${esc(r.auprovid||'')}" placeholder="000652"></label>
+<label>EMM cache<input class="reader-emmcache" value="${esc(r.emmcache||'1,3,2,0')}" placeholder="1,3,2,0"></label>
+<label style="grid-column:1/-1">RSAKey<input class="reader-rsakey" autocomplete="off" value="${esc(r.rsakey||'')}" placeholder="HEX RSA key"></label>
 </div><div class="row" style="margin-top:10px"><button class="danger" onclick="this.closest('.reader').remove()">Удалить ридер</button></div></div>`}
 function addReader(r={}){const box=document.createElement('div');box.innerHTML=readerHtml(r,document.querySelectorAll('.reader').length);readers.append(...box.childNodes)}
 
 async function loadAll(){try{const st=await api('/api/oscam-mini/status');devices=st.devices||[];state.textContent=st.service_active?'● работает':'● '+(st.service_state||'остановлен');state.className=st.service_active?'status-ok':'status-bad';proc.textContent=st.process||'процесс не запущен';log.textContent=st.log||'';const s=await api('/api/oscam-mini/settings');bind_ip.value=s.bind_ip||'127.0.0.1';key.value=s.key||'';users.innerHTML='';(s.users||[]).forEach(addUser);readers.innerHTML='';(s.readers||[]).forEach(addReader)}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 
-async function save(){const userRows=[...document.querySelectorAll('.user')].map(e=>({user:e.querySelector('.user-name').value,password:e.querySelector('.user-pass').value,port:+e.querySelector('.user-port').value,caid:e.querySelector('.user-caid').value.trim(),provider:e.querySelector('.user-provider').value.trim(),groups:e.querySelector('.user-groups').value.trim(),au:e.querySelector('.user-au').checked}));const readerRows=[...document.querySelectorAll('.reader')].map(e=>({label:e.querySelector('.reader-label').value,device:e.querySelector('.reader-device').value,caid:e.querySelector('.reader-caid').value.trim(),protocol:e.querySelector('.reader-protocol').value,detect:'cd',mhz:+e.querySelector('.reader-mhz').value,cardmhz:+e.querySelector('.reader-cardmhz').value,group:+e.querySelector('.reader-group').value,ident:e.querySelector('.reader-ident').value.trim(),emmcache:'1,3,2',enabled:true}));const body={bind_ip:bind_ip.value.trim(),key:key.value.trim(),keepalive:true,users:userRows,readers:readerRows};msg.textContent='Сохранение…';msg.className='msg';try{const x=await api('/api/oscam-mini/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});msg.textContent=x.ok?'Сохранено и перезапущено':(x.error||'Ошибка');msg.className=x.ok?'msg success':'msg error';await loadAll()}catch(e){msg.textContent=e.message;msg.className='msg error'}}
+async function save(){const userRows=[...document.querySelectorAll('.user')].map(e=>({user:e.querySelector('.user-name').value,password:e.querySelector('.user-pass').value,port:+e.querySelector('.user-port').value,caid:e.querySelector('.user-caid').value.trim(),provider:e.querySelector('.user-provider').value.trim(),groups:e.querySelector('.user-groups').value.trim(),au:e.querySelector('.user-au').checked}));const readerRows=[...document.querySelectorAll('.reader')].map(e=>({label:e.querySelector('.reader-label').value,device:e.querySelector('.reader-device').value,caid:e.querySelector('.reader-caid').value.trim(),protocol:e.querySelector('.reader-protocol').value,detect:'cd',mhz:+e.querySelector('.reader-mhz').value,cardmhz:+e.querySelector('.reader-cardmhz').value,group:+e.querySelector('.reader-group').value,ident:e.querySelector('.reader-ident').value.trim(),boxkey:e.querySelector('.reader-boxkey').value.trim(),rsakey:e.querySelector('.reader-rsakey').value.trim(),auprovid:e.querySelector('.reader-auprovid').value.trim(),emmcache:e.querySelector('.reader-emmcache').value.trim(),enabled:true}));const body={bind_ip:bind_ip.value.trim(),key:key.value.trim(),keepalive:true,users:userRows,readers:readerRows};msg.textContent='Сохранение…';msg.className='msg';try{const x=await api('/api/oscam-mini/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});msg.textContent=x.ok?'Сохранено и перезапущено':(x.error||'Ошибка');msg.className=x.ok?'msg success':'msg error';await loadAll()}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 
 async function act(action){try{const x=await api('/api/oscam-mini/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})});if(!x.ok){msg.textContent=x.error||'Ошибка';msg.className='msg error'}await loadAll()}catch(e){msg.textContent=e.message;msg.className='msg error'}}
 loadAll();

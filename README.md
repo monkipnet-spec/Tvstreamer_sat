@@ -1247,3 +1247,7 @@ sudo /opt/TVStreammerSAT5/oscam-mini/install_oscam_mini.sh
 ```
 
 Подробности: `OSCAM_MINI.md`.
+
+
+### Irdeto reader keys
+OSCam-mini reader settings support optional `boxkey`, `rsakey`, `auprovid` and editable `emmcache`. Existing runtime values are loaded from `/opt/TVStreammerSAT5/oscam-mini/config/oscam.server` and preserved when saving through the web UI. Real card keys are intentionally not stored in repository default configs.

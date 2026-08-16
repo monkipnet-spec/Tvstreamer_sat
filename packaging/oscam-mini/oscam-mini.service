@@ -9,6 +9,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/TVStreammerSAT5/oscam-mini
 ExecStart=/opt/TVStreammerSAT5/oscam-mini/oscam-mini -c /opt/TVStreammerSAT5/oscam-mini/config
+SuccessExitStatus=15 SIGTERM
 Restart=on-failure
 RestartSec=2
 Nice=5

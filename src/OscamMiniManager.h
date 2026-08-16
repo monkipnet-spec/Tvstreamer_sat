@@ -39,7 +39,10 @@ private:
         std::string caid;
         std::string detect = "cd";
         std::string ident;
-        std::string emmcache = "1,3,2";
+        std::string boxkey;
+        std::string rsakey;
+        std::string auprovid;
+        std::string emmcache = "1,3,2,0";
         int mhz = 600;
         int cardmhz = 600;
         int group = 1;

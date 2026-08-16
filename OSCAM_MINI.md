@@ -105,3 +105,7 @@ http://SERVER:TVSTREAMER_PORT/oscam-mini
 ```
 
 The module provides service controls, multiple Newcamd endpoints/accounts, Phoenix reader settings, validation, process status and journal output. Backend errors are shown verbatim in the page instead of only displaying a generic `Ошибка`.
+
+
+### Irdeto reader keys
+OSCam-mini reader settings support optional `boxkey`, `rsakey`, `auprovid` and editable `emmcache`. Existing runtime values are loaded from `/opt/TVStreammerSAT5/oscam-mini/config/oscam.server` and preserved when saving through the web UI. Real card keys are intentionally not stored in repository default configs.
