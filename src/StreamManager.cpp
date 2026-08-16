@@ -1572,22 +1572,8 @@ void writeSingleProgramPat(uint8_t* packet, const DvbSingleProgramPsiContext& ct
 
 std::vector<uint8_t> dvbUtf8ServiceText(const std::string& value, size_t maxBytes) {
     std::vector<uint8_t> out;
-    if (value.empty() || maxBytes == 0) return out;
-
-    // Plain ASCII is valid in the default DVB character table. Avoid the UTF-8
-    // selector (0x15) for ASCII-only service/provider names because some legacy
-    // IRDs/analyzers report that selector as an unknown charset.
-    const bool asciiOnly = std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-        return ch >= 0x20 && ch <= 0x7E;
-    });
-    if (asciiOnly) {
-        const size_t copy = std::min(maxBytes, value.size());
-        out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
-        return out;
-    }
-
-    if (maxBytes < 2) return out;
-    out.push_back(0x15); // DVB UTF-8 selector for non-ASCII text
+    if (value.empty() || maxBytes < 2) return out;
+    out.push_back(0x15); // DVB UTF-8 selector
     const size_t copy = std::min(maxBytes - 1, value.size());
     out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
     return out;
@@ -6265,7 +6251,7 @@ bool StreamManager::buildPassthroughPipeline(
             return false;
         }
         auto* psiContext = new DvbRemapFinalPsiContext();
-        psiContext->serviceId = static_cast<uint16_t>((cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU);
+        psiContext->serviceId = static_cast<uint16_t>(cfg.serviceId & 0xFFFFU);
         psiContext->serviceName = cfg.serviceName.empty() ? cfg.name : cfg.serviceName;
         psiContext->serviceProvider = cfg.serviceProvider;
         gst_pad_add_probe(psiPad, GST_PAD_PROBE_TYPE_BUFFER,

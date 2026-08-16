@@ -93,6 +93,7 @@ add_executable(TVStreammerSAT5
     src/protocols/outputs/GstRtspOutputProtocol.cpp
     src/protocols/outputs/GstRtmpOutputProtocol.cpp
     src/HttpServer.cpp
+    src/OscamMiniManager.cpp
 )
 
 target_link_libraries(TVStreammerSAT5
@@ -141,3 +142,5 @@ set_target_properties(tvstreammersat5_ca_newcamd PROPERTIES
 )
 install(TARGETS TVStreammerSAT5 RUNTIME DESTINATION bin)
 install(TARGETS tvstreammersat5_ca_newcamd LIBRARY DESTINATION /opt/tvstreammersat5/ca-plugins)
+
+include(${CMAKE_SOURCE_DIR}/cmake/OscamMini.cmake)

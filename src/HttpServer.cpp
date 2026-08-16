@@ -5,6 +5,7 @@
 #include "TranscoderModule.h"
 #include "DvbSatellite.h"
 #include "CardManager.h"
+#include "OscamMiniManager.h"
 #include "protocols/GstProtocolTypes.h"
 
 #include <boost/beast/core.hpp>
@@ -456,6 +457,15 @@ void HttpServer::handleSession(tcp::socket socket) {
                 }
             } else if (target == "/" || target == "/index.html") {
                 res.body() = renderIndexPage();
+            } else if (target == "/oscam-mini") {
+                res.set(http::field::content_type, "text/html; charset=UTF-8");
+                res.body() = OscamMiniManager::instance().renderPage();
+            } else if (target == "/api/oscam-mini/status") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().statusJson();
+            } else if (target == "/api/oscam-mini/settings") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().settingsJson();
             } else if (target == "/api/interfaces") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listInterfaces();
@@ -485,7 +495,13 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = "Not Found";
             }
         } else if (req.method() == http::verb::post) {
-            if (target == "/api/save-config") {
+            if (target == "/api/oscam-mini/save") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().saveSettingsJson(req.body());
+            } else if (target == "/api/oscam-mini/action") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = OscamMiniManager::instance().serviceActionJson(req.body());
+            } else if (target == "/api/save-config") {
                 handleSaveConfig(req.body());
                 res.set(http::field::content_type, "application/json");
                 res.body() = "{\"result\": \"ok\"}";
@@ -2076,6 +2092,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
 <button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
 <button class="system-menu-item" onclick="openAboutModal();closeSystemMenu()" data-i18n="about">About</button>
+<a class="system-menu-item" href="/oscam-mini" style="text-decoration:none">OSCam-mini</a>
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
 </details>

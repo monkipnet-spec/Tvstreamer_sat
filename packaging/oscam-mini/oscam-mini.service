@@ -1,5 +1,5 @@
 [Unit]
-Description=TVStreammerSAT5 OSCam-mini
+Description=TVStreammerSAT5 OSCam-mini Newcamd/Phoenix server
 After=network.target
 Conflicts=oscam.service
 
