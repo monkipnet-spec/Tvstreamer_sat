@@ -258,8 +258,22 @@ uint32_t mpeg2SectionCrc32(const guint8* data, std::size_t size) {
 
 std::vector<guint8> dvbUtf8Text(const std::string& value, std::size_t maxBytes) {
     std::vector<guint8> out;
-    if (value.empty() || maxBytes < 2) return out;
-    out.push_back(0x15); // DVB UTF-8 selector
+    if (value.empty() || maxBytes == 0) return out;
+
+    // DVB service_descriptor text is compatible with the default DVB character
+    // table for plain ASCII. Do not prepend the UTF-8 selector (0x15) in that
+    // case: several legacy IRDs/analyzers report it as an unknown charset.
+    const bool asciiOnly = std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return ch >= 0x20 && ch <= 0x7E;
+    });
+    if (asciiOnly) {
+        const std::size_t copy = std::min(maxBytes, value.size());
+        out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
+        return out;
+    }
+
+    if (maxBytes < 2) return out;
+    out.push_back(0x15); // DVB UTF-8 selector for non-ASCII text
     const std::size_t copy = std::min(maxBytes - 1, value.size());
     out.insert(out.end(), value.begin(), value.begin() + static_cast<std::ptrdiff_t>(copy));
     return out;
