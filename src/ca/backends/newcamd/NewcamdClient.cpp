@@ -437,6 +437,9 @@ void NewcamdClient::receiver_loop() {
             callback(message.id, 1, message.payload.data() + 11);
         } else if (command == 0x80 || command == 0x81) {
             set_error("Newcamd ECM response did not contain a control word");
+            // Notify the plugin that this transaction completed negatively.
+            // 0xFF is an internal sentinel and is never a DVB CSA parity.
+            callback(message.id, 0xFF, nullptr);
         }
     }
     running_ = false;

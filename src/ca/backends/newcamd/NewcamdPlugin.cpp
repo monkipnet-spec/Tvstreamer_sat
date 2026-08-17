@@ -114,6 +114,15 @@ struct ServiceBinding {
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
 
+    // Irdeto ECMs on one service can rotate through several CHIDs.  OSCam/Astra
+    // only keeps using the CHID that actually returns a valid CW.  Track that
+    // selection per service and temporarily suppress rejected CHIDs so the
+    // client can advance to the subscribed one instead of hammering the first
+    // unsubscribed ECM forever.
+    bool irdetoChidSelected = false;
+    uint16_t selectedIrdetoChid = 0;
+    std::map<uint16_t, uint64_t> rejectedIrdetoChidUntilMs;
+
     uint64_t diagLastLogMs = 0;
     uint64_t diagCalls = 0;
     uint64_t diagUnalignedBuffers = 0;
@@ -142,6 +151,9 @@ struct EcmQueueItem {
     std::vector<uint8_t> section;
     std::string signature;
     uint64_t queuedMs = 0;
+    bool isIrdeto = false;
+    bool hasIrdetoChid = false;
+    uint16_t irdetoChid = 0;
 };
 
 struct NewcamdSession {
@@ -160,6 +172,9 @@ struct NewcamdSession {
     uint16_t currentEcmPid = 0;
     uint64_t currentStartedMs = 0;
     std::string currentSignature;
+    bool currentIsIrdeto = false;
+    bool currentHasIrdetoChid = false;
+    uint16_t currentIrdetoChid = 0;
 
     ~NewcamdSession() {
         if (client) {
@@ -219,6 +234,17 @@ uint64_t monotonic_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+bool is_irdeto_caid(uint16_t caid) {
+    return ((caid & 0xFF00u) == 0x0600u) || caid == 0x1702u;
+}
+
+bool extract_irdeto_chid(const std::vector<uint8_t>& section, uint16_t& chid) {
+    // Astra softcam/cas/irdeto.c reads CHID from ECM bytes 6..7.
+    if (section.size() < 8 || (section[0] != 0x80 && section[0] != 0x81)) return false;
+    chid = static_cast<uint16_t>((static_cast<uint16_t>(section[6]) << 8) | section[7]);
+    return true;
 }
 
 const uint8_t* ts_payload(uint8_t* packet, size_t* payloadSize) {
@@ -394,6 +420,9 @@ void pump_ecm_queue(NewcamdInstance* inst, const std::string& clientKey,
     session->currentEcmPid = item.ecmPid;
     session->currentStartedMs = startedMs;
     session->currentSignature = item.signature;
+    session->currentIsIrdeto = item.isIrdeto;
+    session->currentHasIrdetoChid = item.hasIrdetoChid;
+    session->currentIrdetoChid = item.irdetoChid;
     const size_t queueDepth = session->ecmQueue.size();
 
     std::cerr << "NEWCAMD ECM SEND: client=" << clientKey
@@ -402,8 +431,11 @@ void pump_ecm_queue(NewcamdInstance* inst, const std::string& clientKey,
               << " sid=" << item.serviceId
               << " ecm_pid=" << item.ecmPid
               << " queue_depth=" << queueDepth
-              << " queued_ms=" << (startedMs >= item.queuedMs ? startedMs - item.queuedMs : 0)
-              << std::endl;
+              << " queued_ms=" << (startedMs >= item.queuedMs ? startedMs - item.queuedMs : 0);
+    if (item.isIrdeto && item.hasIrdetoChid) {
+        std::cerr << " irdeto_chid=0x" << std::hex << item.irdetoChid << std::dec;
+    }
+    std::cerr << std::endl;
 }
 
 void enqueue_ecm(NewcamdInstance* inst, const std::string& clientKey,
@@ -449,24 +481,29 @@ void configure_service_callback(NewcamdInstance* inst,
          weakBinding = std::weak_ptr<ServiceBinding>(binding),
          weakSession = std::weak_ptr<NewcamdSession>(session)]
         (uint16_t messageId, uint8_t parity, const uint8_t* cw) {
-        if (!cw || !inst || messageId == 0) return;
+        if (!inst || messageId == 0) return;
         auto session = weakSession.lock();
         if (!session) return;
 
         uint16_t expectedMessageId = 0;
         uint64_t startedMs = 0;
+        bool currentIsIrdeto = false;
+        bool currentHasIrdetoChid = false;
+        uint16_t currentIrdetoChid = 0;
         {
             std::lock_guard<std::mutex> queueLock(session->ecmMutex);
             if (!session->ecmInFlight) {
                 std::cerr << "NEWCAMD CW DROP: client=" << clientKey
                           << " stream=" << streamId
                           << " msg=" << messageId
-                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
                           << " reason=no-inflight-ecm" << std::endl;
                 return;
             }
             expectedMessageId = session->currentMessageId;
             startedMs = session->currentStartedMs;
+            currentIsIrdeto = session->currentIsIrdeto;
+            currentHasIrdetoChid = session->currentHasIrdetoChid;
+            currentIrdetoChid = session->currentIrdetoChid;
         }
 
         if (messageId != expectedMessageId) {
@@ -474,8 +511,51 @@ void configure_service_callback(NewcamdInstance* inst,
                       << " stream=" << streamId
                       << " msg=" << messageId
                       << " expected_msg=" << expectedMessageId
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
                       << " reason=transaction-mismatch" << std::endl;
+            return;
+        }
+
+        // NewcamdClient uses parity=0xFF with cw=nullptr for a valid ECM reply
+        // that did not contain a CW (OSCam 'not found').  v175 left the session
+        // permanently ecmInFlight in this case, so the first unsubscribed Irdeto
+        // CHID blocked all later ECMs.  Complete the transaction and allow the
+        // next CHID/ECM to be tried.
+        if (!cw || parity == 0xFF) {
+            {
+                std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+                if (session->ecmInFlight && session->currentMessageId == messageId) {
+                    session->ecmInFlight = false;
+                    session->currentMessageId = 0;
+                    session->currentStreamId.clear();
+                    session->currentEcmPid = 0;
+                    session->currentStartedMs = 0;
+                    session->currentSignature.clear();
+                    session->currentIsIrdeto = false;
+                    session->currentHasIrdetoChid = false;
+                    session->currentIrdetoChid = 0;
+                }
+            }
+
+            auto target = weakBinding.lock();
+            if (target && currentIsIrdeto && currentHasIrdetoChid) {
+                std::lock_guard<std::mutex> serviceLock(target->mutex);
+                const uint64_t now = monotonic_ms();
+                target->rejectedIrdetoChidUntilMs[currentIrdetoChid] = now + 15000;
+                if (target->irdetoChidSelected && target->selectedIrdetoChid == currentIrdetoChid) {
+                    target->irdetoChidSelected = false;
+                }
+                std::cerr << "NEWCAMD IRDETO CHID REJECT: client=" << clientKey
+                          << " stream=" << streamId
+                          << " sid=" << target->serviceId
+                          << " chid=0x" << std::hex << currentIrdetoChid << std::dec
+                          << " retry_after_ms=15000" << std::endl;
+            } else {
+                std::cerr << "NEWCAMD ECM REJECT: client=" << clientKey
+                          << " stream=" << streamId
+                          << " msg=" << messageId
+                          << " reason=no-control-word" << std::endl;
+            }
+            pump_ecm_queue(inst, clientKey, session);
             return;
         }
 
@@ -488,6 +568,7 @@ void configure_service_callback(NewcamdInstance* inst,
                       << " reason=stream-gone" << std::endl;
         } else {
             uint16_t sid = 0;
+            bool newlySelectedChid = false;
             {
                 std::lock_guard<std::mutex> serviceLock(target->mutex);
                 ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
@@ -497,8 +578,22 @@ void configure_service_callback(NewcamdInstance* inst,
                 ++slot.updates;
                 ++target->cwUpdates;
                 sid = target->serviceId;
+
+                if (currentIsIrdeto && currentHasIrdetoChid && !target->irdetoChidSelected) {
+                    target->irdetoChidSelected = true;
+                    target->selectedIrdetoChid = currentIrdetoChid;
+                    target->rejectedIrdetoChidUntilMs.clear();
+                    newlySelectedChid = true;
+                }
             }
             const uint64_t now = monotonic_ms();
+            if (newlySelectedChid) {
+                std::cerr << "NEWCAMD IRDETO CHID SELECT: client=" << clientKey
+                          << " stream=" << streamId
+                          << " sid=" << sid
+                          << " chid=0x" << std::hex << currentIrdetoChid << std::dec
+                          << std::endl;
+            }
             std::cerr << "NEWCAMD CW MAP: client=" << clientKey
                       << " session=per-service"
                       << " stream=" << streamId
@@ -509,9 +604,8 @@ void configure_service_callback(NewcamdInstance* inst,
                       << std::endl;
         }
 
-        // NewcamdClient emits EVEN then ODD for the same response. ODD completes
-        // this service-local transaction and allows the next ECM from this same
-        // service to be sent. No other service shares this TCP session.
+        // NewcamdClient emits EVEN then ODD for the same successful response.
+        // ODD completes the service-local transaction and allows the next ECM.
         if (parity & 1) {
             {
                 std::lock_guard<std::mutex> queueLock(session->ecmMutex);
@@ -522,6 +616,9 @@ void configure_service_callback(NewcamdInstance* inst,
                     session->currentEcmPid = 0;
                     session->currentStartedMs = 0;
                     session->currentSignature.clear();
+                    session->currentIsIrdeto = false;
+                    session->currentHasIrdetoChid = false;
+                    session->currentIrdetoChid = 0;
                 }
             }
             pump_ecm_queue(inst, clientKey, session);
@@ -839,6 +936,21 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                         item.section = section;
                         item.signature = signature;
                         item.queuedMs = monotonic_ms();
+                        item.isIrdeto = is_irdeto_caid(item.caid);
+                        if (item.isIrdeto) {
+                            item.hasIrdetoChid = extract_irdeto_chid(section, item.irdetoChid);
+                            if (item.hasIrdetoChid) {
+                                if (binding.irdetoChidSelected &&
+                                    binding.selectedIrdetoChid != item.irdetoChid) {
+                                    continue;
+                                }
+                                const auto rejected = binding.rejectedIrdetoChidUntilMs.find(item.irdetoChid);
+                                if (!binding.irdetoChidSelected && rejected != binding.rejectedIrdetoChidUntilMs.end()) {
+                                    if (item.queuedMs < rejected->second) continue;
+                                    binding.rejectedIrdetoChidUntilMs.erase(rejected);
+                                }
+                            }
+                        }
                         ++binding.ecmRequests;
                         enqueue_ecm(inst, binding.clientKey, session, std::move(item));
                     }
