@@ -114,6 +114,19 @@ bool isHlsUri(const std::string& inputLower, const std::string& inputMode) {
            inputLower.find(".m3u8") != std::string::npos;
 }
 
+bool isDirectHttpMpegTsConfig(const StreamConfig& cfg) {
+    const std::string input = toLower(cfg.inputUri);
+    if (input.rfind("http://", 0) != 0 && input.rfind("https://", 0) != 0) return false;
+    const std::string mode = toLower(cfg.inputMode);
+    if (mode == "hls") return false;
+    if (mode == "http-ts" || mode == "http-mpegts" || mode == "mpegts") return true;
+    // v187: Auto is deterministic and single-request for opaque HTTP IPTV URLs.
+    // HLS with .m3u8 remains automatic; an HLS URL without an extension must be
+    // explicitly marked HLS. This avoids consuming tokenized MPEG-TS sessions
+    // with a separate sniff request before the real stream connection.
+    return (mode.empty() || mode == "auto") && input.find(".m3u8") == std::string::npos;
+}
+
 bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return element != nullptr && gst_bin_add(GST_BIN(pipeline), element);
 }
@@ -2381,6 +2394,14 @@ void stopHttpMpegTsInput(StreamState* state) {
     auto httpState = std::static_pointer_cast<HttpMpegTsCurlInputState>(state->httpMpegTsInputState);
     if (httpState) httpState->stop();
     state->httpMpegTsInputState.reset();
+}
+
+void startHttpMpegTsInput(StreamState* state) {
+    if (!state || !state->httpMpegTsInputState) return;
+    auto httpState = std::static_pointer_cast<HttpMpegTsCurlInputState>(state->httpMpegTsInputState);
+    if (!httpState || httpState->worker.joinable() ||
+        httpState->stopping.load(std::memory_order_relaxed)) return;
+    httpState->worker = std::thread(runHttpMpegTsCurlInput, httpState);
 }
 
 size_t hlsProbeWrite(char* ptr, size_t size, size_t nmemb, void* userData) {
@@ -4847,10 +4868,11 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
 
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
-        state->statusMessage = "pipeline build failed";
+        if (state->statusMessage.empty()) state->statusMessage = "pipeline build failed";
+        const std::string buildError = state->statusMessage + " for stream: " + streamConfig.name;
         stopHttpMpegTsInput(state.get());
         releaseSharedDvbInput(state.get());
-        if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
+        if (error) *error = buildError;
         return false;
     }
 
@@ -4919,6 +4941,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         return false;
     }
 
+    startHttpMpegTsInput(state.get());
     state->statusMessage = (stateChange == GST_STATE_CHANGE_ASYNC) ? "starting" : "running";
     bool duplicateStart = false;
     {
@@ -5757,6 +5780,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
 
+    stopHttpMpegTsInput(state);
     if (oldPipeline) {
         gst_element_set_state(oldPipeline, GST_STATE_NULL);
     }
@@ -5864,6 +5888,8 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         if (oldPipeline) gst_object_unref(oldPipeline);
         return false;
     }
+
+    startHttpMpegTsInput(state);
 
     if (oldBus) {
         gst_object_unref(oldBus);
@@ -6038,6 +6064,9 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
 
     GstElement* sourceTail = nullptr;
     if (!createSourceChain(state, pipeline, sourceTail) || !sourceTail) {
+        state->statusMessage = "pipeline build failed: source-chain";
+        std::cerr << "Pipeline build failed: stage=source-chain stream=" << cfg.name
+                  << " input=" << cfg.inputUri << " input_mode=" << cfg.inputMode << std::endl;
         gst_object_unref(pipeline);
         return nullptr;
     }
@@ -6056,6 +6085,11 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         sourceTail = transcoderBin;
     }
     if (!buildOutputBranches(state, pipeline, sourceTail)) {
+        state->statusMessage = "pipeline build failed: output-branches";
+        std::cerr << "Pipeline build failed: stage=output-branches stream=" << cfg.name
+                  << " input=" << cfg.inputUri << " input_mode=" << cfg.inputMode
+                  << " output=" << cfg.outputType << " remap=" << (cfg.remapEnabled ? 1 : 0)
+                  << std::endl;
         gst_object_unref(pipeline);
         return nullptr;
     }
@@ -6310,13 +6344,10 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     }
 
     const std::string normalizedInputMode = toLower(cfg.inputMode);
-    const bool forceHttpMpegTs =
-        normalizedInputMode == "http-ts" ||
-        normalizedInputMode == "http-mpegts" ||
-        normalizedInputMode == "mpegts";
+    const bool directHttpMpegTs = isDirectHttpMpegTsConfig(cfg);
 
-    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http && forceHttpMpegTs) {
-        // v186: tokenized IPTV HTTP MPEG-TS is fetched by libcurl and fed to
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http && directHttpMpegTs) {
+        // v187: tokenized IPTV HTTP MPEG-TS is fetched by libcurl and fed to
         // appsrc.  This creates exactly one provider request and avoids a
         // build-time dependency on souphttpsrc/caps negotiation for opaque URLs.
         GstElement* src = gst_element_factory_make("appsrc", "input_src");
@@ -6352,12 +6383,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         const std::string location = appendHlsAccessQuery(input, cfg);
         auto httpState = std::make_shared<HttpMpegTsCurlInputState>(src, cfg, location);
         state->httpMpegTsInputState = httpState;
-        httpState->worker = std::thread(runHttpMpegTsCurlInput, httpState);
 
-        std::cerr << "HTTP MPEG-TS input: mode=forced-single-request"
+        std::cerr << "HTTP MPEG-TS input: mode=single-request"
                   << " uri=" << input
                   << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
-                  << " hls_probe=bypassed transport=libcurl-appsrc"
+                  << " input_mode=" << (normalizedInputMode.empty() ? "auto" : normalizedInputMode)
+                  << " hls_probe=bypassed transport=libcurl-appsrc start=after-pipeline-playing"
                   << std::endl;
         terminalElement = queue;
         return src;
@@ -6368,9 +6399,10 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     // HTTP MPEG-TS: some providers permit only one active request per token
     // and the old HLS sniff request could consume/lock that session before
     // souphttpsrc opened the real stream.
-    const bool useHlsInput = inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls ||
-        (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http &&
-         !forceHttpMpegTs && probeHttpHlsManifest(cfg, input));
+    // v187: do not pre-open opaque HTTP URLs. .m3u8 and explicit HLS mode are
+    // classified as HLS by inputKind(); every other HTTP URL in Auto is treated
+    // as a continuous MPEG-TS stream and opened exactly once through libcurl.
+    const bool useHlsInput = inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls;
 
     if (useHlsInput) {
         if (!hasElementFactory("souphttpsrc")) {
@@ -6474,10 +6506,10 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         std::cerr << "HTTP MPEG-TS input: mode="
-                  << (forceHttpMpegTs ? "forced-single-request" : "auto-non-hls")
+                  << "legacy-http"
                   << " uri=" << input
                   << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
-                  << " hls_probe=" << (forceHttpMpegTs ? "bypassed" : "completed")
+                  << " hls_probe=disabled"
                   << std::endl;
 
         if (!gst_element_link_many(src, capsFilter, queue, nullptr)) {
@@ -6729,6 +6761,7 @@ bool StreamManager::buildOutputBranch(
         state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are

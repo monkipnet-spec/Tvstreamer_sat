@@ -44,7 +44,7 @@ constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kStartupPcrGraceNanoseconds = 2000ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kStartupMinimumPcrSamples = 1;
 constexpr uint64_t kCaCleanStartDualMediaGraceNanoseconds = 1500ULL * 1000ULL * 1000ULL;
-constexpr std::size_t kCaCleanStartMaxStagingBytes = 8 * 1024 * 1024;
+constexpr uint64_t kCaCleanStartRandomAccessWaitNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -381,7 +381,8 @@ void writeRemappedSdtPacket(
 // simultaneous multi-channel startup that could let video enter the reservoir
 // before the first valid audio PES (or vice versa), and some receivers then
 // kept that startup offset for the whole session. v186 stages the first clear
-// media and releases only after both video and audio PES starts are present.
+// media. v187 waits until both clear video and audio have been observed, drops
+// the whole pre-sync interval, then starts from a fresh PAT boundary.
 enum class CleanMediaKind : uint8_t {
     None = 0,
     Audio = 1,
@@ -390,7 +391,11 @@ enum class CleanMediaKind : uint8_t {
 
 struct ClearPesScanResult {
     std::size_t firstMediaOffset = std::numeric_limits<std::size_t>::max();
+    std::size_t firstAudioOffset = std::numeric_limits<std::size_t>::max();
+    std::size_t firstVideoOffset = std::numeric_limits<std::size_t>::max();
     uint16_t firstPid = 0x1FFF;
+    uint16_t firstAudioPid = 0x1FFF;
+    uint16_t firstVideoPid = 0x1FFF;
     bool audioSeen = false;
     bool videoSeen = false;
 };
@@ -442,10 +447,133 @@ ClearPesScanResult scanClearPesStarts(const guint8* data, std::size_t size) {
             result.firstMediaOffset = offset;
             result.firstPid = pid;
         }
-        if (kind == CleanMediaKind::Audio) result.audioSeen = true;
-        if (kind == CleanMediaKind::Video) result.videoSeen = true;
+        if (kind == CleanMediaKind::Audio) {
+            result.audioSeen = true;
+            if (result.firstAudioOffset == std::numeric_limits<std::size_t>::max()) {
+                result.firstAudioOffset = offset;
+                result.firstAudioPid = pid;
+            }
+        }
+        if (kind == CleanMediaKind::Video) {
+            result.videoSeen = true;
+            if (result.firstVideoOffset == std::numeric_limits<std::size_t>::max()) {
+                result.firstVideoOffset = offset;
+                result.firstVideoPid = pid;
+            }
+        }
     }
     return result;
+}
+
+
+bool clearVideoRandomAccessPacket(const guint8* packet, uint16_t videoPid) {
+    if (!packet || packet[0] != 0x47 || videoPid >= 0x1FFF) return false;
+    const uint16_t pid = static_cast<uint16_t>(
+        (static_cast<uint16_t>(packet[1] & 0x1FU) << 8) |
+        static_cast<uint16_t>(packet[2]));
+    if (pid != videoPid) return false;
+    if (((packet[3] >> 6) & 0x03) != 0) return false; // already clear only.
+
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+    if (adaptationControl == 2 || adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (adaptationLength >= 1 && 5 + adaptationLength <= kTsPacketSize) {
+            // ISO/IEC 13818-1 random_access_indicator. This is the most useful
+            // codec-independent marker and is set by normal DVB encoders on an
+            // independently decodable video access unit.
+            if ((packet[5] & 0x40U) != 0) return true;
+        }
+    }
+
+    // Some H.264/H.265 services omit random_access_indicator. On a PES start,
+    // inspect only the bytes already present in this TS packet for an IDR/CRA
+    // NAL. This is intentionally a bounded fallback, not a full ES parser.
+    if ((packet[1] & 0x40U) == 0 || adaptationControl == 0 || adaptationControl == 2) return false;
+    std::size_t payloadOffset = 4;
+    if (adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (5 + adaptationLength >= kTsPacketSize) return false;
+        payloadOffset = 5 + adaptationLength;
+    }
+    if (payloadOffset + 9 > kTsPacketSize) return false;
+    const guint8* payload = packet + payloadOffset;
+    if (payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01) return false;
+    if (cleanMediaKindFromPesStreamId(payload[3]) != CleanMediaKind::Video) return false;
+    const std::size_t pesHeaderLength = payload[8];
+    std::size_t es = payloadOffset + 9 + pesHeaderLength;
+    if (es >= kTsPacketSize) return false;
+
+    for (std::size_t i = es; i + 4 < kTsPacketSize; ++i) {
+        std::size_t nal = std::numeric_limits<std::size_t>::max();
+        if (packet[i] == 0x00 && packet[i + 1] == 0x00 && packet[i + 2] == 0x01) {
+            nal = i + 3;
+        } else if (i + 5 < kTsPacketSize && packet[i] == 0x00 && packet[i + 1] == 0x00 &&
+                   packet[i + 2] == 0x00 && packet[i + 3] == 0x01) {
+            nal = i + 4;
+        }
+        if (nal == std::numeric_limits<std::size_t>::max() || nal >= kTsPacketSize) continue;
+        const guint8 h264Type = static_cast<guint8>(packet[nal] & 0x1FU);
+        if (h264Type == 5) return true; // AVC IDR
+        const guint8 h265Type = static_cast<guint8>((packet[nal] >> 1) & 0x3FU);
+        if (h265Type == 19 || h265Type == 20 || h265Type == 21) return true; // HEVC IDR/CRA
+    }
+    return false;
+}
+
+// Keep only the transport interval from the most recent PAT to the first clear
+// independently-decodable video access point. Starting on an arbitrary PAT can
+// make audio audible immediately while video waits for the next IDR/GOP, which
+// appears as audio leading video on channels with long GOPs.
+bool collectCleanStartToVideoRandomAccess(const guint8* data,
+                                          std::size_t size,
+                                          std::size_t minimumOffset,
+                                          uint16_t videoPid,
+                                          std::vector<guint8>& candidate) {
+    if (!data || size < kTsPacketSize || videoPid >= 0x1FFF) return false;
+    std::size_t start = 0;
+    while (start < size && data[start] != 0x47) ++start;
+    for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
+        if (offset < minimumOffset) continue;
+        const guint8* packet = data + offset;
+        if (packet[0] != 0x47) break;
+        const uint16_t pid = static_cast<uint16_t>(
+            (static_cast<uint16_t>(packet[1] & 0x1FU) << 8) |
+            static_cast<uint16_t>(packet[2]));
+
+        if (pid == 0x0000) {
+            // Use the closest PAT before the keyframe, not an older GOP worth of
+            // audio. This bounds any audio-before-video interval to a PAT cycle.
+            candidate.clear();
+            candidate.insert(candidate.end(), packet, packet + kTsPacketSize);
+        } else if (!candidate.empty()) {
+            candidate.insert(candidate.end(), packet, packet + kTsPacketSize);
+        }
+
+        if (!candidate.empty() && clearVideoRandomAccessPacket(packet, videoPid)) {
+            const std::size_t afterPacket = offset + kTsPacketSize;
+            if (afterPacket < size) {
+                candidate.insert(candidate.end(), data + afterPacket, data + size);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+std::size_t findPatOffset(const guint8* data, std::size_t size, std::size_t minimumOffset = 0) {
+    if (!data || size < kTsPacketSize) return std::numeric_limits<std::size_t>::max();
+    std::size_t start = 0;
+    while (start < size && data[start] != 0x47) ++start;
+    for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
+        if (offset < minimumOffset) continue;
+        const guint8* packet = data + offset;
+        if (packet[0] != 0x47) break;
+        const uint16_t pid = static_cast<uint16_t>(
+            (static_cast<uint16_t>(packet[1] & 0x1FU) << 8) |
+            static_cast<uint16_t>(packet[2]));
+        if (pid == 0x0000) return offset;
+    }
+    return std::numeric_limits<std::size_t>::max();
 }
 
 class StableUdpSender {
@@ -570,54 +698,112 @@ public:
         }
 
         TimedChunk chunk;
-        bool stagedCleanStartRelease = false;
+        bool cleanStartRelease = false;
         if (caCleanStartEnabled && !caCleanStartReleased) {
             const ClearPesScanResult scan = scanClearPesStarts(map.data, map.size);
             const uint64_t nowNs = monotonicNanoseconds();
+            const bool audioBefore = caCleanStartAudioSeen;
+            const bool videoBefore = caCleanStartVideoSeen;
 
-            if (caCleanStartStaging.empty()) {
-                if (scan.firstMediaOffset == std::numeric_limits<std::size_t>::max() ||
-                    scan.firstMediaOffset >= map.size) {
-                    caCleanStartDroppedBytes += map.size;
-                    gst_buffer_unmap(buffer, &map);
-                    return GST_FLOW_OK;
+            if (scan.audioSeen || scan.videoSeen) {
+                if (caCleanStartFirstMediaNanoseconds == 0) {
+                    caCleanStartFirstMediaNanoseconds = nowNs;
+                    caCleanStartFirstPid = scan.firstPid;
                 }
-                caCleanStartDroppedBytes += scan.firstMediaOffset;
-                caCleanStartStaging.insert(
-                    caCleanStartStaging.end(),
-                    map.data + scan.firstMediaOffset,
-                    map.data + map.size);
-                caCleanStartFirstMediaNanoseconds = nowNs;
-                caCleanStartFirstPid = scan.firstPid;
-            } else {
-                caCleanStartStaging.insert(
-                    caCleanStartStaging.end(), map.data, map.data + map.size);
+                if (scan.audioSeen && caCleanStartAudioPid >= 0x1FFF) {
+                    caCleanStartAudioPid = scan.firstAudioPid;
+                }
+                if (scan.videoSeen && caCleanStartVideoPid >= 0x1FFF) {
+                    caCleanStartVideoPid = scan.firstVideoPid;
+                }
+                caCleanStartAudioSeen = caCleanStartAudioSeen || scan.audioSeen;
+                caCleanStartVideoSeen = caCleanStartVideoSeen || scan.videoSeen;
             }
-
-            caCleanStartAudioSeen = caCleanStartAudioSeen || scan.audioSeen;
-            caCleanStartVideoSeen = caCleanStartVideoSeen || scan.videoSeen;
 
             const bool dualMediaReady = caCleanStartAudioSeen && caCleanStartVideoSeen;
             const bool graceExpired = caCleanStartFirstMediaNanoseconds != 0 &&
                 nowNs >= caCleanStartFirstMediaNanoseconds + kCaCleanStartDualMediaGraceNanoseconds;
-            const bool stagingLimitReached = caCleanStartStaging.size() >= kCaCleanStartMaxStagingBytes;
 
-            if (!dualMediaReady && !graceExpired && !stagingLimitReached) {
+            if (dualMediaReady && !caCleanStartDualMediaReady) {
+                caCleanStartDualMediaReady = true;
+                caCleanStartReadyNanoseconds = nowNs;
+                std::size_t secondMediaOffset = 0;
+                if (!audioBefore && scan.firstAudioOffset != std::numeric_limits<std::size_t>::max()) {
+                    secondMediaOffset = scan.firstAudioOffset;
+                }
+                if (!videoBefore && scan.firstVideoOffset != std::numeric_limits<std::size_t>::max()) {
+                    secondMediaOffset = std::max(secondMediaOffset, scan.firstVideoOffset);
+                }
+                caCleanStartReleaseAnchorOffset = secondMediaOffset;
+                caCleanStartCandidate.clear();
+            }
+
+            bool randomAccessRelease = false;
+            bool randomAccessFallback = false;
+            std::size_t directReleaseOffset = std::numeric_limits<std::size_t>::max();
+
+            if (caCleanStartDualMediaReady) {
+                randomAccessRelease = collectCleanStartToVideoRandomAccess(
+                    map.data,
+                    map.size,
+                    caCleanStartReleaseAnchorOffset,
+                    caCleanStartVideoPid,
+                    caCleanStartCandidate);
+                caCleanStartReleaseAnchorOffset = 0;
+
+                // Broken/non-standard services occasionally provide neither the
+                // TS random_access_indicator nor an IDR/CRA start code in the
+                // first TS packet. Do not block forever: after one GOP-sized
+                // wait, fall back to a clean PAT boundary, matching v187.
+                if (!randomAccessRelease && caCleanStartReadyNanoseconds != 0 &&
+                    nowNs >= caCleanStartReadyNanoseconds + kCaCleanStartRandomAccessWaitNanoseconds) {
+                    if (!caCleanStartCandidate.empty()) {
+                        randomAccessFallback = true;
+                    } else {
+                        directReleaseOffset = findPatOffset(map.data, map.size, 0);
+                        if (directReleaseOffset != std::numeric_limits<std::size_t>::max()) {
+                            randomAccessFallback = true;
+                        }
+                    }
+                }
+            } else if (graceExpired && (scan.audioSeen || scan.videoSeen)) {
+                // Genuine single-media service fallback. For a video-only
+                // service prefer its random-access point; audio-only can start
+                // from a fresh PES immediately.
+                if (caCleanStartVideoSeen && !caCleanStartAudioSeen && caCleanStartVideoPid < 0x1FFF) {
+                    if (caCleanStartReadyNanoseconds == 0) caCleanStartReadyNanoseconds = nowNs;
+                    randomAccessRelease = collectCleanStartToVideoRandomAccess(
+                        map.data, map.size, 0, caCleanStartVideoPid, caCleanStartCandidate);
+                } else {
+                    directReleaseOffset = scan.firstMediaOffset;
+                }
+            }
+
+            if (randomAccessRelease || (randomAccessFallback && !caCleanStartCandidate.empty())) {
+                chunk.bytes = std::move(caCleanStartCandidate);
+                caCleanStartCandidate.clear();
+            } else if (directReleaseOffset != std::numeric_limits<std::size_t>::max() &&
+                       directReleaseOffset < map.size) {
+                caCleanStartDroppedBytes += directReleaseOffset;
+                chunk.bytes.assign(map.data + directReleaseOffset, map.data + map.size);
+            } else {
+                caCleanStartDroppedBytes += map.size;
                 gst_buffer_unmap(buffer, &map);
                 return GST_FLOW_OK;
             }
 
             caCleanStartReleased = true;
-            stagedCleanStartRelease = true;
-            chunk.bytes.swap(caCleanStartStaging);
-            std::cerr << "UDP CA dual-media clean-start released: first_clear_pes_pid="
+            cleanStartRelease = true;
+            std::cerr << "UDP CA keyframe synchronized clean-start released: first_clear_pes_pid="
                       << caCleanStartFirstPid
+                      << " audio_pid=" << caCleanStartAudioPid
+                      << " video_pid=" << caCleanStartVideoPid
                       << " audio_seen=" << (caCleanStartAudioSeen ? 1 : 0)
                       << " video_seen=" << (caCleanStartVideoSeen ? 1 : 0)
-                      << " fallback=" << (dualMediaReady ? "none" : (graceExpired ? "grace" : "size"))
-                      << " dropped_pre_cw_bytes=" << caCleanStartDroppedBytes
-                      << " staged_bytes=" << chunk.bytes.size()
-                      << " startup_reservoir=dual-media-clear" << std::endl;
+                      << " video_random_access=" << (randomAccessRelease ? 1 : 0)
+                      << " random_access_fallback=" << (randomAccessFallback ? 1 : 0)
+                      << " dropped_pre_sync_bytes=" << caCleanStartDroppedBytes
+                      << " startup_reservoir=keyframe-synchronized-clear" << std::endl;
         } else {
             chunk.bytes.assign(map.data, map.data + map.size);
         }
@@ -627,7 +813,7 @@ public:
         }
 
         GstClockTime timestamp = GST_CLOCK_TIME_NONE;
-        if (!stagedCleanStartRelease) {
+        if (!cleanStartRelease) {
             timestamp = GST_BUFFER_PTS(buffer);
             if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
                 timestamp = GST_BUFFER_DTS(buffer);
@@ -1502,10 +1688,15 @@ private:
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
     bool caCleanStartVideoSeen = false;
+    bool caCleanStartDualMediaReady = false;
     uint16_t caCleanStartFirstPid = 0x1FFF;
+    uint16_t caCleanStartAudioPid = 0x1FFF;
+    uint16_t caCleanStartVideoPid = 0x1FFF;
     uint64_t caCleanStartFirstMediaNanoseconds = 0;
+    uint64_t caCleanStartReadyNanoseconds = 0;
     uint64_t caCleanStartDroppedBytes = 0;
-    std::vector<guint8> caCleanStartStaging;
+    std::size_t caCleanStartReleaseAnchorOffset = 0;
+    std::vector<guint8> caCleanStartCandidate;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
@@ -1672,7 +1863,7 @@ GstElement* createSink(
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
-              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "dual-media-clear-pes" : "off")
+              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "post-dual-media-video-random-access" : "off")
               << std::endl;
     return sink;
 }
