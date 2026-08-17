@@ -533,7 +533,14 @@ private:
 
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
+        // Media/PCR time is deliberately independent from the physical sender
+        // deadline. If the sender thread wakes up late we may move the wall-clock
+        // deadline forward, but we must never jump PCR with it: upstream PTS/DTS
+        // did not jump. Keeping a continuous transport timeline prevents A/V
+        // drift when several output threads contend for CPU scheduling.
+        uint64_t mediaTimelineNanoseconds = 0;
         uint64_t scheduleRemainder = 0;
+        uint64_t mediaRemainder = 0;
         uint64_t scheduleBitrate = 0;
 
         while (!stopping.load(std::memory_order_relaxed)) {
@@ -542,6 +549,7 @@ private:
                     break;
                 }
                 nextSendNanoseconds = monotonicNanoseconds();
+                mediaTimelineNanoseconds = nextSendNanoseconds;
                 statsStartedNanoseconds = nextSendNanoseconds;
                 lastStatsNanoseconds = nextSendNanoseconds;
                 lastRateSampleNanoseconds = nextSendNanoseconds;
@@ -567,6 +575,7 @@ private:
             if (scheduleBitrate != activeBitrate) {
                 scheduleBitrate = activeBitrate;
                 scheduleRemainder = 0;
+                mediaRemainder = 0;
             }
 
             const uint64_t datagramNumerator = kUdpPayloadSize * 8ULL * 1000000000ULL;
@@ -590,7 +599,7 @@ private:
 
             std::array<guint8, kUdpPayloadSize> datagram {};
             const FillCounts filled = fillDatagram(
-                datagram.data(), nextSendNanoseconds, activeBitrate);
+                datagram.data(), mediaTimelineNanoseconds, activeBitrate);
             normalizeFinalDatagramContinuity(datagram.data());
             verifyFinalDatagramContinuity(datagram.data());
             sendDatagram(datagram.data(), datagram.size());
@@ -607,10 +616,21 @@ private:
             maybeLogStats(now);
 
             nextSendNanoseconds += intervalNanoseconds;
+            mediaTimelineNanoseconds += intervalNanoseconds;
+
             scheduleRemainder += intervalRemainder;
             if (scheduleRemainder >= activeBitrate) {
                 nextSendNanoseconds += scheduleRemainder / activeBitrate;
                 scheduleRemainder %= activeBitrate;
+            }
+
+            // Keep PCR/media time continuous even if nextSendNanoseconds was
+            // reset to the current wall clock above. It advances only by the
+            // transport duration actually represented by this datagram.
+            mediaRemainder += intervalRemainder;
+            if (mediaRemainder >= activeBitrate) {
+                mediaTimelineNanoseconds += mediaRemainder / activeBitrate;
+                mediaRemainder %= activeBitrate;
             }
         }
     }
@@ -1000,7 +1020,7 @@ private:
 
     FillCounts fillDatagram(
         guint8* destination,
-        uint64_t datagramDeadlineNanoseconds,
+        uint64_t datagramMediaNanoseconds,
         uint64_t activeTransportBitrate) {
         FillCounts counts;
         if (!destination) {
@@ -1011,7 +1031,7 @@ private:
         for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
             const uint64_t slotOffset = multiplyDivide(
                 slot * kTsPacketSize * 8ULL, 1000000000ULL, activeTransportBitrate);
-            const uint64_t slotTime = datagramDeadlineNanoseconds + slotOffset;
+            const uint64_t slotTime = datagramMediaNanoseconds + slotOffset;
             guint8* outputPacket = destination + slot * kTsPacketSize;
 
             // Accumulate useful-data entitlement on every transport slot,
@@ -1284,6 +1304,7 @@ private:
                   << " pcr_declared=" << (declaredPcrPidValid ? declaredPcrPid : 0x1FFF)
                   << " pcr_program=" << declaredPcrProgram
                   << " timing=reservoir_rate_controller_periodic_pcr"
+                  << " pcr_clock=continuous_transport_media"
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " startup_pcr_samples="
@@ -1478,8 +1499,9 @@ GstElement* createSink(
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing=reservoir-rate-controller"
               << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
-              << " pcr_restamp=output-clock"
-              << " clock=clock_nanosleep-abstime busywait=off"
+              << " pcr_restamp=continuous-transport-media"
+              << " sender_clock=clock_nanosleep-abstime"
+              << " pcr_scheduler_decoupled=1 busywait=off"
               << std::endl;
     return sink;
 }
