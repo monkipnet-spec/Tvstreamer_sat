@@ -976,37 +976,15 @@ bool buildSharedDvbPids(
     size_t& filterCount,
     std::string& error,
     bool forceFullTransportStream = false) {
-    if (forceFullTransportStream) {
-        requestedPids = "8192";
-        filterCount = 1;
-        return true;
-    }
-
-    constexpr size_t kMaxDvbSrcFilters = 32;
-    std::set<uint16_t> unionPids;
-    bool fullTransportStream = false;
-    for (const auto& [streamId, pids] : consumers) {
-        (void)streamId;
-        if (pids.empty()) {
-            fullTransportStream = true;
-            break;
-        }
-        unionPids.insert(pids.begin(), pids.end());
-    }
-
-    filterCount = fullTransportStream ? 1 : unionPids.size();
-    if (!fullTransportStream && filterCount > kMaxDvbSrcFilters) {
-        std::ostringstream message;
-        message << "active services require " << filterCount
-                << " DVB PID filters, but GStreamer dvbsrc supports "
-                << kMaxDvbSrcFilters
-                << "; stop a channel or use another frontend";
-        error = message.str();
-        return false;
-    }
-
-    requestedPids =
-        fullTransportStream || unionPids.empty() ? "8192" : formatDvbPids(unionPids);
+    // v167: a shared DVB frontend always captures the complete transponder.
+    // Individual services are filtered in software by their service-relay
+    // pipelines. This mirrors Astra's full-MPTS acquisition model and avoids
+    // dvbsrc's finite per-PID filter budget as more services are enabled.
+    (void)consumers;
+    (void)error;
+    (void)forceFullTransportStream;
+    requestedPids = "8192";
+    filterCount = 1;
     return true;
 }
 
@@ -3096,14 +3074,10 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             initialConsumers, frontendPids, pidFilterCount, error)) {
         return false;
     }
-    const std::string serviceFrontendPids = frontendPids;
-    const size_t servicePidFilterCount = pidFilterCount;
-    const bool preferFullTsCapture = state->sharedDvbPreferFullTsCapture &&
-        !servicePids.empty() && serviceFrontendPids != "8192";
-    if (preferFullTsCapture) {
-        frontendPids = "8192";
-        pidFilterCount = 1;
-    }
+    // v167 shared frontends are permanently full-MPTS. Keep servicePids only
+    // for the downstream software relay; never apply them to dvbsrc itself.
+    frontendPids = "8192";
+    pidFilterCount = 1;
     const std::string device = "/dev/dvb/adapter" + std::to_string(params.adapter) +
                                "/frontend" + std::to_string(params.frontend);
     if (!std::filesystem::exists(device)) {
@@ -3334,31 +3308,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return std::pair<bool, std::string>(false, lastError);
     };
 
-    auto [started, startupError] = startWithCurrentPidsRetry(frontendPids == "8192" ? "full-ts" : "service-pids");
-    if (!started && preferFullTsCapture &&
-        !serviceFrontendPids.empty() && serviceFrontendPids != "8192") {
-        const std::string fullTsError = startupError;
-        resetFailedStart();
-        frontendPids = serviceFrontendPids;
-        pidFilterCount = servicePidFilterCount;
-        g_object_set(source, "pids", frontendPids.c_str(), nullptr);
-        std::cerr << "Shared DVB CA frontend full-TS rejected: stream=" << state->config.id
-                  << " SID=" << state->config.inputServiceId
-                  << " retry_pids=" << frontendPids
-                  << " full_ts_error=" << fullTsError << std::endl;
-        auto retry = startWithCurrentPidsRetry("service-pids");
-        started = retry.first;
-        startupError = retry.second;
-        if (started) {
-            std::cerr << "Shared DVB CA frontend fallback active: stream=" << state->config.id
-                      << " SID=" << state->config.inputServiceId
-                      << " pids=" << frontendPids
-                      << " reason=full-ts-not-supported-by-driver" << std::endl;
-        } else {
-            startupError = "full-TS failed: " + fullTsError +
-                "; service PID fallback failed: " + startupError;
-        }
-    }
+    auto [started, startupError] = startWithCurrentPidsRetry("full-ts");
     if (!started) {
         if (startupError.find("Device or resource busy") != std::string::npos ||
             startupError.find("resource busy") != std::string::npos) {
@@ -3379,7 +3329,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     }
 
     shared->requestedPids = frontendPids;
-    shared->fullTsCapture = preferFullTsCapture && frontendPids == "8192";
+    shared->fullTsCapture = true;
 
     state->sharedDvbInput = true;
     state->sharedDvbFrontendKey = frontendKey;
@@ -3434,7 +3384,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
               << " frequency_khz=" << params.frequencyKHz
               << " symbol_rate=" << params.symbolRateK
               << " polarity=" << params.polarity
-              << " pid_mode=" << (frontendPids == "8192" ? "full-ts" : "active-union")
+              << " pid_mode=full-mpts-software-service-filter"
               << " pid_services=" << initialConsumers.size()
               << " pid_filters=" << pidFilterCount
               << " pids=" << frontendPids
@@ -3839,7 +3789,7 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
         std::cerr << "Shared DVB CA frontend full-TS preferred: stream=" << state->config.id
                   << " SID=" << state->config.inputServiceId
                   << " software_service_pids=" << state->sharedDvbServicePids
-                  << " fallback=service-pid-filter" << std::endl;
+                  << " frontend_mode=full-mpts" << std::endl;
     }
 
     if (!acquireSharedDvbFrontend(state, error)) return false;
