@@ -6160,9 +6160,20 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
+    const std::string normalizedInputMode = toLower(cfg.inputMode);
+    const bool forceHttpMpegTs =
+        normalizedInputMode == "http-ts" ||
+        normalizedInputMode == "http-mpegts" ||
+        normalizedInputMode == "mpegts";
+
+    // Opaque IPTV HTTP URLs often contain a per-session access token in the
+    // path.  Do not pre-open such URLs when the user explicitly selects
+    // HTTP MPEG-TS: some providers permit only one active request per token
+    // and the old HLS sniff request could consume/lock that session before
+    // souphttpsrc opened the real stream.
     const bool useHlsInput = inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls ||
         (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http &&
-         probeHttpHlsManifest(cfg, input));
+         !forceHttpMpegTs && probeHttpHlsManifest(cfg, input));
 
     if (useHlsInput) {
         if (!hasElementFactory("souphttpsrc")) {
@@ -6233,26 +6244,46 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
+        GstElement* capsFilter = gst_element_factory_make("capsfilter", "input_http_ts_caps");
         GstElement* queue = addQueue("input_queue");
-        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+        if (!src || !capsFilter || !queue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, capsFilter)) {
             return nullptr;
         }
 
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
+        // hls_access_* fields are deliberately retained for config backward
+        // compatibility, but they are generic HTTP/HLS credentials since v185.
+        // A token already embedded in the URL path is left byte-for-byte intact.
         const std::string httpLocation = appendHlsAccessQuery(input, cfg);
-        g_object_set(src, "location", httpLocation.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
-        // The same per-stream header/User-Agent settings are useful for opaque
-        // HTTP live URLs as well; auto-probe above promotes HLS manifests to the
-        // HLS branch, while direct MPEG-TS remains a simple HTTP source.
+        g_object_set(src, "location", httpLocation.c_str(), "is-live", TRUE, "do-timestamp", FALSE, nullptr);
         configureHlsHttpSource(src, cfg);
+        // Never request gzip/deflate for a continuous MPEG-TS byte stream.
+        setBooleanPropertyIfPresent(src, "compress", FALSE);
         setIntPropertyIfPresent(src, "timeout", 15);
+        setUIntPropertyIfPresent(src, "blocksize", kTsPacketsPerUdpBuffer * kTsPacketSize);
+
+        GstCaps* tsCaps = gst_caps_from_string(
+            "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+        if (!tsCaps) return nullptr;
+        g_object_set(capsFilter, "caps", tsCaps, nullptr);
+        gst_caps_unref(tsCaps);
+
         if (!inputInterface.empty()) {
-            std::cerr << "HTTP input: input_iface=" << inputInterface
+            std::cerr << "HTTP MPEG-TS input: input_iface=" << inputInterface
                       << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
                       << std::endl;
         }
 
-        if (!gst_element_link(src, queue)) {
+        std::cerr << "HTTP MPEG-TS input: mode="
+                  << (forceHttpMpegTs ? "forced-single-request" : "auto-non-hls")
+                  << " uri=" << input
+                  << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
+                  << " hls_probe=" << (forceHttpMpegTs ? "bypassed" : "completed")
+                  << std::endl;
+
+        if (!gst_element_link_many(src, capsFilter, queue, nullptr)) {
             return nullptr;
         }
 
