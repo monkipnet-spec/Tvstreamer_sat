@@ -373,12 +373,64 @@ void writeRemappedSdtPacket(
     section[pos++] = static_cast<guint8>(crc & 0xFF);
 }
 
+// CA clean-start gate: when a stream is configured for conditional access,
+// do not start the five-second WISI reservoir from PSI/ECM or still-scrambled
+// media. Wait for the first clear PES start after CW acquisition, then begin
+// buffering from that packet. This prevents the startup reservoir from
+// containing unusable pre-CW media, which can make A/V recover at different
+// points after automatic multi-channel startup.
+std::size_t firstClearPesPacketOffset(const guint8* data, std::size_t size, uint16_t& pidOut) {
+    pidOut = 0x1FFF;
+    if (!data || size < kTsPacketSize) return size;
+
+    std::size_t start = 0;
+    while (start < size && data[start] != 0x47) ++start;
+    for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
+        const guint8* packet = data + offset;
+        if (packet[0] != 0x47) break;
+
+        // Before CW acquisition media TS keeps scrambling_control=2/3.
+        // Newcamd clears those bits only after successful decryption.
+        const guint8 scrambling = static_cast<guint8>((packet[3] >> 6) & 0x03);
+        if (scrambling != 0) continue;
+        if ((packet[1] & 0x40U) == 0) continue; // PES start must be in this packet.
+
+        const uint16_t pid = static_cast<uint16_t>(
+            (static_cast<uint16_t>(packet[1] & 0x1FU) << 8) |
+            static_cast<uint16_t>(packet[2]));
+        if (pid == 0x0000 || pid == 0x0001 || pid == 0x0011 || pid == 0x1FFF) continue;
+
+        const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+        if (adaptationControl == 0 || adaptationControl == 2) continue;
+        std::size_t payloadOffset = 4;
+        if (adaptationControl == 3) {
+            const std::size_t adaptationLength = packet[4];
+            if (5 + adaptationLength > kTsPacketSize) continue;
+            payloadOffset = 5 + adaptationLength;
+        }
+        if (payloadOffset + 4 > kTsPacketSize) continue;
+
+        const guint8* payload = packet + payloadOffset;
+        if (payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01) continue;
+        const guint8 streamId = payload[3];
+        const bool mediaPes =
+            (streamId >= 0xC0 && streamId <= 0xEF) ||
+            streamId == 0xBD || streamId == 0xFD;
+        if (!mediaPes) continue;
+
+        pidOut = pid;
+        return offset;
+    }
+    return size;
+}
+
 class StableUdpSender {
 public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
+          caCleanStartEnabled(!cfg.conditionalAccessClient.empty()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // StableUdpOutput creates a new paced UDP transport domain for every
           // source, not only Remap ON. Normalize final CC for both IP and DVB
@@ -493,8 +545,24 @@ public:
             return GST_FLOW_ERROR;
         }
 
+        std::size_t cleanStartOffset = 0;
+        uint16_t cleanStartPid = 0x1FFF;
+        if (caCleanStartEnabled && !caCleanStartReleased) {
+            cleanStartOffset = firstClearPesPacketOffset(map.data, map.size, cleanStartPid);
+            if (cleanStartOffset >= map.size) {
+                caCleanStartDroppedBytes += map.size;
+                gst_buffer_unmap(buffer, &map);
+                return GST_FLOW_OK;
+            }
+            caCleanStartReleased = true;
+            std::cerr << "UDP CA clean-start gate released: first_clear_pes_pid="
+                      << cleanStartPid
+                      << " dropped_pre_cw_bytes=" << caCleanStartDroppedBytes
+                      << " startup_reservoir=clean-media-only" << std::endl;
+        }
+
         TimedChunk chunk;
-        chunk.bytes.assign(map.data, map.data + map.size);
+        chunk.bytes.assign(map.data + cleanStartOffset, map.data + map.size);
         gst_buffer_unmap(buffer, &map);
         if (chunk.bytes.empty()) {
             return GST_FLOW_OK;
@@ -1369,6 +1437,9 @@ private:
     std::atomic<uint64_t>* networkBytes = nullptr;
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
+    const bool caCleanStartEnabled = false;
+    bool caCleanStartReleased = false;
+    uint64_t caCleanStartDroppedBytes = 0;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
@@ -1535,6 +1606,7 @@ GstElement* createSink(
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
+              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "clear-pes" : "off")
               << std::endl;
     return sink;
 }
