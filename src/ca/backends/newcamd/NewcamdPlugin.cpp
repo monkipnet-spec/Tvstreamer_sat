@@ -9,7 +9,6 @@ extern "C" {
 #include <chrono>
 #include <deque>
 #include <cstring>
-#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -85,17 +84,10 @@ private:
 
 struct ControlWordSlot {
     dvbcsa_key_t* key = nullptr;
-    struct dvbcsa_bs_key_s* bsKey = nullptr;
     bool valid = false;
     uint64_t updates = 0;
-    ControlWordSlot() {
-        key = dvbcsa_key_alloc();
-        bsKey = dvbcsa_bs_key_alloc();
-    }
-    ~ControlWordSlot() {
-        if (key) dvbcsa_key_free(key);
-        if (bsKey) dvbcsa_bs_key_free(bsKey);
-    }
+    ControlWordSlot() { key = dvbcsa_key_alloc(); }
+    ~ControlWordSlot() { if (key) dvbcsa_key_free(key); }
     ControlWordSlot(const ControlWordSlot&) = delete;
     ControlWordSlot& operator=(const ControlWordSlot&) = delete;
 };
@@ -116,15 +108,6 @@ struct ServiceBinding {
     ControlWordSlot odd;
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
-
-    // v170 low-allocation CSA scratch. These containers are owned by the
-    // service and reused under ServiceBinding::mutex on every TS buffer.
-    // This preserves v169 bitslice behaviour without heap churn per buffer.
-    std::vector<std::pair<uint8_t*, size_t>> evenPayloadScratch;
-    std::vector<std::pair<uint8_t*, size_t>> oddPayloadScratch;
-    std::vector<uint8_t*> evenHeaderScratch;
-    std::vector<uint8_t*> oddHeaderScratch;
-    std::vector<dvbcsa_bs_batch_s> bsBatchScratch;
 
     uint64_t diagLastLogMs = 0;
     uint64_t diagCalls = 0;
@@ -451,9 +434,8 @@ void configure_service_callback(NewcamdInstance* inst,
             {
                 std::lock_guard<std::mutex> serviceLock(target->mutex);
                 ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
-                if (!slot.key || !slot.bsKey) return;
+                if (!slot.key) return;
                 dvbcsa_key_set(cw, slot.key);
-                dvbcsa_bs_key_set(cw, slot.bsKey);
                 slot.valid = true;
                 ++slot.updates;
                 ++target->cwUpdates;
@@ -668,34 +650,6 @@ static void newcamd_stop_service(void* instance, const char* stream_id) {
     removedSession.reset();
 }
 
-static bool heavy_ca_diagnostics_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("TVS_HEAVY_DIAGNOSTICS");
-        return value && *value && std::string(value) != "0";
-    }();
-    return enabled;
-}
-
-static void decrypt_bs_batch(struct dvbcsa_bs_key_s* key,
-                             const std::vector<std::pair<uint8_t*, size_t>>& payloads,
-                             std::vector<dvbcsa_bs_batch_s>& batchScratch) {
-    if (!key || payloads.empty()) return;
-    const size_t capacity = static_cast<size_t>(std::max(1u, dvbcsa_bs_batch_size()));
-    if (batchScratch.size() < capacity + 1) batchScratch.resize(capacity + 1);
-    for (size_t base = 0; base < payloads.size(); base += capacity) {
-        const size_t count = std::min(capacity, payloads.size() - base);
-        unsigned int maxLen = 0;
-        for (size_t i = 0; i < count; ++i) {
-            batchScratch[i].data = payloads[base + i].first;
-            batchScratch[i].len = static_cast<unsigned int>(payloads[base + i].second);
-            maxLen = std::max(maxLen, batchScratch[i].len);
-        }
-        batchScratch[count].data = nullptr;
-        batchScratch[count].len = 0;
-        dvbcsa_bs_decrypt(key, batchScratch.data(), maxLen);
-    }
-}
-
 static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* data, size_t size, struct tvs_ca_ts_result_v1* result) {
     if (!instance || !stream_id || !data || !result) return TVS_CA_RESULT_PASSTHROUGH;
     auto* inst = static_cast<NewcamdInstance*>(instance);
@@ -720,29 +674,15 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     bool changed = false;
     bool waitingForKey = false;
     bool sawEcm = false;
-    const bool heavyDiag = heavy_ca_diagnostics_enabled();
-    auto& evenPayloads = binding.evenPayloadScratch;
-    auto& oddPayloads = binding.oddPayloadScratch;
-    auto& evenHeaders = binding.evenHeaderScratch;
-    auto& oddHeaders = binding.oddHeaderScratch;
-    evenPayloads.clear();
-    oddPayloads.clear();
-    evenHeaders.clear();
-    oddHeaders.clear();
-    const size_t expectedPayloads = size / kTsPacketSize / 2 + 1;
-    if (evenPayloads.capacity() < expectedPayloads) evenPayloads.reserve(expectedPayloads);
-    if (oddPayloads.capacity() < expectedPayloads) oddPayloads.reserve(expectedPayloads);
-    if (evenHeaders.capacity() < expectedPayloads) evenHeaders.reserve(expectedPayloads);
-    if (oddHeaders.capacity() < expectedPayloads) oddHeaders.reserve(expectedPayloads);
 
-    if (heavyDiag) ++binding.diagCalls;
+    ++binding.diagCalls;
     const size_t bufferRemainder = size % kTsPacketSize;
-    if (heavyDiag && bufferRemainder != 0) ++binding.diagUnalignedBuffers;
+    if (bufferRemainder != 0) ++binding.diagUnalignedBuffers;
 
     for (size_t offset = 0; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
         uint8_t* packet = data + offset;
         if (packet[0] != 0x47) {
-            if (heavyDiag) ++binding.diagBadSyncPackets;
+            ++binding.diagBadSyncPackets;
             continue;
         }
 
@@ -754,54 +694,48 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
         const uint8_t continuityCounter = static_cast<uint8_t>(packet[3] & 0x0F);
 
-        if (heavyDiag && tei) ++binding.diagTeiPackets;
+        if (tei) ++binding.diagTeiPackets;
         
         switch (scramblingControl) {
             case 0: result->packets_clear++; break;
-            default:
-                result->packets_scrambled++;
-                if (heavyDiag) ++binding.diagScrambledPackets;
-                break;
+            default: result->packets_scrambled++; ++binding.diagScrambledPackets; break;
         }
 
-        if (heavyDiag) {
-            size_t diagnosticPayloadSize = 0;
-            bool validAdaptation = true;
-            if (adaptationControl == 0) {
+        size_t diagnosticPayloadSize = 0;
+        bool validAdaptation = true;
+        if (adaptationControl == 0) {
+            validAdaptation = false;
+        } else if (adaptationControl == 1) {
+            diagnosticPayloadSize = kTsPacketSize - 4;
+        } else if (adaptationControl == 3) {
+            const size_t adaptationLength = packet[4];
+            if (5 + adaptationLength > kTsPacketSize) {
                 validAdaptation = false;
-            } else if (adaptationControl == 1) {
-                diagnosticPayloadSize = kTsPacketSize - 4;
-            } else if (adaptationControl == 3) {
-                const size_t adaptationLength = packet[4];
-                if (5 + adaptationLength > kTsPacketSize) {
-                    validAdaptation = false;
-                } else {
-                    const size_t diagnosticPayloadOffset = 5 + adaptationLength;
-                    if (diagnosticPayloadOffset < kTsPacketSize) {
-                        diagnosticPayloadSize = kTsPacketSize - diagnosticPayloadOffset;
-                    }
+            } else {
+                const size_t diagnosticPayloadOffset = 5 + adaptationLength;
+                if (diagnosticPayloadOffset < kTsPacketSize) {
+                    diagnosticPayloadSize = kTsPacketSize - diagnosticPayloadOffset;
                 }
             }
+        }
 
-            if (!validAdaptation) {
-                ++binding.diagBadAdaptationPackets;
-            } else if (diagnosticPayloadSize > 0) {
-                ++binding.diagPayloadPackets;
-                if ((diagnosticPayloadSize % 8) != 0) {
-                    ++binding.diagNonModulo8Payloads;
-                    if (scramblingControl == 2 || scramblingControl == 3) {
-                        ++binding.diagScrambledNonModulo8Payloads;
-                        binding.diagSamplePid = pid;
-                        binding.diagSampleScrambling = scramblingControl;
-                        binding.diagSampleAdaptation = adaptationControl;
-                        binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
-                        binding.diagSampleCc = continuityCounter;
-                        binding.diagSamplePusi = payloadStart;
-                        binding.diagSampleTei = tei;
-                    }
+        if (!validAdaptation) {
+            ++binding.diagBadAdaptationPackets;
+        } else if (diagnosticPayloadSize > 0) {
+            ++binding.diagPayloadPackets;
+            if ((diagnosticPayloadSize % 8) != 0) {
+                ++binding.diagNonModulo8Payloads;
+                if (scramblingControl == 2 || scramblingControl == 3) {
+                    ++binding.diagScrambledNonModulo8Payloads;
+                    binding.diagSamplePid = pid;
+                    binding.diagSampleScrambling = scramblingControl;
+                    binding.diagSampleAdaptation = adaptationControl;
+                    binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
+                    binding.diagSampleCc = continuityCounter;
+                    binding.diagSamplePusi = payloadStart;
+                    binding.diagSampleTei = tei;
                 }
             }
-
         }
 
         size_t payloadSize = 0;
@@ -854,35 +788,19 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         }
 
         ControlWordSlot& slot = scramblingControl == 3 ? binding.odd : binding.even;
-        if (!slot.valid || !slot.bsKey) {
+        if (!slot.valid || !slot.key) {
             waitingForKey = true;
             continue;
         }
-
-        if (scramblingControl == 3) {
-            oddPayloads.emplace_back(scrambledPayload, scrambledPayloadSize);
-            oddHeaders.push_back(packet);
-        } else {
-            evenPayloads.emplace_back(scrambledPayload, scrambledPayloadSize);
-            evenHeaders.push_back(packet);
-        }
-    }
-
-    if (!evenPayloads.empty()) {
-        decrypt_bs_batch(binding.even.bsKey, evenPayloads, binding.bsBatchScratch);
-        for (uint8_t* packet : evenHeaders) packet[3] &= 0x3F;
-        result->packets_changed += evenPayloads.size();
-        changed = true;
-    }
-    if (!oddPayloads.empty()) {
-        decrypt_bs_batch(binding.odd.bsKey, oddPayloads, binding.bsBatchScratch);
-        for (uint8_t* packet : oddHeaders) packet[3] &= 0x3F;
-        result->packets_changed += oddPayloads.size();
+        
+        dvbcsa_decrypt(slot.key, scrambledPayload, scrambledPayloadSize);
+        packet[3] &= 0x3F;
+        result->packets_changed++;
         changed = true;
     }
 
     const uint64_t diagNowMs = monotonic_ms();
-    if (heavyDiag && (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000)) {
+    if (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000) {
         binding.diagLastLogMs = diagNowMs;
         std::cerr
             << "CA TS DIAG: stream=" << stream_id

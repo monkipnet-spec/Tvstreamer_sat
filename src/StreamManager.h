@@ -59,15 +59,12 @@ struct SharedDvbFrontendState {
     std::map<std::string, std::set<uint16_t>> consumerPids;
     std::string requestedPids;
     bool fullTsCapture = false;
-    std::mutex dispatchMutex;
-    std::map<std::string, std::shared_ptr<void>> dispatchConsumers;
 };
 
 struct DvbServiceRelayState {
     GstElement* pipeline = nullptr;
     GstBus* bus = nullptr;
     uint16_t outputPort = 0;
-    std::shared_ptr<void> dispatcherConsumer;
 };
 
 struct StreamState {
