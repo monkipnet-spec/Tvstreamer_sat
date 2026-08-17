@@ -59,12 +59,18 @@ struct SharedDvbFrontendState {
     std::map<std::string, std::set<uint16_t>> consumerPids;
     std::string requestedPids;
     bool fullTsCapture = false;
+    // v178: one in-process dispatcher owns TS framing and PID routing for all
+    // services on this physical frontend.  Kept opaque here so the hot-path
+    // implementation stays local to StreamManager.cpp.
+    std::shared_ptr<void> dispatcherState;
 };
 
 struct DvbServiceRelayState {
-    GstElement* pipeline = nullptr;
-    GstBus* bus = nullptr;
+    // v178 no longer creates a per-service GStreamer full-MPTS relay.  The
+    // shared dispatcher emits the already-selected SPTS to this localhost UDP
+    // port and the normal stream pipeline consumes it.
     uint16_t outputPort = 0;
+    std::shared_ptr<void> dispatcherConsumer;
 };
 
 struct StreamState {

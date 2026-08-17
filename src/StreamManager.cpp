@@ -1752,6 +1752,317 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 }
 
 
+// v178 single-pass DVB service dispatcher.
+//
+// The v167-v177 relay topology delivered the complete transponder to a
+// separate GStreamer service pipeline for every selected channel.  That made
+// each shared_service_* thread scan and compact the same MPTS again.  v178
+// performs TS framing once on the shared frontend, routes each PID to the
+// interested services, applies the existing packet-level SPTS rewrite and CA
+// backend per service, then emits 7x188-byte localhost UDP datagrams directly
+// to the normal stream input pipeline.  No per-service full-MPTS udpsrc/queue
+// pipeline is created.
+struct SharedDvbDispatchConsumer {
+    std::string streamId;
+    std::string frontendKey;
+    DvbSingleProgramPsiContext psi;
+    int socketFd = -1;
+    sockaddr_in destination{};
+    bool caEnabled = false;
+    unsigned slot = 0;
+    std::array<uint8_t, kTsPacketSize * kTsPacketsPerUdpBuffer> datagram{};
+    size_t datagramBytes = 0;
+    uint64_t inputPackets = 0;
+    uint64_t outputPackets = 0;
+    uint64_t udpDatagrams = 0;
+    uint64_t udpErrors = 0;
+
+    ~SharedDvbDispatchConsumer() {
+        if (socketFd >= 0) {
+            ::close(socketFd);
+            socketFd = -1;
+        }
+    }
+};
+
+struct SharedDvbDispatcherState {
+    std::mutex mutex;
+    std::array<std::shared_ptr<SharedDvbDispatchConsumer>, 64> slots{};
+    std::map<std::string, unsigned> streamSlots;
+    std::array<uint64_t, 8192> pidRoutes{};
+    std::vector<uint8_t> remainder;
+    uint64_t inputPackets = 0;
+    uint64_t routedPackets = 0;
+    uint64_t droppedPackets = 0;
+    uint64_t resyncs = 0;
+    bool announced = false;
+    std::chrono::steady_clock::time_point statsStarted = std::chrono::steady_clock::now();
+};
+
+size_t countAllowedDvbPids(const DvbSingleProgramPsiContext& ctx) {
+    return static_cast<size_t>(std::count(ctx.allowedPids.begin(), ctx.allowedPids.end(), true));
+}
+
+void rebuildSharedDvbPidRoutes(SharedDvbDispatcherState& dispatcher) {
+    dispatcher.pidRoutes.fill(0);
+    for (unsigned slot = 0; slot < dispatcher.slots.size(); ++slot) {
+        const auto& consumer = dispatcher.slots[slot];
+        if (!consumer) continue;
+        const uint64_t bit = uint64_t{1} << slot;
+        for (size_t pid = 0; pid < consumer->psi.allowedPids.size(); ++pid) {
+            if (consumer->psi.allowedPids[pid]) dispatcher.pidRoutes[pid] |= bit;
+        }
+        // PAT and SDT must always reach every service because they are rewritten
+        // to a single-program view and are also used to discover PMT metadata.
+        dispatcher.pidRoutes[0x0000] |= bit;
+        dispatcher.pidRoutes[0x0011] |= bit;
+        if (consumer->psi.pmtPid > 0 && consumer->psi.pmtPid < 0x1FFF) {
+            dispatcher.pidRoutes[consumer->psi.pmtPid] |= bit;
+        }
+    }
+}
+
+bool flushSharedDvbConsumerDatagram(SharedDvbDispatchConsumer& consumer, bool force) {
+    if (consumer.datagramBytes == 0) return true;
+    const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
+    if (!force && consumer.datagramBytes < fullDatagram) return true;
+
+    // The existing CA backend remains exactly per service and sees only the
+    // selected SPTS.  The v176 Irdeto CHID autoselect/Newcamd implementation is
+    // untouched; this merely changes where its TS callback is invoked.
+    if (consumer.caEnabled) {
+        (void)CaBackendManager::instance().processTransport(
+            consumer.streamId, consumer.datagram.data(), consumer.datagramBytes);
+    }
+
+    const ssize_t sent = ::sendto(
+        consumer.socketFd,
+        consumer.datagram.data(),
+        consumer.datagramBytes,
+        MSG_NOSIGNAL,
+        reinterpret_cast<const sockaddr*>(&consumer.destination),
+        sizeof(consumer.destination));
+    if (sent != static_cast<ssize_t>(consumer.datagramBytes)) {
+        ++consumer.udpErrors;
+        if (consumer.udpErrors <= 5 || (consumer.udpErrors % 100) == 0) {
+            std::cerr << "Shared DVB dispatcher UDP warning: stream=" << consumer.streamId
+                      << " sent=" << sent
+                      << " expected=" << consumer.datagramBytes
+                      << " errno=" << errno
+                      << " errors=" << consumer.udpErrors << std::endl;
+        }
+        consumer.datagramBytes = 0;
+        return false;
+    }
+    ++consumer.udpDatagrams;
+    consumer.datagramBytes = 0;
+    return true;
+}
+
+void appendSharedDvbConsumerPacket(
+    SharedDvbDispatchConsumer& consumer, const uint8_t* packet) {
+    if (!packet || packet[0] != 0x47) return;
+    const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
+    if (consumer.datagramBytes + kTsPacketSize > fullDatagram) {
+        flushSharedDvbConsumerDatagram(consumer, true);
+    }
+    std::memcpy(
+        consumer.datagram.data() + consumer.datagramBytes,
+        packet,
+        kTsPacketSize);
+    consumer.datagramBytes += kTsPacketSize;
+    ++consumer.outputPackets;
+    if (consumer.datagramBytes == fullDatagram) {
+        flushSharedDvbConsumerDatagram(consumer, false);
+    }
+}
+
+bool prepareSharedDvbServicePacket(
+    const uint8_t* inputPacket,
+    SharedDvbDispatchConsumer& consumer,
+    std::array<uint8_t, kTsPacketSize>& packetCopy,
+    bool& routesChanged) {
+    if (!inputPacket || inputPacket[0] != 0x47) return false;
+    ++consumer.inputPackets;
+    std::memcpy(packetCopy.data(), inputPacket, kTsPacketSize);
+    uint8_t* packet = packetCopy.data();
+    auto& ctx = consumer.psi;
+
+    const uint16_t inputPid = static_cast<uint16_t>(
+        ((packet[1] & 0x1F) << 8) | packet[2]);
+    const uint16_t previousPmtPid = ctx.pmtPid;
+    const size_t allowedBefore =
+        (inputPid == 0x0000 || inputPid == ctx.pmtPid)
+            ? countAllowedDvbPids(ctx)
+            : 0;
+
+    // PSI parsing is intentionally limited to packets which can change routing.
+    // Ordinary video/audio/PCR packets never enter the section assembler here.
+    if (inputPid == 0x0000 || inputPid == 0x0011 || inputPid == ctx.pmtPid) {
+        discoverSelectedPmtFromPacket(packet, &ctx);
+        if (ctx.pmtPid > 0 && ctx.pmtPid < 0x1FFF) {
+            ctx.allowedPids[ctx.pmtPid] = true;
+        }
+        if (inputPid == ctx.pmtPid) {
+            healAllowedPidsFromSelectedPmt(packet, &ctx);
+        }
+    }
+
+    if (previousPmtPid != ctx.pmtPid) routesChanged = true;
+    if (inputPid == 0x0000 || inputPid == ctx.pmtPid) {
+        if (countAllowedDvbPids(ctx) != allowedBefore) routesChanged = true;
+    }
+
+    // Unlike the old per-service filter, never pass the full transponder while
+    // PMT discovery is warming up.  Saved scan PIDs flow immediately; if a scan
+    // list is absent, PAT -> selected PMT dynamically teaches the route table.
+    const bool keepPacket = inputPid < ctx.allowedPids.size() && ctx.allowedPids[inputPid];
+    if (!keepPacket) return false;
+
+    if (ctx.remapEnabled && inputPid == ctx.pmtPid) {
+        rewriteDvbRemapPmt(packet, &ctx);
+    }
+
+    if (inputPid == 0x0000) {
+        if (ctx.pmtPid > 0 && ctx.pmtPid < 0x1FFF) {
+            writeSingleProgramPat(packet, ctx);
+            if (!ctx.announced) {
+                std::cerr << "DVB SPTS PSI filter: SID=" << ctx.serviceId
+                          << " PMT_PID=" << ctx.pmtPid
+                          << " PAT=single-program SDT=single-service media=passthrough"
+                          << " pid_filter=single-pass-dispatcher" << std::endl;
+                ctx.announced = true;
+            }
+        } else {
+            suppressPatPacketUntilPmtKnown(packet);
+        }
+    } else if (inputPid == 0x0011) {
+        writeSingleProgramSdt(packet, ctx);
+    }
+
+    if (inputPid != 0x0000 && inputPid != 0x0011 && inputPid != ctx.pmtPid) {
+        rewriteDvbRemapPacketPid(packet, ctx);
+    }
+    if (ctx.remapEnabled) normalizeDvbRemapContinuity(packet, &ctx);
+    return true;
+}
+
+void dispatchSharedDvbPacket(
+    SharedDvbDispatcherState& dispatcher, const uint8_t* packet) {
+    if (!packet || packet[0] != 0x47) return;
+    ++dispatcher.inputPackets;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid >= dispatcher.pidRoutes.size()) return;
+
+    uint64_t routes = dispatcher.pidRoutes[pid];
+    if (routes == 0) {
+        ++dispatcher.droppedPackets;
+        return;
+    }
+
+    bool routesChanged = false;
+    std::array<uint8_t, kTsPacketSize> packetCopy{};
+    while (routes) {
+        const unsigned slot = static_cast<unsigned>(__builtin_ctzll(routes));
+        routes &= routes - 1;
+        if (slot >= dispatcher.slots.size()) continue;
+        const auto& consumer = dispatcher.slots[slot];
+        if (!consumer) continue;
+        if (prepareSharedDvbServicePacket(packet, *consumer, packetCopy, routesChanged)) {
+            appendSharedDvbConsumerPacket(*consumer, packetCopy.data());
+            ++dispatcher.routedPackets;
+        }
+    }
+    if (routesChanged) rebuildSharedDvbPidRoutes(dispatcher);
+}
+
+GstPadProbeReturn sharedDvbDispatcherProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* dispatcher = static_cast<SharedDvbDispatcherState*>(userData);
+    if (!dispatcher || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+
+    std::lock_guard<std::mutex> lock(dispatcher->mutex);
+    size_t offset = 0;
+
+    // Complete at most one packet carried over from the previous GstBuffer.
+    if (!dispatcher->remainder.empty()) {
+        const size_t need = kTsPacketSize - dispatcher->remainder.size();
+        const size_t take = std::min(need, map.size);
+        dispatcher->remainder.insert(
+            dispatcher->remainder.end(), map.data, map.data + take);
+        offset += take;
+        if (dispatcher->remainder.size() == kTsPacketSize) {
+            if (dispatcher->remainder[0] == 0x47) {
+                dispatchSharedDvbPacket(*dispatcher, dispatcher->remainder.data());
+            } else {
+                ++dispatcher->resyncs;
+            }
+            dispatcher->remainder.clear();
+        }
+    }
+
+    while (offset + kTsPacketSize <= map.size) {
+        if (map.data[offset] != 0x47) {
+            bool found = false;
+            const size_t searchEnd = std::min(map.size, offset + kTsPacketSize);
+            for (size_t candidate = offset + 1; candidate < searchEnd; ++candidate) {
+                if (map.data[candidate] != 0x47) continue;
+                if (candidate + kTsPacketSize >= map.size ||
+                    map.data[candidate + kTsPacketSize] == 0x47) {
+                    offset = candidate;
+                    found = true;
+                    ++dispatcher->resyncs;
+                    break;
+                }
+            }
+            if (!found) break;
+        }
+        dispatchSharedDvbPacket(*dispatcher, map.data + offset);
+        offset += kTsPacketSize;
+    }
+
+    if (offset < map.size) {
+        dispatcher->remainder.assign(map.data + offset, map.data + map.size);
+        if (dispatcher->remainder.size() >= kTsPacketSize) {
+            dispatcher->remainder.erase(
+                dispatcher->remainder.begin(),
+                dispatcher->remainder.end() - (kTsPacketSize - 1));
+        }
+    }
+
+    if (!dispatcher->announced) {
+        std::cerr << "Shared DVB dispatcher active: mode=single-pass-pid-routing"
+                  << " per-service-full-mpts=off"
+                  << " internal-multicast=off"
+                  << " udp_packet_group=7x188"
+                  << " ca_stage=selected-spts-before-local-udp" << std::endl;
+        dispatcher->announced = true;
+    }
+
+    if (dvbDiagnosticsEnabled()) {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - dispatcher->statsStarted).count();
+        if (seconds >= 10.0) {
+            std::cerr << "Shared DVB dispatcher stats: input_packets=" << dispatcher->inputPackets
+                      << " routed_packets=" << dispatcher->routedPackets
+                      << " dropped_packets=" << dispatcher->droppedPackets
+                      << " resyncs=" << dispatcher->resyncs
+                      << " services=" << dispatcher->streamSlots.size() << std::endl;
+            dispatcher->statsStarted = now;
+        }
+    }
+
+    gst_buffer_unmap(buffer, &map);
+    return GST_PAD_PROBE_OK;
+}
+
+
 struct TsCcStageProbeContext {
     explicit TsCcStageProbeContext(std::string streamId, std::string stage)
         : trace(std::move(streamId), std::move(stage)) {}
@@ -3160,8 +3471,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                       << " pid_services=" << existing->second->consumerPids.size()
                       << " pid_filters=" << activeFilterCount
                       << " pids=" << existing->second->requestedPids
-                      << " relay=udp://@" << state->sharedDvbMulticastAddress
-                      << ":" << state->sharedDvbMulticastPort << std::endl;
+                      << " dispatcher=single-pass-in-process" << std::endl;
             return true;
         }
     }
@@ -3177,7 +3487,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
     GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
     GstElement* queue = gst_element_factory_make("queue", "shared_dvb_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "shared_dvb_multicast_sink");
+    GstElement* sink = gst_element_factory_make("fakesink", "shared_dvb_dispatch_sink");
     if (!pipeline || !source || !queue || !sink ||
         !addElementOrFail(pipeline, source) ||
         !addElementOrFail(pipeline, queue) || !addElementOrFail(pipeline, sink)) {
@@ -3234,14 +3544,14 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
             gst_object_unref(statsPad);
         }
 
-        // Same cumulative fingerprint immediately before the internal multicast
-        // udpsink. At equal packet counts its hash must match dvbsrc-src exactly.
+        // Same cumulative fingerprint immediately before the v178 in-process
+        // dispatcher. At equal packet counts its hash must match dvbsrc-src.
         {
             GstPad* auditPad = gst_element_get_static_pad(queue, "src");
             if (auditPad) {
                 auto* auditContext = new DvbByteAuditContext();
                 auditContext->frontendKey = frontendKey;
-                auditContext->stage = "pre-internal-udp";
+                auditContext->stage = "pre-single-pass-dispatch";
                 gst_pad_add_probe(
                     auditPad, GST_PAD_PROBE_TYPE_BUFFER,
                     dvbByteAuditProbe, auditContext,
@@ -3253,17 +3563,28 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
 
     configureQueue(queue, 12000000000ULL);
     g_object_set(sink,
-        "host", shared->multicastAddress.c_str(),
-        "port", static_cast<gint>(shared->multicastPort),
         "sync", FALSE,
         "async", FALSE,
         nullptr);
-    setStringPropertyIfPresent(sink, "multicast-iface", "lo");
-    setBooleanPropertyIfPresent(sink, "auto-multicast", TRUE);
-    setBooleanPropertyIfPresent(sink, "loop", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "ttl-mc", 1);
-    setIntPropertyIfPresent(sink, "buffer-size", 16 * 1024 * 1024);
+
+    // v178: the shared frontend is consumed in-process.  A single pad probe
+    // frames the MPTS once and dispatches only selected SPTS packets to each
+    // service.  The fakesink merely drains the GStreamer source; no full-MPTS
+    // localhost multicast copy is generated.
+    auto dispatcher = std::make_shared<SharedDvbDispatcherState>();
+    shared->dispatcherState = dispatcher;
+    GstPad* dispatchPad = gst_element_get_static_pad(queue, "src");
+    if (!dispatchPad) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        error = "failed to attach shared DVB single-pass dispatcher";
+        return false;
+    }
+    gst_pad_add_probe(
+        dispatchPad, GST_PAD_PROBE_TYPE_BUFFER,
+        sharedDvbDispatcherProbe, dispatcher.get(), nullptr);
+    gst_object_unref(dispatchPad);
 
     if (!gst_element_link_many(source, queue, sink, nullptr)) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -3403,8 +3724,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
               << " pid_services=" << initialConsumers.size()
               << " pid_filters=" << pidFilterCount
               << " pids=" << frontendPids
-              << " relay=udp://@" << state->sharedDvbMulticastAddress
-              << ":" << state->sharedDvbMulticastPort << std::endl;
+              << " dispatcher=single-pass-in-process"
+              << " internal_multicast=off" << std::endl;
     return true;
 }
 
@@ -3471,14 +3792,18 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
 }
 
 bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error) {
-    if (!state || !state->sharedDvbInput || state->sharedDvbMulticastAddress.empty() || !state->sharedDvbMulticastPort) {
+    if (!state || !state->sharedDvbInput || state->sharedDvbFrontendKey.empty()) {
         error = "shared DVB frontend is not ready";
+        return false;
+    }
+    if (state->config.inputServiceId == 0) {
+        error = "shared DVB single-pass dispatcher requires an input service id";
         return false;
     }
 
     DvbSatelliteParams params;
     if (!DvbSatellite::parseUri(state->runtimeConfig.inputUri, params, error)) {
-        if (error.empty()) error = "invalid DVB URI for service relay";
+        if (error.empty()) error = "invalid DVB URI for service dispatcher";
         return false;
     }
     const std::string servicePidFilter = state->sharedDvbServicePids.empty()
@@ -3508,243 +3833,92 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
 
     const uint16_t outputPort = allocateDvbServiceRelayPort(state->config.id);
     if (!outputPort) {
-        error = "no free internal UDP port for DVB service relay";
+        error = "no free internal UDP port for DVB single-pass service output";
         return false;
+    }
+
+    auto consumer = std::make_shared<SharedDvbDispatchConsumer>();
+    consumer->streamId = state->config.id;
+    consumer->frontendKey = state->sharedDvbFrontendKey;
+    consumer->caEnabled = !state->config.conditionalAccessClient.empty();
+    consumer->psi.serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
+    consumer->psi.serviceName = state->config.serviceName;
+    consumer->psi.serviceProvider = state->config.serviceProvider;
+    consumer->psi.remapEnabled = state->config.remapEnabled;
+    consumer->psi.outputServiceId = static_cast<uint16_t>(remapOutputSid & 0xFFFFU);
+    consumer->psi.requestedVideoPid = dvbPacketPidRemap
+        ? static_cast<uint16_t>(state->config.videoPid & 0x1FFFU)
+        : 0;
+    consumer->psi.requestedAudioPid = dvbPacketPidRemap
+        ? static_cast<uint16_t>(state->config.audioPid & 0x1FFFU)
+        : 0;
+
+    const bool savedPidFilter = configureServicePidFilter(consumer->psi, servicePidFilter);
+    if (!savedPidFilter) {
+        // No scan PID list is available.  Keep the dispatcher selective anyway:
+        // PAT discovers this SID's PMT and the PMT self-heals PCR/ES/ECM PIDs.
+        // Passing the whole MPTS here would recreate the CPU regression v178 is
+        // intended to remove.
+        consumer->psi.filterPids = true;
+        std::cerr << "Shared DVB dispatcher dynamic PID discovery: stream=" << state->config.id
+                  << " SID=" << state->config.inputServiceId
+                  << " source=PAT/PMT saved_pids=none" << std::endl;
+    }
+
+    consumer->socketFd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (consumer->socketFd < 0) {
+        releaseDvbServiceRelayPort(outputPort);
+        error = "failed to create localhost UDP socket for DVB dispatcher";
+        return false;
+    }
+    int sendBuffer = 8 * 1024 * 1024;
+    (void)::setsockopt(
+        consumer->socketFd, SOL_SOCKET, SO_SNDBUF,
+        &sendBuffer, static_cast<socklen_t>(sizeof(sendBuffer)));
+    std::memset(&consumer->destination, 0, sizeof(consumer->destination));
+    consumer->destination.sin_family = AF_INET;
+    consumer->destination.sin_port = htons(outputPort);
+    consumer->destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    std::shared_ptr<SharedDvbDispatcherState> dispatcher;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = sharedDvbFrontends.find(state->sharedDvbFrontendKey);
+        if (found == sharedDvbFrontends.end() || !found->second || !found->second->dispatcherState) {
+            releaseDvbServiceRelayPort(outputPort);
+            error = "shared DVB single-pass dispatcher disappeared before service attach";
+            return false;
+        }
+        dispatcher = std::static_pointer_cast<SharedDvbDispatcherState>(found->second->dispatcherState);
+    }
+
+    {
+        std::lock_guard<std::mutex> dispatchLock(dispatcher->mutex);
+        unsigned slot = 64;
+        for (unsigned i = 0; i < dispatcher->slots.size(); ++i) {
+            if (!dispatcher->slots[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot >= dispatcher->slots.size()) {
+            releaseDvbServiceRelayPort(outputPort);
+            error = "shared DVB dispatcher service limit reached (64)";
+            return false;
+        }
+        consumer->slot = slot;
+        dispatcher->slots[slot] = consumer;
+        dispatcher->streamSlots[state->config.id] = slot;
+        rebuildSharedDvbPidRoutes(*dispatcher);
     }
 
     auto relay = std::make_unique<DvbServiceRelayState>();
     relay->outputPort = outputPort;
-    GstElement* pipeline = gst_pipeline_new(("dvb_service_" + state->config.id).c_str());
-    GstElement* source = gst_element_factory_make("udpsrc", "shared_transponder_src");
-    GstElement* inputQueue = gst_element_factory_make("queue", "shared_transponder_queue");
-    GstElement* outputQueue = gst_element_factory_make("queue", "shared_service_queue");
-    GstElement* sink = gst_element_factory_make("udpsink", "shared_service_sink");
-    if (!pipeline || !source || !inputQueue || !outputQueue || !sink ||
-        !addElementOrFail(pipeline, source) || !addElementOrFail(pipeline, inputQueue) ||
-        !addElementOrFail(pipeline, outputQueue) || !addElementOrFail(pipeline, sink)) {
-        if (pipeline) {
-            gst_element_set_state(pipeline, GST_STATE_NULL);
-            gst_object_unref(pipeline);
-        }
-        releaseDvbServiceRelayPort(outputPort);
-        error = "failed to create DVB service relay pipeline";
-        return false;
-    }
-
-    GstCaps* caps = gst_caps_from_string("video/mpegts,systemstream=(boolean)true");
-    g_object_set(source,
-        "address", state->sharedDvbMulticastAddress.c_str(),
-        "port", static_cast<gint>(state->sharedDvbMulticastPort),
-        "reuse", TRUE,
-        "auto-multicast", TRUE,
-        "buffer-size", 16 * 1024 * 1024,
-        "caps", caps,
-        nullptr);
-    if (caps) gst_caps_unref(caps);
-    setStringPropertyIfPresent(source, "multicast-iface", "lo");
-    configureQueue(inputQueue, 12000000000ULL);
-    configureQueue(outputQueue, 8000000000ULL);
-    g_object_set(sink,
-        "host", "127.0.0.1",
-        "port", static_cast<gint>(outputPort),
-        "sync", FALSE,
-        "async", FALSE,
-        nullptr);
-    setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "buffer-size", 8 * 1024 * 1024);
-
-    if (!gst_element_link_many(source, inputQueue, outputQueue, sink, nullptr)) {
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_object_unref(pipeline);
-        releaseDvbServiceRelayPort(outputPort);
-        error = "failed to link DVB service relay pipeline";
-        return false;
-    }
-
-    if (dvbDiagnosticsEnabled()) {
-        // v155 exact byte correlation after the internal multicast receiver and
-        // before the custom framer/SPTS filtering. The probe is read-only and
-        // compares each reconstructed 188-byte packet with recent dvbsrc output.
-        {
-            GstPad* auditPad = gst_element_get_static_pad(inputQueue, "src");
-            if (auditPad) {
-                auto* auditContext = new DvbByteAuditContext();
-                auditContext->frontendKey = state->sharedDvbFrontendKey;
-                auditContext->streamId = state->config.id;
-                auditContext->stage = "internal-udp-recv";
-                auditContext->compareWithSourceHistory = true;
-                gst_pad_add_probe(
-                    auditPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    dvbByteAuditProbe, auditContext,
-                    [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
-                gst_object_unref(auditPad);
-            }
-        }
-
-        // v152 passive stage-by-stage CC trace. The first probe observes the raw
-        // shared transponder before SPTS filtering/remap. It never rewrites bytes.
-        {
-            GstPad* rawCcPad = gst_element_get_static_pad(inputQueue, "src");
-            if (rawCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_RAW");
-                gst_pad_add_probe(rawCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(rawCcPad);
-            }
-        }
-
-    }
-
-    // Reassemble 188-byte transport packets across arbitrary GstBuffer boundaries.
-    // The raw trace above is intentionally registered first, so DVB_RAW still sees
-    // the original 8192-byte chunks while every downstream stage sees framed TS.
-    {
-        GstPad* framerPad = gst_element_get_static_pad(inputQueue, "src");
-        if (framerPad) {
-            auto* framerContext = new SharedDvbTsFramerContext();
-            framerContext->streamId = state->config.id;
-            gst_pad_add_probe(framerPad, GST_PAD_PROBE_TYPE_BUFFER,
-                sharedDvbTsFramerProbe, framerContext,
-                [](gpointer data) { delete static_cast<SharedDvbTsFramerContext*>(data); });
-            gst_object_unref(framerPad);
-        }
-    }
-
-    if (dvbDiagnosticsEnabled()) {
-        // The sink pad is after the custom framer and before PID/PSI filtering.
-        {
-            GstPad* alignedCcPad = gst_element_get_static_pad(outputQueue, "sink");
-            if (alignedCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_ALIGNED");
-                gst_pad_add_probe(alignedCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(alignedCcPad);
-            }
-        }
-
-    }
-
-    // v177: filter full-MPTS to the selected SPTS first.  The filter learns
-    // PMT/PCR/ES/CA PIDs from the selected PMT, so ECM remains present while
-    // unrelated transponder traffic is dropped before the CA hot path.
-    if (state->config.inputServiceId > 0) {
-        // Filter only complete 188-byte packets produced by the custom framer.
-        GstPad* psiPad = gst_element_get_static_pad(outputQueue, "sink");
-        if (psiPad) {
-            auto* psiContext = new DvbSingleProgramPsiContext();
-            psiContext->serviceId = static_cast<uint16_t>(state->config.inputServiceId & 0xFFFFU);
-            psiContext->serviceName = state->config.serviceName;
-            psiContext->serviceProvider = state->config.serviceProvider;
-            psiContext->remapEnabled = state->config.remapEnabled;
-            psiContext->outputServiceId = static_cast<uint16_t>(remapOutputSid & 0xFFFFU);
-            psiContext->requestedVideoPid = dvbPacketPidRemap
-                ? static_cast<uint16_t>(state->config.videoPid & 0x1FFFU)
-                : 0;
-            psiContext->requestedAudioPid = dvbPacketPidRemap
-                ? static_cast<uint16_t>(state->config.audioPid & 0x1FFFU)
-                : 0;
-            configureServicePidFilter(*psiContext, servicePidFilter);
-            if (!psiContext->filterPids) {
-                std::cerr << "Shared DVB service relay warning: stream=" << state->config.id
-                          << " SID=" << state->config.inputServiceId
-                          << " has no saved service PID list; relay will not drop unrelated PIDs" << std::endl;
-            }
-            gst_pad_add_probe(
-                psiPad,
-                GST_PAD_PROBE_TYPE_BUFFER,
-                dvbSingleProgramPsiProbe,
-                psiContext,
-                [](gpointer data) { delete static_cast<DvbSingleProgramPsiContext*>(data); });
-            gst_object_unref(psiPad);
-        }
-    }
-
-    // v177: CA runs AFTER the software SPTS filter.  This keeps the working
-    // v176 CHID/Newcamd logic intact while preventing every service session
-    // from parsing/decrypting the entire transponder.
-    if (!state->config.conditionalAccessClient.empty()) {
-        GstPad* caPad = gst_element_get_static_pad(outputQueue, "src");
-        if (caPad) {
-            auto* caContext = new CaBackendTsProbeContext();
-            caContext->streamId = state->config.id;
-            gst_pad_add_probe(
-                caPad,
-                GST_PAD_PROBE_TYPE_BUFFER,
-                caBackendTsProbe,
-                caContext,
-                [](gpointer data) { delete static_cast<CaBackendTsProbeContext*>(data); });
-            gst_object_unref(caPad);
-            std::cerr << "CA backend SPTS postfilter hook attached: stream=" << state->config.id
-                      << " cam_client=" << state->config.conditionalAccessClient
-                      << " stage=selected-spts-after-pid-filter" << std::endl;
-        }
-    }
-
-    if (dvbDiagnosticsEnabled()) {
-        // Selected SPTS diagnostics after PID/PSI filtering and CA.
-        {
-            GstPad* preCaCcPad = gst_element_get_static_pad(outputQueue, "src");
-            if (preCaCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
-                gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(preCaCcPad);
-            }
-        }
-
-        // Final selected SPTS continuity diagnostics after CA.
-        {
-            GstPad* postCaCcPad = gst_element_get_static_pad(outputQueue, "src");
-            if (postCaCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
-                gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(postCaCcPad);
-            }
-        }
-
-        {
-            GstPad* statsPad = gst_element_get_static_pad(outputQueue, "src");
-            if (statsPad) {
-                auto* statsContext = new SharedDvbPidStatsContext();
-                statsContext->stage = "service-relay-output";
-                statsContext->label = state->config.id;
-                gst_pad_add_probe(
-                    statsPad,
-                    GST_PAD_PROBE_TYPE_BUFFER,
-                    sharedDvbPidStatsProbe,
-                    statsContext,
-                    [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
-                gst_object_unref(statsPad);
-            }
-        }
-
-    }
-
-    std::cerr << "DVB service relay TS framing: stream=" << state->config.id
-              << " stage=pre-spts-filter custom_framer=188"
-              << " partial-buffer-tail=preserved parser=none"
-              << " ca_stage=after-spts diagnostics=" << (dvbDiagnosticsEnabled() ? "on" : "off") << std::endl;
-
-    relay->pipeline = pipeline;
-    relay->bus = gst_element_get_bus(pipeline);
-    const GstStateChangeReturn stateResult = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-    if (stateResult == GST_STATE_CHANGE_FAILURE) {
-        error = popGstPipelineError(relay->bus, "failed to start DVB service relay");
-        gst_element_set_state(pipeline, GST_STATE_NULL);
-        gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
-        if (relay->bus) gst_object_unref(relay->bus);
-        gst_object_unref(pipeline);
-        releaseDvbServiceRelayPort(outputPort);
-        return false;
-    }
-
+    relay->dispatcherConsumer = consumer;
+    state->dvbServiceRelay = std::move(relay);
     state->sharedDvbServiceRelayUri = "udp://127.0.0.1:" + std::to_string(outputPort);
-    state->dvbTsRemapApplied = state->config.remapEnabled && state->config.inputServiceId > 0;
+    state->dvbTsRemapApplied = state->config.remapEnabled;
+
     if (state->dvbTsRemapApplied) {
         std::cerr << "DVB remap metadata configured: SID=" << remapOutputSid
                   << " service=\"" << (state->config.serviceName.empty() ? state->config.name : state->config.serviceName) << "\""
@@ -3752,28 +3926,47 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
                   << " target_bitrate=" << state->config.targetBitrate
                   << " output_type=" << state->config.outputType << std::endl;
     }
-    state->dvbServiceRelay = std::move(relay);
-    std::cerr << "DVB service relay started: stream=" << state->config.id
+
+    std::cerr << "Shared DVB single-pass service attached: stream=" << state->config.id
               << " SID=" << state->config.inputServiceId
-              << " transponder=udp://@" << state->sharedDvbMulticastAddress
-              << ":" << state->sharedDvbMulticastPort
-              << " service=" << state->sharedDvbServiceRelayUri
-              << " mode=" << (state->config.remapEnabled
-                    ? (dvbPacketPidRemap ? "PID-passthrough-dvb-remap-av-pids"
-                                         : "PID-passthrough-dvb-remap-sid-only")
-                    : "PID-passthrough-no-remux") << std::endl;
+              << " frontend=" << state->sharedDvbFrontendKey
+              << " slot=" << consumer->slot
+              << " service_pids=" << (servicePidFilter.empty() ? "dynamic" : servicePidFilter)
+              << " ca=" << (consumer->caEnabled ? "selected-spts" : "off")
+              << " source=" << state->sharedDvbServiceRelayUri
+              << " per_service_gstreamer_relay=off"
+              << " full_mpts_copy=off" << std::endl;
     return true;
 }
 
 void StreamManager::stopDvbServiceRelay(StreamState* state) {
     if (!state || !state->dvbServiceRelay) return;
     auto relay = std::move(state->dvbServiceRelay);
-    if (relay->pipeline) {
-        gst_element_set_state(relay->pipeline, GST_STATE_NULL);
-        gst_element_get_state(relay->pipeline, nullptr, nullptr, kFastDvbReleaseWait);
+    auto consumer = std::static_pointer_cast<SharedDvbDispatchConsumer>(relay->dispatcherConsumer);
+
+    std::shared_ptr<SharedDvbDispatcherState> dispatcher;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = sharedDvbFrontends.find(state->sharedDvbFrontendKey);
+        if (found != sharedDvbFrontends.end() && found->second && found->second->dispatcherState) {
+            dispatcher = std::static_pointer_cast<SharedDvbDispatcherState>(found->second->dispatcherState);
+        }
     }
-    if (relay->bus) gst_object_unref(relay->bus);
-    if (relay->pipeline) gst_object_unref(relay->pipeline);
+
+    if (dispatcher && consumer) {
+        std::lock_guard<std::mutex> dispatchLock(dispatcher->mutex);
+        auto it = dispatcher->streamSlots.find(state->config.id);
+        if (it != dispatcher->streamSlots.end()) {
+            const unsigned slot = it->second;
+            if (slot < dispatcher->slots.size() && dispatcher->slots[slot] == consumer) {
+                flushSharedDvbConsumerDatagram(*consumer, true);
+                dispatcher->slots[slot].reset();
+            }
+            dispatcher->streamSlots.erase(it);
+            rebuildSharedDvbPidRoutes(*dispatcher);
+        }
+    }
+
     releaseDvbServiceRelayPort(relay->outputPort);
     state->sharedDvbServiceRelayUri.clear();
     state->dvbTsRemapApplied = false;
@@ -3845,11 +4038,11 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
 
 void StreamManager::releaseSharedDvbInput(StreamState* state) {
     if (!state) return;
-    // Free the physical frontend before tearing down the localhost relay.  The
-    // relay does not own /dev/dvb, so there is no reason to keep the tuner open
-    // while the rest of the stream cleanup waits on buses/threads.
-    releaseSharedDvbFrontend(state);
+    // v178: unregister the in-process dispatcher consumer first.  The physical
+    // frontend owns the dispatcher, so destroying the last frontend before the
+    // consumer is detached would race the streaming pad probe.
     stopDvbServiceRelay(state);
+    releaseSharedDvbFrontend(state);
     state->runtimeConfig = state->config;
 }
 
