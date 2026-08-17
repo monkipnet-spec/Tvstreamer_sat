@@ -1767,11 +1767,11 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 }
 
 
-std::vector<uint8_t> filterSharedDvbServiceBytes(
-    const uint8_t* data, size_t size, SharedDvbDispatchConsumer& consumer) {
-    std::vector<uint8_t> output;
-    if (!data || size < kTsPacketSize || consumer.psi.serviceId == 0) return output;
-    output.reserve(size / 4);
+size_t filterSharedDvbServiceBytes(
+    const uint8_t* data, size_t size, SharedDvbDispatchConsumer& consumer,
+    uint8_t* output, size_t outputCapacity) {
+    if (!data || !output || size < kTsPacketSize || consumer.psi.serviceId == 0) return 0;
+    size_t writeOffset = 0;
     auto& ctx = consumer.psi;
 
     size_t packetStart = 0;
@@ -1788,7 +1788,7 @@ std::vector<uint8_t> filterSharedDvbServiceBytes(
                 break;
             }
         }
-        if (!found) return output;
+        if (!found) return 0;
     }
 
     std::array<uint8_t, kTsPacketSize> packetCopy{};
@@ -1849,10 +1849,12 @@ std::vector<uint8_t> filterSharedDvbServiceBytes(
         }
         if (ctx.remapEnabled) normalizeDvbRemapContinuity(packet, &ctx);
 
-        output.insert(output.end(), packet, packet + kTsPacketSize);
+        if (writeOffset + kTsPacketSize > outputCapacity) break;
+        std::memcpy(output + writeOffset, packet, kTsPacketSize);
+        writeOffset += kTsPacketSize;
         ++consumer.outputPackets;
     }
-    return output;
+    return writeOffset;
 }
 
 GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
@@ -1879,19 +1881,32 @@ GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
     for (const auto& consumer : consumers) {
         if (!consumer) continue;
         GstElement* appsrc = nullptr;
-        std::vector<uint8_t> selected;
+        GstBuffer* out = nullptr;
+        size_t selectedSize = 0;
         {
             std::lock_guard<std::mutex> lock(consumer->mutex);
             appsrc = consumer->appsrc;
             if (!appsrc) continue;
-            selected = filterSharedDvbServiceBytes(map.data, map.size, *consumer);
-            if (selected.empty()) continue;
             gst_object_ref(appsrc);
+
+            // v170 low-allocation dispatcher: allocate the destination GstBuffer
+            // once and write selected packets directly into it. v169 built a
+            // temporary std::vector and then copied it again with gst_buffer_fill.
+            out = gst_buffer_new_allocate(nullptr, map.size, nullptr);
+            if (out) {
+                GstMapInfo outMap{};
+                if (gst_buffer_map(out, &outMap, GST_MAP_WRITE)) {
+                    selectedSize = filterSharedDvbServiceBytes(
+                        map.data, map.size, *consumer, outMap.data, outMap.size);
+                    gst_buffer_unmap(out, &outMap);
+                    if (selectedSize > 0 && selectedSize < map.size) {
+                        gst_buffer_resize(out, 0, static_cast<gssize>(selectedSize));
+                    }
+                }
+            }
         }
 
-        GstBuffer* out = gst_buffer_new_allocate(nullptr, selected.size(), nullptr);
-        if (out) {
-            gst_buffer_fill(out, 0, selected.data(), selected.size());
+        if (out && selectedSize > 0) {
             GST_BUFFER_PTS(out) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DTS(out) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(out) = GST_CLOCK_TIME_NONE;
@@ -1905,6 +1920,8 @@ GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
                               << " failures=" << consumer->pushFailures << std::endl;
                 }
             }
+        } else if (out) {
+            gst_buffer_unref(out);
         }
         gst_object_unref(appsrc);
     }
@@ -5603,7 +5620,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         std::cerr << "Shared DVB source chain: stream=" << state->config.id
-                  << " mode=single-pass-appsrc-fast"
+                  << " mode=single-pass-appsrc-lowalloc"
                   << " frontend=" << state->sharedDvbFrontendKey
                   << " internal_udp=off"
                   << " heavy_diagnostics=" << (heavyDiagnosticsEnabled() ? "on" : "off")

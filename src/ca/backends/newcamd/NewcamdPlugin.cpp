@@ -117,6 +117,15 @@ struct ServiceBinding {
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
 
+    // v170 low-allocation CSA scratch. These containers are owned by the
+    // service and reused under ServiceBinding::mutex on every TS buffer.
+    // This preserves v169 bitslice behaviour without heap churn per buffer.
+    std::vector<std::pair<uint8_t*, size_t>> evenPayloadScratch;
+    std::vector<std::pair<uint8_t*, size_t>> oddPayloadScratch;
+    std::vector<uint8_t*> evenHeaderScratch;
+    std::vector<uint8_t*> oddHeaderScratch;
+    std::vector<dvbcsa_bs_batch_s> bsBatchScratch;
+
     uint64_t diagLastLogMs = 0;
     uint64_t diagCalls = 0;
     uint64_t diagUnalignedBuffers = 0;
@@ -668,21 +677,22 @@ static bool heavy_ca_diagnostics_enabled() {
 }
 
 static void decrypt_bs_batch(struct dvbcsa_bs_key_s* key,
-                             const std::vector<std::pair<uint8_t*, size_t>>& payloads) {
+                             const std::vector<std::pair<uint8_t*, size_t>>& payloads,
+                             std::vector<dvbcsa_bs_batch_s>& batchScratch) {
     if (!key || payloads.empty()) return;
     const size_t capacity = static_cast<size_t>(std::max(1u, dvbcsa_bs_batch_size()));
+    if (batchScratch.size() < capacity + 1) batchScratch.resize(capacity + 1);
     for (size_t base = 0; base < payloads.size(); base += capacity) {
         const size_t count = std::min(capacity, payloads.size() - base);
-        std::vector<dvbcsa_bs_batch_s> batch(count + 1);
         unsigned int maxLen = 0;
         for (size_t i = 0; i < count; ++i) {
-            batch[i].data = payloads[base + i].first;
-            batch[i].len = static_cast<unsigned int>(payloads[base + i].second);
-            maxLen = std::max(maxLen, batch[i].len);
+            batchScratch[i].data = payloads[base + i].first;
+            batchScratch[i].len = static_cast<unsigned int>(payloads[base + i].second);
+            maxLen = std::max(maxLen, batchScratch[i].len);
         }
-        batch[count].data = nullptr;
-        batch[count].len = 0;
-        dvbcsa_bs_decrypt(key, batch.data(), maxLen);
+        batchScratch[count].data = nullptr;
+        batchScratch[count].len = 0;
+        dvbcsa_bs_decrypt(key, batchScratch.data(), maxLen);
     }
 }
 
@@ -711,14 +721,19 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     bool waitingForKey = false;
     bool sawEcm = false;
     const bool heavyDiag = heavy_ca_diagnostics_enabled();
-    std::vector<std::pair<uint8_t*, size_t>> evenPayloads;
-    std::vector<std::pair<uint8_t*, size_t>> oddPayloads;
-    std::vector<uint8_t*> evenHeaders;
-    std::vector<uint8_t*> oddHeaders;
-    evenPayloads.reserve(size / kTsPacketSize / 2 + 1);
-    oddPayloads.reserve(size / kTsPacketSize / 2 + 1);
-    evenHeaders.reserve(evenPayloads.capacity());
-    oddHeaders.reserve(oddPayloads.capacity());
+    auto& evenPayloads = binding.evenPayloadScratch;
+    auto& oddPayloads = binding.oddPayloadScratch;
+    auto& evenHeaders = binding.evenHeaderScratch;
+    auto& oddHeaders = binding.oddHeaderScratch;
+    evenPayloads.clear();
+    oddPayloads.clear();
+    evenHeaders.clear();
+    oddHeaders.clear();
+    const size_t expectedPayloads = size / kTsPacketSize / 2 + 1;
+    if (evenPayloads.capacity() < expectedPayloads) evenPayloads.reserve(expectedPayloads);
+    if (oddPayloads.capacity() < expectedPayloads) oddPayloads.reserve(expectedPayloads);
+    if (evenHeaders.capacity() < expectedPayloads) evenHeaders.reserve(expectedPayloads);
+    if (oddHeaders.capacity() < expectedPayloads) oddHeaders.reserve(expectedPayloads);
 
     if (heavyDiag) ++binding.diagCalls;
     const size_t bufferRemainder = size % kTsPacketSize;
@@ -854,13 +869,13 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     }
 
     if (!evenPayloads.empty()) {
-        decrypt_bs_batch(binding.even.bsKey, evenPayloads);
+        decrypt_bs_batch(binding.even.bsKey, evenPayloads, binding.bsBatchScratch);
         for (uint8_t* packet : evenHeaders) packet[3] &= 0x3F;
         result->packets_changed += evenPayloads.size();
         changed = true;
     }
     if (!oddPayloads.empty()) {
-        decrypt_bs_batch(binding.odd.bsKey, oddPayloads);
+        decrypt_bs_batch(binding.odd.bsKey, oddPayloads, binding.bsBatchScratch);
         for (uint8_t* packet : oddHeaders) packet[3] &= 0x3F;
         result->packets_changed += oddPayloads.size();
         changed = true;
