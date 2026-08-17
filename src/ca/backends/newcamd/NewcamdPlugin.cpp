@@ -5,6 +5,7 @@ extern "C" {
 }
 #include <jsoncpp/json/json.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -91,6 +92,7 @@ struct ControlWordSlot {
 };
 
 struct ServiceBinding {
+    mutable std::mutex mutex;
     std::string clientKey;
     uint16_t serviceId = 0;
     uint16_t pmtPid = kNullPid;
@@ -100,6 +102,7 @@ struct ServiceBinding {
     std::map<uint16_t, SectionAssembler> assemblers;
     std::set<std::string> sentEcms;
     std::set<uint16_t> pendingEcmIds;
+    std::map<uint16_t, uint64_t> pendingEcmStartedMs;
     ControlWordSlot even;
     ControlWordSlot odd;
     uint64_t ecmRequests = 0;
@@ -126,7 +129,7 @@ struct ServiceBinding {
 
 struct NewcamdSession {
     std::unique_ptr<NewcamdClient> client;
-    bool connected = false;
+    std::atomic<bool> connected{false};
     std::string lastError;
     ~NewcamdSession() {
         if (client) {
@@ -138,8 +141,8 @@ struct NewcamdSession {
 
 struct NewcamdInstance {
     std::mutex mutex;
-    std::map<std::string, std::unique_ptr<NewcamdSession>> sessionsByClient;
-    std::map<std::string, ServiceBinding> servicesByStream;
+    std::map<std::string, std::shared_ptr<NewcamdSession>> sessionsByClient;
+    std::map<std::string, std::shared_ptr<ServiceBinding>> servicesByStream;
     // Route each Newcamd ECM response back to the stream that sent it.
     // A single ECM response delivers EVEN and ODD CW callbacks with the same
     // message id, so ownership must remain valid until the ODD callback.
@@ -303,7 +306,7 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         return TVS_CA_RESULT_ERROR;
     }
 
-    auto session = std::make_unique<NewcamdSession>();
+    auto session = std::make_shared<NewcamdSession>();
     session->client = std::make_unique<NewcamdClient>(
         config.get("host", "127.0.0.1").asString(),
         config.get("port", 15000).asInt(),
@@ -313,67 +316,96 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
 
     session->client->set_key_update_callback([inst, clientKey](uint16_t messageId, uint8_t parity, const uint8_t* cw) {
         if (!cw || !inst || messageId == 0) return;
-        std::lock_guard<std::mutex> lock(inst->mutex);
 
-        auto clientOwnersIt = inst->ecmOwnerByClient.find(clientKey);
-        if (clientOwnersIt == inst->ecmOwnerByClient.end()) {
-            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                      << " msg=" << messageId
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                      << " reason=no-client-owner-map" << std::endl;
-            return;
+        std::string streamId;
+        std::shared_ptr<ServiceBinding> target;
+        {
+            // Keep the global instance lock only long enough to resolve routing.
+            // Never wait for a per-service lock while holding this mutex: all
+            // channels and the receiver callback must be able to progress in parallel.
+            std::lock_guard<std::mutex> lock(inst->mutex);
+            auto clientOwnersIt = inst->ecmOwnerByClient.find(clientKey);
+            if (clientOwnersIt == inst->ecmOwnerByClient.end()) {
+                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " reason=no-client-owner-map" << std::endl;
+                return;
+            }
+
+            auto ownerIt = clientOwnersIt->second.find(messageId);
+            if (ownerIt == clientOwnersIt->second.end()) {
+                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " reason=no-message-owner" << std::endl;
+                return;
+            }
+
+            streamId = ownerIt->second;
+            auto serviceIt = inst->servicesByStream.find(streamId);
+            if (serviceIt == inst->servicesByStream.end() || !serviceIt->second ||
+                serviceIt->second->clientKey != clientKey) {
+                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " stream=" << streamId
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " reason=stream-gone" << std::endl;
+                clientOwnersIt->second.erase(ownerIt);
+                if (clientOwnersIt->second.empty()) inst->ecmOwnerByClient.erase(clientOwnersIt);
+                return;
+            }
+            target = serviceIt->second;
         }
 
-        auto ownerIt = clientOwnersIt->second.find(messageId);
-        if (ownerIt == clientOwnersIt->second.end()) {
-            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                      << " msg=" << messageId
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                      << " reason=no-message-owner" << std::endl;
-            return;
-        }
+        uint16_t sid = 0;
+        uint64_t latencyMs = 0;
+        {
+            std::lock_guard<std::mutex> serviceLock(target->mutex);
+            ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
+            if (!slot.key) {
+                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " stream=" << streamId
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " reason=no-key-slot" << std::endl;
+                return;
+            }
 
-        const std::string streamId = ownerIt->second;
-        auto serviceIt = inst->servicesByStream.find(streamId);
-        if (serviceIt == inst->servicesByStream.end() || serviceIt->second.clientKey != clientKey) {
-            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                      << " msg=" << messageId
-                      << " stream=" << streamId
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                      << " reason=stream-gone" << std::endl;
-            clientOwnersIt->second.erase(ownerIt);
-            return;
-        }
+            dvbcsa_key_set(cw, slot.key);
+            slot.valid = true;
+            ++slot.updates;
+            ++target->cwUpdates;
+            sid = target->serviceId;
+            const auto started = target->pendingEcmStartedMs.find(messageId);
+            if (started != target->pendingEcmStartedMs.end()) {
+                const uint64_t now = monotonic_ms();
+                latencyMs = now >= started->second ? now - started->second : 0;
+            }
 
-        ServiceBinding& target = serviceIt->second;
-        ControlWordSlot& slot = (parity & 1) ? target.odd : target.even;
-        if (!slot.key) {
-            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                      << " msg=" << messageId
-                      << " stream=" << streamId
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                      << " reason=no-key-slot" << std::endl;
-            return;
+            // NewcamdClient emits EVEN first and ODD second for the same ECM reply.
+            // Keep ownership for both callbacks; release it after ODD has arrived.
+            if (parity & 1) {
+                target->pendingEcmIds.erase(messageId);
+                target->pendingEcmStartedMs.erase(messageId);
+            }
         }
-
-        dvbcsa_key_set(cw, slot.key);
-        slot.valid = true;
-        ++slot.updates;
-        ++target.cwUpdates;
 
         std::cerr << "NEWCAMD CW MAP: client=" << clientKey
                   << " msg=" << messageId
                   << " stream=" << streamId
-                  << " sid=" << target.serviceId
+                  << " sid=" << sid
                   << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                  << " latency_ms=" << latencyMs
                   << std::endl;
 
-        // NewcamdClient emits EVEN first and ODD second for the same ECM reply.
-        // Keep ownership for both callbacks; release it after ODD has arrived.
         if (parity & 1) {
-            target.pendingEcmIds.erase(messageId);
-            clientOwnersIt->second.erase(messageId);
-            if (clientOwnersIt->second.empty()) inst->ecmOwnerByClient.erase(clientOwnersIt);
+            std::lock_guard<std::mutex> lock(inst->mutex);
+            auto clientOwnersIt = inst->ecmOwnerByClient.find(clientKey);
+            if (clientOwnersIt != inst->ecmOwnerByClient.end()) {
+                clientOwnersIt->second.erase(messageId);
+                if (clientOwnersIt->second.empty()) inst->ecmOwnerByClient.erase(clientOwnersIt);
+            }
         }
     });
 
@@ -382,7 +414,7 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         session->connected = true;
         session->lastError = session->client->last_error();
         std::lock_guard<std::mutex> lock(inst->mutex);
-        inst->sessionsByClient[clientKey] = std::move(session);
+        inst->sessionsByClient[clientKey] = session;
         return TVS_CA_RESULT_OK;
     }
 
@@ -395,18 +427,18 @@ static void newcamd_close_reader(void* instance, const char* reader_key) {
     auto* inst = static_cast<NewcamdInstance*>(instance);
     if (!inst || !reader_key) return;
 
-    std::unique_ptr<NewcamdSession> removedSession;
+    std::shared_ptr<NewcamdSession> removedSession;
     const std::string clientKey = reader_key;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         for (auto it = inst->servicesByStream.begin(); it != inst->servicesByStream.end();) {
-            if (it->second.clientKey == clientKey) it = inst->servicesByStream.erase(it);
+            if (it->second && it->second->clientKey == clientKey) it = inst->servicesByStream.erase(it);
             else ++it;
         }
         inst->ecmOwnerByClient.erase(clientKey);
         auto sessionIt = inst->sessionsByClient.find(clientKey);
         if (sessionIt != inst->sessionsByClient.end()) {
-            removedSession = std::move(sessionIt->second);
+            removedSession = sessionIt->second;
             inst->sessionsByClient.erase(sessionIt);
         }
     }
@@ -424,10 +456,10 @@ static int newcamd_start_service(void* instance, const char* reader_key, const s
         write_error(error, error_size, "Newcamd CAM client is not connected");
         return TVS_CA_RESULT_ERROR;
     }
-    inst->servicesByStream.erase(service->stream_id);
-    auto& binding = inst->servicesByStream.try_emplace(service->stream_id).first->second;
-    binding.clientKey = reader_key;
-    binding.serviceId = service->service_id <= 0xFFFF ? static_cast<uint16_t>(service->service_id) : 0;
+    auto binding = std::make_shared<ServiceBinding>();
+    binding->clientKey = reader_key;
+    binding->serviceId = service->service_id <= 0xFFFF ? static_cast<uint16_t>(service->service_id) : 0;
+    inst->servicesByStream[service->stream_id] = std::move(binding);
     return TVS_CA_RESULT_OK;
 }
 
@@ -451,14 +483,23 @@ static void newcamd_stop_service(void* instance, const char* stream_id) {
 static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* data, size_t size, struct tvs_ca_ts_result_v1* result) {
     if (!instance || !stream_id || !data || !result) return TVS_CA_RESULT_PASSTHROUGH;
     auto* inst = static_cast<NewcamdInstance*>(instance);
-    std::lock_guard<std::mutex> instanceLock(inst->mutex);
-    auto serviceIt = inst->servicesByStream.find(stream_id);
-    if (serviceIt == inst->servicesByStream.end()) return TVS_CA_RESULT_PASSTHROUGH;
-    ServiceBinding& binding = serviceIt->second;
-    auto sessionIt = inst->sessionsByClient.find(binding.clientKey);
-    if (sessionIt == inst->sessionsByClient.end() || !sessionIt->second) return TVS_CA_RESULT_PASSTHROUGH;
-    NewcamdSession* session = sessionIt->second.get();
-    if (!session->connected || !session->client) return TVS_CA_RESULT_PASSTHROUGH;
+    std::shared_ptr<ServiceBinding> bindingPtr;
+    std::shared_ptr<NewcamdSession> session;
+    {
+        // Resolve stable shared objects under the global lock, then release it.
+        // Each service has its own lock so multiple channels can descramble and
+        // submit ECMs concurrently without blocking CW delivery to other streams.
+        std::lock_guard<std::mutex> instanceLock(inst->mutex);
+        auto serviceIt = inst->servicesByStream.find(stream_id);
+        if (serviceIt == inst->servicesByStream.end() || !serviceIt->second) return TVS_CA_RESULT_PASSTHROUGH;
+        bindingPtr = serviceIt->second;
+        auto sessionIt = inst->sessionsByClient.find(bindingPtr->clientKey);
+        if (sessionIt == inst->sessionsByClient.end() || !sessionIt->second) return TVS_CA_RESULT_PASSTHROUGH;
+        session = sessionIt->second;
+    }
+    if (!session->connected.load() || !session->client) return TVS_CA_RESULT_PASSTHROUGH;
+    std::lock_guard<std::mutex> serviceLock(bindingPtr->mutex);
+    ServiceBinding& binding = *bindingPtr;
 
     bool changed = false;
     bool waitingForKey = false;
@@ -551,12 +592,21 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                                 ++binding.ecmRequests;
                                 if (messageId != 0) {
                                     binding.pendingEcmIds.insert(messageId);
-                                    inst->ecmOwnerByClient[binding.clientKey][messageId] = stream_id;
+                                    binding.pendingEcmStartedMs[messageId] = monotonic_ms();
+                                    size_t clientPending = 0;
+                                    {
+                                        std::lock_guard<std::mutex> routeLock(inst->mutex);
+                                        auto& owners = inst->ecmOwnerByClient[binding.clientKey];
+                                        owners[messageId] = stream_id;
+                                        clientPending = owners.size();
+                                    }
                                     std::cerr << "NEWCAMD ECM MAP: client=" << binding.clientKey
                                               << " msg=" << messageId
                                               << " stream=" << stream_id
                                               << " sid=" << binding.serviceId
                                               << " ecm_pid=" << ecm.pid
+                                              << " stream_pending=" << binding.pendingEcmIds.size()
+                                              << " client_pending=" << clientPending
                                               << std::endl;
                                 }
                             } else {
@@ -644,24 +694,36 @@ static const char* newcamd_status_json(void* instance) {
         status = "{\"status\":\"disconnected\",\"clients\":0}";
         return status.c_str();
     }
-    std::lock_guard<std::mutex> lock(inst->mutex);
+
+    std::vector<std::shared_ptr<NewcamdSession>> sessions;
+    std::vector<std::shared_ptr<ServiceBinding>> services;
+    {
+        std::lock_guard<std::mutex> lock(inst->mutex);
+        for (const auto& entry : inst->sessionsByClient) if (entry.second) sessions.push_back(entry.second);
+        for (const auto& entry : inst->servicesByStream) if (entry.second) services.push_back(entry.second);
+    }
+
     size_t connected = 0;
     size_t authenticated = 0;
     size_t evenKeys = 0;
     size_t oddKeys = 0;
-    for (const auto& entry : inst->sessionsByClient) {
-        if (!entry.second || !entry.second->connected) continue;
+    size_t pendingEcms = 0;
+    for (const auto& session : sessions) {
+        if (!session || !session->connected.load()) continue;
         ++connected;
-        if (entry.second->client && entry.second->client->authenticated()) ++authenticated;
+        if (session->client && session->client->authenticated()) ++authenticated;
     }
-    for (const auto& entry : inst->servicesByStream) {
-        if (entry.second.even.valid) ++evenKeys;
-        if (entry.second.odd.valid) ++oddKeys;
+    for (const auto& binding : services) {
+        std::lock_guard<std::mutex> serviceLock(binding->mutex);
+        if (binding->even.valid) ++evenKeys;
+        if (binding->odd.valid) ++oddKeys;
+        pendingEcms += binding->pendingEcmIds.size();
     }
     status = "{\"status\":\"" + std::string(connected ? "connected" : "disconnected") +
              "\",\"clients\":" + std::to_string(connected) +
              ",\"authenticated_clients\":" + std::to_string(authenticated) +
-             ",\"streams\":" + std::to_string(inst->servicesByStream.size()) +
+             ",\"streams\":" + std::to_string(services.size()) +
+             ",\"pending_ecms\":" + std::to_string(pendingEcms) +
              ",\"even_keys\":" + std::to_string(evenKeys) +
              ",\"odd_keys\":" + std::to_string(oddKeys) +
              ",\"newcamd_authenticated\":" + std::string(authenticated ? "true" : "false") +

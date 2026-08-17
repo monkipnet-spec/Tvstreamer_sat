@@ -26,6 +26,7 @@ constexpr uint8_t kMsgCardData = 0xE4;
 constexpr uint16_t kClientId = 0x8888;
 constexpr size_t kHeaderSize = 12;
 constexpr size_t kMaxMessageSize = 2048;
+constexpr size_t kMaxPendingEcms = 64;
 
 uint8_t hex_value(char ch) {
     if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
@@ -383,7 +384,27 @@ bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid
         set_error("Newcamd ECM request is not a valid ECM section");
         return false;
     }
-    if (!send_message(ecm, service_id, caid, provid & 0x00FFFFFFu, true, message_id)) return false;
+
+    // Newcamd is request/response but does not require waiting for one ECM reply
+    // before the next request is sent. Keep multiple requests in flight on the
+    // same TCP connection; only the actual socket write is serialized. The cap
+    // prevents an unhealthy server/link from growing the pending window forever.
+    size_t pending = pending_ecms_.load(std::memory_order_relaxed);
+    while (true) {
+        if (pending >= kMaxPendingEcms) {
+            set_error("Newcamd ECM pending window is full (64)");
+            return false;
+        }
+        if (pending_ecms_.compare_exchange_weak(
+                pending, pending + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+
+    if (!send_message(ecm, service_id, caid, provid & 0x00FFFFFFu, true, message_id)) {
+        pending_ecms_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
     set_error({});
     return true;
 }
@@ -408,6 +429,10 @@ void NewcamdClient::receiver_loop() {
         if (!callback) continue;
 
         const uint8_t command = message.payload[0];
+        if (command == 0x80 || command == 0x81) {
+            const size_t pending = pending_ecms_.load(std::memory_order_relaxed);
+            if (pending > 0) pending_ecms_.fetch_sub(1, std::memory_order_acq_rel);
+        }
         if ((command == 0x80 || command == 0x81) && message.payload.size() >= 19) {
             callback(message.id, 0, message.payload.data() + 3);
             callback(message.id, 1, message.payload.data() + 11);
@@ -421,6 +446,7 @@ void NewcamdClient::receiver_loop() {
 void NewcamdClient::disconnect() {
     running_ = false;
     authenticated_ = false;
+    pending_ecms_ = 0;
     if (socket_) {
         // Wake a synchronous receive before joining the receiver thread.
         // close() alone is not a reliable cross-thread interruption for an

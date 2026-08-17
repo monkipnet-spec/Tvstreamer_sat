@@ -30,6 +30,7 @@ public:
         callback_ = std::move(cb);
     }
     bool authenticated() const { return authenticated_; }
+    size_t pending_ecms() const { return pending_ecms_.load(std::memory_order_relaxed); }
     std::string last_error() const;
 
 private:
@@ -62,4 +63,5 @@ private:
     bool session_key_ready_ = false;
     std::atomic<bool> running_{false};
     std::atomic<bool> authenticated_{false};
+    std::atomic<size_t> pending_ecms_{0};
 };
