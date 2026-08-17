@@ -27,7 +27,8 @@ constexpr uint16_t kNullPid = 0x1FFF;
 
 bool caDiagnosticsEnabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("TVS_DVB_DIAGNOSTICS");
+        const char* value = std::getenv("TVS_CA_DIAGNOSTICS");
+        if (!value || !*value) value = std::getenv("TVS_DVB_DIAGNOSTICS");
         return value && *value && std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -92,13 +93,36 @@ private:
 };
 
 struct ControlWordSlot {
-    dvbcsa_key_t* key = nullptr;
+    dvbcsa_key_t* scalarKey = nullptr;
+    struct dvbcsa_bs_key_s* bsKey = nullptr;
     bool valid = false;
     uint64_t updates = 0;
-    ControlWordSlot() { key = dvbcsa_key_alloc(); }
-    ~ControlWordSlot() { if (key) dvbcsa_key_free(key); }
+    ControlWordSlot() {
+        scalarKey = dvbcsa_key_alloc();
+        bsKey = dvbcsa_bs_key_alloc();
+    }
+    ~ControlWordSlot() {
+        if (scalarKey) dvbcsa_key_free(scalarKey);
+        if (bsKey) dvbcsa_bs_key_free(bsKey);
+    }
     ControlWordSlot(const ControlWordSlot&) = delete;
     ControlWordSlot& operator=(const ControlWordSlot&) = delete;
+};
+
+struct DvbcsaBatchScratch {
+    std::vector<struct dvbcsa_bs_batch_s> even;
+    std::vector<struct dvbcsa_bs_batch_s> odd;
+    size_t evenCount = 0;
+    size_t oddCount = 0;
+
+    DvbcsaBatchScratch() {
+        const size_t capacity = std::max<size_t>(1, dvbcsa_bs_batch_size());
+        // One extra sentinel entry is required by dvbcsa_bs_decrypt().
+        even.resize(capacity + 1);
+        odd.resize(capacity + 1);
+    }
+
+    size_t capacity() const { return even.empty() ? 0 : even.size() - 1; }
 };
 
 struct ServiceBinding {
@@ -120,6 +144,8 @@ struct ServiceBinding {
     std::map<uint16_t, uint64_t> pendingEcmStartedMs;
     ControlWordSlot even;
     ControlWordSlot odd;
+    DvbcsaBatchScratch csaBatch;
+    std::string lastSuccessfulEcmSignature;
     uint64_t ecmRequests = 0;
     uint64_t cwUpdates = 0;
 
@@ -434,17 +460,19 @@ void pump_ecm_queue(NewcamdInstance* inst, const std::string& clientKey,
     session->currentIrdetoChid = item.irdetoChid;
     const size_t queueDepth = session->ecmQueue.size();
 
-    std::cerr << "NEWCAMD ECM SEND: client=" << clientKey
-              << " msg=" << messageId
-              << " stream=" << item.streamId
-              << " sid=" << item.serviceId
-              << " ecm_pid=" << item.ecmPid
-              << " queue_depth=" << queueDepth
-              << " queued_ms=" << (startedMs >= item.queuedMs ? startedMs - item.queuedMs : 0);
-    if (item.isIrdeto && item.hasIrdetoChid) {
-        std::cerr << " irdeto_chid=0x" << std::hex << item.irdetoChid << std::dec;
+    if (caDiagnosticsEnabled()) {
+        std::cerr << "NEWCAMD ECM SEND: client=" << clientKey
+                  << " msg=" << messageId
+                  << " stream=" << item.streamId
+                  << " sid=" << item.serviceId
+                  << " ecm_pid=" << item.ecmPid
+                  << " queue_depth=" << queueDepth
+                  << " queued_ms=" << (startedMs >= item.queuedMs ? startedMs - item.queuedMs : 0);
+        if (item.isIrdeto && item.hasIrdetoChid) {
+            std::cerr << " irdeto_chid=0x" << std::hex << item.irdetoChid << std::dec;
+        }
+        std::cerr << std::endl;
     }
-    std::cerr << std::endl;
 }
 
 void enqueue_ecm(NewcamdInstance* inst, const std::string& clientKey,
@@ -499,6 +527,7 @@ void configure_service_callback(NewcamdInstance* inst,
         bool currentIsIrdeto = false;
         bool currentHasIrdetoChid = false;
         uint16_t currentIrdetoChid = 0;
+        std::string currentSignature;
         {
             std::lock_guard<std::mutex> queueLock(session->ecmMutex);
             if (!session->ecmInFlight) {
@@ -513,6 +542,7 @@ void configure_service_callback(NewcamdInstance* inst,
             currentIsIrdeto = session->currentIsIrdeto;
             currentHasIrdetoChid = session->currentHasIrdetoChid;
             currentIrdetoChid = session->currentIrdetoChid;
+            currentSignature = session->currentSignature;
         }
 
         if (messageId != expectedMessageId) {
@@ -581,12 +611,16 @@ void configure_service_callback(NewcamdInstance* inst,
             {
                 std::lock_guard<std::mutex> serviceLock(target->mutex);
                 ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
-                if (!slot.key) return;
-                dvbcsa_key_set(cw, slot.key);
+                if (!slot.scalarKey || !slot.bsKey) return;
+                dvbcsa_key_set(cw, slot.scalarKey);
+                dvbcsa_bs_key_set(cw, slot.bsKey);
                 slot.valid = true;
                 ++slot.updates;
                 ++target->cwUpdates;
                 sid = target->serviceId;
+                if ((parity & 1) && !currentSignature.empty()) {
+                    target->lastSuccessfulEcmSignature = currentSignature;
+                }
 
                 if (currentIsIrdeto && currentHasIrdetoChid && !target->irdetoChidSelected) {
                     target->irdetoChidSelected = true;
@@ -603,14 +637,16 @@ void configure_service_callback(NewcamdInstance* inst,
                           << " chid=0x" << std::hex << currentIrdetoChid << std::dec
                           << std::endl;
             }
-            std::cerr << "NEWCAMD CW MAP: client=" << clientKey
-                      << " session=per-service"
-                      << " stream=" << streamId
-                      << " msg=" << messageId
-                      << " sid=" << sid
-                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                      << " latency_ms=" << (now >= startedMs ? now - startedMs : 0)
-                      << std::endl;
+            if (caDiagnosticsEnabled()) {
+                std::cerr << "NEWCAMD CW MAP: client=" << clientKey
+                          << " session=per-service"
+                          << " stream=" << streamId
+                          << " msg=" << messageId
+                          << " sid=" << sid
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " latency_ms=" << (now >= startedMs ? now - startedMs : 0)
+                          << std::endl;
+            }
         }
 
         // NewcamdClient emits EVEN then ODD for the same successful response.
@@ -792,7 +828,12 @@ static int newcamd_start_service(void* instance, const char* reader_key,
               << " stream=" << streamId
               << " sid=" << binding->serviceId
               << " mode=independent-tcp session=" << (activeForReader + 1)
-              << "/" << kMaxSessionsPerReader << std::endl;
+              << "/" << kMaxSessionsPerReader
+              << " csa=adaptive-scalar-bitslice"
+              << " bs_batch_size=" << dvbcsa_bs_batch_size()
+              << " ecm_duplicate_suppression=on"
+              << " ca_diagnostics=" << (caDiagnosticsEnabled() ? "on" : "off")
+              << std::endl;
     return TVS_CA_RESULT_OK;
 }
 
@@ -939,6 +980,13 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     } else if ((section[0] == 0x80 || section[0] == 0x81) && knownEcmPid) {
                         sawEcm = true;
                         const std::string signature = ecm_signature(section);
+                        // Repeated copies of an ECM section are normal. Once that exact
+                        // ECM has already produced a valid CW there is no reason to send
+                        // it to OSCam again; wait for a genuinely new ECM signature.
+                        if (!binding.lastSuccessfulEcmSignature.empty() &&
+                            signature == binding.lastSuccessfulEcmSignature) {
+                            continue;
+                        }
                         const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
                         EcmQueueItem item;
                         item.streamId = stream_id;
@@ -976,10 +1024,9 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             continue;
         }
 
-        // The full-MPTS prefilter hook sees scrambled packets from every service
-        // on the transponder.  Only descramble elementary/PCR PIDs advertised by
-        // the selected service PMT; unrelated services are left byte-for-byte
-        // untouched and are dropped by the downstream SPTS filter.
+        // The v177+ CA hook receives the selected SPTS. Keep the PMT-derived
+        // payload guard as an additional safety check so only elementary/PCR PIDs
+        // belonging to this service can ever be descrambled with its CW.
         if (!binding.servicePayloadPids.empty() &&
             binding.servicePayloadPids.count(pid) == 0) {
             continue;
@@ -993,16 +1040,55 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         }
 
         ControlWordSlot& slot = scramblingControl == 3 ? binding.odd : binding.even;
-        if (!slot.valid || !slot.key) {
+        if (!slot.valid || !slot.scalarKey || !slot.bsKey) {
             waitingForKey = true;
             continue;
         }
-        
-        dvbcsa_decrypt(slot.key, scrambledPayload, scrambledPayloadSize);
+
+        auto& batch = scramblingControl == 3 ? binding.csaBatch.odd : binding.csaBatch.even;
+        size_t& batchCount = scramblingControl == 3 ? binding.csaBatch.oddCount : binding.csaBatch.evenCount;
+        const size_t batchCapacity = binding.csaBatch.capacity();
+        if (batchCapacity == 0 || batchCount >= batchCapacity) {
+            waitingForKey = true;
+            continue;
+        }
+
+        // Persistent scratch only: pointers reference the caller-owned TS buffer
+        // and remain valid until process_ts returns. No allocations occur here.
+        batch[batchCount].data = scrambledPayload;
+        batch[batchCount].len = static_cast<unsigned int>(scrambledPayloadSize);
+        ++batchCount;
+
         packet[3] &= 0x3F;
         result->packets_changed++;
         changed = true;
     }
+
+    auto flushBatch = [](ControlWordSlot& slot,
+                         std::vector<struct dvbcsa_bs_batch_s>& batch, size_t& count) {
+        if (!slot.valid || !slot.scalarKey || !slot.bsKey || count == 0) return;
+
+        // The current dispatcher normally hands CA 7 TS packets at a time.
+        // A wide bitslice implementation (often 32/64/128 lanes) can be slower
+        // when only a few lanes are populated, so keep the scalar fast path for
+        // small groups and use bitslice automatically once a useful batch exists.
+        const size_t nativeBatch = std::max<size_t>(1, dvbcsa_bs_batch_size());
+        const size_t bitsliceThreshold = std::min<size_t>(nativeBatch, 8);
+        if (count >= bitsliceThreshold) {
+            batch[count].data = nullptr;
+            batch[count].len = 0;
+            dvbcsa_bs_decrypt(slot.bsKey, batch.data(), static_cast<unsigned int>(kTsPacketSize - 4));
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                if (batch[i].data && batch[i].len) {
+                    dvbcsa_decrypt(slot.scalarKey, batch[i].data, batch[i].len);
+                }
+            }
+        }
+        count = 0;
+    };
+    flushBatch(binding.even, binding.csaBatch.even, binding.csaBatch.evenCount);
+    flushBatch(binding.odd, binding.csaBatch.odd, binding.csaBatch.oddCount);
 
     const uint64_t diagNowMs = diagnostics ? monotonic_ms() : 0;
     if (diagnostics && (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000)) {
