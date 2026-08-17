@@ -100,6 +100,11 @@ struct ServiceBinding {
     uint16_t defaultCaid = 0;
     uint32_t defaultProvid = 0;
     std::set<EcmDescriptor> ecmPids;
+    // Elementary/PCR PIDs belonging to this selected service.  In full-MPTS
+    // mode the CA hook sees the transponder before software service filtering,
+    // so never apply this service's CW to scrambled packets of other services.
+    std::set<uint16_t> servicePayloadPids;
+    bool pmtRoutingAnnounced = false;
     std::map<uint16_t, SectionAssembler> assemblers;
     std::set<std::string> sentEcms;
     std::set<uint16_t> pendingEcmIds;
@@ -259,23 +264,75 @@ void collect_ca_descriptors(const uint8_t* data, size_t size, std::set<EcmDescri
     }
 }
 
+void parse_pat_section(const std::vector<uint8_t>& section, ServiceBinding& binding) {
+    if (section.size() < 12 || section[0] != 0x00 || binding.serviceId == 0) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t sectionTotal = 3 + sectionLength;
+    if (sectionLength < 9 || sectionTotal > section.size()) return;
+    const size_t entriesEnd = sectionTotal - 4;
+    for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+        const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+        const uint16_t pmtPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+        if (program == binding.serviceId && pmtPid > 0 && pmtPid < kNullPid) {
+            if (binding.pmtPid != pmtPid) {
+                binding.pmtPid = pmtPid;
+                binding.ecmPids.clear();
+                binding.servicePayloadPids.clear();
+                binding.pmtRoutingAnnounced = false;
+                // Drop stale PSI assemblers except PAT and the newly selected PMT.
+                auto patIt = binding.assemblers.find(0);
+                SectionAssembler patCopy;
+                if (patIt != binding.assemblers.end()) patCopy = patIt->second;
+                binding.assemblers.clear();
+                binding.assemblers.emplace(0, std::move(patCopy));
+            }
+            return;
+        }
+    }
+}
+
 void parse_pmt_section(const std::vector<uint8_t>& section, ServiceBinding& binding) {
     if (section.size() < 12 || section[0] != 0x02) return;
     const uint16_t serviceId = static_cast<uint16_t>((section[3] << 8) | section[4]);
     if (binding.serviceId && serviceId != binding.serviceId) return;
+
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t sectionTotal = 3 + sectionLength;
+    if (sectionLength < 13 || sectionTotal > section.size()) return;
+
     binding.serviceId = serviceId;
+    std::set<EcmDescriptor> newEcmPids;
+    std::set<uint16_t> newPayloadPids;
+
+    const uint16_t pcrPid = static_cast<uint16_t>(((section[8] & 0x1F) << 8) | section[9]);
+    if (pcrPid > 0 && pcrPid < kNullPid) newPayloadPids.insert(pcrPid);
+
     const uint16_t programInfoLength = static_cast<uint16_t>(((section[10] & 0x0F) << 8) | section[11]);
     size_t pos = 12;
-    if (pos + programInfoLength > section.size()) return;
-    collect_ca_descriptors(section.data() + pos, programInfoLength, binding.ecmPids);
+    const size_t crcStart = sectionTotal >= 4 ? sectionTotal - 4 : sectionTotal;
+    if (pos + programInfoLength > crcStart) return;
+    collect_ca_descriptors(section.data() + pos, programInfoLength, newEcmPids);
     pos += programInfoLength;
-    const size_t crcStart = section.size() >= 4 ? section.size() - 4 : section.size();
+
     while (pos + 5 <= crcStart) {
+        const uint16_t elementaryPid = static_cast<uint16_t>(((section[pos + 1] & 0x1F) << 8) | section[pos + 2]);
         const uint16_t esInfoLength = static_cast<uint16_t>(((section[pos + 3] & 0x0F) << 8) | section[pos + 4]);
         pos += 5;
         if (pos + esInfoLength > crcStart) break;
-        collect_ca_descriptors(section.data() + pos, esInfoLength, binding.ecmPids);
+        if (elementaryPid > 0 && elementaryPid < kNullPid) newPayloadPids.insert(elementaryPid);
+        collect_ca_descriptors(section.data() + pos, esInfoLength, newEcmPids);
         pos += esInfoLength;
+    }
+
+    binding.ecmPids = std::move(newEcmPids);
+    binding.servicePayloadPids = std::move(newPayloadPids);
+    if (!binding.pmtRoutingAnnounced) {
+        std::cerr << "NEWCAMD PMT SELECT: stream_service=" << binding.serviceId
+                  << " pmt_pid=" << binding.pmtPid
+                  << " ecm_pids=" << binding.ecmPids.size()
+                  << " payload_pids=" << binding.servicePayloadPids.size()
+                  << " source=full-mpts-pat-selected" << std::endl;
+        binding.pmtRoutingAnnounced = true;
     }
 }
 
@@ -742,17 +799,34 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         const uint8_t* payload = ts_payload(packet, &payloadSize);
 
         if (payload && payloadSize > 0) {
-            auto sections = binding.assemblers[pid].push(payload, payloadSize, payloadStart);
-            for (const auto& section : sections) {
-                if (section.empty()) continue;
-                if (section[0] == 0x02) {
-                    binding.pmtPid = pid;
-                    parse_pmt_section(section, binding);
-                } else if (section[0] == 0x80 || section[0] == 0x81) {
-                    if (binding.ecmPids.empty()) continue;
-                    bool knownEcmPid = false;
-                    for (const auto& ecm : binding.ecmPids) if (ecm.pid == pid) knownEcmPid = true;
-                    if (knownEcmPid) {
+            bool knownEcmPid = false;
+            for (const auto& ecm : binding.ecmPids) {
+                if (ecm.pid == pid) {
+                    knownEcmPid = true;
+                    break;
+                }
+            }
+
+            // Full-MPTS CA path: parse only PAT, the PAT-selected PMT and known
+            // ECM PIDs.  Never feed video/audio/other-service payload into the
+            // PSI section assembler.  Besides lowering CPU this prevents random
+            // PES bytes from being mistaken for CA sections during MPTS warmup.
+            const bool parsePsiPid = pid == 0x0000 || pid == binding.pmtPid || knownEcmPid ||
+                (binding.serviceId == 0 && binding.pmtPid == kNullPid);
+            if (parsePsiPid) {
+                auto sections = binding.assemblers[pid].push(payload, payloadSize, payloadStart);
+                for (const auto& section : sections) {
+                    if (section.empty()) continue;
+                    if (pid == 0x0000 && section[0] == 0x00) {
+                        parse_pat_section(section, binding);
+                    } else if (section[0] == 0x02) {
+                        const uint16_t sectionServiceId = section.size() >= 5
+                            ? static_cast<uint16_t>((section[3] << 8) | section[4]) : 0;
+                        if (!binding.serviceId || sectionServiceId == binding.serviceId) {
+                            binding.pmtPid = pid;
+                            parse_pmt_section(section, binding);
+                        }
+                    } else if ((section[0] == 0x80 || section[0] == 0x81) && knownEcmPid) {
                         sawEcm = true;
                         const std::string signature = ecm_signature(section);
                         const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
@@ -766,9 +840,6 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                         item.signature = signature;
                         item.queuedMs = monotonic_ms();
                         ++binding.ecmRequests;
-                        // Do not call send_ecm directly here. The per-connection
-                        // Astra-style scheduler serializes ECM transactions while
-                        // allowing all services to continue TS/CSA processing.
                         enqueue_ecm(inst, binding.clientKey, session, std::move(item));
                     }
                 }
@@ -777,6 +848,15 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
 
         if (scramblingControl == 0 || scramblingControl == 1) {
             if (scramblingControl == 1) waitingForKey = true;
+            continue;
+        }
+
+        // The full-MPTS prefilter hook sees scrambled packets from every service
+        // on the transponder.  Only descramble elementary/PCR PIDs advertised by
+        // the selected service PMT; unrelated services are left byte-for-byte
+        // untouched and are dropped by the downstream SPTS filter.
+        if (!binding.servicePayloadPids.empty() &&
+            binding.servicePayloadPids.count(pid) == 0) {
             continue;
         }
 
