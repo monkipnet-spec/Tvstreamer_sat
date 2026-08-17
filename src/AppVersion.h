@@ -3,8 +3,8 @@
 namespace tvs::app {
 
 inline constexpr const char* kProductName = "TVStreammerSAT5";
-inline constexpr const char* kProgramRelease = "Release 42";
-inline constexpr const char* kProgramVersion = "v171";
+inline constexpr const char* kProgramRelease = "Release 43";
+inline constexpr const char* kProgramVersion = "v172";
 inline constexpr const char* kSupportEmail = "monkipnet@gmail.com";
 
 } // namespace tvs::app

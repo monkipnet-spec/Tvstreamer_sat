@@ -276,6 +276,30 @@ void collect_ca_descriptors(const uint8_t* data, size_t size, std::set<EcmDescri
     }
 }
 
+void parse_pat_section(const std::vector<uint8_t>& section, ServiceBinding& binding) {
+    if (section.size() < 12 || section[0] != 0x00) return;
+    const size_t crcStart = section.size() >= 4 ? section.size() - 4 : section.size();
+    size_t pos = 8;
+    while (pos + 4 <= crcStart) {
+        const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+        const uint16_t pid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+        pos += 4;
+        if (program == 0) continue;
+        if (!binding.serviceId || program == binding.serviceId) {
+            binding.pmtPid = pid;
+            if (!binding.serviceId) binding.serviceId = program;
+            return;
+        }
+    }
+}
+
+static bool is_known_ecm_pid(const ServiceBinding& binding, uint16_t pid) {
+    for (const auto& ecm : binding.ecmPids) {
+        if (ecm.pid == pid) return true;
+    }
+    return false;
+}
+
 void parse_pmt_section(const std::vector<uint8_t>& section, ServiceBinding& binding) {
     if (section.size() < 12 || section[0] != 0x02) return;
     const uint16_t serviceId = static_cast<uint16_t>((section[3] << 8) | section[4]);
@@ -647,7 +671,8 @@ static int newcamd_start_service(void* instance, const char* reader_key,
               << " stream=" << streamId
               << " sid=" << binding->serviceId
               << " mode=independent-tcp session=" << (activeForReader + 1)
-              << "/" << kMaxSessionsPerReader << std::endl;
+              << "/" << kMaxSessionsPerReader
+              << " ts_parser=psi-ecm-only" << std::endl;
     return TVS_CA_RESULT_OK;
 }
 
@@ -804,21 +829,29 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
 
         }
 
-        size_t payloadSize = 0;
-        const uint8_t* payload = ts_payload(packet, &payloadSize);
-
-        if (payload && payloadSize > 0) {
-            auto sections = binding.assemblers[pid].push(payload, payloadSize, payloadStart);
-            for (const auto& section : sections) {
-                if (section.empty()) continue;
-                if (section[0] == 0x02) {
-                    binding.pmtPid = pid;
-                    parse_pmt_section(section, binding);
-                } else if (section[0] == 0x80 || section[0] == 0x81) {
-                    if (binding.ecmPids.empty()) continue;
-                    bool knownEcmPid = false;
-                    for (const auto& ecm : binding.ecmPids) if (ecm.pid == pid) knownEcmPid = true;
-                    if (knownEcmPid) {
+        // v172: PSI/ECM fast path.  Do not feed video/audio payload into the
+        // generic section assembler.  The old code created/updated a
+        // SectionAssembler for every media PID on every TS packet, which was
+        // by far the hottest CPU path with multiple services.  PAT identifies
+        // the selected PMT PID; after that only PAT, that PMT and known ECM
+        // PIDs need section assembly.
+        const bool knownEcmPid = is_known_ecm_pid(binding, pid);
+        const bool sectionPid = pid == 0x0000 ||
+            (binding.pmtPid != kNullPid && pid == binding.pmtPid) || knownEcmPid;
+        if (sectionPid) {
+            size_t payloadSize = 0;
+            const uint8_t* payload = ts_payload(packet, &payloadSize);
+            if (payload && payloadSize > 0) {
+                auto sections = binding.assemblers[pid].push(payload, payloadSize, payloadStart);
+                for (const auto& section : sections) {
+                    if (section.empty()) continue;
+                    if (section[0] == 0x00 && pid == 0x0000) {
+                        parse_pat_section(section, binding);
+                    } else if (section[0] == 0x02 &&
+                               (binding.pmtPid == kNullPid || pid == binding.pmtPid)) {
+                        binding.pmtPid = pid;
+                        parse_pmt_section(section, binding);
+                    } else if ((section[0] == 0x80 || section[0] == 0x81) && knownEcmPid) {
                         sawEcm = true;
                         const std::string signature = ecm_signature(section);
                         const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
@@ -832,9 +865,6 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                         item.signature = signature;
                         item.queuedMs = monotonic_ms();
                         ++binding.ecmRequests;
-                        // Do not call send_ecm directly here. The per-connection
-                        // Astra-style scheduler serializes ECM transactions while
-                        // allowing all services to continue TS/CSA processing.
                         enqueue_ecm(inst, binding.clientKey, session, std::move(item));
                     }
                 }

@@ -249,18 +249,50 @@ public:
 
     void push(const uint8_t* data, size_t size) {
         if (!ready_ || !data) return;
-        for (size_t offset = 0; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
-            std::memcpy(pending_.data() + pendingPackets_ * kTsPacketSize, data + offset, kTsPacketSize);
+        size -= size % kTsPacketSize;
+        size_t offset = 0;
+
+        // Complete an existing partial datagram first.
+        while (pendingPackets_ > 0 && pendingPackets_ < kTsPacketsPerUdpBuffer &&
+               offset + kTsPacketSize <= size) {
+            std::memcpy(pending_.data() + pendingPackets_ * kTsPacketSize,
+                        data + offset, kTsPacketSize);
             ++pendingPackets_;
-            if (pendingPackets_ == kTsPacketsPerUdpBuffer) flush();
+            offset += kTsPacketSize;
+        }
+        if (pendingPackets_ == kTsPacketsPerUdpBuffer) flush();
+
+        // v172 zero-copy UDP fast path: CA already owns a contiguous SPTS
+        // buffer, so full 7x188 datagrams can be sent directly from it instead
+        // of copying every TS packet into pending_.
+        constexpr size_t datagramBytes = kTsPacketSize * kTsPacketsPerUdpBuffer;
+        while (offset + datagramBytes <= size) {
+            sendDatagram(data + offset, datagramBytes);
+            offset += datagramBytes;
+        }
+
+        while (offset + kTsPacketSize <= size) {
+            std::memcpy(pending_.data() + pendingPackets_ * kTsPacketSize,
+                        data + offset, kTsPacketSize);
+            ++pendingPackets_;
+            offset += kTsPacketSize;
         }
     }
 
     void flush() {
         if (!ready_ || pendingPackets_ == 0) return;
         const size_t bytes = pendingPackets_ * kTsPacketSize;
+        sendDatagram(pending_.data(), bytes);
+        pendingPackets_ = 0;
+    }
+
+private:
+    struct Target { int fd = -1; sockaddr_in addr{}; };
+
+    void sendDatagram(const uint8_t* data, size_t bytes) {
+        if (!data || bytes == 0) return;
         for (auto& target : targets_) {
-            const ssize_t sent = ::sendto(target.fd, pending_.data(), bytes, MSG_DONTWAIT,
+            const ssize_t sent = ::sendto(target.fd, data, bytes, MSG_DONTWAIT,
                 reinterpret_cast<const sockaddr*>(&target.addr), sizeof(target.addr));
             if (sent > 0 && state_) {
                 state_->stableUdpNetworkBytes.fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
@@ -276,11 +308,7 @@ public:
             }
         }
         if (state_) state_->outputBytes.fetch_add(bytes, std::memory_order_relaxed);
-        pendingPackets_ = 0;
     }
-
-private:
-    struct Target { int fd = -1; sockaddr_in addr{}; };
 
     void addTarget(const std::string& host, int port, const std::string& iface, std::string& error) {
         if (host.empty() || port <= 0 || port > 65535) {
@@ -335,6 +363,9 @@ struct SharedDvbDispatchConsumer {
     std::thread worker;
     std::condition_variable queueReady;
     std::deque<std::vector<uint8_t>> directQueue;
+    // v172: recycle dispatcher buffers instead of allocating one vector for
+    // every DVR read and every active service.
+    std::deque<std::vector<uint8_t>> directFreeBuffers;
     size_t directQueuedBytes = 0;
     bool directStopping = false;
     DvbSingleProgramPsiContext psi;
@@ -1983,8 +2014,48 @@ void dispatchSharedDvbRaw(SharedDvbFrontendState* shared, const uint8_t* data, s
         }
     }
     if (consumers.empty()) return;
+    if (consumers.size() > 10) consumers.resize(10);
+
+    // v172: build one PID -> service bitmask snapshot per DVR read.  v171 did
+    // packet x service iteration and took consumer->mutex for every 188-byte
+    // packet, so two services already multiplied the full-transponder hot path.
+    // Saved scan PIDs are trusted immediately; PAT/PMT processing can still
+    // self-heal the tables for the next snapshot.
+    std::array<uint16_t, 8192> routeMask{};
+    std::vector<bool> remap(consumers.size(), false);
+    std::vector<uint16_t> pmtPid(consumers.size(), 0x1FFF);
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        auto& consumer = consumers[i];
+        if (!consumer) continue;
+        std::lock_guard<std::mutex> lock(consumer->mutex);
+        const auto& ctx = consumer->psi;
+        remap[i] = ctx.remapEnabled;
+        pmtPid[i] = ctx.pmtPid;
+        const uint16_t bit = static_cast<uint16_t>(1u << i);
+        if (!ctx.filterPids) {
+            for (auto& mask : routeMask) mask = static_cast<uint16_t>(mask | bit);
+        } else {
+            for (size_t pid = 0; pid < ctx.allowedPids.size(); ++pid) {
+                if (ctx.allowedPids[pid]) routeMask[pid] = static_cast<uint16_t>(routeMask[pid] | bit);
+            }
+            if (ctx.pmtPid > 0 && ctx.pmtPid < 0x1FFF) routeMask[ctx.pmtPid] |= bit;
+        }
+    }
+
     std::vector<std::vector<uint8_t>> batches(consumers.size());
-    for (auto& b : batches) b.reserve(64 * 1024);
+    for (size_t i = 0; i < consumers.size(); ++i) {
+        auto& consumer = consumers[i];
+        if (!consumer) continue;
+        {
+            std::lock_guard<std::mutex> lock(consumer->mutex);
+            if (!consumer->directFreeBuffers.empty()) {
+                batches[i] = std::move(consumer->directFreeBuffers.front());
+                consumer->directFreeBuffers.pop_front();
+            }
+        }
+        batches[i].clear();
+        if (batches[i].capacity() < 64 * 1024) batches[i].reserve(64 * 1024);
+    }
 
     size_t packetStart = 0;
     if (data[0] != 0x47) {
@@ -1996,35 +2067,64 @@ void dispatchSharedDvbRaw(SharedDvbFrontendState* shared, const uint8_t* data, s
         }
         if (!found) return;
     }
+
     std::array<uint8_t, kTsPacketSize> outPacket{};
     for (size_t off = packetStart; off + kTsPacketSize <= size; off += kTsPacketSize) {
         const uint8_t* packet = data + off;
         if (packet[0] != 0x47) continue;
         const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
-        for (size_t i = 0; i < consumers.size(); ++i) {
+        if (pid >= routeMask.size()) continue;
+        uint16_t mask = routeMask[pid];
+        while (mask) {
+            const unsigned i = static_cast<unsigned>(__builtin_ctz(mask));
+            mask = static_cast<uint16_t>(mask & (mask - 1));
+            if (i >= consumers.size()) continue;
             auto& consumer = consumers[i];
+            if (!consumer) continue;
+
+            // PAT/SDT/selected PMT and remap require mutable per-service PSI
+            // state. Ordinary media/ECM packets in remap-OFF mode are already
+            // selected by routeMask and can be copied byte-for-byte with no
+            // mutex or PSI parser at all.
+            const bool needsPsi = pid == 0x0000 || pid == 0x0011 ||
+                (pmtPid[i] > 0 && pmtPid[i] < 0x1FFF && pid == pmtPid[i]);
+            if (!remap[i] && !needsPsi) {
+                auto& batch = batches[i];
+                batch.insert(batch.end(), packet, packet + kTsPacketSize);
+                ++consumer->inputPackets;
+                ++consumer->outputPackets;
+                continue;
+            }
+
             std::lock_guard<std::mutex> lock(consumer->mutex);
-            auto& ctx = consumer->psi;
-            bool candidate = true;
-            const bool remapPending = ctx.remapEnabled &&
-                (ctx.requestedVideoPid || ctx.requestedAudioPid) && !ctx.remapPmtRewritten;
-            const bool filterReady = !ctx.filterPids || (ctx.pidSelfHealAnnounced && !remapPending);
-            if (filterReady && pid < ctx.allowedPids.size() && !ctx.allowedPids[pid]) candidate = false;
-            if (pid == 0x0000 || pid == 0x0011 || (ctx.pmtPid && pid == ctx.pmtPid)) candidate = true;
-            if (!candidate) { ++consumer->droppedPackets; continue; }
             const size_t n = filterSharedDvbServiceBytes(packet, kTsPacketSize, *consumer,
                 outPacket.data(), outPacket.size());
-            if (n == kTsPacketSize) batches[i].insert(batches[i].end(), outPacket.begin(), outPacket.end());
+            if (n == kTsPacketSize) {
+                batches[i].insert(batches[i].end(), outPacket.begin(), outPacket.end());
+            }
         }
     }
+
     for (size_t i = 0; i < consumers.size(); ++i) {
         auto& consumer = consumers[i];
         auto& batch = batches[i];
-        if (batch.empty()) continue;
+        if (!consumer) continue;
+        if (batch.empty()) {
+            std::lock_guard<std::mutex> lock(consumer->mutex);
+            if (consumer->directFreeBuffers.size() < 4) {
+                batch.clear();
+                consumer->directFreeBuffers.emplace_back(std::move(batch));
+            }
+            continue;
+        }
         std::unique_lock<std::mutex> lock(consumer->mutex);
         constexpr size_t kMaxQueue = 4 * 1024 * 1024;
         if (consumer->directQueuedBytes + batch.size() > kMaxQueue) {
             ++consumer->pushFailures;
+            if (consumer->directFreeBuffers.size() < 4) {
+                batch.clear();
+                consumer->directFreeBuffers.emplace_back(std::move(batch));
+            }
             continue;
         }
         consumer->directQueuedBytes += batch.size();
@@ -3757,6 +3857,8 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
                   << " polarity=" << params.polarity
                   << " pid_mode=full-mpts-direct-linux-dvb"
                   << " pids=8192 dispatcher=single-pass-cpp"
+                  << " routing=pid-bitmask-lockless-media"
+                  << " buffer_pool=reuse"
                   << " gstreamer=off" << std::endl;
         return true;
     }
@@ -4114,6 +4216,14 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
                 (void)CaBackendManager::instance().processTransport(
                     consumer->streamId, chunk.data(), chunk.size());
                 if (consumer->directSender) consumer->directSender->push(chunk.data(), chunk.size());
+                // Recycle the large service buffer after CA/output.
+                chunk.clear();
+                {
+                    std::lock_guard<std::mutex> recycleLock(consumer->mutex);
+                    if (consumer->directFreeBuffers.size() < 4) {
+                        consumer->directFreeBuffers.emplace_back(std::move(chunk));
+                    }
+                }
             }
             if (consumer->directSender) consumer->directSender->flush();
         });
@@ -4623,7 +4733,8 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         std::cerr << "Direct DVB passthrough running: stream=" << streamConfig.id
                   << " SID=" << streamConfig.inputServiceId
                   << " output=" << streamConfig.outputHost << ':' << streamConfig.outputPort
-                  << " gstreamer_hotpath=off" << std::endl;
+                  << " gstreamer_hotpath=off"
+                  << " udp_copy=zero-copy-1316" << std::endl;
         return true;
     }
 
