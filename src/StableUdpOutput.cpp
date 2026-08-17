@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -59,6 +60,14 @@ enum class UdpShapingMode {
     Cbr,
     Vbr
 };
+
+bool tsDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_DVB_DIAGNOSTICS");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 UdpShapingMode udpShapingMode(const StreamConfig& cfg) {
     std::string type = cfg.outputType;
@@ -369,6 +378,7 @@ public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
+          diagnosticsEnabled(tsDiagnosticsEnabled()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // StableUdpOutput creates a new paced UDP transport domain for every
           // source, not only Remap ON. Normalize final CC for both IP and DVB
@@ -601,7 +611,9 @@ private:
             const FillCounts filled = fillDatagram(
                 datagram.data(), mediaTimelineNanoseconds, activeBitrate);
             normalizeFinalDatagramContinuity(datagram.data());
-            verifyFinalDatagramContinuity(datagram.data());
+            if (diagnosticsEnabled) {
+                verifyFinalDatagramContinuity(datagram.data());
+            }
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
             totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
@@ -1253,9 +1265,11 @@ private:
     }
 
     void sendDatagram(const guint8* data, std::size_t size) {
-        // Passive v152 checkpoint after PCR insertion/final CC normalization
-        // and immediately before the kernel sendto() call. No bytes are changed.
-        preSendCcTrace.inspect(data, size);
+        // PRE_SEND performs a full 188-byte hash/continuity inspection and is
+        // diagnostic-only. Do not execute it in the production send hot path.
+        if (diagnosticsEnabled) {
+            preSendCcTrace.inspect(data, size);
+        }
         const auto* destination = reinterpret_cast<const sockaddr*>(&destinationAddress);
         const socklen_t destinationSize = sizeof(destinationAddress);
         const ssize_t sent = ::sendto(socketFd, data, size, 0, destination, destinationSize);
@@ -1354,6 +1368,7 @@ private:
 
     std::atomic<uint64_t>* networkBytes = nullptr;
     TsCcStageTrace preSendCcTrace;
+    const bool diagnosticsEnabled = false;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;

@@ -6447,20 +6447,23 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     if (directStableUdpTs) {
-        // Last passive GStreamer-side checkpoint immediately before the
-        // StableUdpOutput appsink/WISI reservoir. When a final remap continuity
-        // guard exists, this probe is registered after it and sees its output.
-        GstPad* preWisiCcPad = gst_element_get_static_pad(queue, "src");
-        if (preWisiCcPad) {
-            auto* ccContext = new TsCcStageProbeContext(state->config.id, "PRE_WISI");
-            gst_pad_add_probe(preWisiCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                tsCcStageProbe, ccContext,
-                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-            gst_object_unref(preWisiCcPad);
+        // PRE_WISI is a heavy passive TS continuity/hash diagnostic. Keep it
+        // completely out of the production hot path unless explicitly enabled.
+        if (dvbDiagnosticsEnabled()) {
+            GstPad* preWisiCcPad = gst_element_get_static_pad(queue, "src");
+            if (preWisiCcPad) {
+                auto* ccContext = new TsCcStageProbeContext(state->config.id, "PRE_WISI");
+                gst_pad_add_probe(preWisiCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    tsCcStageProbe, ccContext,
+                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                gst_object_unref(preWisiCcPad);
+            }
         }
         std::cerr << "Stable UDP passthrough: direct MPEG-TS -> WISI reservoir"
                   << " timestamp_tsparse=off smoothing=off"
-                  << " packetization=preserve-upstream" << std::endl;
+                  << " packetization=preserve-upstream"
+                  << " ts_diagnostics=" << (dvbDiagnosticsEnabled() ? "on" : "off")
+                  << std::endl;
         return gst_element_link_many(sourceTail, queue, sink, nullptr);
     }
 
