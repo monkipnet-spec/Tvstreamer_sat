@@ -2183,18 +2183,39 @@ bool openDirectDvbFrontend(const DvbSatelliteParams& params, SharedDvbFrontendSt
     }
     (void)::ioctl(fe, FE_SET_TONE, highBand ? SEC_TONE_ON : SEC_TONE_OFF);
 
-    dtv_property props[8]{};
+    // Linux DVB API uses kHz for DTV_FREQUENCY on satellite delivery
+    // systems. params.frequencyKHz and the calculated LNB IF are already in
+    // kHz, so multiplying by 1000 here (v171-v173) tuned the direct frontend
+    // with the wrong units and could yield FE status without a usable DVR TS.
+    dtv_property props[12]{};
     int n = 0;
     props[n++].cmd = DTV_CLEAR;
     props[n].cmd = DTV_DELIVERY_SYSTEM; props[n++].u.data = params.deliverySystem == "dvb-s2" ? SYS_DVBS2 : SYS_DVBS;
-    props[n].cmd = DTV_FREQUENCY; props[n++].u.data = ifKHz * 1000U;
+    props[n].cmd = DTV_FREQUENCY; props[n++].u.data = ifKHz;
     props[n].cmd = DTV_SYMBOL_RATE; props[n++].u.data = params.symbolRateK * 1000U;
     props[n].cmd = DTV_INNER_FEC; props[n++].u.data = directFec(params.fec);
+    props[n].cmd = DTV_INVERSION; props[n++].u.data = INVERSION_AUTO;
     props[n].cmd = DTV_MODULATION; props[n++].u.data = directModulation(params.modulation);
+#ifdef DTV_PILOT
+    if (params.deliverySystem == "dvb-s2") { props[n].cmd = DTV_PILOT; props[n++].u.data = PILOT_AUTO; }
+#endif
+#ifdef DTV_ROLLOFF
+    if (params.deliverySystem == "dvb-s2") { props[n].cmd = DTV_ROLLOFF; props[n++].u.data = ROLLOFF_AUTO; }
+#endif
 #ifdef DTV_STREAM_ID
     if (params.streamId >= 0) { props[n].cmd = DTV_STREAM_ID; props[n++].u.data = static_cast<uint32_t>(params.streamId); }
 #endif
     props[n++].cmd = DTV_TUNE;
+
+    std::cerr << "Direct DVB tune request: adapter=" << params.adapter
+              << " frontend=" << params.frontend
+              << " rf_khz=" << params.frequencyKHz
+              << " lof_khz=" << lof
+              << " if_khz=" << ifKHz
+              << " dtv_frequency_khz=" << ifKHz
+              << " symbol_rate=" << (params.symbolRateK * 1000U)
+              << " delsys=" << params.deliverySystem
+              << " units=satellite-kHz" << std::endl;
     dtv_properties command{}; command.num = n; command.props = props;
     if (::ioctl(fe, FE_SET_PROPERTY, &command) < 0) {
         error = "direct DVB FE_SET_PROPERTY failed: " + std::string(std::strerror(errno)); ::close(fe); return false;
@@ -2220,6 +2241,10 @@ bool openDirectDvbFrontend(const DvbSatelliteParams& params, SharedDvbFrontendSt
     }
     int dvr = ::open(dvrPath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (dvr < 0) { error = "direct DVB DVR open failed: " + std::string(std::strerror(errno)); ::close(dmx); ::close(fe); return false; }
+    // Some DVB drivers attach the TS tap buffer sizing to the DVR node rather
+    // than to the demux filter fd. Apply the same size on both; unsupported
+    // drivers simply return an error which is safe to ignore here.
+    (void)::ioctl(dvr, DMX_SET_BUFFER_SIZE, demuxBuffer);
     shared.directDvb = true; shared.directFrontendFd = fe; shared.directDemuxFd = dmx; shared.directDvrFd = dvr;
     shared.directStopping.store(false);
     return true;
@@ -3812,13 +3837,43 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         shared->fullTsCapture = true;
         shared->directThread = std::thread([raw = shared.get(), frontendKey]() {
             std::vector<uint8_t> buffer(1022 * kTsPacketSize);
+            bool firstDataAnnounced = false;
+            uint64_t totalDvrBytes = 0;
+            auto noDataSince = std::chrono::steady_clock::now();
+            auto lastNoDataWarning = noDataSince;
             while (!raw->directStopping.load(std::memory_order_relaxed)) {
                 pollfd pfd{}; pfd.fd = raw->directDvrFd; pfd.events = POLLIN;
                 const int prc = ::poll(&pfd, 1, 100);
-                if (prc <= 0) continue;
+                if (prc <= 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (!firstDataAnnounced &&
+                        now - noDataSince >= std::chrono::seconds(2) &&
+                        now - lastNoDataWarning >= std::chrono::seconds(2)) {
+                        fe_status_t status{};
+                        const int statusRc = ::ioctl(raw->directFrontendFd, FE_READ_STATUS, &status);
+                        std::cerr << "Direct DVB DVR no data: frontend=" << frontendKey
+                                  << " fe_status=0x" << std::hex
+                                  << (statusRc == 0 ? static_cast<unsigned>(status) : 0U)
+                                  << std::dec
+                                  << " poll_rc=" << prc
+                                  << " dvr_bytes=" << totalDvrBytes << std::endl;
+                        lastNoDataWarning = now;
+                    }
+                    continue;
+                }
                 const ssize_t n = ::read(raw->directDvrFd, buffer.data(), buffer.size());
-                if (n > 0) dispatchSharedDvbRaw(raw, buffer.data(), static_cast<size_t>(n));
-                else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                if (n > 0) {
+                    totalDvrBytes += static_cast<uint64_t>(n);
+                    if (!firstDataAnnounced) {
+                        firstDataAnnounced = true;
+                        std::cerr << "Direct DVB DVR first data: frontend=" << frontendKey
+                                  << " bytes=" << n
+                                  << " aligned188=" << ((n % static_cast<ssize_t>(kTsPacketSize)) == 0 ? 1 : 0)
+                                  << " first_sync=" << ((buffer[0] == 0x47) ? 1 : 0)
+                                  << std::endl;
+                    }
+                    dispatchSharedDvbRaw(raw, buffer.data(), static_cast<size_t>(n));
+                } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                     std::cerr << "Direct DVB DVR read failed: frontend=" << frontendKey
                               << " error=" << std::strerror(errno) << std::endl;
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
