@@ -2,6 +2,7 @@
 
 #include <gio/gio.h>
 
+#include <algorithm>
 #include <iostream>
 #include <regex>
 #include <sys/socket.h>
@@ -24,13 +25,20 @@ std::vector<std::string> multicastInterfaceNames(
     std::string& error) {
     std::vector<std::string> names;
     std::unordered_set<std::string> added;
-    for (const auto& iface : enumerateNetworkInterfaces()) {
+    for (const auto& iface : enumerateNetworkInterfaces(true)) {
         if (!configuredInterface.empty() &&
             iface.address != configuredInterface && iface.name != configuredInterface) {
             continue;
         }
 
-        if (iface.name.empty() || !iface.isUp || !iface.supportsMulticast) {
+        // Linux loopback normally does not advertise IFF_MULTICAST, but IPv4
+        // multicast membership by interface index is supported on lo and is
+        // useful for local producers feeding TVStreammerSAT5 without leaving
+        // the host. Allow lo/127.0.0.0/8 as an input-only multicast interface.
+        const bool loopbackInterface =
+            iface.name == "lo" || iface.address.rfind("127.", 0) == 0;
+        if (iface.name.empty() || !iface.isUp ||
+            (!iface.supportsMulticast && !loopbackInterface)) {
             if (!configuredInterface.empty()) {
                 error = "selected multicast input interface is down or does not support multicast: " +
                     configuredInterface;
@@ -298,6 +306,9 @@ GstElement* build(
     if (multicastInput) {
         std::cerr << " multicast_join=" << uriHost
                   << " multicast_iface=" << joinedInterfaceNames(joinedInterfaces);
+        if (std::find(joinedInterfaces.begin(), joinedInterfaces.end(), "lo") != joinedInterfaces.end()) {
+            std::cerr << " loopback_multicast=on";
+        }
     }
     std::cerr << std::endl;
 

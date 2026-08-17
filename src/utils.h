@@ -13,4 +13,4 @@ struct NetworkInterface {
 std::string toLower(const std::string& value);
 std::string gstQuote(const std::string& value);
 std::string normalizeIpAddress(const std::string& value);
-std::vector<NetworkInterface> enumerateNetworkInterfaces();
+std::vector<NetworkInterface> enumerateNetworkInterfaces(bool includeLoopback = false);

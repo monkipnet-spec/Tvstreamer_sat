@@ -42,7 +42,7 @@ std::string normalizeIpAddress(const std::string& value) {
     return normalized;
 }
 
-std::vector<NetworkInterface> enumerateNetworkInterfaces() {
+std::vector<NetworkInterface> enumerateNetworkInterfaces(bool includeLoopback) {
     std::vector<NetworkInterface> list;
     struct ifaddrs* ifaddr = nullptr;
     if (getifaddrs(&ifaddr) != 0) {
@@ -59,7 +59,7 @@ std::vector<NetworkInterface> enumerateNetworkInterfaces() {
         if (result != 0) continue;
 
         std::string name(ifa->ifa_name);
-        if (name == "lo") continue;
+        if (name == "lo" && !includeLoopback) continue;
         list.push_back({
             name,
             std::string(host),
