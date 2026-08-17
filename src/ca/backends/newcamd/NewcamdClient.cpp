@@ -26,7 +26,7 @@ constexpr uint8_t kMsgCardData = 0xE4;
 constexpr uint16_t kClientId = 0x8888;
 constexpr size_t kHeaderSize = 12;
 constexpr size_t kMaxMessageSize = 2048;
-constexpr size_t kMaxPendingEcms = 64;
+constexpr size_t kMaxPendingEcms = 1;
 
 uint8_t hex_value(char ch) {
     if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
@@ -385,14 +385,13 @@ bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid
         return false;
     }
 
-    // Newcamd is request/response but does not require waiting for one ECM reply
-    // before the next request is sent. Keep multiple requests in flight on the
-    // same TCP connection; only the actual socket write is serialized. The cap
-    // prevents an unhealthy server/link from growing the pending window forever.
+    // Astra-compatible transaction model: one ECM request is in flight per
+    // Newcamd TCP connection. Multi-service scheduling is handled by the plugin
+    // queue, which submits the next service immediately after this reply arrives.
     size_t pending = pending_ecms_.load(std::memory_order_relaxed);
     while (true) {
         if (pending >= kMaxPendingEcms) {
-            set_error("Newcamd ECM pending window is full (64)");
+            set_error("Newcamd ECM transaction is already in flight");
             return false;
         }
         if (pending_ecms_.compare_exchange_weak(

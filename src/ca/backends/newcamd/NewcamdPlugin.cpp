@@ -7,6 +7,7 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -127,10 +128,34 @@ struct ServiceBinding {
     bool diagSampleTei = false;
 };
 
+struct EcmQueueItem {
+    std::string streamId;
+    uint16_t serviceId = 0;
+    uint16_t caid = 0;
+    uint32_t provid = 0;
+    uint16_t ecmPid = 0;
+    std::vector<uint8_t> section;
+    std::string signature;
+    uint64_t queuedMs = 0;
+};
+
 struct NewcamdSession {
     std::unique_ptr<NewcamdClient> client;
     std::atomic<bool> connected{false};
     std::string lastError;
+
+    // Astra-style Newcamd scheduler: exactly one ECM transaction is in flight
+    // on this TCP connection. Other services wait here. For a service that is
+    // already queued, a newer ECM replaces the stale queued one.
+    std::mutex ecmMutex;
+    std::deque<EcmQueueItem> ecmQueue;
+    bool ecmInFlight = false;
+    uint16_t currentMessageId = 0;
+    std::string currentStreamId;
+    uint16_t currentEcmPid = 0;
+    uint64_t currentStartedMs = 0;
+    std::string currentSignature;
+
     ~NewcamdSession() {
         if (client) {
             client->set_key_update_callback({});
@@ -143,10 +168,6 @@ struct NewcamdInstance {
     std::mutex mutex;
     std::map<std::string, std::shared_ptr<NewcamdSession>> sessionsByClient;
     std::map<std::string, std::shared_ptr<ServiceBinding>> servicesByStream;
-    // Route each Newcamd ECM response back to the stream that sent it.
-    // A single ECM response delivers EVEN and ODD CW callbacks with the same
-    // message id, so ownership must remain valid until the ODD callback.
-    std::map<std::string, std::map<uint16_t, std::string>> ecmOwnerByClient;
 };
 
 void write_error(char* error, size_t error_size, const std::string& message) {
@@ -270,6 +291,81 @@ EcmDescriptor descriptor_for_pid(const ServiceBinding& binding, uint16_t pid) {
     fallback.provid = binding.defaultProvid;
     return fallback;
 }
+
+void pump_ecm_queue(NewcamdInstance* inst, const std::string& clientKey,
+                    const std::shared_ptr<NewcamdSession>& session) {
+    if (!inst || !session || !session->client || !session->connected.load()) return;
+
+    // Hold ecmMutex across send_ecm and ownership publication. If an extremely
+    // fast reply reaches the receiver thread, its callback waits here until the
+    // current transaction metadata is fully installed.
+    std::unique_lock<std::mutex> queueLock(session->ecmMutex);
+    if (session->ecmInFlight || session->ecmQueue.empty()) return;
+
+    EcmQueueItem item = std::move(session->ecmQueue.front());
+    session->ecmQueue.pop_front();
+
+    uint16_t messageId = 0;
+    const uint64_t startedMs = monotonic_ms();
+    if (!session->client->send_ecm(item.serviceId, item.caid, item.provid, item.section, &messageId)) {
+        session->lastError = session->client->last_error();
+        std::cerr << "NEWCAMD ECM DROP: client=" << clientKey
+                  << " stream=" << item.streamId
+                  << " sid=" << item.serviceId
+                  << " ecm_pid=" << item.ecmPid
+                  << " reason=send-failed detail=" << session->lastError << std::endl;
+        return;
+    }
+
+    session->ecmInFlight = true;
+    session->currentMessageId = messageId;
+    session->currentStreamId = item.streamId;
+    session->currentEcmPid = item.ecmPid;
+    session->currentStartedMs = startedMs;
+    session->currentSignature = item.signature;
+    const size_t queueDepth = session->ecmQueue.size();
+
+    std::cerr << "NEWCAMD ECM SEND: client=" << clientKey
+              << " msg=" << messageId
+              << " stream=" << item.streamId
+              << " sid=" << item.serviceId
+              << " ecm_pid=" << item.ecmPid
+              << " queue_depth=" << queueDepth
+              << " queued_ms=" << (startedMs >= item.queuedMs ? startedMs - item.queuedMs : 0)
+              << std::endl;
+}
+
+void enqueue_ecm(NewcamdInstance* inst, const std::string& clientKey,
+                 const std::shared_ptr<NewcamdSession>& session, EcmQueueItem item) {
+    if (!inst || !session || !session->client || !session->connected.load()) return;
+
+    bool shouldPump = false;
+    {
+        std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+
+        // Repeated transmission of the currently active ECM is normal DVB SI
+        // behaviour. Do not queue the same transaction again.
+        if (session->ecmInFlight && session->currentStreamId == item.streamId &&
+            session->currentSignature == item.signature) {
+            return;
+        }
+
+        // Keep at most one not-yet-sent ECM per service. A newly observed ECM is
+        // more useful than an older queued one for that same service.
+        bool replaced = false;
+        for (auto& queued : session->ecmQueue) {
+            if (queued.streamId == item.streamId) {
+                if (queued.signature == item.signature) return;
+                queued = std::move(item);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) session->ecmQueue.push_back(std::move(item));
+        shouldPump = !session->ecmInFlight;
+    }
+    if (shouldPump) pump_ecm_queue(inst, clientKey, session);
+}
 } // namespace
 
 extern "C" {
@@ -314,98 +410,110 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
         config.get("pass", "pass").asString(),
         config.get("des", "0102030405060708091011121314").asString());
 
-    session->client->set_key_update_callback([inst, clientKey](uint16_t messageId, uint8_t parity, const uint8_t* cw) {
+    session->client->set_key_update_callback(
+        [inst, clientKey, weakSession = std::weak_ptr<NewcamdSession>(session)]
+        (uint16_t messageId, uint8_t parity, const uint8_t* cw) {
         if (!cw || !inst || messageId == 0) return;
+        auto session = weakSession.lock();
+        if (!session) return;
 
         std::string streamId;
+        uint16_t expectedMessageId = 0;
+        uint64_t startedMs = 0;
+        {
+            std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+            if (!session->ecmInFlight) {
+                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                          << " reason=no-inflight-ecm" << std::endl;
+                return;
+            }
+            expectedMessageId = session->currentMessageId;
+            streamId = session->currentStreamId;
+            startedMs = session->currentStartedMs;
+        }
+
+        if (messageId != expectedMessageId) {
+            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                      << " msg=" << messageId
+                      << " expected_msg=" << expectedMessageId
+                      << " stream=" << streamId
+                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                      << " reason=transaction-mismatch" << std::endl;
+            return;
+        }
+
         std::shared_ptr<ServiceBinding> target;
         {
-            // Keep the global instance lock only long enough to resolve routing.
-            // Never wait for a per-service lock while holding this mutex: all
-            // channels and the receiver callback must be able to progress in parallel.
-            std::lock_guard<std::mutex> lock(inst->mutex);
-            auto clientOwnersIt = inst->ecmOwnerByClient.find(clientKey);
-            if (clientOwnersIt == inst->ecmOwnerByClient.end()) {
-                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                          << " msg=" << messageId
-                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                          << " reason=no-client-owner-map" << std::endl;
-                return;
-            }
-
-            auto ownerIt = clientOwnersIt->second.find(messageId);
-            if (ownerIt == clientOwnersIt->second.end()) {
-                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                          << " msg=" << messageId
-                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                          << " reason=no-message-owner" << std::endl;
-                return;
-            }
-
-            streamId = ownerIt->second;
+            std::lock_guard<std::mutex> instanceLock(inst->mutex);
             auto serviceIt = inst->servicesByStream.find(streamId);
-            if (serviceIt == inst->servicesByStream.end() || !serviceIt->second ||
-                serviceIt->second->clientKey != clientKey) {
-                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                          << " msg=" << messageId
-                          << " stream=" << streamId
-                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                          << " reason=stream-gone" << std::endl;
-                clientOwnersIt->second.erase(ownerIt);
-                if (clientOwnersIt->second.empty()) inst->ecmOwnerByClient.erase(clientOwnersIt);
-                return;
+            if (serviceIt != inst->servicesByStream.end() && serviceIt->second &&
+                serviceIt->second->clientKey == clientKey) {
+                target = serviceIt->second;
             }
-            target = serviceIt->second;
+        }
+        if (!target) {
+            std::cerr << "NEWCAMD CW DROP: client=" << clientKey
+                      << " msg=" << messageId
+                      << " stream=" << streamId
+                      << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
+                      << " reason=stream-gone" << std::endl;
+            if (parity & 1) {
+                {
+                    std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+                    if (session->ecmInFlight && session->currentMessageId == messageId) {
+                        session->ecmInFlight = false;
+                        session->currentMessageId = 0;
+                        session->currentStreamId.clear();
+                        session->currentEcmPid = 0;
+                        session->currentStartedMs = 0;
+                        session->currentSignature.clear();
+                    }
+                }
+                pump_ecm_queue(inst, clientKey, session);
+            }
+            return;
         }
 
         uint16_t sid = 0;
-        uint64_t latencyMs = 0;
         {
             std::lock_guard<std::mutex> serviceLock(target->mutex);
             ControlWordSlot& slot = (parity & 1) ? target->odd : target->even;
-            if (!slot.key) {
-                std::cerr << "NEWCAMD CW DROP: client=" << clientKey
-                          << " msg=" << messageId
-                          << " stream=" << streamId
-                          << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                          << " reason=no-key-slot" << std::endl;
-                return;
-            }
-
+            if (!slot.key) return;
             dvbcsa_key_set(cw, slot.key);
             slot.valid = true;
             ++slot.updates;
             ++target->cwUpdates;
             sid = target->serviceId;
-            const auto started = target->pendingEcmStartedMs.find(messageId);
-            if (started != target->pendingEcmStartedMs.end()) {
-                const uint64_t now = monotonic_ms();
-                latencyMs = now >= started->second ? now - started->second : 0;
-            }
 
-            // NewcamdClient emits EVEN first and ODD second for the same ECM reply.
-            // Keep ownership for both callbacks; release it after ODD has arrived.
-            if (parity & 1) {
-                target->pendingEcmIds.erase(messageId);
-                target->pendingEcmStartedMs.erase(messageId);
-            }
         }
 
+        const uint64_t now = monotonic_ms();
         std::cerr << "NEWCAMD CW MAP: client=" << clientKey
                   << " msg=" << messageId
                   << " stream=" << streamId
                   << " sid=" << sid
                   << " parity=" << ((parity & 1) ? "ODD" : "EVEN")
-                  << " latency_ms=" << latencyMs
+                  << " latency_ms=" << (now >= startedMs ? now - startedMs : 0)
                   << std::endl;
 
+        // NewcamdClient emits EVEN then ODD from the same 16-byte response. ODD
+        // is the completion point for this transaction; only then send the next
+        // service from the shared connection queue.
         if (parity & 1) {
-            std::lock_guard<std::mutex> lock(inst->mutex);
-            auto clientOwnersIt = inst->ecmOwnerByClient.find(clientKey);
-            if (clientOwnersIt != inst->ecmOwnerByClient.end()) {
-                clientOwnersIt->second.erase(messageId);
-                if (clientOwnersIt->second.empty()) inst->ecmOwnerByClient.erase(clientOwnersIt);
+            {
+                std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+                if (session->ecmInFlight && session->currentMessageId == messageId) {
+                    session->ecmInFlight = false;
+                    session->currentMessageId = 0;
+                    session->currentStreamId.clear();
+                    session->currentEcmPid = 0;
+                    session->currentStartedMs = 0;
+                    session->currentSignature.clear();
+                }
             }
+            pump_ecm_queue(inst, clientKey, session);
         }
     });
 
@@ -435,7 +543,6 @@ static void newcamd_close_reader(void* instance, const char* reader_key) {
             if (it->second && it->second->clientKey == clientKey) it = inst->servicesByStream.erase(it);
             else ++it;
         }
-        inst->ecmOwnerByClient.erase(clientKey);
         auto sessionIt = inst->sessionsByClient.find(clientKey);
         if (sessionIt != inst->sessionsByClient.end()) {
             removedSession = sessionIt->second;
@@ -466,17 +573,23 @@ static int newcamd_start_service(void* instance, const char* reader_key, const s
 static void newcamd_stop_service(void* instance, const char* stream_id) {
     auto* inst = static_cast<NewcamdInstance*>(instance);
     if (!inst || !stream_id) return;
-    std::lock_guard<std::mutex> lock(inst->mutex);
     const std::string streamId = stream_id;
-    inst->servicesByStream.erase(streamId);
-    for (auto clientIt = inst->ecmOwnerByClient.begin(); clientIt != inst->ecmOwnerByClient.end();) {
-        auto& owners = clientIt->second;
-        for (auto ownerIt = owners.begin(); ownerIt != owners.end();) {
-            if (ownerIt->second == streamId) ownerIt = owners.erase(ownerIt);
-            else ++ownerIt;
+    std::shared_ptr<NewcamdSession> session;
+    {
+        std::lock_guard<std::mutex> lock(inst->mutex);
+        auto serviceIt = inst->servicesByStream.find(streamId);
+        if (serviceIt != inst->servicesByStream.end() && serviceIt->second) {
+            auto sessionIt = inst->sessionsByClient.find(serviceIt->second->clientKey);
+            if (sessionIt != inst->sessionsByClient.end()) session = sessionIt->second;
         }
-        if (owners.empty()) clientIt = inst->ecmOwnerByClient.erase(clientIt);
-        else ++clientIt;
+        inst->servicesByStream.erase(streamId);
+    }
+    if (session) {
+        std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+        for (auto it = session->ecmQueue.begin(); it != session->ecmQueue.end();) {
+            if (it->streamId == streamId) it = session->ecmQueue.erase(it);
+            else ++it;
+        }
     }
 }
 
@@ -585,35 +698,21 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     if (knownEcmPid) {
                         sawEcm = true;
                         const std::string signature = ecm_signature(section);
-                        if (binding.sentEcms.insert(signature).second) {
-                            const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
-                            uint16_t messageId = 0;
-                            if (session->client->send_ecm(binding.serviceId, ecm.caid, ecm.provid, section, &messageId)) {
-                                ++binding.ecmRequests;
-                                if (messageId != 0) {
-                                    binding.pendingEcmIds.insert(messageId);
-                                    binding.pendingEcmStartedMs[messageId] = monotonic_ms();
-                                    size_t clientPending = 0;
-                                    {
-                                        std::lock_guard<std::mutex> routeLock(inst->mutex);
-                                        auto& owners = inst->ecmOwnerByClient[binding.clientKey];
-                                        owners[messageId] = stream_id;
-                                        clientPending = owners.size();
-                                    }
-                                    std::cerr << "NEWCAMD ECM MAP: client=" << binding.clientKey
-                                              << " msg=" << messageId
-                                              << " stream=" << stream_id
-                                              << " sid=" << binding.serviceId
-                                              << " ecm_pid=" << ecm.pid
-                                              << " stream_pending=" << binding.pendingEcmIds.size()
-                                              << " client_pending=" << clientPending
-                                              << std::endl;
-                                }
-                            } else {
-                                session->lastError = session->client->last_error();
-                            }
-                            if (binding.sentEcms.size() > 128) binding.sentEcms.clear();
-                        }
+                        const EcmDescriptor ecm = descriptor_for_pid(binding, pid);
+                        EcmQueueItem item;
+                        item.streamId = stream_id;
+                        item.serviceId = binding.serviceId;
+                        item.caid = ecm.caid;
+                        item.provid = ecm.provid;
+                        item.ecmPid = ecm.pid;
+                        item.section = section;
+                        item.signature = signature;
+                        item.queuedMs = monotonic_ms();
+                        ++binding.ecmRequests;
+                        // Do not call send_ecm directly here. The per-connection
+                        // Astra-style scheduler serializes ECM transactions while
+                        // allowing all services to continue TS/CSA processing.
+                        enqueue_ecm(inst, binding.clientKey, session, std::move(item));
                     }
                 }
             }
@@ -712,12 +811,13 @@ static const char* newcamd_status_json(void* instance) {
         if (!session || !session->connected.load()) continue;
         ++connected;
         if (session->client && session->client->authenticated()) ++authenticated;
+        std::lock_guard<std::mutex> queueLock(session->ecmMutex);
+        pendingEcms += session->ecmQueue.size() + (session->ecmInFlight ? 1 : 0);
     }
     for (const auto& binding : services) {
         std::lock_guard<std::mutex> serviceLock(binding->mutex);
         if (binding->even.valid) ++evenKeys;
         if (binding->odd.valid) ++oddKeys;
-        pendingEcms += binding->pendingEcmIds.size();
     }
     status = "{\"status\":\"" + std::string(connected ? "connected" : "disconnected") +
              "\",\"clients\":" + std::to_string(connected) +
