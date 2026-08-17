@@ -9,6 +9,7 @@ extern "C" {
 #include <chrono>
 #include <deque>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -23,6 +24,14 @@ namespace {
 
 constexpr size_t kTsPacketSize = 188;
 constexpr uint16_t kNullPid = 0x1FFF;
+
+bool caDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_DVB_DIAGNOSTICS");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 struct EcmDescriptor {
     uint16_t pid = kNullPid;
@@ -828,66 +837,70 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     bool changed = false;
     bool waitingForKey = false;
     bool sawEcm = false;
+    const bool diagnostics = caDiagnosticsEnabled();
 
-    ++binding.diagCalls;
+    if (diagnostics) ++binding.diagCalls;
     const size_t bufferRemainder = size % kTsPacketSize;
-    if (bufferRemainder != 0) ++binding.diagUnalignedBuffers;
+    if (diagnostics && bufferRemainder != 0) ++binding.diagUnalignedBuffers;
 
     for (size_t offset = 0; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
         uint8_t* packet = data + offset;
         if (packet[0] != 0x47) {
-            ++binding.diagBadSyncPackets;
+            if (diagnostics) ++binding.diagBadSyncPackets;
             continue;
         }
 
         result->packets_seen++;
         const uint16_t pid = parse_pid(packet);
-        const bool tei = (packet[1] & 0x80) != 0;
         const bool payloadStart = (packet[1] & 0x40) != 0;
         const uint8_t scramblingControl = static_cast<uint8_t>((packet[3] >> 6) & 0x03);
-        const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
-        const uint8_t continuityCounter = static_cast<uint8_t>(packet[3] & 0x0F);
 
-        if (tei) ++binding.diagTeiPackets;
-        
         switch (scramblingControl) {
             case 0: result->packets_clear++; break;
-            default: result->packets_scrambled++; ++binding.diagScrambledPackets; break;
+            default: result->packets_scrambled++; break;
         }
 
-        size_t diagnosticPayloadSize = 0;
-        bool validAdaptation = true;
-        if (adaptationControl == 0) {
-            validAdaptation = false;
-        } else if (adaptationControl == 1) {
-            diagnosticPayloadSize = kTsPacketSize - 4;
-        } else if (adaptationControl == 3) {
-            const size_t adaptationLength = packet[4];
-            if (5 + adaptationLength > kTsPacketSize) {
+        if (diagnostics) {
+            const bool tei = (packet[1] & 0x80) != 0;
+            const uint8_t adaptationControl = static_cast<uint8_t>((packet[3] >> 4) & 0x03);
+            const uint8_t continuityCounter = static_cast<uint8_t>(packet[3] & 0x0F);
+            if (tei) ++binding.diagTeiPackets;
+            if (scramblingControl != 0) ++binding.diagScrambledPackets;
+
+            size_t diagnosticPayloadSize = 0;
+            bool validAdaptation = true;
+            if (adaptationControl == 0) {
                 validAdaptation = false;
-            } else {
-                const size_t diagnosticPayloadOffset = 5 + adaptationLength;
-                if (diagnosticPayloadOffset < kTsPacketSize) {
-                    diagnosticPayloadSize = kTsPacketSize - diagnosticPayloadOffset;
+            } else if (adaptationControl == 1) {
+                diagnosticPayloadSize = kTsPacketSize - 4;
+            } else if (adaptationControl == 3) {
+                const size_t adaptationLength = packet[4];
+                if (5 + adaptationLength > kTsPacketSize) {
+                    validAdaptation = false;
+                } else {
+                    const size_t diagnosticPayloadOffset = 5 + adaptationLength;
+                    if (diagnosticPayloadOffset < kTsPacketSize) {
+                        diagnosticPayloadSize = kTsPacketSize - diagnosticPayloadOffset;
+                    }
                 }
             }
-        }
 
-        if (!validAdaptation) {
-            ++binding.diagBadAdaptationPackets;
-        } else if (diagnosticPayloadSize > 0) {
-            ++binding.diagPayloadPackets;
-            if ((diagnosticPayloadSize % 8) != 0) {
-                ++binding.diagNonModulo8Payloads;
-                if (scramblingControl == 2 || scramblingControl == 3) {
-                    ++binding.diagScrambledNonModulo8Payloads;
-                    binding.diagSamplePid = pid;
-                    binding.diagSampleScrambling = scramblingControl;
-                    binding.diagSampleAdaptation = adaptationControl;
-                    binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
-                    binding.diagSampleCc = continuityCounter;
-                    binding.diagSamplePusi = payloadStart;
-                    binding.diagSampleTei = tei;
+            if (!validAdaptation) {
+                ++binding.diagBadAdaptationPackets;
+            } else if (diagnosticPayloadSize > 0) {
+                ++binding.diagPayloadPackets;
+                if ((diagnosticPayloadSize % 8) != 0) {
+                    ++binding.diagNonModulo8Payloads;
+                    if (scramblingControl == 2 || scramblingControl == 3) {
+                        ++binding.diagScrambledNonModulo8Payloads;
+                        binding.diagSamplePid = pid;
+                        binding.diagSampleScrambling = scramblingControl;
+                        binding.diagSampleAdaptation = adaptationControl;
+                        binding.diagSamplePayload = static_cast<uint16_t>(diagnosticPayloadSize);
+                        binding.diagSampleCc = continuityCounter;
+                        binding.diagSamplePusi = payloadStart;
+                        binding.diagSampleTei = tei;
+                    }
                 }
             }
         }
@@ -991,8 +1004,8 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         changed = true;
     }
 
-    const uint64_t diagNowMs = monotonic_ms();
-    if (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000) {
+    const uint64_t diagNowMs = diagnostics ? monotonic_ms() : 0;
+    if (diagnostics && (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000)) {
         binding.diagLastLogMs = diagNowMs;
         std::cerr
             << "CA TS DIAG: stream=" << stream_id

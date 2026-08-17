@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -52,6 +53,14 @@ constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr GstClockTime kFastDvbReleaseWait = 250 * GST_MSECOND;
 constexpr const char* kTestPatternUri = "test://bars";
+
+bool dvbDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_DVB_DIAGNOSTICS");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 
 class CardReservationGuard {
 public:
@@ -3189,53 +3198,59 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
-    // v155 byte-for-byte diagnostics at the DVB source. This probe publishes
-    // recent exact TS packet fingerprints for the corresponding service relay
-    // receiver to correlate against. It is read-only.
-    {
-        GstPad* auditPad = gst_element_get_static_pad(source, "src");
-        if (auditPad) {
-            auto* auditContext = new DvbByteAuditContext();
-            auditContext->frontendKey = frontendKey;
-            auditContext->stage = "dvbsrc-src";
-            auditContext->publishSourceHistory = true;
+    // Heavy DVB packet diagnostics are intentionally disabled in the normal
+    // hot path.  Enable them only when troubleshooting with
+    // TVS_DVB_DIAGNOSTICS=1.
+    if (dvbDiagnosticsEnabled()) {
+        // v155 byte-for-byte diagnostics at the DVB source. This probe publishes
+        // recent exact TS packet fingerprints for the corresponding service relay
+        // receiver to correlate against. It is read-only.
+        {
+            GstPad* auditPad = gst_element_get_static_pad(source, "src");
+            if (auditPad) {
+                auto* auditContext = new DvbByteAuditContext();
+                auditContext->frontendKey = frontendKey;
+                auditContext->stage = "dvbsrc-src";
+                auditContext->publishSourceHistory = true;
+                gst_pad_add_probe(
+                    auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    dvbByteAuditProbe, auditContext,
+                    [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+                gst_object_unref(auditPad);
+            }
+        }
+
+        GstPad* statsPad = gst_element_get_static_pad(source, "src");
+        if (statsPad) {
+            auto* statsContext = new SharedDvbPidStatsContext();
+            statsContext->stage = "dvbsrc-src";
+            statsContext->label = frontendKey;
             gst_pad_add_probe(
-                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
-                dvbByteAuditProbe, auditContext,
-                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
-            gst_object_unref(auditPad);
+                statsPad,
+                GST_PAD_PROBE_TYPE_BUFFER,
+                sharedDvbPidStatsProbe,
+                statsContext,
+                [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
+            gst_object_unref(statsPad);
+        }
+
+        // Same cumulative fingerprint immediately before the internal multicast
+        // udpsink. At equal packet counts its hash must match dvbsrc-src exactly.
+        {
+            GstPad* auditPad = gst_element_get_static_pad(queue, "src");
+            if (auditPad) {
+                auto* auditContext = new DvbByteAuditContext();
+                auditContext->frontendKey = frontendKey;
+                auditContext->stage = "pre-internal-udp";
+                gst_pad_add_probe(
+                    auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    dvbByteAuditProbe, auditContext,
+                    [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+                gst_object_unref(auditPad);
+            }
         }
     }
 
-    GstPad* statsPad = gst_element_get_static_pad(source, "src");
-    if (statsPad) {
-        auto* statsContext = new SharedDvbPidStatsContext();
-        statsContext->stage = "dvbsrc-src";
-        statsContext->label = frontendKey;
-        gst_pad_add_probe(
-            statsPad,
-            GST_PAD_PROBE_TYPE_BUFFER,
-            sharedDvbPidStatsProbe,
-            statsContext,
-            [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
-        gst_object_unref(statsPad);
-    }
-
-    // Same cumulative fingerprint immediately before the internal multicast
-    // udpsink. At equal packet counts its hash must match dvbsrc-src exactly.
-    {
-        GstPad* auditPad = gst_element_get_static_pad(queue, "src");
-        if (auditPad) {
-            auto* auditContext = new DvbByteAuditContext();
-            auditContext->frontendKey = frontendKey;
-            auditContext->stage = "pre-internal-udp";
-            gst_pad_add_probe(
-                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
-                dvbByteAuditProbe, auditContext,
-                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
-            gst_object_unref(auditPad);
-        }
-    }
     configureQueue(queue, 12000000000ULL);
     g_object_set(sink,
         "host", shared->multicastAddress.c_str(),
@@ -3546,36 +3561,39 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         return false;
     }
 
-    // v155 exact byte correlation after the internal multicast receiver and
-    // before the custom framer/SPTS filtering. The probe is read-only and
-    // compares each reconstructed 188-byte packet with recent dvbsrc output.
-    {
-        GstPad* auditPad = gst_element_get_static_pad(inputQueue, "src");
-        if (auditPad) {
-            auto* auditContext = new DvbByteAuditContext();
-            auditContext->frontendKey = state->sharedDvbFrontendKey;
-            auditContext->streamId = state->config.id;
-            auditContext->stage = "internal-udp-recv";
-            auditContext->compareWithSourceHistory = true;
-            gst_pad_add_probe(
-                auditPad, GST_PAD_PROBE_TYPE_BUFFER,
-                dvbByteAuditProbe, auditContext,
-                [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
-            gst_object_unref(auditPad);
+    if (dvbDiagnosticsEnabled()) {
+        // v155 exact byte correlation after the internal multicast receiver and
+        // before the custom framer/SPTS filtering. The probe is read-only and
+        // compares each reconstructed 188-byte packet with recent dvbsrc output.
+        {
+            GstPad* auditPad = gst_element_get_static_pad(inputQueue, "src");
+            if (auditPad) {
+                auto* auditContext = new DvbByteAuditContext();
+                auditContext->frontendKey = state->sharedDvbFrontendKey;
+                auditContext->streamId = state->config.id;
+                auditContext->stage = "internal-udp-recv";
+                auditContext->compareWithSourceHistory = true;
+                gst_pad_add_probe(
+                    auditPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    dvbByteAuditProbe, auditContext,
+                    [](gpointer data) { delete static_cast<DvbByteAuditContext*>(data); });
+                gst_object_unref(auditPad);
+            }
         }
-    }
 
-    // v152 passive stage-by-stage CC trace. The first probe observes the raw
-    // shared transponder before SPTS filtering/remap. It never rewrites bytes.
-    {
-        GstPad* rawCcPad = gst_element_get_static_pad(inputQueue, "src");
-        if (rawCcPad) {
-            auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_RAW");
-            gst_pad_add_probe(rawCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                tsCcStageProbe, ccContext,
-                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-            gst_object_unref(rawCcPad);
+        // v152 passive stage-by-stage CC trace. The first probe observes the raw
+        // shared transponder before SPTS filtering/remap. It never rewrites bytes.
+        {
+            GstPad* rawCcPad = gst_element_get_static_pad(inputQueue, "src");
+            if (rawCcPad) {
+                auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_RAW");
+                gst_pad_add_probe(rawCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    tsCcStageProbe, ccContext,
+                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                gst_object_unref(rawCcPad);
+            }
         }
+
     }
 
     // Reassemble 188-byte transport packets across arbitrary GstBuffer boundaries.
@@ -3593,41 +3611,24 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
-    // The sink pad is after the custom framer and before PID/PSI filtering.
-    {
-        GstPad* alignedCcPad = gst_element_get_static_pad(outputQueue, "sink");
-        if (alignedCcPad) {
-            auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_ALIGNED");
-            gst_pad_add_probe(alignedCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                tsCcStageProbe, ccContext,
-                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-            gst_object_unref(alignedCcPad);
+    if (dvbDiagnosticsEnabled()) {
+        // The sink pad is after the custom framer and before PID/PSI filtering.
+        {
+            GstPad* alignedCcPad = gst_element_get_static_pad(outputQueue, "sink");
+            if (alignedCcPad) {
+                auto* ccContext = new TsCcStageProbeContext(state->config.id, "DVB_ALIGNED");
+                gst_pad_add_probe(alignedCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    tsCcStageProbe, ccContext,
+                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                gst_object_unref(alignedCcPad);
+            }
         }
+
     }
 
-    // v175: in full-MPTS mode feed CA from the aligned transponder BEFORE the
-    // software SPTS filter.  This guarantees that the selected service PMT and
-    // ECM PID reach Newcamd even when the saved PID list is stale/incomplete.
-    // Newcamd itself restricts CSA to elementary/PCR PIDs of the selected PMT,
-    // so packets belonging to other services are never descrambled with this CW.
-    if (!state->config.conditionalAccessClient.empty()) {
-        GstPad* caPad = gst_element_get_static_pad(outputQueue, "sink");
-        if (caPad) {
-            auto* caContext = new CaBackendTsProbeContext();
-            caContext->streamId = state->config.id;
-            gst_pad_add_probe(
-                caPad,
-                GST_PAD_PROBE_TYPE_BUFFER,
-                caBackendTsProbe,
-                caContext,
-                [](gpointer data) { delete static_cast<CaBackendTsProbeContext*>(data); });
-            gst_object_unref(caPad);
-            std::cerr << "CA backend full-MPTS prefilter hook attached: stream=" << state->config.id
-                      << " cam_client=" << state->config.conditionalAccessClient
-                      << " stage=aligned-full-mpts-before-spts-filter" << std::endl;
-        }
-    }
-
+    // v177: filter full-MPTS to the selected SPTS first.  The filter learns
+    // PMT/PCR/ES/CA PIDs from the selected PMT, so ECM remains present while
+    // unrelated transponder traffic is dropped before the CA hot path.
     if (state->config.inputServiceId > 0) {
         // Filter only complete 188-byte packets produced by the custom framer.
         GstPad* psiPad = gst_element_get_static_pad(outputQueue, "sink");
@@ -3660,50 +3661,74 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
         }
     }
 
-    // Selected SPTS trace after the full-MPTS CA hook and PID/PSI filtering.
-    {
-        GstPad* preCaCcPad = gst_element_get_static_pad(outputQueue, "src");
-        if (preCaCcPad) {
-            auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
-            gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                tsCcStageProbe, ccContext,
-                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-            gst_object_unref(preCaCcPad);
-        }
-    }
-
-    // Final selected SPTS trace.  CA is now upstream at the full-MPTS prefilter
-    // stage; this remains useful for continuity diagnostics after filtering.
-    {
-        GstPad* postCaCcPad = gst_element_get_static_pad(outputQueue, "src");
-        if (postCaCcPad) {
-            auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
-            gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                tsCcStageProbe, ccContext,
-                [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-            gst_object_unref(postCaCcPad);
-        }
-    }
-
-    {
-        GstPad* statsPad = gst_element_get_static_pad(outputQueue, "src");
-        if (statsPad) {
-            auto* statsContext = new SharedDvbPidStatsContext();
-            statsContext->stage = "service-relay-output";
-            statsContext->label = state->config.id;
+    // v177: CA runs AFTER the software SPTS filter.  This keeps the working
+    // v176 CHID/Newcamd logic intact while preventing every service session
+    // from parsing/decrypting the entire transponder.
+    if (!state->config.conditionalAccessClient.empty()) {
+        GstPad* caPad = gst_element_get_static_pad(outputQueue, "src");
+        if (caPad) {
+            auto* caContext = new CaBackendTsProbeContext();
+            caContext->streamId = state->config.id;
             gst_pad_add_probe(
-                statsPad,
+                caPad,
                 GST_PAD_PROBE_TYPE_BUFFER,
-                sharedDvbPidStatsProbe,
-                statsContext,
-                [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
-            gst_object_unref(statsPad);
+                caBackendTsProbe,
+                caContext,
+                [](gpointer data) { delete static_cast<CaBackendTsProbeContext*>(data); });
+            gst_object_unref(caPad);
+            std::cerr << "CA backend SPTS postfilter hook attached: stream=" << state->config.id
+                      << " cam_client=" << state->config.conditionalAccessClient
+                      << " stage=selected-spts-after-pid-filter" << std::endl;
         }
+    }
+
+    if (dvbDiagnosticsEnabled()) {
+        // Selected SPTS diagnostics after PID/PSI filtering and CA.
+        {
+            GstPad* preCaCcPad = gst_element_get_static_pad(outputQueue, "src");
+            if (preCaCcPad) {
+                auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
+                gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    tsCcStageProbe, ccContext,
+                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                gst_object_unref(preCaCcPad);
+            }
+        }
+
+        // Final selected SPTS continuity diagnostics after CA.
+        {
+            GstPad* postCaCcPad = gst_element_get_static_pad(outputQueue, "src");
+            if (postCaCcPad) {
+                auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
+                gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                    tsCcStageProbe, ccContext,
+                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                gst_object_unref(postCaCcPad);
+            }
+        }
+
+        {
+            GstPad* statsPad = gst_element_get_static_pad(outputQueue, "src");
+            if (statsPad) {
+                auto* statsContext = new SharedDvbPidStatsContext();
+                statsContext->stage = "service-relay-output";
+                statsContext->label = state->config.id;
+                gst_pad_add_probe(
+                    statsPad,
+                    GST_PAD_PROBE_TYPE_BUFFER,
+                    sharedDvbPidStatsProbe,
+                    statsContext,
+                    [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
+                gst_object_unref(statsPad);
+            }
+        }
+
     }
 
     std::cerr << "DVB service relay TS framing: stream=" << state->config.id
               << " stage=pre-spts-filter custom_framer=188"
-              << " partial-buffer-tail=preserved parser=none" << std::endl;
+              << " partial-buffer-tail=preserved parser=none"
+              << " ca_stage=after-spts diagnostics=" << (dvbDiagnosticsEnabled() ? "on" : "off") << std::endl;
 
     relay->pipeline = pipeline;
     relay->bus = gst_element_get_bus(pipeline);
