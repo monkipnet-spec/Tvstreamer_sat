@@ -532,11 +532,6 @@ private:
     static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
 
     void sendLoop() {
-        if (mode == UdpShapingMode::Vbr) {
-            sendVbrPcrBlockLoop();
-            return;
-        }
-
         uint64_t nextSendNanoseconds = 0;
         // Media/PCR time is deliberately independent from the physical sender
         // deadline. If the sender thread wakes up late we may move the wall-clock
@@ -637,188 +632,6 @@ private:
                 mediaTimelineNanoseconds += mediaRemainder / activeBitrate;
                 mediaRemainder %= activeBitrate;
             }
-        }
-    }
-
-    static uint64_t pcrDeltaTicks(uint64_t previous, uint64_t current) {
-        if (current >= previous) {
-            return current - previous;
-        }
-        return (kPcrTicksModulus - previous) + current;
-    }
-
-    bool selectedSourcePcr(const TimedTsPacket& packet) const {
-        return packet.hasPcr && declaredPcrPidValid && packet.pid == declaredPcrPid;
-    }
-
-    // Astra-style VBR pacing: preserve broadcaster PCR/PTS/DTS verbatim and use
-    // consecutive source PCR samples only as the pacing clock. Packets between
-    // PCR[n] and PCR[n+1] are emitted uniformly over exactly PCR[n+1]-PCR[n].
-    // This makes each service follow its own broadcaster clock and removes any
-    // dependency on EWMA bitrate estimates or competing sender-thread wakeups.
-    void sendVbrPcrBlockLoop() {
-        if (!waitForInitialPackets()) {
-            return;
-        }
-
-        uint64_t nextPacketDeadline = monotonicNanoseconds();
-        statsStartedNanoseconds = nextPacketDeadline;
-        lastStatsNanoseconds = nextPacketDeadline;
-        lastRateSampleNanoseconds = nextPacketDeadline;
-        lastRateSampleBytes = inputBytesReceived.load(std::memory_order_relaxed);
-        lastControllerUpdateNanoseconds = nextPacketDeadline;
-
-        std::array<guint8, kUdpPayloadSize> datagram {};
-        std::size_t datagramPackets = 0;
-        uint64_t pacingRemainder = 0;
-        uint64_t blockCount = 0;
-        uint64_t invalidBlocks = 0;
-
-        std::cerr << "UDP VBR pacing: mode=astra-source-pcr-block"
-                  << " pcr_passthrough=1 pts_dts_passthrough=1"
-                  << " datagram_packets=" << kTsPacketsPerDatagram << std::endl;
-
-        while (!stopping.load(std::memory_order_relaxed)) {
-            moveAvailableChunks();
-
-            // Find the first selected-service PCR and discard only packets that
-            // precede it. The startup reservoir keeps enough history for this to
-            // happen once, just as Astra starts its sync buffer at the first PCR.
-            while (!realPackets.empty() && !selectedSourcePcr(realPackets.front())) {
-                bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-                realPackets.pop_front();
-                queueSpace.notify_all();
-            }
-
-            if (realPackets.empty()) {
-                std::unique_lock<std::mutex> lock(queueMutex);
-                queueReady.wait_for(lock, std::chrono::milliseconds(2));
-                continue;
-            }
-
-            // Need the next PCR to know the exact duration of this block.
-            std::size_t nextPcrIndex = 0;
-            bool haveNextPcr = false;
-            for (std::size_t i = 1; i < realPackets.size(); ++i) {
-                if (selectedSourcePcr(realPackets[i])) {
-                    nextPcrIndex = i;
-                    haveNextPcr = true;
-                    break;
-                }
-            }
-            if (!haveNextPcr) {
-                std::unique_lock<std::mutex> lock(queueMutex);
-                queueReady.wait_for(lock, std::chrono::milliseconds(2));
-                continue;
-            }
-
-            const uint64_t firstPcr = realPackets.front().sourcePcrTicks;
-            const uint64_t nextPcr = realPackets[nextPcrIndex].sourcePcrTicks;
-            if (!periodicPcrInitialized) {
-                periodicPcrInitialized = true;
-                periodicPcrPid = declaredPcrPid;
-                periodicPcrOriginTicks = firstPcr;
-                std::cerr << "UDP PCR lock: program=" << declaredPcrProgram
-                          << " pcr_pid=" << periodicPcrPid
-                          << " source=selected-PMT mode=astra-source-pcr-block"
-                          << std::endl;
-            }
-            const uint64_t deltaTicks = pcrDeltaTicks(firstPcr, nextPcr);
-            const uint64_t blockNanoseconds = multiplyDivide(
-                deltaTicks, 1000000000ULL, kPcrClockHz);
-
-            // Match Astra's safety policy: an impossible/very large PCR interval
-            // is not used to invent a replacement clock. Resync at the next PCR.
-            if (blockNanoseconds == 0 || blockNanoseconds > 500ULL * 1000ULL * 1000ULL) {
-                ++invalidBlocks;
-                for (std::size_t i = 0; i < nextPcrIndex; ++i) {
-                    bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-                    realPackets.pop_front();
-                }
-                nextPacketDeadline = monotonicNanoseconds();
-                pacingRemainder = 0;
-                queueSpace.notify_all();
-                std::cerr << "UDP VBR PCR block resync: delta_ns=" << blockNanoseconds
-                          << " packets=" << nextPcrIndex
-                          << " invalid_blocks=" << invalidBlocks << std::endl;
-                continue;
-            }
-
-            const std::size_t packetsInBlock = nextPcrIndex;
-            if (packetsInBlock == 0) {
-                continue;
-            }
-
-            const uint64_t intervalNanoseconds = blockNanoseconds / packetsInBlock;
-            const uint64_t intervalRemainder = blockNanoseconds % packetsInBlock;
-            pacingRemainder = 0;
-            const uint64_t measuredBitrate = multiplyDivide(
-                packetsInBlock * kTsPacketSize * 8ULL, 1000000000ULL, blockNanoseconds);
-            if (measuredBitrate > 0) {
-                estimatedInputBitrate = measuredBitrate;
-                inputBitrateEstimate.store(measuredBitrate, std::memory_order_relaxed);
-                realPaceBitrate.store(measuredBitrate, std::memory_order_relaxed);
-                transportBitrate.store(measuredBitrate, std::memory_order_relaxed);
-            }
-
-            ++blockCount;
-            for (std::size_t i = 0; i < packetsInBlock &&
-                 !stopping.load(std::memory_order_relaxed); ++i) {
-                sleepUntilMonotonic(nextPacketDeadline);
-
-                TimedTsPacket packet = std::move(realPackets.front());
-                realPackets.pop_front();
-                bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-
-                // Source PCR, PTS and DTS are copied byte-for-byte.
-                observePcrPidContinuity(packet);
-                std::copy(packet.bytes.begin(), packet.bytes.end(),
-                          datagram.begin() + datagramPackets * kTsPacketSize);
-                ++datagramPackets;
-                totalRealPackets.fetch_add(1, std::memory_order_relaxed);
-
-                if (datagramPackets == kTsPacketsPerDatagram) {
-                    normalizeFinalDatagramContinuity(datagram.data());
-                    verifyFinalDatagramContinuity(datagram.data());
-                    sendDatagram(datagram.data(), datagram.size());
-                    totalDatagrams.fetch_add(1, std::memory_order_relaxed);
-                    datagramPackets = 0;
-                    queueSpace.notify_all();
-                }
-
-                nextPacketDeadline += intervalNanoseconds;
-                pacingRemainder += intervalRemainder;
-                if (pacingRemainder >= packetsInBlock) {
-                    nextPacketDeadline += pacingRemainder / packetsInBlock;
-                    pacingRemainder %= packetsInBlock;
-                }
-            }
-
-            const uint64_t now = monotonicNanoseconds();
-            const uint64_t bufferNow = bufferedBytes.load(std::memory_order_relaxed);
-            const uint64_t bufferMs = measuredBitrate > 0
-                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, measuredBitrate) : 0;
-            reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
-            maybeLogStats(now);
-
-            // Do not chase a large scheduling delay by changing PCR/media time.
-            // Re-anchor only the physical deadline; the next block duration still
-            // comes exclusively from the next pair of source PCR values.
-            if (now > nextPacketDeadline + 100ULL * 1000ULL * 1000ULL) {
-                schedulerTimelineShiftNanoseconds.fetch_add(
-                    now - nextPacketDeadline, std::memory_order_relaxed);
-                ++schedulerResets;
-                nextPacketDeadline = now;
-                pacingRemainder = 0;
-            }
-        }
-
-        // Normally datagrams are 7 TS packets. Flush a short final datagram only
-        // during shutdown so no payload is silently lost.
-        if (datagramPackets > 0) {
-            const std::size_t bytes = datagramPackets * kTsPacketSize;
-            preSendCcTrace.inspect(datagram.data(), bytes);
-            sendDatagram(datagram.data(), bytes);
         }
     }
 
@@ -1506,12 +1319,10 @@ private:
                   << " timing=reservoir_rate_controller_periodic_pcr"
                   << " pcr_clock="
                   << (mode == UdpShapingMode::Vbr
-                          ? "astra_source_pcr_block"
+                          ? "source_passthrough"
                           : "continuous_transport_media")
                   << " pcr_source_passthrough="
                   << (mode == UdpShapingMode::Vbr ? 1 : 0)
-                  << " vbr_pacing="
-                  << (mode == UdpShapingMode::Vbr ? "astra_pcr_block" : "cbr_slot_clock")
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " startup_pcr_samples="

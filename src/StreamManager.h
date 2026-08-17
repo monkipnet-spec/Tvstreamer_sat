@@ -61,12 +61,6 @@ struct SharedDvbFrontendState {
     bool fullTsCapture = false;
     std::mutex dispatchMutex;
     std::map<std::string, std::shared_ptr<void>> dispatchConsumers;
-    bool directDvb = false;
-    int directFrontendFd = -1;
-    int directDemuxFd = -1;
-    int directDvrFd = -1;
-    std::atomic<bool> directStopping{false};
-    std::thread directThread;
 };
 
 struct DvbServiceRelayState {
@@ -101,7 +95,6 @@ struct StreamState {
     std::string sharedDvbServicePids;
     bool sharedDvbPreferFullTsCapture = false;
     bool dvbTsRemapApplied = false;
-    bool directDvbPassthrough = false;
     std::unique_ptr<DvbServiceRelayState> dvbServiceRelay;
     // Runtime PAT result used only when input_service_id=0 (Auto).
     // The configured value remains 0; effective selection is kept in state->config.

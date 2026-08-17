@@ -36,11 +36,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/ioctl.h>
-#include <linux/dvb/frontend.h>
-#include <linux/dvb/dmx.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
 #include <gst/app/gstappsink.h>
@@ -224,150 +219,11 @@ struct DvbSingleProgramPsiContext {
     bool remapContinuityAnnounced = false;
 };
 
-
-class DirectDvbUdpSender {
-public:
-    explicit DirectDvbUdpSender(const StreamConfig& config, StreamState* state, std::string& error)
-        : state_(state) {
-        addTarget(config.outputHost, config.outputPort, config.interfaceAddress, error);
-        if (!error.empty()) return;
-        for (const auto& output : config.additionalOutputs) {
-            if (output.outputType.rfind("udp", 0) != 0) continue;
-            addTarget(output.outputHost, output.outputPort, config.interfaceAddress, error);
-            if (!error.empty()) return;
-        }
-        ready_ = !targets_.empty();
-        if (!ready_ && error.empty()) error = "direct DVB output has no UDP target";
-    }
-
-    ~DirectDvbUdpSender() {
-        flush();
-        for (auto& target : targets_) if (target.fd >= 0) ::close(target.fd);
-    }
-
-    bool ready() const { return ready_; }
-
-    void push(const uint8_t* data, size_t size) {
-        if (!ready_ || !data) return;
-        size -= size % kTsPacketSize;
-        size_t offset = 0;
-
-        // Complete an existing partial datagram first.
-        while (pendingPackets_ > 0 && pendingPackets_ < kTsPacketsPerUdpBuffer &&
-               offset + kTsPacketSize <= size) {
-            std::memcpy(pending_.data() + pendingPackets_ * kTsPacketSize,
-                        data + offset, kTsPacketSize);
-            ++pendingPackets_;
-            offset += kTsPacketSize;
-        }
-        if (pendingPackets_ == kTsPacketsPerUdpBuffer) flush();
-
-        // v172 zero-copy UDP fast path: CA already owns a contiguous SPTS
-        // buffer, so full 7x188 datagrams can be sent directly from it instead
-        // of copying every TS packet into pending_.
-        constexpr size_t datagramBytes = kTsPacketSize * kTsPacketsPerUdpBuffer;
-        while (offset + datagramBytes <= size) {
-            sendDatagram(data + offset, datagramBytes);
-            offset += datagramBytes;
-        }
-
-        while (offset + kTsPacketSize <= size) {
-            std::memcpy(pending_.data() + pendingPackets_ * kTsPacketSize,
-                        data + offset, kTsPacketSize);
-            ++pendingPackets_;
-            offset += kTsPacketSize;
-        }
-    }
-
-    void flush() {
-        if (!ready_ || pendingPackets_ == 0) return;
-        const size_t bytes = pendingPackets_ * kTsPacketSize;
-        sendDatagram(pending_.data(), bytes);
-        pendingPackets_ = 0;
-    }
-
-private:
-    struct Target { int fd = -1; sockaddr_in addr{}; };
-
-    void sendDatagram(const uint8_t* data, size_t bytes) {
-        if (!data || bytes == 0) return;
-        for (auto& target : targets_) {
-            const ssize_t sent = ::sendto(target.fd, data, bytes, MSG_DONTWAIT,
-                reinterpret_cast<const sockaddr*>(&target.addr), sizeof(target.addr));
-            if (sent > 0 && state_) {
-                state_->stableUdpNetworkBytes.fetch_add(static_cast<uint64_t>(sent), std::memory_order_relaxed);
-                state_->stableUdpNetworkTelemetry.store(true, std::memory_order_relaxed);
-            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                const uint64_t n = ++sendErrors_;
-                if (n <= 5 || n % 100 == 0) {
-                    std::cerr << "Direct DVB UDP send failed: stream="
-                              << (state_ ? state_->config.id : std::string("?"))
-                              << " error=" << std::strerror(errno)
-                              << " count=" << n << std::endl;
-                }
-            }
-        }
-        if (state_) state_->outputBytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
-
-    void addTarget(const std::string& host, int port, const std::string& iface, std::string& error) {
-        if (host.empty() || port <= 0 || port > 65535) {
-            error = "invalid direct DVB UDP target";
-            return;
-        }
-        Target target;
-        target.fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        if (target.fd < 0) { error = std::string("UDP socket failed: ") + std::strerror(errno); return; }
-        int sndbuf = 4 * 1024 * 1024;
-        ::setsockopt(target.fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-        target.addr.sin_family = AF_INET;
-        target.addr.sin_port = htons(static_cast<uint16_t>(port));
-        if (::inet_pton(AF_INET, host.c_str(), &target.addr.sin_addr) != 1) {
-            error = "invalid direct DVB UDP host: " + host;
-            ::close(target.fd); target.fd = -1; return;
-        }
-        if (!iface.empty()) {
-            in_addr local{};
-            if (::inet_pton(AF_INET, iface.c_str(), &local) == 1) {
-                const uint32_t dst = ntohl(target.addr.sin_addr.s_addr);
-                if ((dst & 0xF0000000U) == 0xE0000000U) {
-                    ::setsockopt(target.fd, IPPROTO_IP, IP_MULTICAST_IF, &local, sizeof(local));
-                } else {
-                    sockaddr_in bindAddr{};
-                    bindAddr.sin_family = AF_INET;
-                    bindAddr.sin_addr = local;
-                    bindAddr.sin_port = 0;
-                    (void)::bind(target.fd, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr));
-                }
-            }
-        }
-        targets_.push_back(target);
-    }
-
-    StreamState* state_ = nullptr;
-    bool ready_ = false;
-    std::vector<Target> targets_;
-    std::array<uint8_t, kTsPacketSize * kTsPacketsPerUdpBuffer> pending_{};
-    size_t pendingPackets_ = 0;
-    std::atomic<uint64_t> sendErrors_{0};
-};
-
 struct SharedDvbDispatchConsumer {
     std::string streamId;
     std::string frontendKey;
     std::mutex mutex;
-    GstElement* appsrc = nullptr; // fallback GStreamer service pipeline
-    bool directOutput = false;
-    StreamState* streamState = nullptr;
-    std::unique_ptr<DirectDvbUdpSender> directSender;
-    std::thread worker;
-    std::condition_variable queueReady;
-    std::deque<std::vector<uint8_t>> directQueue;
-    // v172: recycle dispatcher buffers instead of allocating one vector for
-    // every DVR read and every active service.
-    std::deque<std::vector<uint8_t>> directFreeBuffers;
-    size_t directQueuedBytes = 0;
-    bool directStopping = false;
+    GstElement* appsrc = nullptr; // owned by the service pipeline
     DvbSingleProgramPsiContext psi;
     uint64_t inputPackets = 0;
     uint64_t outputPackets = 0;
@@ -2001,265 +1857,6 @@ size_t filterSharedDvbServiceBytes(
     return writeOffset;
 }
 
-
-void dispatchSharedDvbRaw(SharedDvbFrontendState* shared, const uint8_t* data, size_t size) {
-    if (!shared || !data || size < kTsPacketSize) return;
-    std::vector<std::shared_ptr<SharedDvbDispatchConsumer>> consumers;
-    {
-        std::lock_guard<std::mutex> lock(shared->dispatchMutex);
-        consumers.reserve(shared->dispatchConsumers.size());
-        for (auto& entry : shared->dispatchConsumers) {
-            auto consumer = std::static_pointer_cast<SharedDvbDispatchConsumer>(entry.second);
-            if (consumer && consumer->directOutput) consumers.push_back(std::move(consumer));
-        }
-    }
-    if (consumers.empty()) return;
-    if (consumers.size() > 10) consumers.resize(10);
-
-    // v172: build one PID -> service bitmask snapshot per DVR read.  v171 did
-    // packet x service iteration and took consumer->mutex for every 188-byte
-    // packet, so two services already multiplied the full-transponder hot path.
-    // Saved scan PIDs are trusted immediately; PAT/PMT processing can still
-    // self-heal the tables for the next snapshot.
-    std::array<uint16_t, 8192> routeMask{};
-    std::vector<bool> remap(consumers.size(), false);
-    std::vector<uint16_t> pmtPid(consumers.size(), 0x1FFF);
-    for (size_t i = 0; i < consumers.size(); ++i) {
-        auto& consumer = consumers[i];
-        if (!consumer) continue;
-        std::lock_guard<std::mutex> lock(consumer->mutex);
-        const auto& ctx = consumer->psi;
-        remap[i] = ctx.remapEnabled;
-        pmtPid[i] = ctx.pmtPid;
-        const uint16_t bit = static_cast<uint16_t>(1u << i);
-        if (!ctx.filterPids) {
-            for (auto& mask : routeMask) mask = static_cast<uint16_t>(mask | bit);
-        } else {
-            for (size_t pid = 0; pid < ctx.allowedPids.size(); ++pid) {
-                if (ctx.allowedPids[pid]) routeMask[pid] = static_cast<uint16_t>(routeMask[pid] | bit);
-            }
-            if (ctx.pmtPid > 0 && ctx.pmtPid < 0x1FFF) routeMask[ctx.pmtPid] |= bit;
-        }
-    }
-
-    std::vector<std::vector<uint8_t>> batches(consumers.size());
-    for (size_t i = 0; i < consumers.size(); ++i) {
-        auto& consumer = consumers[i];
-        if (!consumer) continue;
-        {
-            std::lock_guard<std::mutex> lock(consumer->mutex);
-            if (!consumer->directFreeBuffers.empty()) {
-                batches[i] = std::move(consumer->directFreeBuffers.front());
-                consumer->directFreeBuffers.pop_front();
-            }
-        }
-        batches[i].clear();
-        if (batches[i].capacity() < 64 * 1024) batches[i].reserve(64 * 1024);
-    }
-
-    size_t packetStart = 0;
-    if (data[0] != 0x47) {
-        bool found = false;
-        for (size_t c = 0; c < std::min<size_t>(kTsPacketSize, size); ++c) {
-            if (data[c] == 0x47 && (c + kTsPacketSize >= size || data[c + kTsPacketSize] == 0x47)) {
-                packetStart = c; found = true; break;
-            }
-        }
-        if (!found) return;
-    }
-
-    std::array<uint8_t, kTsPacketSize> outPacket{};
-    for (size_t off = packetStart; off + kTsPacketSize <= size; off += kTsPacketSize) {
-        const uint8_t* packet = data + off;
-        if (packet[0] != 0x47) continue;
-        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1f) << 8) | packet[2]);
-        if (pid >= routeMask.size()) continue;
-        uint16_t mask = routeMask[pid];
-        while (mask) {
-            const unsigned i = static_cast<unsigned>(__builtin_ctz(mask));
-            mask = static_cast<uint16_t>(mask & (mask - 1));
-            if (i >= consumers.size()) continue;
-            auto& consumer = consumers[i];
-            if (!consumer) continue;
-
-            // PAT/SDT/selected PMT and remap require mutable per-service PSI
-            // state. Ordinary media/ECM packets in remap-OFF mode are already
-            // selected by routeMask and can be copied byte-for-byte with no
-            // mutex or PSI parser at all.
-            const bool needsPsi = pid == 0x0000 || pid == 0x0011 ||
-                (pmtPid[i] > 0 && pmtPid[i] < 0x1FFF && pid == pmtPid[i]);
-            if (!remap[i] && !needsPsi) {
-                auto& batch = batches[i];
-                batch.insert(batch.end(), packet, packet + kTsPacketSize);
-                ++consumer->inputPackets;
-                ++consumer->outputPackets;
-                continue;
-            }
-
-            std::lock_guard<std::mutex> lock(consumer->mutex);
-            const size_t n = filterSharedDvbServiceBytes(packet, kTsPacketSize, *consumer,
-                outPacket.data(), outPacket.size());
-            if (n == kTsPacketSize) {
-                batches[i].insert(batches[i].end(), outPacket.begin(), outPacket.end());
-            }
-        }
-    }
-
-    for (size_t i = 0; i < consumers.size(); ++i) {
-        auto& consumer = consumers[i];
-        auto& batch = batches[i];
-        if (!consumer) continue;
-        if (batch.empty()) {
-            std::lock_guard<std::mutex> lock(consumer->mutex);
-            if (consumer->directFreeBuffers.size() < 4) {
-                batch.clear();
-                consumer->directFreeBuffers.emplace_back(std::move(batch));
-            }
-            continue;
-        }
-        std::unique_lock<std::mutex> lock(consumer->mutex);
-        constexpr size_t kMaxQueue = 4 * 1024 * 1024;
-        if (consumer->directQueuedBytes + batch.size() > kMaxQueue) {
-            ++consumer->pushFailures;
-            if (consumer->directFreeBuffers.size() < 4) {
-                batch.clear();
-                consumer->directFreeBuffers.emplace_back(std::move(batch));
-            }
-            continue;
-        }
-        consumer->directQueuedBytes += batch.size();
-        consumer->directQueue.emplace_back(std::move(batch));
-        lock.unlock();
-        consumer->queueReady.notify_one();
-    }
-}
-
-fe_code_rate_t directFec(const std::string& fec) {
-    if (fec == "1/2") return FEC_1_2; if (fec == "2/3") return FEC_2_3;
-    if (fec == "3/4") return FEC_3_4; if (fec == "4/5") return FEC_4_5;
-    if (fec == "5/6") return FEC_5_6; if (fec == "6/7") return FEC_6_7;
-    if (fec == "7/8") return FEC_7_8; if (fec == "8/9") return FEC_8_9;
-#ifdef FEC_3_5
-    if (fec == "3/5") return FEC_3_5;
-#endif
-#ifdef FEC_9_10
-    if (fec == "9/10") return FEC_9_10;
-#endif
-    return FEC_AUTO;
-}
-
-fe_modulation_t directModulation(const std::string& modulation) {
-    if (modulation == "qpsk") return QPSK;
-#ifdef PSK_8
-    if (modulation == "8psk" || modulation == "8-psk") return PSK_8;
-#endif
-    return QAM_AUTO;
-}
-
-bool openDirectDvbFrontend(const DvbSatelliteParams& params, SharedDvbFrontendState& shared, std::string& error) {
-    const std::string base = "/dev/dvb/adapter" + std::to_string(params.adapter) + "/";
-    const std::string fePath = base + "frontend" + std::to_string(params.frontend);
-    const std::string dmxPath = base + "demux" + std::to_string(params.frontend);
-    const std::string dvrPath = base + "dvr" + std::to_string(params.frontend);
-    int fe = ::open(fePath.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fe < 0) { error = "direct DVB frontend open failed: " + std::string(std::strerror(errno)); return false; }
-
-    const bool horizontal = params.polarity == "H";
-    const bool highBand = params.lnbLof2KHz > 0 && params.lnbSlofKHz > 0 && params.frequencyKHz >= params.lnbSlofKHz;
-    const uint32_t lof = highBand ? params.lnbLof2KHz : params.lnbLof1KHz;
-    const uint32_t ifKHz = params.frequencyKHz > lof ? params.frequencyKHz - lof : lof - params.frequencyKHz;
-    fe_sec_voltage_t voltage = horizontal ? SEC_VOLTAGE_18 : SEC_VOLTAGE_13;
-    (void)::ioctl(fe, FE_SET_TONE, SEC_TONE_OFF);
-    (void)::ioctl(fe, FE_SET_VOLTAGE, voltage);
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-    if (params.diseqcSource >= 0) {
-        dvb_diseqc_master_cmd cmd{};
-        cmd.msg_len = 4; cmd.msg[0] = 0xE0; cmd.msg[1] = 0x10; cmd.msg[2] = 0x38;
-        cmd.msg[3] = static_cast<uint8_t>(0xF0 | ((params.diseqcSource & 0x03) << 2) |
-            (horizontal ? 0x02 : 0x00) | (highBand ? 0x01 : 0x00));
-        (void)::ioctl(fe, FE_DISEQC_SEND_MASTER_CMD, &cmd);
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    (void)::ioctl(fe, FE_SET_TONE, highBand ? SEC_TONE_ON : SEC_TONE_OFF);
-
-    // Linux DVB API uses kHz for DTV_FREQUENCY on satellite delivery
-    // systems. params.frequencyKHz and the calculated LNB IF are already in
-    // kHz, so multiplying by 1000 here (v171-v173) tuned the direct frontend
-    // with the wrong units and could yield FE status without a usable DVR TS.
-    dtv_property props[12]{};
-    int n = 0;
-    props[n++].cmd = DTV_CLEAR;
-    props[n].cmd = DTV_DELIVERY_SYSTEM; props[n++].u.data = params.deliverySystem == "dvb-s2" ? SYS_DVBS2 : SYS_DVBS;
-    props[n].cmd = DTV_FREQUENCY; props[n++].u.data = ifKHz;
-    props[n].cmd = DTV_SYMBOL_RATE; props[n++].u.data = params.symbolRateK * 1000U;
-    props[n].cmd = DTV_INNER_FEC; props[n++].u.data = directFec(params.fec);
-    props[n].cmd = DTV_INVERSION; props[n++].u.data = INVERSION_AUTO;
-    props[n].cmd = DTV_MODULATION; props[n++].u.data = directModulation(params.modulation);
-#ifdef DTV_PILOT
-    if (params.deliverySystem == "dvb-s2") { props[n].cmd = DTV_PILOT; props[n++].u.data = PILOT_AUTO; }
-#endif
-#ifdef DTV_ROLLOFF
-    if (params.deliverySystem == "dvb-s2") { props[n].cmd = DTV_ROLLOFF; props[n++].u.data = ROLLOFF_AUTO; }
-#endif
-#ifdef DTV_STREAM_ID
-    if (params.streamId >= 0) { props[n].cmd = DTV_STREAM_ID; props[n++].u.data = static_cast<uint32_t>(params.streamId); }
-#endif
-    props[n++].cmd = DTV_TUNE;
-
-    std::cerr << "Direct DVB tune request: adapter=" << params.adapter
-              << " frontend=" << params.frontend
-              << " rf_khz=" << params.frequencyKHz
-              << " lof_khz=" << lof
-              << " if_khz=" << ifKHz
-              << " dtv_frequency_khz=" << ifKHz
-              << " symbol_rate=" << (params.symbolRateK * 1000U)
-              << " delsys=" << params.deliverySystem
-              << " units=satellite-kHz" << std::endl;
-    dtv_properties command{}; command.num = n; command.props = props;
-    if (::ioctl(fe, FE_SET_PROPERTY, &command) < 0) {
-        error = "direct DVB FE_SET_PROPERTY failed: " + std::string(std::strerror(errno)); ::close(fe); return false;
-    }
-    bool locked = false;
-    for (int i = 0; i < 100; ++i) {
-        fe_status_t status{};
-        if (::ioctl(fe, FE_READ_STATUS, &status) == 0 && (status & FE_HAS_LOCK)) { locked = true; break; }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    if (!locked) { error = "direct DVB frontend lock timeout"; ::close(fe); return false; }
-
-    int dmx = ::open(dmxPath.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (dmx < 0) { error = "direct DVB demux open failed: " + std::string(std::strerror(errno)); ::close(fe); return false; }
-    int demuxBuffer = 8 * 1024 * 1024;
-    (void)::ioctl(dmx, DMX_SET_BUFFER_SIZE, demuxBuffer);
-    dmx_pes_filter_params pes{};
-    pes.pid = 0x2000; pes.input = DMX_IN_FRONTEND; pes.output = DMX_OUT_TS_TAP;
-    pes.pes_type = DMX_PES_OTHER; pes.flags = DMX_IMMEDIATE_START;
-    if (::ioctl(dmx, DMX_SET_PES_FILTER, &pes) < 0) {
-        error = "direct DVB full-MPTS filter failed: " + std::string(std::strerror(errno));
-        ::close(dmx); ::close(fe); return false;
-    }
-    int dvr = ::open(dvrPath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (dvr < 0) { error = "direct DVB DVR open failed: " + std::string(std::strerror(errno)); ::close(dmx); ::close(fe); return false; }
-    // Some DVB drivers attach the TS tap buffer sizing to the DVR node rather
-    // than to the demux filter fd. Apply the same size on both; unsupported
-    // drivers simply return an error which is safe to ignore here.
-    (void)::ioctl(dvr, DMX_SET_BUFFER_SIZE, demuxBuffer);
-    shared.directDvb = true; shared.directFrontendFd = fe; shared.directDemuxFd = dmx; shared.directDvrFd = dvr;
-    shared.directStopping.store(false);
-    return true;
-}
-
-void closeDirectDvbFrontend(SharedDvbFrontendState& shared) {
-    shared.directStopping.store(true);
-    if (shared.directThread.joinable()) shared.directThread.join();
-    if (shared.directDvrFd >= 0) ::close(shared.directDvrFd);
-    if (shared.directDemuxFd >= 0) ::close(shared.directDemuxFd);
-    if (shared.directFrontendFd >= 0) ::close(shared.directFrontendFd);
-    shared.directDvrFd = shared.directDemuxFd = shared.directFrontendFd = -1;
-    shared.directDvb = false;
-}
-
 GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
     auto* shared = static_cast<SharedDvbFrontendState*>(userData);
     if (!shared || !sink) return GST_FLOW_ERROR;
@@ -2281,90 +1878,8 @@ GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
         }
     }
 
-    // v171: scan the MPTS only once. Direct DVB consumers receive only TS
-    // packets that survive their service PID/PSI filter; no GstBuffer/appsrc
-    // service pipeline is created for those streams.
-    std::vector<std::vector<uint8_t>> directBatches(consumers.size());
-    for (size_t i = 0; i < consumers.size(); ++i) {
-        if (consumers[i] && consumers[i]->directOutput) directBatches[i].reserve(64 * 1024);
-    }
-
-    size_t packetStart = 0;
-    bool aligned = map.size >= kTsPacketSize && map.data[0] == 0x47;
-    if (aligned && map.size >= kTsPacketSize * 2 && map.data[kTsPacketSize] != 0x47) aligned = false;
-    if (!aligned) {
-        bool found = false;
-        const size_t maxSyncOffset = std::min<size_t>(kTsPacketSize, map.size);
-        for (size_t candidate = 0; candidate < maxSyncOffset; ++candidate) {
-            if (map.data[candidate] != 0x47) continue;
-            if (candidate + kTsPacketSize >= map.size || map.data[candidate + kTsPacketSize] == 0x47) {
-                packetStart = candidate; found = true; break;
-            }
-        }
-        if (!found) packetStart = map.size;
-    }
-
-    std::array<uint8_t, kTsPacketSize> selectedPacket{};
-    for (size_t offset = packetStart; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
-        const uint8_t* packet = map.data + offset;
-        if (packet[0] != 0x47) continue;
-        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
-
-        for (size_t i = 0; i < consumers.size(); ++i) {
-            const auto& consumer = consumers[i];
-            if (!consumer || !consumer->directOutput) continue;
-
-            bool candidate = true;
-            {
-                std::lock_guard<std::mutex> lock(consumer->mutex);
-                const auto& ctx = consumer->psi;
-                const bool remapPending = ctx.remapEnabled &&
-                    (ctx.requestedVideoPid || ctx.requestedAudioPid) && !ctx.remapPmtRewritten;
-                const bool filterReady = !ctx.filterPids || (ctx.pidSelfHealAnnounced && !remapPending);
-                if (filterReady && pid < ctx.allowedPids.size() && !ctx.allowedPids[pid]) candidate = false;
-                if (pid == 0x0000 || pid == 0x0011 || (ctx.pmtPid && pid == ctx.pmtPid)) candidate = true;
-                if (candidate) {
-                    const size_t n = filterSharedDvbServiceBytes(
-                        packet, kTsPacketSize, *consumer, selectedPacket.data(), selectedPacket.size());
-                    if (n == kTsPacketSize) {
-                        auto& batch = directBatches[i];
-                        batch.insert(batch.end(), selectedPacket.begin(), selectedPacket.end());
-                    }
-                } else {
-                    ++consumer->droppedPackets;
-                }
-            }
-        }
-    }
-
-    // Queue compact SPTS buffers to independent CA+UDP workers. Keeping CA
-    // outside the shared frontend callback prevents one service from delaying
-    // the MPTS dispatcher or another service.
-    for (size_t i = 0; i < consumers.size(); ++i) {
-        const auto& consumer = consumers[i];
-        auto& batch = directBatches[i];
-        if (!consumer || !consumer->directOutput || batch.empty()) continue;
-        std::unique_lock<std::mutex> lock(consumer->mutex);
-        constexpr size_t kMaxDirectQueueBytes = 4 * 1024 * 1024;
-        if (consumer->directQueuedBytes + batch.size() > kMaxDirectQueueBytes) {
-            ++consumer->pushFailures;
-            if (consumer->pushFailures <= 5 || consumer->pushFailures % 100 == 0) {
-                std::cerr << "Direct DVB queue overflow: stream=" << consumer->streamId
-                          << " queued=" << consumer->directQueuedBytes
-                          << " incoming=" << batch.size()
-                          << " count=" << consumer->pushFailures << std::endl;
-            }
-            continue;
-        }
-        consumer->directQueuedBytes += batch.size();
-        consumer->directQueue.emplace_back(std::move(batch));
-        lock.unlock();
-        consumer->queueReady.notify_one();
-    }
-
-    // Compatibility fallback for non-direct DVB consumers (transcode/non-UDP).
     for (const auto& consumer : consumers) {
-        if (!consumer || consumer->directOutput) continue;
+        if (!consumer) continue;
         GstElement* appsrc = nullptr;
         GstBuffer* out = nullptr;
         size_t selectedSize = 0;
@@ -2373,6 +1888,10 @@ GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
             appsrc = consumer->appsrc;
             if (!appsrc) continue;
             gst_object_ref(appsrc);
+
+            // v170 low-allocation dispatcher: allocate the destination GstBuffer
+            // once and write selected packets directly into it. v169 built a
+            // temporary std::vector and then copied it again with gst_buffer_fill.
             out = gst_buffer_new_allocate(nullptr, map.size, nullptr);
             if (out) {
                 GstMapInfo outMap{};
@@ -2380,17 +1899,30 @@ GstFlowReturn onSharedDvbDispatcherSample(GstAppSink* sink, gpointer userData) {
                     selectedSize = filterSharedDvbServiceBytes(
                         map.data, map.size, *consumer, outMap.data, outMap.size);
                     gst_buffer_unmap(out, &outMap);
-                    if (selectedSize > 0 && selectedSize < map.size) gst_buffer_resize(out, 0, selectedSize);
+                    if (selectedSize > 0 && selectedSize < map.size) {
+                        gst_buffer_resize(out, 0, static_cast<gssize>(selectedSize));
+                    }
                 }
             }
         }
+
         if (out && selectedSize > 0) {
             GST_BUFFER_PTS(out) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DTS(out) = GST_CLOCK_TIME_NONE;
             GST_BUFFER_DURATION(out) = GST_CLOCK_TIME_NONE;
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc), out);
-            if (flow != GST_FLOW_OK && flow != GST_FLOW_FLUSHING) ++consumer->pushFailures;
-        } else if (out) gst_buffer_unref(out);
+            if (flow != GST_FLOW_OK && flow != GST_FLOW_FLUSHING) {
+                std::lock_guard<std::mutex> lock(consumer->mutex);
+                ++consumer->pushFailures;
+                if (consumer->pushFailures <= 5 || consumer->pushFailures % 100 == 0) {
+                    std::cerr << "Shared DVB dispatcher push warning: stream=" << consumer->streamId
+                              << " flow=" << gst_flow_get_name(flow)
+                              << " failures=" << consumer->pushFailures << std::endl;
+                }
+            }
+        } else if (out) {
+            gst_buffer_unref(out);
+        }
         gst_object_unref(appsrc);
     }
 
@@ -2523,16 +2055,6 @@ bool isUdpOutputType(const std::string& type) {
 
 bool usesStableUdpShaper(const StreamConfig& cfg) {
     return isUdpOutputType(outputType(cfg));
-}
-
-bool directDvbPassthroughEligible(const StreamConfig& cfg) {
-    if (!DvbSatellite::isDvbUri(cfg.inputUri) || cfg.testPattern || cfg.transcodeEnabled) return false;
-    if (!cfg.backupInputUri.empty()) return false;
-    if (cfg.outputType != "udp-vbr" && cfg.outputType != "udp") return false;
-    for (const auto& output : cfg.additionalOutputs) {
-        if (output.outputType != "udp-vbr" && output.outputType != "udp") return false;
-    }
-    return cfg.inputServiceId > 0;
 }
 
 bool allOutputsUseStableUdp(const StreamConfig& cfg) {
@@ -3832,92 +3354,6 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     shared->consumerPids = initialConsumers;
     shared->requestedPids = frontendPids;
 
-    if (state->directDvbPassthrough) {
-        if (!openDirectDvbFrontend(params, *shared, error)) return false;
-        shared->fullTsCapture = true;
-        shared->directThread = std::thread([raw = shared.get(), frontendKey]() {
-            std::vector<uint8_t> buffer(1022 * kTsPacketSize);
-            bool firstDataAnnounced = false;
-            uint64_t totalDvrBytes = 0;
-            auto noDataSince = std::chrono::steady_clock::now();
-            auto lastNoDataWarning = noDataSince;
-            while (!raw->directStopping.load(std::memory_order_relaxed)) {
-                pollfd pfd{}; pfd.fd = raw->directDvrFd; pfd.events = POLLIN;
-                const int prc = ::poll(&pfd, 1, 100);
-                if (prc <= 0) {
-                    const auto now = std::chrono::steady_clock::now();
-                    if (!firstDataAnnounced &&
-                        now - noDataSince >= std::chrono::seconds(2) &&
-                        now - lastNoDataWarning >= std::chrono::seconds(2)) {
-                        fe_status_t status{};
-                        const int statusRc = ::ioctl(raw->directFrontendFd, FE_READ_STATUS, &status);
-                        std::cerr << "Direct DVB DVR no data: frontend=" << frontendKey
-                                  << " fe_status=0x" << std::hex
-                                  << (statusRc == 0 ? static_cast<unsigned>(status) : 0U)
-                                  << std::dec
-                                  << " poll_rc=" << prc
-                                  << " dvr_bytes=" << totalDvrBytes << std::endl;
-                        lastNoDataWarning = now;
-                    }
-                    continue;
-                }
-                const ssize_t n = ::read(raw->directDvrFd, buffer.data(), buffer.size());
-                if (n > 0) {
-                    totalDvrBytes += static_cast<uint64_t>(n);
-                    if (!firstDataAnnounced) {
-                        firstDataAnnounced = true;
-                        std::cerr << "Direct DVB DVR first data: frontend=" << frontendKey
-                                  << " bytes=" << n
-                                  << " aligned188=" << ((n % static_cast<ssize_t>(kTsPacketSize)) == 0 ? 1 : 0)
-                                  << " first_sync=" << ((buffer[0] == 0x47) ? 1 : 0)
-                                  << std::endl;
-                    }
-                    dispatchSharedDvbRaw(raw, buffer.data(), static_cast<size_t>(n));
-                } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                    std::cerr << "Direct DVB DVR read failed: frontend=" << frontendKey
-                              << " error=" << std::strerror(errno) << std::endl;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                }
-            }
-        });
-        state->sharedDvbInput = true;
-        state->sharedDvbFrontendKey = frontendKey;
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            auto existing = sharedDvbFrontends.find(frontendKey);
-            if (existing != sharedDvbFrontends.end()) {
-                closeDirectDvbFrontend(*shared);
-                if (existing->second->tuningSignature != tuningSignature) {
-                    state->sharedDvbInput = false;
-                    state->sharedDvbFrontendKey.clear();
-                    error = "DVB frontend became busy with a different transponder";
-                    return false;
-                }
-                auto activeConsumers = existing->second->consumerPids;
-                activeConsumers[consumerId] = servicePids;
-                size_t activeFilterCount = 0;
-                if (!applySharedDvbPids(*existing->second, activeConsumers, activeFilterCount, error, false, true)) {
-                    state->sharedDvbInput = false;
-                    state->sharedDvbFrontendKey.clear();
-                    return false;
-                }
-                ++existing->second->consumers;
-                return true;
-            }
-            sharedDvbFrontends[frontendKey] = std::move(shared);
-        }
-        std::cerr << "Shared DVB frontend started: " << frontendKey
-                  << " frequency_khz=" << params.frequencyKHz
-                  << " symbol_rate=" << params.symbolRateK
-                  << " polarity=" << params.polarity
-                  << " pid_mode=full-mpts-direct-linux-dvb"
-                  << " pids=8192 dispatcher=single-pass-cpp"
-                  << " routing=pid-bitmask-lockless-media"
-                  << " buffer_pool=reuse"
-                  << " gstreamer=off" << std::endl;
-        return true;
-    }
-
     GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
     GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
     GstElement* queue = gst_element_factory_make("queue", "shared_dvb_queue");
@@ -4184,17 +3620,13 @@ void StreamManager::releaseSharedDvbFrontend(StreamState* state) {
     }
     if (released) {
         const auto releaseStarted = std::chrono::steady_clock::now();
-        if (released->directDvb) {
-            closeDirectDvbFrontend(*released);
-        } else {
-            if (released->pipeline) {
-                gst_element_set_state(released->pipeline, GST_STATE_NULL);
-                gst_element_get_state(
-                    released->pipeline, nullptr, nullptr, kFastDvbReleaseWait);
-            }
-            if (released->bus) gst_object_unref(released->bus);
-            if (released->pipeline) gst_object_unref(released->pipeline);
+        if (released->pipeline) {
+            gst_element_set_state(released->pipeline, GST_STATE_NULL);
+            gst_element_get_state(
+                released->pipeline, nullptr, nullptr, kFastDvbReleaseWait);
         }
+        if (released->bus) gst_object_unref(released->bus);
+        if (released->pipeline) gst_object_unref(released->pipeline);
         const auto releaseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - releaseStarted).count();
         std::cerr << "Shared DVB frontend stopped: " << key
@@ -4241,48 +3673,6 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
     consumer->psi.requestedAudioPid = dvbPacketPidRemap
         ? static_cast<uint16_t>(state->config.audioPid & 0x1FFFU) : 0;
     configureServicePidFilter(consumer->psi, state->sharedDvbServicePids);
-    consumer->streamState = state;
-    consumer->directOutput = state->directDvbPassthrough;
-    if (consumer->directOutput) {
-        std::string senderError;
-        consumer->directSender = std::make_unique<DirectDvbUdpSender>(state->config, state, senderError);
-        if (!consumer->directSender || !consumer->directSender->ready()) {
-            error = senderError.empty() ? "failed to create direct DVB UDP sender" : senderError;
-            return false;
-        }
-        consumer->worker = std::thread([consumer]() {
-            for (;;) {
-                std::vector<uint8_t> chunk;
-                {
-                    std::unique_lock<std::mutex> lock(consumer->mutex);
-                    consumer->queueReady.wait(lock, [&] {
-                        return consumer->directStopping || !consumer->directQueue.empty();
-                    });
-                    if (consumer->directStopping && consumer->directQueue.empty()) break;
-                    chunk = std::move(consumer->directQueue.front());
-                    consumer->directQueue.pop_front();
-                    consumer->directQueuedBytes -= chunk.size();
-                }
-                if (chunk.empty()) continue;
-                if (consumer->streamState) {
-                    consumer->streamState->inputBytes.fetch_add(chunk.size(), std::memory_order_relaxed);
-                    consumer->streamState->lastInputActivity = std::chrono::steady_clock::now();
-                }
-                (void)CaBackendManager::instance().processTransport(
-                    consumer->streamId, chunk.data(), chunk.size());
-                if (consumer->directSender) consumer->directSender->push(chunk.data(), chunk.size());
-                // Recycle the large service buffer after CA/output.
-                chunk.clear();
-                {
-                    std::lock_guard<std::mutex> recycleLock(consumer->mutex);
-                    if (consumer->directFreeBuffers.size() < 4) {
-                        consumer->directFreeBuffers.emplace_back(std::move(chunk));
-                    }
-                }
-            }
-            if (consumer->directSender) consumer->directSender->flush();
-        });
-    }
 
     {
         std::lock_guard<std::mutex> lock(managerMutex);
@@ -4297,9 +3687,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
 
     relay->dispatcherConsumer = consumer;
     state->dvbServiceRelay = std::move(relay);
-    state->sharedDvbServiceRelayUri = state->directDvbPassthrough
-        ? ("direct://shared-dvb/" + state->config.id)
-        : ("appsrc://shared-dvb/" + state->config.id);
+    state->sharedDvbServiceRelayUri = "appsrc://shared-dvb/" + state->config.id;
     state->dvbTsRemapApplied = state->config.remapEnabled;
 
     std::cerr << "Shared DVB single-pass dispatcher attached: stream=" << state->config.id
@@ -4308,7 +3696,6 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
               << " service_pids=" << state->sharedDvbServicePids
               << " remap=" << (state->config.remapEnabled ? "on" : "off")
               << " internal_multicast=off"
-              << " direct_cpp_output=" << (state->directDvbPassthrough ? 1 : 0)
               << " source=" << state->sharedDvbServiceRelayUri << std::endl;
     return true;
 }
@@ -4318,15 +3705,6 @@ void StreamManager::stopDvbServiceRelay(StreamState* state) {
     auto relay = std::move(state->dvbServiceRelay);
     auto consumer = std::static_pointer_cast<SharedDvbDispatchConsumer>(relay->dispatcherConsumer);
     if (consumer) {
-        if (consumer->directOutput) {
-            {
-                std::lock_guard<std::mutex> lock(consumer->mutex);
-                consumer->directStopping = true;
-            }
-            consumer->queueReady.notify_all();
-            if (consumer->worker.joinable()) consumer->worker.join();
-            consumer->directSender.reset();
-        }
         GstElement* appsrc = nullptr;
         {
             std::lock_guard<std::mutex> lock(consumer->mutex);
@@ -4394,14 +3772,6 @@ bool StreamManager::prepareSharedDvbInput(StreamState* state, std::string& error
     if (!startDvbServiceRelay(state, error)) {
         releaseSharedDvbFrontend(state);
         return false;
-    }
-
-    if (state->directDvbPassthrough) {
-        std::cerr << "Direct DVB C++ path attached: stream=" << state->config.id
-                  << " SID=" << state->config.inputServiceId
-                  << " gstreamer_service_pipeline=off stable_udp_output=off"
-                  << " transport_timestamps=passthrough" << std::endl;
-        return true;
     }
 
     state->runtimeConfig = state->config;
@@ -4746,7 +4116,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
 
     state->config = effectiveConfig;
     state->runtimeConfig = effectiveConfig;
-    state->directDvbPassthrough = directDvbPassthroughEligible(effectiveConfig);
     state->primaryInputUri = effectiveConfig.inputUri;
     state->activeInputUri = effectiveConfig.testPattern ? kTestPatternUri : effectiveConfig.inputUri;
 
@@ -4757,48 +4126,6 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         std::cerr << "Stream start failed: id=" << streamConfig.id
                   << " stage=shared-dvb-input error=" << sharedDvbError << std::endl;
         return false;
-    }
-
-    if (state->directDvbPassthrough) {
-        state->running = true;
-        state->active = true;
-        state->statusMessage = "running direct DVB C++";
-        state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
-        state->lastInputActivity = std::chrono::steady_clock::now();
-        state->lastPrimaryRetry = state->lastInputActivity;
-        state->lastBitrateSample = state->lastInputActivity;
-
-        bool duplicateStart = false;
-        {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            if (streams.count(streamConfig.id)) {
-                duplicateStart = true;
-            } else {
-                streams[streamConfig.id] = std::move(state);
-                // Direct DVB has no GStreamer bus, but it still needs the
-                // lightweight monitor thread to calculate input/output bitrate
-                // from inputBytes/outputBytes and keep activity timestamps live.
-                streams[streamConfig.id]->busThread =
-                    std::thread(&StreamManager::monitorBus, this, streamConfig.id);
-            }
-        }
-        if (duplicateStart) {
-            if (state) releaseSharedDvbInput(state.get());
-            if (error) *error = "duplicate stream start detected: " + streamConfig.id;
-            return false;
-        }
-        cardReservation.commit();
-        notifyStreamState(
-            streamConfig, "🟢",
-            telegramText(configManager, "Поток запущен", "Stream started"),
-            telegramText(configManager, "Прямой DVB C++ passthrough", "Direct DVB C++ passthrough") +
-                "\nURL: " + streamConfig.inputUri);
-        std::cerr << "Direct DVB passthrough running: stream=" << streamConfig.id
-                  << " SID=" << streamConfig.inputServiceId
-                  << " output=" << streamConfig.outputHost << ':' << streamConfig.outputPort
-                  << " gstreamer_hotpath=off"
-                  << " udp_copy=zero-copy-1316" << std::endl;
-        return true;
     }
 
     state->sourceContext = std::make_unique<RemapContext>();
@@ -7833,38 +7160,6 @@ void StreamManager::monitorBus(const std::string& id) {
 
     StreamState* state = found->second.get();
     GstBus* bus = state->bus;
-
-    // v173: direct DVB C++ passthrough deliberately has no GStreamer pipeline
-    // and therefore no GstBus. Keep a tiny telemetry loop for this path so the
-    // dashboard receives real service input/output bitrate instead of 0.
-    if (state->directDvbPassthrough && !bus) {
-        std::cerr << "Direct DVB telemetry: stream=" << state->config.id
-                  << " bitrate_source=service-bytes monitor=gstreamer-independent" << std::endl;
-        while (state->running.load()) {
-            const auto now = std::chrono::steady_clock::now();
-            const uint64_t currentInputBytes = state->inputBytes.load(std::memory_order_relaxed);
-            if (currentInputBytes != state->lastInputBytesSeen) {
-                state->lastInputBytesSeen = currentInputBytes;
-                state->lastInputActivity = now;
-                state->inputLossNotified = false;
-            }
-
-            updateBitrateEstimates(state);
-
-            if (now - state->lastInputActivity >= kInputFailoverDelay) {
-                state->inputBitrate.store(0, std::memory_order_relaxed);
-                if (!state->inputLossNotified) {
-                    state->inputLossNotified = true;
-                    state->statusMessage = "direct DVB: no service data";
-                }
-            } else {
-                state->statusMessage = "running direct DVB C++";
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        }
-        return;
-    }
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
