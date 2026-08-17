@@ -4716,8 +4716,16 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         bool duplicateStart = false;
         {
             std::lock_guard<std::mutex> lock(managerMutex);
-            if (streams.count(streamConfig.id)) duplicateStart = true;
-            else streams[streamConfig.id] = std::move(state);
+            if (streams.count(streamConfig.id)) {
+                duplicateStart = true;
+            } else {
+                streams[streamConfig.id] = std::move(state);
+                // Direct DVB has no GStreamer bus, but it still needs the
+                // lightweight monitor thread to calculate input/output bitrate
+                // from inputBytes/outputBytes and keep activity timestamps live.
+                streams[streamConfig.id]->busThread =
+                    std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+            }
         }
         if (duplicateStart) {
             if (state) releaseSharedDvbInput(state.get());
@@ -7770,6 +7778,38 @@ void StreamManager::monitorBus(const std::string& id) {
 
     StreamState* state = found->second.get();
     GstBus* bus = state->bus;
+
+    // v173: direct DVB C++ passthrough deliberately has no GStreamer pipeline
+    // and therefore no GstBus. Keep a tiny telemetry loop for this path so the
+    // dashboard receives real service input/output bitrate instead of 0.
+    if (state->directDvbPassthrough && !bus) {
+        std::cerr << "Direct DVB telemetry: stream=" << state->config.id
+                  << " bitrate_source=service-bytes monitor=gstreamer-independent" << std::endl;
+        while (state->running.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t currentInputBytes = state->inputBytes.load(std::memory_order_relaxed);
+            if (currentInputBytes != state->lastInputBytesSeen) {
+                state->lastInputBytesSeen = currentInputBytes;
+                state->lastInputActivity = now;
+                state->inputLossNotified = false;
+            }
+
+            updateBitrateEstimates(state);
+
+            if (now - state->lastInputActivity >= kInputFailoverDelay) {
+                state->inputBitrate.store(0, std::memory_order_relaxed);
+                if (!state->inputLossNotified) {
+                    state->inputLossNotified = true;
+                    state->statusMessage = "direct DVB: no service data";
+                }
+            } else {
+                state->statusMessage = "running direct DVB C++";
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+        return;
+    }
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
