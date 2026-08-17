@@ -130,6 +130,57 @@ std::string cleanPathToken(const std::string& value, bool allowDot = false) {
     return cleaned;
 }
 
+std::string hlsPublicName(const StreamConfig& cfg) {
+    const std::string raw = !cfg.name.empty() ? cfg.name : (!cfg.serviceName.empty() ? cfg.serviceName : cfg.id);
+    std::string result;
+    result.reserve(raw.size());
+    bool underscore = false;
+    for (unsigned char ch : raw) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_') {
+            result.push_back(static_cast<char>(ch));
+            underscore = false;
+        } else if (!result.empty() && !underscore) {
+            result.push_back('_');
+            underscore = true;
+        }
+    }
+    while (!result.empty() && result.back() == '_') result.pop_back();
+    return result.empty() ? cleanPathToken(cfg.id) : result;
+}
+
+bool resolveHlsTarget(const std::vector<StreamConfig>& streams, const std::string& target,
+                      std::string& streamId, std::string& fileName) {
+    streamId.clear();
+    fileName.clear();
+    const std::string path = target.substr(0, target.find('?'));
+    const std::string legacyPrefix = "/hls/";
+    if (path.rfind(legacyPrefix, 0) == 0) {
+        const auto slash = path.find('/', legacyPrefix.size());
+        if (slash == std::string::npos) return false;
+        streamId = cleanPathToken(path.substr(legacyPrefix.size(), slash - legacyPrefix.size()));
+        fileName = cleanPathToken(path.substr(slash + 1), true);
+        if (fileName == "playlist.m3u8") fileName = "video.m3u8";
+        return !streamId.empty() && !fileName.empty();
+    }
+    if (path.size() < 3 || path.front() != '/') return false;
+    const auto slash = path.find('/', 1);
+    if (slash == std::string::npos) return false;
+    const std::string publicName = cleanPathToken(path.substr(1, slash - 1));
+    fileName = cleanPathToken(path.substr(slash + 1), true);
+    if (publicName.empty() || fileName.empty()) return false;
+    for (const auto& cfg : streams) {
+        bool hasHls = toLower(cfg.outputType) == "hls";
+        for (const auto& extra : cfg.additionalOutputs) {
+            if (toLower(extra.outputType) == "hls") { hasHls = true; break; }
+        }
+        if (hasHls && hlsPublicName(cfg) == publicName) {
+            streamId = cfg.id;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string cleanFileName(const std::string& value) {
     std::string name;
     for (char ch : value) {
@@ -358,7 +409,8 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtsp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort > 0 ? cfg.outputPort : 8554) + "/" + cfg.id;
     }
     if (type == "hls") {
-        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/hls/" + cfg.id + "/playlist.m3u8";
+        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) +
+            "/" + hlsPublicName(cfg) + "/video.m3u8";
     }
     return "udp://@" + cfg.outputHost + ":" + std::to_string(cfg.outputPort);
 }
@@ -447,7 +499,7 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (handleHttpStream(socket, target)) {
               return;
             }
-            } else if (target.rfind("/hls/", 0) == 0) {
+            } else if ([&] { std::string sid, file; return resolveHlsTarget(configManager.config.streams, target, sid, file); }()) {
                 if (!isStreamClientAllowed(socket, target)) {
                     res.result(http::status::forbidden);
                     res.set(http::field::content_type, "text/plain");
@@ -567,9 +619,11 @@ void HttpServer::handleSession(tcp::socket socket) {
 }
 
 bool HttpServer::requiresAuthentication(const std::string& target) const {
+    std::string hlsId, hlsFile;
+    const bool hlsTarget = resolveHlsTarget(configManager.config.streams, target, hlsId, hlsFile);
     return target != "/health" &&
            target.rfind("/stream/", 0) != 0 &&
-           target.rfind("/hls/", 0) != 0;
+           !hlsTarget;
 }
 
 bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const {
@@ -623,7 +677,11 @@ bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::str
   if (ec) {
     return false;
   }
-  const std::string streamId = extractStreamIdFromTarget(target);
+  std::string streamId = extractStreamIdFromTarget(target);
+  if (streamId.empty()) {
+    std::string fileName;
+    resolveHlsTarget(configManager.config.streams, target, streamId, fileName);
+  }
   return isClientAllowedForStream(streamId, clientIp);
 }
 
@@ -841,6 +899,14 @@ std::string HttpServer::currentState() {
         interfaces.append(item);
     }
     root["interfaces"] = interfaces;
+    Json::Value inputInterfaces(Json::arrayValue);
+    for (const auto& iface : enumerateNetworkInterfaces(true)) {
+        Json::Value item;
+        item["name"] = iface.name;
+        item["address"] = iface.address;
+        inputInterfaces.append(item);
+    }
+    root["input_interfaces"] = inputInterfaces;
     root["stream_count"] = Json::UInt(configManager.config.streams.size());
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["ca_manager"] = CardManager::instance().snapshot();
@@ -1287,16 +1353,10 @@ bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target
 }
 
 bool HttpServer::serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res) {
-    const std::string prefix = "/hls/";
-    const auto slash = target.find('/', prefix.size());
-    if (slash == std::string::npos) {
-        return false;
-    }
-
-    const std::string id = cleanPathToken(target.substr(prefix.size(), slash - prefix.size()));
-    const std::string rawFileName = target.substr(slash + 1);
-    const std::string fileName = cleanPathToken(rawFileName, true);
-    if (id.empty() || fileName.empty() || fileName != rawFileName || fileName.find("..") != std::string::npos) {
+    std::string id;
+    std::string fileName;
+    if (!resolveHlsTarget(configManager.config.streams, target, id, fileName) ||
+        fileName.find("..") != std::string::npos) {
         return false;
     }
 
@@ -2313,7 +2373,11 @@ function fetchState() {
       localStorage.setItem('tvstreammersat5-language', language);
       data.language = language;
       const cachedInterfaces = Array.isArray(state.interfaces) ? state.interfaces : [];
+      const cachedInputInterfaces = Array.isArray(state.input_interfaces) ? state.input_interfaces : [];
       if (!Array.isArray(data.interfaces) || !data.interfaces.length) data.interfaces = cachedInterfaces;
+      if (!Array.isArray(data.input_interfaces) || !data.input_interfaces.length) {
+        data.input_interfaces = cachedInputInterfaces.length ? cachedInputInterfaces : data.interfaces;
+      }
       state = data;
       applyLanguage();
       try {
@@ -2905,7 +2969,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 52'} / ${state.program_version||'v181'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 54'} / ${state.program_version||'v183'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -3518,7 +3582,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', conditional_access_client:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', hls_access_key_mode:'none', hls_access_key_name:'Authorization', hls_access_key_value:'', hls_user_agent:'Mozilla/5.0 TVStreammerSAT5', conditional_access_client:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, input_service_id:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -3715,10 +3779,11 @@ function uploadBackupReplacementFile(streamId, input) {
 function openStreamForm(stream) {
   const renderStreamForm = () => {
     const ifaceOptions = state.interfaces || [];
+    const inputIfaceOptions = (state.input_interfaces && state.input_interfaces.length) ? state.input_interfaces : ifaceOptions;
     const outputOptions = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===stream.interface_address?'selected':''}>${i.name} (${i.address})</option>`).join('');
     const hasInputInterface = Object.prototype.hasOwnProperty.call(stream, 'input_interface_address');
     const selectedInputInterface = hasInputInterface ? (stream.input_interface_address || '') : (stream.interface_address || '');
-    const inputOptions = ifaceOptions.map(i=>`<option value="${i.address}" ${i.address===selectedInputInterface?'selected':''}>${i.name} (${i.address})</option>`).join('');
+    const inputOptions = inputIfaceOptions.map(i=>`<option value="${i.address}" ${i.address===selectedInputInterface?'selected':''}>${i.name} (${i.address})</option>`).join('');
     const outputs = outputConfigsForStream(stream);
     const outputType = normalizedOutputType(outputs[0] || stream);
     const links = Array.isArray(stream.vlc_links) ? stream.vlc_links : [];
@@ -3734,6 +3799,7 @@ function openStreamForm(stream) {
       <div class="form-grid">
         <div class="form-row full"><label>Имя плитки</label><input class="compact" id="streamName" value="${stream.name||''}" placeholder="Belarus 5" /></div>
         <div class="form-row full"><div class="input-main-row"><div class="form-row"><label>Входной URL (Основной)</label><input id="streamInput" value="${stream.input_uri||''}" placeholder="rtsp://camera/live, udp://@:9087, udp://239.1.1.1:1234 или https://host/live.m3u8" /></div><div class="form-row"><label>Интерфейс входа</label><select id="streamInputInterface"><option value="">Auto / все интерфейсы</option>${inputOptions}</select></div><div class="form-row"><label>Режим входа</label><select id="streamInputMode"><option value="auto" ${(!stream.input_mode || stream.input_mode==='auto')?'selected':''}>Auto</option><option value="hls" ${stream.input_mode==='hls'?'selected':''}>HLS</option><option value="caller" ${stream.input_mode==='caller'?'selected':''}>SRT Caller</option><option value="listener" ${stream.input_mode==='listener'?'selected':''}>SRT Listener</option></select></div></div></div>
+        <div class="form-row full"><label>HLS доступ</label><div class="row-inline compact-row"><select id="streamHlsAccessKeyMode"><option value="none" ${(!stream.hls_access_key_mode||stream.hls_access_key_mode==='none')?'selected':''}>Без ключа</option><option value="header" ${stream.hls_access_key_mode==='header'?'selected':''}>HTTP Header</option><option value="query" ${stream.hls_access_key_mode==='query'?'selected':''}>Query parameter</option></select><input id="streamHlsAccessKeyName" value="${stream.hls_access_key_name||'Authorization'}" placeholder="Authorization или token" /><input id="streamHlsAccessKeyValue" value="${stream.hls_access_key_value||''}" autocomplete="off" placeholder="Bearer TOKEN / значение ключа" /></div><div class="row-inline compact-row" style="margin-top:8px"><input id="streamHlsUserAgent" value="${stream.hls_user_agent||'Mozilla/5.0 TVStreammerSAT5'}" placeholder="User-Agent" /></div><small>Ключ индивидуален для этого канала и применяется к manifest, variant playlist, сегментам и EXT-X-KEY. Для Authorization указывай полное значение, например Bearer xxxxx.</small></div>
         <div class="form-row full" id="streamCamRow" style="display:${String(stream.input_uri||'').startsWith('dvb://')?'': 'none'}"><label>CAM client (scrambled DVB)</label><select id="streamConditionalAccessClient">${camOptions}</select><small>Select a CAM/Newcamd client for encrypted DVB services. FTA streams do not use this setting.</small></div>
         <div class="form-row full"><label>Резерв / файл замены</label><div class="backup-source"><select id="streamBackupInputType" onchange="updateBackupInputMode()"><option value="url" ${(!stream.backup_input_type || stream.backup_input_type==='url')?'selected':''}>URL резерва</option><option value="file" ${stream.backup_input_type==='file'?'selected':''}>Файл замены</option></select><input id="streamBackupInput" value="${stream.backup_input_uri||''}" placeholder="http://192.168.1.2/..." /><div class="backup-library" id="streamBackupLibrary"><button class="backup-library-button" id="streamBackupLibraryButton" type="button" onclick="toggleBackupFileLibrary()">Выбрать ранее загруженный файл</button><div class="backup-library-menu" id="streamBackupLibraryMenu"></div></div><div class="backup-file-row" id="streamBackupFileRow"><input id="streamBackupFilePicker" type="file" accept="video/*,.ts,.mts,.m2ts,.mp4,.mov,.m4v" onchange="uploadBackupReplacementFile('${stream.id}', this)" /><span id="streamBackupUploadStatus"></span></div></div></div>
         <div class="form-row full" id="streamBackupFileLoopRow"><label>Зациклить файл замены</label><div class="checkbox-inline"><input id="streamBackupFileLoop" type="checkbox" ${stream.backup_file_loop ? 'checked' : ''} /><span>Повторять до появления основного потока</span></div></div>
@@ -3945,6 +4011,10 @@ function saveStream(id) {
     interface_address: document.getElementById('streamInterface').value,
     input_interface_address: document.getElementById('streamInputInterface').value,
     input_mode: document.getElementById('streamInputMode').value,
+    hls_access_key_mode: document.getElementById('streamHlsAccessKeyMode').value,
+    hls_access_key_name: document.getElementById('streamHlsAccessKeyName').value,
+    hls_access_key_value: document.getElementById('streamHlsAccessKeyValue').value,
+    hls_user_agent: document.getElementById('streamHlsUserAgent').value,
     test_pattern: document.getElementById('streamTestPattern').checked,
     auto_start: document.getElementById('streamAutoStart').checked,
     remap_enabled: document.getElementById('streamRemapEnabled').checked,

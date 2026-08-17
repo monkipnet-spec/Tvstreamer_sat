@@ -31,6 +31,12 @@ struct StreamConfig {
     std::string inputInterfaceAddress;
     bool inputInterfaceAddressConfigured = false;
     std::string inputMode = "auto";
+    // Per-stream HTTP access credentials for HLS manifests, segments and EXT-X-KEY URIs.
+    // mode: none | header | query. The value is stored per stream and never shared.
+    std::string hlsAccessKeyMode = "none";
+    std::string hlsAccessKeyName = "Authorization";
+    std::string hlsAccessKeyValue;
+    std::string hlsUserAgent = "Mozilla/5.0 TVStreammerSAT5";
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;

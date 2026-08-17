@@ -51,6 +51,14 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");
     config.inputInterfaceAddress = root.get("input_interface_address", "").asString();
     config.inputMode = root.get("input_mode", "auto").asString();
+    config.hlsAccessKeyMode = root.get("hls_access_key_mode", "none").asString();
+    if (config.hlsAccessKeyMode != "header" && config.hlsAccessKeyMode != "query") {
+        config.hlsAccessKeyMode = "none";
+    }
+    config.hlsAccessKeyName = root.get("hls_access_key_name",
+        config.hlsAccessKeyMode == "query" ? "token" : "Authorization").asString();
+    config.hlsAccessKeyValue = root.get("hls_access_key_value", "").asString();
+    config.hlsUserAgent = root.get("hls_user_agent", "Mozilla/5.0 TVStreammerSAT5").asString();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -112,6 +120,10 @@ Json::Value StreamConfig::toJson() const {
         root["input_interface_address"] = inputInterfaceAddress;
     }
     root["input_mode"] = inputMode;
+    root["hls_access_key_mode"] = hlsAccessKeyMode;
+    root["hls_access_key_name"] = hlsAccessKeyName;
+    root["hls_access_key_value"] = hlsAccessKeyValue;
+    root["hls_user_agent"] = hlsUserAgent;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;

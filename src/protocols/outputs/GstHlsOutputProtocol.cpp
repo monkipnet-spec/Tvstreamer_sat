@@ -83,14 +83,14 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     const std::string dir = prepareHlsDirectory(cfg);
     args.insert(args.end(), {
         "hlssink",
-        "playlist-location=" + dir + "/playlist.m3u8",
+        "playlist-location=" + dir + "/video.m3u8",
         "location=" + dir + "/segment%05d.ts",
         "target-duration=6",
         "max-files=6",
         "playlist-length=3"
     });
 
-    spec.description = "hls@" + dir + "/playlist.m3u8";
+    spec.description = "hls@" + dir + "/video.m3u8";
     return true;
 }
 

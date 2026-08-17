@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <curl/curl.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
 
@@ -2141,6 +2142,152 @@ void setStringPropertyIfPresent(GstElement* element, const char* propertyName, c
     }
 }
 
+std::string appendHlsAccessQuery(const std::string& uri, const StreamConfig& cfg) {
+    if (cfg.hlsAccessKeyMode != "query" || cfg.hlsAccessKeyName.empty() || cfg.hlsAccessKeyValue.empty()) {
+        return uri;
+    }
+    gchar* escapedName = g_uri_escape_string(cfg.hlsAccessKeyName.c_str(), nullptr, TRUE);
+    gchar* escapedValue = g_uri_escape_string(cfg.hlsAccessKeyValue.c_str(), nullptr, TRUE);
+    if (!escapedName || !escapedValue) {
+        if (escapedName) g_free(escapedName);
+        if (escapedValue) g_free(escapedValue);
+        return uri;
+    }
+    const std::string keyPrefix = std::string(escapedName) + "=";
+    // Do not duplicate a key already present in a provider URL.
+    const auto queryPos = uri.find('?');
+    if (queryPos != std::string::npos) {
+        const std::string query = uri.substr(queryPos + 1);
+        if (query.rfind(keyPrefix, 0) == 0 || query.find("&" + keyPrefix) != std::string::npos) {
+            g_free(escapedName);
+            g_free(escapedValue);
+            return uri;
+        }
+    }
+    const std::string result = uri + (queryPos == std::string::npos ? "?" : "&") +
+        escapedName + "=" + escapedValue;
+    g_free(escapedName);
+    g_free(escapedValue);
+    return result;
+}
+
+void configureHlsHttpSource(GstElement* element, const StreamConfig& cfg);
+
+void onHlsSourceLocationChanged(GObject* object, GParamSpec*, gpointer userData) {
+    auto* cfg = static_cast<StreamConfig*>(userData);
+    if (!cfg || cfg->hlsAccessKeyMode != "query" || cfg->hlsAccessKeyValue.empty()) return;
+    if (g_object_get_data(object, "tvs-hls-query-update")) return;
+    gchar* current = nullptr;
+    g_object_get(object, "location", &current, nullptr);
+    if (!current || !*current) {
+        if (current) g_free(current);
+        return;
+    }
+    const std::string updated = appendHlsAccessQuery(current, *cfg);
+    if (updated != current) {
+        g_object_set_data(object, "tvs-hls-query-update", GINT_TO_POINTER(1));
+        g_object_set(object, "location", updated.c_str(), nullptr);
+        g_object_set_data(object, "tvs-hls-query-update", nullptr);
+    }
+    g_free(current);
+}
+
+void configureHlsHttpSource(GstElement* element, const StreamConfig& cfg) {
+    if (!element) return;
+    GstElementFactory* factory = gst_element_get_factory(element);
+    const gchar* factoryName = factory
+        ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
+        : nullptr;
+    if (!factoryName ||
+        (g_strcmp0(factoryName, "souphttpsrc") != 0 && g_strcmp0(factoryName, "curlhttpsrc") != 0)) {
+        return;
+    }
+
+    setStringPropertyIfPresent(element, "user-agent", cfg.hlsUserAgent);
+    setBooleanPropertyIfPresent(element, "keep-alive", TRUE);
+    setBooleanPropertyIfPresent(element, "compress", TRUE);
+    setIntPropertyIfPresent(element, "timeout", 15);
+
+    if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() &&
+        !cfg.hlsAccessKeyValue.empty() && hasProperty(element, "extra-headers")) {
+        GstStructure* headers = gst_structure_new_empty("extra-headers");
+        gst_structure_set(headers,
+            cfg.hlsAccessKeyName.c_str(), G_TYPE_STRING, cfg.hlsAccessKeyValue.c_str(),
+            nullptr);
+        g_object_set(element, "extra-headers", headers, nullptr);
+        gst_structure_free(headers);
+    }
+
+    if (cfg.hlsAccessKeyMode == "query" && hasProperty(element, "location")) {
+        if (!g_object_get_data(G_OBJECT(element), "tvs-hls-location-watch")) {
+            // RemapContext owns cfg for the complete pipeline lifetime. Internal
+            // hlsdemux download sources set their location after being added to
+            // the bin, so watch the property and append the per-stream token to
+            // manifests, segments and EXT-X-KEY requests alike.
+            g_signal_connect(element, "notify::location", G_CALLBACK(onHlsSourceLocationChanged),
+                const_cast<StreamConfig*>(&cfg));
+            g_object_set_data(G_OBJECT(element), "tvs-hls-location-watch", GINT_TO_POINTER(1));
+        }
+        onHlsSourceLocationChanged(G_OBJECT(element), nullptr, const_cast<StreamConfig*>(&cfg));
+    }
+}
+
+void onHlsDeepElementAdded(GstBin*, GstBin*, GstElement* element, gpointer userData) {
+    auto* ctx = static_cast<RemapContext*>(userData);
+    if (!ctx) return;
+    configureHlsHttpSource(element, ctx->config);
+}
+
+size_t hlsProbeWrite(char* ptr, size_t size, size_t nmemb, void* userData) {
+    auto* body = static_cast<std::string*>(userData);
+    const size_t bytes = size * nmemb;
+    if (!body || !ptr || bytes == 0) return bytes;
+    constexpr size_t kProbeLimit = 128 * 1024;
+    const size_t remaining = body->size() < kProbeLimit ? kProbeLimit - body->size() : 0;
+    const size_t copy = std::min(bytes, remaining);
+    body->append(ptr, copy);
+    // Playlists are small. Abort large media downloads once the sniff buffer is full.
+    return remaining == 0 ? 0 : bytes;
+}
+
+bool probeHttpHlsManifest(const StreamConfig& cfg, const std::string& rawUri) {
+    const std::string lower = toLower(rawUri);
+    if (lower.rfind("http://", 0) != 0 && lower.rfind("https://", 0) != 0) return false;
+    if (lower.find(".m3u8") != std::string::npos || toLower(cfg.inputMode) == "hls") return true;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    const std::string uri = appendHlsAccessQuery(rawUri, cfg);
+    std::string body;
+    struct curl_slist* headers = nullptr;
+    if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() && !cfg.hlsAccessKeyValue.empty()) {
+        const std::string header = cfg.hlsAccessKeyName + ": " + cfg.hlsAccessKeyValue;
+        headers = curl_slist_append(headers, header.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, uri.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2500L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, hlsProbeWrite);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,
+        cfg.hlsUserAgent.empty() ? "Mozilla/5.0 TVStreammerSAT5" : cfg.hlsUserAgent.c_str());
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    (void)curl_easy_perform(curl);
+    char* contentType = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &contentType);
+    const std::string ct = contentType ? toLower(contentType) : "";
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    const auto first = body.find_first_not_of(" \t\r\n");
+    const bool bodyHls = first != std::string::npos && body.compare(first, 7, "#EXTM3U") == 0;
+    const bool typeHls = ct.find("mpegurl") != std::string::npos || ct.find("x-mpegurl") != std::string::npos;
+    return bodyHls || typeHls;
+}
+
 void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
     (void)userData;
     if (!queue) {
@@ -2962,7 +3109,7 @@ void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
 
 void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
     std::filesystem::create_directories(hlsDirectory(cfg));
-    const std::string playlist = hlsDirectory(cfg) + "/playlist.m3u8";
+    const std::string playlist = hlsDirectory(cfg) + "/video.m3u8";
     const std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
     g_object_set(sink,
         "playlist-location", playlist.c_str(),
@@ -3217,7 +3364,8 @@ std::string parserForCaps(GstCaps* caps, const std::string& capsString) {
     if (g_strcmp0(mediaType, "video/x-h265") == 0 || capsString.find("video/x-h265") != std::string::npos) {
         return "h265parse";
     }
-    if (g_strcmp0(mediaType, "video/mpeg") == 0 || capsString.find("video/mpeg") != std::string::npos) {
+    if (g_strcmp0(mediaType, "video/mpeg") == 0 ||
+        capsString.find("video/mpeg,") != std::string::npos) {
         return "mpegvideoparse";
     }
     if (g_strcmp0(mediaType, "audio/mpeg") == 0 || capsString.find("audio/mpeg") != std::string::npos) {
@@ -6012,7 +6160,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls) {
+    const bool useHlsInput = inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls ||
+        (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http &&
+         probeHttpHlsManifest(cfg, input));
+
+    if (useHlsInput) {
         if (!hasElementFactory("souphttpsrc")) {
             std::cerr << missingElementStatus("souphttpsrc") << std::endl;
             return nullptr;
@@ -6030,6 +6182,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         if (inputLower.rfind("hls://", 0) == 0) {
             location = "http://" + input.substr(6);
         }
+        location = appendHlsAccessQuery(location, cfg);
 
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
@@ -6063,6 +6216,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         state->sourceContext->mux = mux;
         state->sourceContext->config = cfg;
         state->sourceContext->flvMux = false;
+        configureHlsHttpSource(src, state->sourceContext->config);
+        // Legacy hlsdemux creates HTTP child sources for variant playlists,
+        // segments and AES key URIs. Apply this stream's access credential to
+        // every such child, not just to the first manifest request.
+        g_signal_connect(demux, "deep-element-added", G_CALLBACK(onHlsDeepElementAdded), state->sourceContext.get());
         g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
         terminalElement = queue;
         return src;
@@ -6081,7 +6239,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
-        g_object_set(src, "location", input.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
+        const std::string httpLocation = appendHlsAccessQuery(input, cfg);
+        g_object_set(src, "location", httpLocation.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
+        // The same per-stream header/User-Agent settings are useful for opaque
+        // HTTP live URLs as well; auto-probe above promotes HLS manifests to the
+        // HLS branch, while direct MPEG-TS remains a simple HTTP source.
+        configureHlsHttpSource(src, cfg);
         setIntPropertyIfPresent(src, "timeout", 15);
         if (!inputInterface.empty()) {
             std::cerr << "HTTP input: input_iface=" << inputInterface
@@ -6752,6 +6915,30 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         caps = gst_pad_query_caps(pad, nullptr);
     }
     std::string capsString = caps ? gst_caps_to_string(caps) : "unknown";
+    const bool isMpegTs = capsString.find("video/mpegts") != std::string::npos ||
+        capsString.find("video/mpegts") != std::string::npos ||
+        capsString.find("application/x-mpegts") != std::string::npos;
+    if (isMpegTs) {
+        // Some hlsdemux versions expose complete MPEG-TS fragments instead of
+        // elementary audio/video pads. Do not mistake video/mpegts for MPEG-2
+        // video. Insert tsdemux and feed its elementary pads to the existing mux.
+        GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+        GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
+        if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
+            gst_element_sync_state_with_parent(tsdemux);
+            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
+            if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
+                g_signal_connect(tsdemux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
+                gst_object_unref(sinkPad);
+                if (caps) gst_caps_unref(caps);
+                gst_object_unref(pipeline);
+                return;
+            }
+            if (sinkPad) gst_object_unref(sinkPad);
+        }
+        if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
+        if (pipeline) gst_object_unref(pipeline);
+    }
     bool isAudio = capsString.find("audio/") != std::string::npos;
     bool isVideo = capsString.find("video/") != std::string::npos;
     bool isPrivateTs = capsString.find("private") != std::string::npos || capsString.find("subpicture") != std::string::npos;
