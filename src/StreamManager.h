@@ -147,6 +147,9 @@ struct StreamState {
     uint16_t outputTelemetryPmtPid = 0x1FFF;
     std::array<bool, 8192> outputTelemetryMediaPids {};
     bool outputTelemetryMediaPidsKnown = false;
+    // v186: custom single-request libcurl -> appsrc HTTP MPEG-TS source.
+    // Kept opaque here so curl/GStreamer implementation stays in StreamManager.cpp.
+    std::shared_ptr<void> httpMpegTsInputState;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;

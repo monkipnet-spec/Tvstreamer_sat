@@ -39,6 +39,7 @@
 #include <curl/curl.h>
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
+#include <gst/app/gstappsrc.h>
 
 namespace {
 
@@ -2236,6 +2237,150 @@ void onHlsDeepElementAdded(GstBin*, GstBin*, GstElement* element, gpointer userD
     auto* ctx = static_cast<RemapContext*>(userData);
     if (!ctx) return;
     configureHlsHttpSource(element, ctx->config);
+}
+
+
+struct HttpMpegTsCurlInputState {
+    std::atomic<bool> stopping{false};
+    std::atomic<uint64_t> bytesReceived{0};
+    GstElement* appsrc = nullptr;
+    std::thread worker;
+    StreamConfig config;
+    std::string location;
+
+    HttpMpegTsCurlInputState(GstElement* source, const StreamConfig& cfg, std::string uri)
+        : appsrc(source ? GST_ELEMENT(gst_object_ref(source)) : nullptr),
+          config(cfg),
+          location(std::move(uri)) {}
+
+    ~HttpMpegTsCurlInputState() {
+        stop();
+        if (appsrc) {
+            gst_object_unref(appsrc);
+            appsrc = nullptr;
+        }
+    }
+
+    void stop() {
+        stopping.store(true, std::memory_order_relaxed);
+        if (appsrc && GST_IS_APP_SRC(appsrc)) {
+            gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+        }
+        if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
+            worker.join();
+        }
+    }
+};
+
+size_t httpMpegTsCurlWrite(char* ptr, size_t size, size_t nmemb, void* userData) {
+    auto* state = static_cast<HttpMpegTsCurlInputState*>(userData);
+    const size_t bytes = size * nmemb;
+    if (!state || !ptr || bytes == 0) return bytes;
+    if (state->stopping.load(std::memory_order_relaxed) || !state->appsrc) return 0;
+
+    GstBuffer* buffer = gst_buffer_new_allocate(nullptr, bytes, nullptr);
+    if (!buffer) return 0;
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+        gst_buffer_unref(buffer);
+        return 0;
+    }
+    std::memcpy(map.data, ptr, bytes);
+    gst_buffer_unmap(buffer, &map);
+
+    const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(state->appsrc), buffer);
+    if (flow != GST_FLOW_OK) {
+        state->stopping.store(true, std::memory_order_relaxed);
+        return 0;
+    }
+    state->bytesReceived.fetch_add(bytes, std::memory_order_relaxed);
+    return bytes;
+}
+
+int httpMpegTsCurlProgress(void* userData, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    auto* state = static_cast<HttpMpegTsCurlInputState*>(userData);
+    return state && state->stopping.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+void postHttpMpegTsError(HttpMpegTsCurlInputState* state, const std::string& message) {
+    if (!state || !state->appsrc) return;
+    GError* error = g_error_new_literal(
+        g_quark_from_static_string("tvs-http-mpegts"), 1, message.c_str());
+    GstMessage* gstMessage = gst_message_new_error(
+        GST_OBJECT(state->appsrc), error, message.c_str());
+    g_error_free(error);
+    gst_element_post_message(state->appsrc, gstMessage);
+}
+
+void runHttpMpegTsCurlInput(const std::shared_ptr<HttpMpegTsCurlInputState>& state) {
+    if (!state || !state->appsrc) return;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        postHttpMpegTsError(state.get(), "HTTP MPEG-TS: curl_easy_init failed");
+        return;
+    }
+
+    struct curl_slist* headers = nullptr;
+    if (state->config.hlsAccessKeyMode == "header" &&
+        !state->config.hlsAccessKeyName.empty() &&
+        !state->config.hlsAccessKeyValue.empty()) {
+        const std::string header = state->config.hlsAccessKeyName + ": " + state->config.hlsAccessKeyValue;
+        headers = curl_slist_append(headers, header.c_str());
+    }
+    headers = curl_slist_append(headers, "Accept: */*");
+    headers = curl_slist_append(headers, "Accept-Encoding: identity");
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    curl_easy_setopt(curl, CURLOPT_URL, state->location.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, httpMpegTsCurlWrite);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, state.get());
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, httpMpegTsCurlProgress);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, state.get());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,
+        state->config.hlsUserAgent.empty()
+            ? "Mozilla/5.0 TVStreammerSAT5"
+            : state->config.hlsUserAgent.c_str());
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    std::cerr << "HTTP MPEG-TS curl input: single_request=1 uri=" << state->location
+              << " access=" << (state->config.hlsAccessKeyMode.empty() ? "none" : state->config.hlsAccessKeyMode)
+              << " source=libcurl-appsrc" << std::endl;
+
+    const CURLcode result = curl_easy_perform(curl);
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    const uint64_t received = state->bytesReceived.load(std::memory_order_relaxed);
+
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (!state->stopping.load(std::memory_order_relaxed) && result != CURLE_OK) {
+        std::ostringstream message;
+        message << "HTTP MPEG-TS input failed: " << curl_easy_strerror(result)
+                << " http=" << httpCode << " bytes=" << received;
+        std::cerr << message.str() << std::endl;
+        postHttpMpegTsError(state.get(), message.str());
+    }
+    if (state->appsrc && GST_IS_APP_SRC(state->appsrc)) {
+        gst_app_src_end_of_stream(GST_APP_SRC(state->appsrc));
+    }
+}
+
+void stopHttpMpegTsInput(StreamState* state) {
+    if (!state || !state->httpMpegTsInputState) return;
+    auto httpState = std::static_pointer_cast<HttpMpegTsCurlInputState>(state->httpMpegTsInputState);
+    if (httpState) httpState->stop();
+    state->httpMpegTsInputState.reset();
 }
 
 size_t hlsProbeWrite(char* ptr, size_t size, size_t nmemb, void* userData) {
@@ -4703,6 +4848,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     GstElement* pipeline = createPipeline(state.get());
     if (!pipeline) {
         state->statusMessage = "pipeline build failed";
+        stopHttpMpegTsInput(state.get());
         releaseSharedDvbInput(state.get());
         if (error) *error = "failed to build GStreamer pipeline for stream: " + streamConfig.name;
         return false;
@@ -4764,6 +4910,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         // complete pipeline to NULL before the last reference is released so
         // the frontend fd is closed deterministically.
         gst_element_set_state(pipeline, GST_STATE_NULL);
+        stopHttpMpegTsInput(state.get());
         gst_element_get_state(pipeline, nullptr, nullptr, GST_SECOND);
         state->pipeline = nullptr;
         gst_object_unref(pipeline);
@@ -4788,6 +4935,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         if (state->pipeline) {
             gst_element_set_state(state->pipeline, GST_STATE_NULL);
         }
+        stopHttpMpegTsInput(state.get());
         if (state->bus) {
             gst_object_unref(state->bus);
             state->bus = nullptr;
@@ -4846,6 +4994,7 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
     if (state.pipeline) {
         gst_element_set_state(state.pipeline, GST_STATE_NULL);
     }
+    stopHttpMpegTsInput(&state);
     // Release DVB immediately after shutdown starts; do not wait for output
     // threads/transcoders before returning the adapter to the kernel.
     releaseSharedDvbInput(&state);
@@ -6165,6 +6314,54 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         normalizedInputMode == "http-ts" ||
         normalizedInputMode == "http-mpegts" ||
         normalizedInputMode == "mpegts";
+
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http && forceHttpMpegTs) {
+        // v186: tokenized IPTV HTTP MPEG-TS is fetched by libcurl and fed to
+        // appsrc.  This creates exactly one provider request and avoids a
+        // build-time dependency on souphttpsrc/caps negotiation for opaque URLs.
+        GstElement* src = gst_element_factory_make("appsrc", "input_src");
+        GstElement* queue = addQueue("input_queue");
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+            if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
+            std::cerr << "HTTP MPEG-TS input: failed to create appsrc/queue" << std::endl;
+            return nullptr;
+        }
+
+        GstCaps* caps = gst_caps_from_string(
+            "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+        if (!caps) {
+            std::cerr << "HTTP MPEG-TS input: failed to create MPEG-TS caps" << std::endl;
+            return nullptr;
+        }
+        gst_app_src_set_caps(GST_APP_SRC(src), caps);
+        gst_caps_unref(caps);
+        gst_app_src_set_stream_type(GST_APP_SRC(src), GST_APP_STREAM_TYPE_STREAM);
+        gst_app_src_set_max_bytes(GST_APP_SRC(src), 4ULL * 1024ULL * 1024ULL);
+        g_object_set(src,
+            "is-live", TRUE,
+            "format", GST_FORMAT_BYTES,
+            "block", FALSE,
+            "do-timestamp", FALSE,
+            nullptr);
+
+        if (!gst_element_link(src, queue)) {
+            std::cerr << "HTTP MPEG-TS input: failed to link appsrc -> input_queue" << std::endl;
+            return nullptr;
+        }
+
+        const std::string location = appendHlsAccessQuery(input, cfg);
+        auto httpState = std::make_shared<HttpMpegTsCurlInputState>(src, cfg, location);
+        state->httpMpegTsInputState = httpState;
+        httpState->worker = std::thread(runHttpMpegTsCurlInput, httpState);
+
+        std::cerr << "HTTP MPEG-TS input: mode=forced-single-request"
+                  << " uri=" << input
+                  << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
+                  << " hls_probe=bypassed transport=libcurl-appsrc"
+                  << std::endl;
+        terminalElement = queue;
+        return src;
+    }
 
     // Opaque IPTV HTTP URLs often contain a per-session access token in the
     // path.  Do not pre-open such URLs when the user explicitly selects

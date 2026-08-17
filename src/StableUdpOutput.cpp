@@ -43,6 +43,8 @@ constexpr int kMulticastTtl = 32;
 constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kStartupPcrGraceNanoseconds = 2000ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kStartupMinimumPcrSamples = 1;
+constexpr uint64_t kCaCleanStartDualMediaGraceNanoseconds = 1500ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kCaCleanStartMaxStagingBytes = 8 * 1024 * 1024;
 constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -375,25 +377,46 @@ void writeRemappedSdtPacket(
 
 // CA clean-start gate: when a stream is configured for conditional access,
 // do not start the five-second WISI reservoir from PSI/ECM or still-scrambled
-// media. Wait for the first clear PES start after CW acquisition, then begin
-// buffering from that packet. This prevents the startup reservoir from
-// containing unusable pre-CW media, which can make A/V recover at different
-// points after automatic multi-channel startup.
-std::size_t firstClearPesPacketOffset(const guint8* data, std::size_t size, uint16_t& pidOut) {
-    pidOut = 0x1FFF;
-    if (!data || size < kTsPacketSize) return size;
+// media. v181 released on the first clear PES of either media type. During
+// simultaneous multi-channel startup that could let video enter the reservoir
+// before the first valid audio PES (or vice versa), and some receivers then
+// kept that startup offset for the whole session. v186 stages the first clear
+// media and releases only after both video and audio PES starts are present.
+enum class CleanMediaKind : uint8_t {
+    None = 0,
+    Audio = 1,
+    Video = 2
+};
+
+struct ClearPesScanResult {
+    std::size_t firstMediaOffset = std::numeric_limits<std::size_t>::max();
+    uint16_t firstPid = 0x1FFF;
+    bool audioSeen = false;
+    bool videoSeen = false;
+};
+
+CleanMediaKind cleanMediaKindFromPesStreamId(guint8 streamId) {
+    if (streamId >= 0xE0 && streamId <= 0xEF) return CleanMediaKind::Video;
+    if (streamId >= 0xC0 && streamId <= 0xDF) return CleanMediaKind::Audio;
+    // private_stream_1 is the normal PES carrier for AC-3/E-AC-3 on DVB.
+    if (streamId == 0xBD) return CleanMediaKind::Audio;
+    // extended_stream_id is used by some modern video services. Treat it as
+    // video for startup gating; the fallback timer still protects exotic cases.
+    if (streamId == 0xFD) return CleanMediaKind::Video;
+    return CleanMediaKind::None;
+}
+
+ClearPesScanResult scanClearPesStarts(const guint8* data, std::size_t size) {
+    ClearPesScanResult result;
+    if (!data || size < kTsPacketSize) return result;
 
     std::size_t start = 0;
     while (start < size && data[start] != 0x47) ++start;
     for (std::size_t offset = start; offset + kTsPacketSize <= size; offset += kTsPacketSize) {
         const guint8* packet = data + offset;
         if (packet[0] != 0x47) break;
-
-        // Before CW acquisition media TS keeps scrambling_control=2/3.
-        // Newcamd clears those bits only after successful decryption.
-        const guint8 scrambling = static_cast<guint8>((packet[3] >> 6) & 0x03);
-        if (scrambling != 0) continue;
-        if ((packet[1] & 0x40U) == 0) continue; // PES start must be in this packet.
+        if (((packet[3] >> 6) & 0x03) != 0) continue; // must already be descrambled.
+        if ((packet[1] & 0x40U) == 0) continue;        // PES start.
 
         const uint16_t pid = static_cast<uint16_t>(
             (static_cast<uint16_t>(packet[1] & 0x1FU) << 8) |
@@ -412,16 +435,17 @@ std::size_t firstClearPesPacketOffset(const guint8* data, std::size_t size, uint
 
         const guint8* payload = packet + payloadOffset;
         if (payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01) continue;
-        const guint8 streamId = payload[3];
-        const bool mediaPes =
-            (streamId >= 0xC0 && streamId <= 0xEF) ||
-            streamId == 0xBD || streamId == 0xFD;
-        if (!mediaPes) continue;
+        const CleanMediaKind kind = cleanMediaKindFromPesStreamId(payload[3]);
+        if (kind == CleanMediaKind::None) continue;
 
-        pidOut = pid;
-        return offset;
+        if (result.firstMediaOffset == std::numeric_limits<std::size_t>::max()) {
+            result.firstMediaOffset = offset;
+            result.firstPid = pid;
+        }
+        if (kind == CleanMediaKind::Audio) result.audioSeen = true;
+        if (kind == CleanMediaKind::Video) result.videoSeen = true;
     }
-    return size;
+    return result;
 }
 
 class StableUdpSender {
@@ -545,32 +569,69 @@ public:
             return GST_FLOW_ERROR;
         }
 
-        std::size_t cleanStartOffset = 0;
-        uint16_t cleanStartPid = 0x1FFF;
+        TimedChunk chunk;
+        bool stagedCleanStartRelease = false;
         if (caCleanStartEnabled && !caCleanStartReleased) {
-            cleanStartOffset = firstClearPesPacketOffset(map.data, map.size, cleanStartPid);
-            if (cleanStartOffset >= map.size) {
-                caCleanStartDroppedBytes += map.size;
+            const ClearPesScanResult scan = scanClearPesStarts(map.data, map.size);
+            const uint64_t nowNs = monotonicNanoseconds();
+
+            if (caCleanStartStaging.empty()) {
+                if (scan.firstMediaOffset == std::numeric_limits<std::size_t>::max() ||
+                    scan.firstMediaOffset >= map.size) {
+                    caCleanStartDroppedBytes += map.size;
+                    gst_buffer_unmap(buffer, &map);
+                    return GST_FLOW_OK;
+                }
+                caCleanStartDroppedBytes += scan.firstMediaOffset;
+                caCleanStartStaging.insert(
+                    caCleanStartStaging.end(),
+                    map.data + scan.firstMediaOffset,
+                    map.data + map.size);
+                caCleanStartFirstMediaNanoseconds = nowNs;
+                caCleanStartFirstPid = scan.firstPid;
+            } else {
+                caCleanStartStaging.insert(
+                    caCleanStartStaging.end(), map.data, map.data + map.size);
+            }
+
+            caCleanStartAudioSeen = caCleanStartAudioSeen || scan.audioSeen;
+            caCleanStartVideoSeen = caCleanStartVideoSeen || scan.videoSeen;
+
+            const bool dualMediaReady = caCleanStartAudioSeen && caCleanStartVideoSeen;
+            const bool graceExpired = caCleanStartFirstMediaNanoseconds != 0 &&
+                nowNs >= caCleanStartFirstMediaNanoseconds + kCaCleanStartDualMediaGraceNanoseconds;
+            const bool stagingLimitReached = caCleanStartStaging.size() >= kCaCleanStartMaxStagingBytes;
+
+            if (!dualMediaReady && !graceExpired && !stagingLimitReached) {
                 gst_buffer_unmap(buffer, &map);
                 return GST_FLOW_OK;
             }
-            caCleanStartReleased = true;
-            std::cerr << "UDP CA clean-start gate released: first_clear_pes_pid="
-                      << cleanStartPid
-                      << " dropped_pre_cw_bytes=" << caCleanStartDroppedBytes
-                      << " startup_reservoir=clean-media-only" << std::endl;
-        }
 
-        TimedChunk chunk;
-        chunk.bytes.assign(map.data + cleanStartOffset, map.data + map.size);
+            caCleanStartReleased = true;
+            stagedCleanStartRelease = true;
+            chunk.bytes.swap(caCleanStartStaging);
+            std::cerr << "UDP CA dual-media clean-start released: first_clear_pes_pid="
+                      << caCleanStartFirstPid
+                      << " audio_seen=" << (caCleanStartAudioSeen ? 1 : 0)
+                      << " video_seen=" << (caCleanStartVideoSeen ? 1 : 0)
+                      << " fallback=" << (dualMediaReady ? "none" : (graceExpired ? "grace" : "size"))
+                      << " dropped_pre_cw_bytes=" << caCleanStartDroppedBytes
+                      << " staged_bytes=" << chunk.bytes.size()
+                      << " startup_reservoir=dual-media-clear" << std::endl;
+        } else {
+            chunk.bytes.assign(map.data, map.data + map.size);
+        }
         gst_buffer_unmap(buffer, &map);
         if (chunk.bytes.empty()) {
             return GST_FLOW_OK;
         }
 
-        GstClockTime timestamp = GST_BUFFER_PTS(buffer);
-        if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
-            timestamp = GST_BUFFER_DTS(buffer);
+        GstClockTime timestamp = GST_CLOCK_TIME_NONE;
+        if (!stagedCleanStartRelease) {
+            timestamp = GST_BUFFER_PTS(buffer);
+            if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
+                timestamp = GST_BUFFER_DTS(buffer);
+            }
         }
         if (GST_CLOCK_TIME_IS_VALID(timestamp)) {
             chunk.timestampValid = true;
@@ -1439,7 +1500,12 @@ private:
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
     bool caCleanStartReleased = false;
+    bool caCleanStartAudioSeen = false;
+    bool caCleanStartVideoSeen = false;
+    uint16_t caCleanStartFirstPid = 0x1FFF;
+    uint64_t caCleanStartFirstMediaNanoseconds = 0;
     uint64_t caCleanStartDroppedBytes = 0;
+    std::vector<guint8> caCleanStartStaging;
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
@@ -1606,7 +1672,7 @@ GstElement* createSink(
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
-              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "clear-pes" : "off")
+              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "dual-media-clear-pes" : "off")
               << std::endl;
     return sink;
 }
