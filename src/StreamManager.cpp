@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -54,6 +55,14 @@ constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr GstClockTime kFastDvbReleaseWait = 250 * GST_MSECOND;
 constexpr const char* kTestPatternUri = "test://bars";
+
+bool heavyDiagnosticsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_HEAVY_DIAGNOSTICS");
+        return value && *value && std::string(value) != "0";
+    }();
+    return enabled;
+}
 
 class CardReservationGuard {
 public:
@@ -1787,11 +1796,27 @@ std::vector<uint8_t> filterSharedDvbServiceBytes(
         const uint8_t* inputPacket = data + offset;
         if (inputPacket[0] != 0x47) continue;
         ++consumer.inputPackets;
+
+        // v169 fast path: once the selected PMT has healed the PID set, reject
+        // unrelated full-MPTS packets before the 188-byte copy/PSI/remap work.
+        // On a transponder with many services this removes the dominant
+        // per-service memory traffic while keeping PAT/PMT/SDT/ECM/media exact.
+        const uint16_t inputPid = static_cast<uint16_t>(((inputPacket[1] & 0x1F) << 8) | inputPacket[2]);
+        const bool earlyRemapPending = ctx.remapEnabled &&
+            (ctx.requestedVideoPid || ctx.requestedAudioPid) && !ctx.remapPmtRewritten;
+        const bool earlyFilterReady = !ctx.filterPids ||
+            (ctx.pidSelfHealAnnounced && !earlyRemapPending);
+        if (ctx.filterPids && earlyFilterReady &&
+            (inputPid >= ctx.allowedPids.size() || !ctx.allowedPids[inputPid])) {
+            ++consumer.droppedPackets;
+            continue;
+        }
+
         std::memcpy(packetCopy.data(), inputPacket, kTsPacketSize);
         uint8_t* packet = packetCopy.data();
 
         discoverSelectedPmtFromPacket(packet, &ctx);
-        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+        const uint16_t pid = inputPid;
         if (ctx.pmtPid > 0 && ctx.pmtPid < 0x1FFF) ctx.allowedPids[ctx.pmtPid] = true;
         healAllowedPidsFromSelectedPmt(packet, &ctx);
 
@@ -5530,15 +5555,15 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
         // The dispatcher already performs service PID/PSI selection. CA remains
         // per service and therefore never sees unrelated MPTS packets.
-        {
-            GstPad* preCaCcPad = gst_element_get_static_pad(queue, "src");
-            if (preCaCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
-                gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(preCaCcPad);
-            }
+        if (heavyDiagnosticsEnabled()) {
+                GstPad* preCaCcPad = gst_element_get_static_pad(queue, "src");
+                if (preCaCcPad) {
+                    auto* ccContext = new TsCcStageProbeContext(state->config.id, "SPTS_PRE_CA");
+                    gst_pad_add_probe(preCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                        tsCcStageProbe, ccContext,
+                        [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                    gst_object_unref(preCaCcPad);
+                }
         }
         if (!state->config.conditionalAccessClient.empty()) {
             GstPad* caPad = gst_element_get_static_pad(queue, "src");
@@ -5554,33 +5579,35 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                           << " stage=single-pass-dispatcher-spts" << std::endl;
             }
         }
-        {
-            GstPad* postCaCcPad = gst_element_get_static_pad(queue, "src");
-            if (postCaCcPad) {
-                auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
-                gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    tsCcStageProbe, ccContext,
-                    [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
-                gst_object_unref(postCaCcPad);
-            }
+        if (heavyDiagnosticsEnabled()) {
+                GstPad* postCaCcPad = gst_element_get_static_pad(queue, "src");
+                if (postCaCcPad) {
+                    auto* ccContext = new TsCcStageProbeContext(state->config.id, "POST_CA");
+                    gst_pad_add_probe(postCaCcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                        tsCcStageProbe, ccContext,
+                        [](gpointer data) { delete static_cast<TsCcStageProbeContext*>(data); });
+                    gst_object_unref(postCaCcPad);
+                }
         }
-        {
-            GstPad* statsPad = gst_element_get_static_pad(queue, "src");
-            if (statsPad) {
-                auto* statsContext = new SharedDvbPidStatsContext();
-                statsContext->stage = "dispatcher-service-output";
-                statsContext->label = state->config.id;
-                gst_pad_add_probe(statsPad, GST_PAD_PROBE_TYPE_BUFFER,
-                    sharedDvbPidStatsProbe, statsContext,
-                    [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
-                gst_object_unref(statsPad);
-            }
+        if (heavyDiagnosticsEnabled()) {
+                GstPad* statsPad = gst_element_get_static_pad(queue, "src");
+                if (statsPad) {
+                    auto* statsContext = new SharedDvbPidStatsContext();
+                    statsContext->stage = "dispatcher-service-output";
+                    statsContext->label = state->config.id;
+                    gst_pad_add_probe(statsPad, GST_PAD_PROBE_TYPE_BUFFER,
+                        sharedDvbPidStatsProbe, statsContext,
+                        [](gpointer data) { delete static_cast<SharedDvbPidStatsContext*>(data); });
+                    gst_object_unref(statsPad);
+                }
         }
 
         std::cerr << "Shared DVB source chain: stream=" << state->config.id
-                  << " mode=single-pass-appsrc"
+                  << " mode=single-pass-appsrc-fast"
                   << " frontend=" << state->sharedDvbFrontendKey
-                  << " internal_udp=off" << std::endl;
+                  << " internal_udp=off"
+                  << " heavy_diagnostics=" << (heavyDiagnosticsEnabled() ? "on" : "off")
+                  << std::endl;
         terminalElement = queue;
         return src;
     }
