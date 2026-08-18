@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstring>
 #include <random>
+#include <iostream>
 #include <sstream>
 #include <vector>
 
@@ -411,7 +412,13 @@ bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid
 void NewcamdClient::start_receiver() {
     if (running_) return;
     running_ = true;
-    receiver_thread_ = std::thread(&NewcamdClient::receiver_loop, this);
+    try {
+        receiver_thread_ = std::thread(&NewcamdClient::receiver_loop, this);
+    } catch (const std::exception& ex) {
+        running_ = false;
+        set_error(std::string("newcamd receiver thread creation failed: ") + ex.what());
+        std::cerr << "Resource guard: " << last_error() << std::endl;
+    }
 }
 
 void NewcamdClient::receiver_loop() {

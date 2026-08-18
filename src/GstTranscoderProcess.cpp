@@ -584,7 +584,13 @@ bool GstTranscoderProcess::spawnProcess(
             std::cerr << startupStderr;
             if (startupStderr.back() != '\n') std::cerr << std::endl;
         }
-        std::thread(relayChildStderr, stderrPipe[0]).detach();
+        try {
+            std::thread(relayChildStderr, stderrPipe[0]).detach();
+        } catch (const std::exception& ex) {
+            std::cerr << "Resource guard: transcoder stderr relay thread creation failed: "
+                      << ex.what() << std::endl;
+            ::close(stderrPipe[0]);
+        }
     }
     return true;
 }

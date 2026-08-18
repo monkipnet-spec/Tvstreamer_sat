@@ -21,6 +21,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -385,7 +386,7 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
     if (type == "srt") {
         const std::string mode = toLower(cfg.outputMode) == "caller" ? "listener" : "caller";
         const bool listener = toLower(cfg.outputMode) != "caller";
-        return "srt://" + advertisedHost(cfg, listener) + ":" + std::to_string(cfg.outputPort) + "?mode=" + mode;
+        return "srt://" + advertisedHost(cfg, listener) + ":" + std::to_string(validPortOrDefault(cfg.outputPort, 7001)) + "?mode=" + mode;
     }
     if (type == "youtube") {
         const std::string hostLower = toLower(cfg.outputHost);
@@ -458,7 +459,15 @@ void HttpServer::doAccept(std::shared_ptr<tcp::acceptor> listener, int port, uin
             return;
         }
         if (!ec) {
-            std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
+            try {
+                std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
+            } catch (const std::exception& ex) {
+                // Never let pthread/resource exhaustion escape the Asio handler
+                // and terminate the complete streaming process.
+                std::cerr << "HTTP session thread creation failed: " << ex.what() << std::endl;
+                boost::system::error_code closeEc;
+                socket.close(closeEc);
+            }
         } else if (ec != boost::asio::error::operation_aborted) {
             std::cerr << "HTTP accept failed on port " << port << ": " << ec.message() << std::endl;
         }
@@ -554,9 +563,8 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.set(http::field::content_type, "application/json");
                 res.body() = OscamMiniManager::instance().serviceActionJson(req.body());
             } else if (target == "/api/save-config") {
-                handleSaveConfig(req.body());
                 res.set(http::field::content_type, "application/json");
-                res.body() = "{\"result\": \"ok\"}";
+                res.body() = handleSaveConfig(req.body());
             } else if (target == "/api/start-stream") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleStartStream(req.body());
@@ -701,8 +709,9 @@ std::set<int> HttpServer::configuredHttpPorts() const {
     for (const auto& stream : configManager.config.streams) {
         for (const auto& output : streamOutputs(stream)) {
             const std::string type = normalizedOutputType(output);
-            if ((type == "http" || type == "hls") && output.outputPort > 0 && output.outputPort <= 65535) {
-                ports.insert(streamHttpPort(output, defaultPort));
+            if (type == "http" || type == "hls") {
+                const int port = streamHttpPort(output, defaultPort);
+                if (port > 0 && port <= 65535) ports.insert(port);
             }
         }
     }
@@ -712,7 +721,50 @@ std::set<int> HttpServer::configuredHttpPorts() const {
     return ports;
 }
 
+bool HttpServer::validateHttpPortsForConfig(const AppConfig& config, std::string& error) const {
+    error.clear();
+    struct Owner { std::string label; std::string protocol; };
+    std::map<int, Owner> requested;
+    if (config.httpPort > 0 && config.httpPort <= 65535) {
+        requested.emplace(config.httpPort, Owner{"Control Panel", "HTTP"});
+    }
+    for (const auto& stream : config.streams) {
+        for (const auto& output : streamOutputs(stream)) {
+            const std::string type = normalizedOutputType(output);
+            if (type != "http" && type != "hls") continue;
+            const int port = streamHttpPort(output, config.httpPort);
+            if (port <= 0 || port > 65535) continue;
+            const std::string label = stream.name.empty() ? stream.id : stream.name;
+            requested[port] = Owner{label, type == "hls" ? "HLS" : "HTTP"};
+        }
+    }
+    for (const auto& [port, owner] : requested) {
+        {
+            std::lock_guard<std::mutex> lock(acceptorsMutex);
+            const auto current = acceptors.find(port);
+            if (current != acceptors.end() && current->second && current->second->is_open()) continue;
+        }
+        boost::system::error_code ec;
+        tcp::acceptor probe(ioContext);
+        tcp::endpoint endpoint(tcp::v4(), static_cast<unsigned short>(port));
+        probe.open(endpoint.protocol(), ec);
+        if (!ec) probe.set_option(boost::asio::socket_base::reuse_address(true), ec);
+        if (!ec) probe.bind(endpoint, ec);
+        if (probe.is_open()) {
+            boost::system::error_code closeEc;
+            probe.close(closeEc);
+        }
+        if (ec) {
+            error = owner.protocol + " port " + std::to_string(port) +
+                " is unavailable for " + owner.label + ": " + ec.message();
+            return false;
+        }
+    }
+    return true;
+}
+
 bool HttpServer::bindHttpPorts(const std::set<int>& ports) {
+    std::lock_guard<std::mutex> acceptorLock(acceptorsMutex);
     boost::system::error_code ec;
     const uint64_t generation = acceptGeneration.fetch_add(1) + 1;
 
@@ -816,6 +868,40 @@ std::string HttpServer::listInterfaces() {
       }
     }
 
+    // Lightweight in-process resource telemetry.  This makes a future
+    // TasksMax/OOM diagnosis visible in the web UI without requiring shell
+    // scripts on a production headend.
+    uint64_t processThreads = 0;
+    uint64_t processRssKb = 0;
+    {
+      std::ifstream status("/proc/self/status");
+      std::string line;
+      while (std::getline(status, line)) {
+        if (line.rfind("Threads:", 0) == 0) {
+          std::istringstream value(line.substr(8));
+          value >> processThreads;
+        } else if (line.rfind("VmRSS:", 0) == 0) {
+          std::istringstream value(line.substr(6));
+          value >> processRssKb;
+        }
+      }
+    }
+    uint64_t processFds = 0;
+    {
+      std::error_code ec;
+      for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end; it.increment(ec)) {
+        ++processFds;
+      }
+    }
+    uint64_t cgroupPidsCurrent = 0;
+    std::string cgroupPidsMax;
+    {
+      std::ifstream current("/sys/fs/cgroup/pids.current");
+      current >> cgroupPidsCurrent;
+      std::ifstream maximum("/sys/fs/cgroup/pids.max");
+      maximum >> cgroupPidsMax;
+    }
+
     Json::Value root;
     std::lock_guard<std::mutex> lock(metricsMutex);
     double cpuPercent = 0.0;
@@ -836,6 +922,11 @@ std::string HttpServer::listInterfaces() {
     root["ram_percent"] = memoryTotal == 0
       ? 0.0
       : 100.0 * static_cast<double>(memoryTotal - std::min(memoryTotal, memoryAvailable)) / memoryTotal;
+    root["process_threads"] = Json::UInt64(processThreads);
+    root["process_fds"] = Json::UInt64(processFds);
+    root["process_rss_mb"] = static_cast<double>(processRssKb) / 1024.0;
+    root["cgroup_pids_current"] = Json::UInt64(cgroupPidsCurrent);
+    root["cgroup_pids_max"] = cgroupPidsMax;
     Json::Value interfaces(Json::arrayValue);
     const auto interfaceAddresses = enumerateNetworkInterfaces();
     std::ifstream netdev("/proc/net/dev");
@@ -935,6 +1026,57 @@ std::string HttpServer::currentState() {
     root["subscribers"] = subscribers;
     Json::Value streams(Json::arrayValue);
     auto snap = streamManager.snapshot();
+    Json::Value listeners(Json::arrayValue);
+    std::set<std::string> listenerKeys;
+    auto appendListener = [&](const std::string& protocol, const std::string& transport,
+                              const std::string& bindAddress, int port, const std::string& owner,
+                              const std::string& stateText) {
+        const std::string key = protocol + ":" + transport + ":" + bindAddress + ":" + std::to_string(port);
+        if (!listenerKeys.insert(key).second) return;
+        Json::Value entry;
+        entry["protocol"] = protocol;
+        entry["transport"] = transport;
+        entry["bind"] = bindAddress;
+        entry["port"] = port;
+        entry["owner"] = owner;
+        entry["state"] = stateText;
+        listeners.append(entry);
+    };
+    std::vector<std::pair<int, std::shared_ptr<tcp::acceptor>>> acceptorSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(acceptorsMutex);
+        for (const auto& item : acceptors) acceptorSnapshot.push_back(item);
+    }
+    for (const auto& [port, listener] : acceptorSnapshot) {
+        if (!listener || !listener->is_open()) continue;
+        bool hasHttp = port == configManager.config.httpPort;
+        bool hasHls = false;
+        for (const auto& stream : configManager.config.streams) {
+            for (const auto& output : streamOutputs(stream)) {
+                const std::string type = normalizedOutputType(output);
+                if ((type == "http" || type == "hls") &&
+                    streamHttpPort(output, configManager.config.httpPort) == port) {
+                    if (type == "http") hasHttp = true;
+                    if (type == "hls") hasHls = true;
+                }
+            }
+        }
+        if (hasHttp) appendListener("HTTP", "TCP", "0.0.0.0", port, "HTTP server", "LISTEN");
+        if (hasHls) appendListener("HLS", "TCP", "0.0.0.0", port, "HLS server", "LISTEN");
+    }
+    for (const auto& cfg : configManager.config.streams) {
+        const auto it = snap.find(cfg.id);
+        const bool active = it != snap.end() && it->second && it->second->active.load();
+        if (!active) continue;
+        for (const auto& output : streamOutputs(cfg)) {
+            if (normalizedOutputType(output) != "srt" || toLower(output.outputMode) == "caller") continue;
+            const int port = validPortOrDefault(output.outputPort, 7001);
+            const std::string bindAddress = output.interfaceAddress.empty() ? "0.0.0.0" : output.interfaceAddress;
+            appendListener("SRT", "UDP", bindAddress, port,
+                cfg.name.empty() ? cfg.id : cfg.name, "LISTEN");
+        }
+    }
+    root["listeners"] = listeners;
     // Reading FE status is cheap and does not retune the frontend, but several
     // channel tiles may share the exact same DVB input/transponder. Cache one
     // ioctl snapshot per live DVB URI for each /api/state response.
@@ -1517,14 +1659,16 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     }
 }
 
-void HttpServer::handleSaveConfig(const std::string& body) {
+std::string HttpServer::handleSaveConfig(const std::string& body) {
     Json::CharReaderBuilder readerBuilder;
     Json::Value root;
     std::string errs;
     std::istringstream ss(body);
     if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
-        std::cerr << "Invalid config payload: " << errs << std::endl;
-        return;
+        const std::string message = "Invalid config payload: " + errs;
+        std::cerr << message << std::endl;
+        Json::Value response; response["result"] = "error"; response["error"] = message;
+        Json::StreamWriterBuilder writer; return Json::writeString(writer, response);
     }
     const AppConfig previousConfig = configManager.config;
     const auto previousStreams = streamConfigById(previousConfig.streams);
@@ -1557,6 +1701,12 @@ void HttpServer::handleSaveConfig(const std::string& body) {
                   << " existing stream(s): request contained no streams or an empty stream list"
                   << std::endl;
     }
+    std::string listenerError;
+    if (!validateHttpPortsForConfig(nextConfig, listenerError)) {
+        std::cerr << "Config save rejected: " << listenerError << std::endl;
+        Json::Value response; response["result"] = "error"; response["error"] = listenerError;
+        Json::StreamWriterBuilder writer; return Json::writeString(writer, response);
+    }
     const auto nextStreams = streamConfigById(nextConfig.streams);
     std::vector<std::string> streamsToStop;
     std::vector<StreamConfig> streamsToRestart;
@@ -1588,6 +1738,8 @@ void HttpServer::handleSaveConfig(const std::string& body) {
             std::cerr << "Hard restart failed for stream: " << stream.id << std::endl;
         }
     }
+    Json::Value response; response["result"] = "ok";
+    Json::StreamWriterBuilder writer; return Json::writeString(writer, response);
 }
 
 std::string HttpServer::listBackupFiles() {
@@ -1800,13 +1952,17 @@ std::string HttpServer::handleStopStream(const std::string& body) {
 
 void HttpServer::handleRestartProgram() {
     const auto args = currentProcessArgs();
-    std::thread([this, args]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        std::cerr << "Restarting TVStreammerSAT5 process" << std::endl;
-        streamManager.stopAll();
-        closeInheritedFileDescriptors();
-        execCurrentProcess(args);
-    }).detach();
+    try {
+        std::thread([this, args]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::cerr << "Restarting TVStreammerSAT5 process" << std::endl;
+            streamManager.stopAll();
+            closeInheritedFileDescriptors();
+            execCurrentProcess(args);
+        }).detach();
+    } catch (const std::exception& ex) {
+        std::cerr << "Restart worker thread creation failed: " << ex.what() << std::endl;
+    }
 }
 
   void HttpServer::handleDeleteStream(const std::string& body) {
@@ -1916,6 +2072,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .system-load strong{color:#fff;font-size:.76rem}
 .system-load .metric{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;line-height:1.2}
 .system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
+.system-load .listener-metric span{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
 .network-button:hover{background:rgba(57,189,248,.24)}
 .restart-button{border-color:rgba(255,184,77,.28);color:#ffe0a3;background:rgba(255,184,77,.1)}
@@ -2138,6 +2295,8 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <div class="system-load">
 <span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
 <span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
+<span class="metric"><strong>PROC</strong> <span id="procLoad">—</span></span>
+<span class="metric listener-metric"><strong>LISTEN</strong> <span id="listenerStatus">—</span></span>
 </div>
 <div class="stats-panel">
 <div class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></div>
@@ -2404,6 +2563,12 @@ async function statePollLoop() {
 function updateSystemLoad(metrics) {
   document.getElementById('cpuLoad').textContent = `${Number(metrics.cpu_percent || 0).toFixed(1)}%`;
   document.getElementById('ramLoad').textContent = `${Number(metrics.ram_percent || 0).toFixed(1)}%`;
+  const procEl = document.getElementById('procLoad');
+  if (procEl) {
+    const pidsMax = String(metrics.cgroup_pids_max || '');
+    const pidsText = metrics.cgroup_pids_current ? ` P:${metrics.cgroup_pids_current}/${pidsMax || '?'}` : '';
+    procEl.textContent = `T:${Number(metrics.process_threads || 0)} FD:${Number(metrics.process_fds || 0)} RSS:${Number(metrics.process_rss_mb || 0).toFixed(0)}M${pidsText}`;
+  }
   const table = document.getElementById('networkTableBody');
   if (!table) return;
   const interfaces = metrics.interfaces || [];
@@ -2638,6 +2803,14 @@ function updateLiveTiles() {
   const activeCount = document.getElementById('activeCount');
   if (totalCount) totalCount.textContent = state.stream_count ?? (state.streams || []).length;
   if (activeCount) activeCount.textContent = state.active_count ?? (state.streams || []).filter(stream => stream.active).length;
+  const listenerStatus = document.getElementById('listenerStatus');
+  if (listenerStatus) {
+    const items = Array.isArray(state.listeners) ? state.listeners : [];
+    listenerStatus.textContent = items.length
+      ? items.map(item => `${item.protocol} ${item.port} ${item.state || 'LISTEN'}`).join(' · ')
+      : '—';
+    listenerStatus.title = items.map(item => `${item.protocol}/${item.transport} ${item.bind}:${item.port} ${item.state || ''}`).join('\n');
+  }
 
   const tiles = document.getElementById('tiles');
   if (!tiles) return;
@@ -2969,7 +3142,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 59'} / ${state.program_version||'v188'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 62'} / ${state.program_version||'v191'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -3902,6 +4075,8 @@ function updateOutputHints() {
       hostLabel.textContent = outputMode === 'caller' ? 'SRT сервер' : 'SRT host для ссылки';
       portLabel.textContent = 'SRT порт';
       port.disabled = false;
+      port.placeholder = '7001';
+      if (!Number(port.value || 0)) port.value = '7001';
       host.placeholder = outputMode === 'caller' ? 'server.example.com или IP' : '0.0.0.0 для listener';
       if (outputMode === 'listener' && (!host.value || host.value === '127.0.0.1' || host.value === '239.0.0.1')) {
         host.value = '0.0.0.0';
@@ -3971,7 +4146,9 @@ function saveSettings() {
   const password = document.getElementById('password')?.value;
   if (password) payload.password = password;
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    .then(()=>{
+    .then(async response => {
+      let data = {}; try { data = await response.json(); } catch (_) {}
+      if (!response.ok || data.result === 'error') throw new Error(data.error || `HTTP ${response.status}`);
       if (httpPortInput && httpPort && httpPort !== previousHttpPort) {
         const nextUrl = new URL(window.location.href);
         nextUrl.port = String(httpPort);
@@ -3980,7 +4157,8 @@ function saveSettings() {
       }
       closeModal();
       fetchState();
-    });
+    })
+    .catch(error => uiError(error?.message || error));
 }
 function saveStream(id) {
   const outputs = collectOutputRows();
@@ -4049,7 +4227,13 @@ function saveStream(id) {
     streams: state.streams
   };
   fetch('/api/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(savePayload)})
-    .then(()=>{closeModal();fetchState();});
+    .then(async response => {
+      let data = {}; try { data = await response.json(); } catch (_) {}
+      if (!response.ok || data.result === 'error') throw new Error(data.error || `HTTP ${response.status}`);
+      closeModal();
+      fetchState();
+    })
+    .catch(error => { uiError(error?.message || error); fetchState(); });
 }
 function setCopyButtonState(button, className) {
   if (!button) return;

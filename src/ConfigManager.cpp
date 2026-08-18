@@ -1,4 +1,5 @@
 #include "ConfigManager.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <fstream>
@@ -8,12 +9,36 @@
 #include <ctime>
 #include <iomanip>
 
+
+namespace {
+
+bool usesUdpEndpointFields(const std::string& outputType) {
+    const std::string type = toLower(outputType);
+    return type == "udp" || type == "udp-cbr" || type == "udp-vbr" || type == "rtp";
+}
+
+void normalizeOutputEndpoint(std::string& outputHost, int& outputPort, const std::string& outputType) {
+    if (!usesUdpEndpointFields(outputType)) return;
+    std::string normalizedHost;
+    int normalizedPort = outputPort;
+    if (normalizeUdpEndpoint(outputHost, outputPort, normalizedHost, normalizedPort)) {
+        outputHost = normalizedHost;
+        outputPort = normalizedPort;
+    }
+}
+
+} // namespace
+
 StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {
     StreamOutputConfig output;
     output.outputType = root.get("output_type", "udp-cbr").asString();
     output.outputMode = root.get("output_mode", "listener").asString();
     output.outputHost = root.get("output_host", "127.0.0.1").asString();
     output.outputPort = root.get("output_port", 1234).asInt();
+    normalizeOutputEndpoint(output.outputHost, output.outputPort, output.outputType);
+    if (toLower(output.outputType) == "srt" && (!root.isMember("output_port") || output.outputPort <= 0 || output.outputPort > 65535)) {
+        output.outputPort = 7001;
+    }
     return output;
 }
 
@@ -47,6 +72,10 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.outputMode = root.get("output_mode", "listener").asString();
     config.outputHost = root.get("output_host", "127.0.0.1").asString();
     config.outputPort = root.get("output_port", 1234).asInt();
+    normalizeOutputEndpoint(config.outputHost, config.outputPort, config.outputType);
+    if (toLower(config.outputType) == "srt" && (!root.isMember("output_port") || config.outputPort <= 0 || config.outputPort > 65535)) {
+        config.outputPort = 7001;
+    }
     config.interfaceAddress = root.get("interface_address", "").asString();
     config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");
     config.inputInterfaceAddress = root.get("input_interface_address", "").asString();

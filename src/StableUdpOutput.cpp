@@ -37,7 +37,9 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
-constexpr std::size_t kMaxBufferedBytes = 32 * 1024 * 1024;
+// 8 MiB is still >12 s at 5 Mbit/s and comfortably covers the required
+// 5 s startup reservoir, while bounding worst-case memory for 20-30 outputs.
+constexpr std::size_t kMaxBufferedBytes = 8 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
@@ -622,9 +624,16 @@ public:
         int sendBufferSize = kSocketBufferSize;
         ::setsockopt(socketFd, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize));
 
-        const std::string outputHost = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+        const std::string rawOutputHost = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+        std::string outputHost;
+        int outputPort = cfg.outputPort;
+        if (!normalizeUdpEndpoint(rawOutputHost, cfg.outputPort, outputHost, outputPort)) {
+            error = "invalid UDP output endpoint: " + rawOutputHost + ":" + std::to_string(cfg.outputPort);
+            closeSocket();
+            return;
+        }
         destinationAddress.sin_family = AF_INET;
-        destinationAddress.sin_port = htons(static_cast<uint16_t>(cfg.outputPort));
+        destinationAddress.sin_port = htons(static_cast<uint16_t>(outputPort));
         if (::inet_pton(AF_INET, outputHost.c_str(), &destinationAddress.sin_addr) != 1) {
             error = "invalid UDP output host: " + outputHost;
             closeSocket();
@@ -670,7 +679,15 @@ public:
         }
 
         ready = true;
-        senderThread = std::thread(&StableUdpSender::sendLoop, this);
+        try {
+            senderThread = std::thread(&StableUdpSender::sendLoop, this);
+        } catch (const std::exception& ex) {
+            error = std::string("failed to create stable UDP sender thread: ") + ex.what();
+            std::cerr << "Resource guard: " << error << std::endl;
+            ready = false;
+            closeSocket();
+            return;
+        }
     }
 
     ~StableUdpSender() {

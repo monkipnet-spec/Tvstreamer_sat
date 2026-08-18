@@ -50,6 +50,7 @@ private:
     std::set<int> configuredHttpPorts() const;
     bool bindHttpPorts(const std::set<int>& ports);
     void refreshHttpPorts();
+    bool validateHttpPortsForConfig(const AppConfig& config, std::string& error) const;
     std::string listInterfaces();
     std::string systemMetrics();
     std::string currentState();
@@ -61,7 +62,7 @@ private:
     std::string handleDvbAddChannels(const std::string& body);
     bool handleHttpStream(tcp::socket& socket, const std::string& target);
     bool serveHlsFile(const tcp::socket& socket, const std::string& target, http::response<http::string_body>& res);
-    void handleSaveConfig(const std::string& body);
+    std::string handleSaveConfig(const std::string& body);
     std::string listBackupFiles();
     std::string handleUploadBackupFile(const std::string& target, const std::string& body);
     std::string handleDeleteBackupFile(const std::string& body);
@@ -76,6 +77,7 @@ private:
 
     boost::asio::io_context& ioContext;
     std::unordered_map<int, std::shared_ptr<tcp::acceptor>> acceptors;
+    mutable std::mutex acceptorsMutex;
     std::atomic<uint64_t> acceptGeneration{0};
     ConfigManager& configManager;
     StreamManager& streamManager;

@@ -55,14 +55,37 @@ int main() {
 
     std::cerr << "HTTP server started" << std::endl;
     for (const auto& stream : configManager.config.streams) {
-        if (stream.autoStart) {
-            std::cerr << "Auto-starting stream: " << stream.id << std::endl;
-            streamManager.startStream(stream);
+        if (!stream.autoStart) continue;
+        std::cerr << "Auto-starting stream: " << stream.id << std::endl;
+        try {
+            std::string startError;
+            if (!streamManager.startStream(stream, &startError)) {
+                std::cerr << "Auto-start failed: stream=" << stream.id
+                          << " error=" << (startError.empty() ? "unknown" : startError) << std::endl;
+            }
+        } catch (const std::exception& ex) {
+            // Resource exhaustion (for example pthread_create -> EAGAIN) must
+            // fail one stream, not terminate the complete headend process.
+            std::cerr << "Auto-start exception contained: stream=" << stream.id
+                      << " error=" << ex.what() << std::endl;
+        } catch (...) {
+            std::cerr << "Auto-start unknown exception contained: stream=" << stream.id << std::endl;
         }
     }
     std::cout << "TVStreammerSAT5 running on port " << configManager.config.httpPort << std::endl;
     std::cerr << "Calling ioc.run()" << std::endl;
 
-    ioc.run();
+    // A handler exception must not take down all 20+ active services.  Asio's
+    // io_context remains usable after an exception escapes a handler, so keep
+    // servicing the remaining descriptors and log the contained failure.
+    while (!ioc.stopped()) {
+        try {
+            ioc.run();
+        } catch (const std::exception& ex) {
+            std::cerr << "io_context handler exception contained: " << ex.what() << std::endl;
+        } catch (...) {
+            std::cerr << "io_context unknown handler exception contained" << std::endl;
+        }
+    }
     return 0;
 }

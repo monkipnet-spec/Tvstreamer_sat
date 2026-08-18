@@ -42,6 +42,52 @@ std::string normalizeIpAddress(const std::string& value) {
     return normalized;
 }
 
+
+
+bool normalizeUdpEndpoint(const std::string& rawHost, int configuredPort,
+                          std::string& host, int& port) {
+    std::string endpoint = rawHost;
+    boost::algorithm::trim(endpoint);
+    if (endpoint.empty()) return false;
+
+    const std::string lower = toLower(endpoint);
+    if (lower.rfind("udp://", 0) == 0 || lower.rfind("rtp://", 0) == 0) {
+        endpoint.erase(0, 6);
+    }
+    if (!endpoint.empty() && endpoint.front() == '@') endpoint.erase(endpoint.begin());
+
+    // Strip URI options/path if a complete udp:// URI was pasted into the host box.
+    const auto suffix = endpoint.find_first_of("/?");
+    if (suffix != std::string::npos) endpoint.resize(suffix);
+    boost::algorithm::trim(endpoint);
+    if (endpoint.empty()) return false;
+
+    host = endpoint;
+    port = configuredPort;
+
+    // UDP output is IPv4 in the current sender implementation. A single colon
+    // therefore unambiguously means host:port. Do not reinterpret IPv6 here.
+    const auto colon = endpoint.rfind(':');
+    if (colon != std::string::npos && endpoint.find(':') == colon && colon > 0 && colon + 1 < endpoint.size()) {
+        const std::string portText = endpoint.substr(colon + 1);
+        const bool numeric = std::all_of(portText.begin(), portText.end(),
+            [](unsigned char c) { return c >= '0' && c <= '9'; });
+        if (numeric) {
+            try {
+                const int embeddedPort = std::stoi(portText);
+                if (embeddedPort < 1 || embeddedPort > 65535) return false;
+                host = endpoint.substr(0, colon);
+                port = embeddedPort;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+
+    boost::algorithm::trim(host);
+    return !host.empty() && port >= 1 && port <= 65535;
+}
+
 std::vector<NetworkInterface> enumerateNetworkInterfaces(bool includeLoopback) {
     std::vector<NetworkInterface> list;
     struct ifaddrs* ifaddr = nullptr;

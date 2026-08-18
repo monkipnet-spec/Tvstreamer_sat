@@ -105,17 +105,25 @@ public:
         int sendBufferSize = kSocketBufferSize;
         ::setsockopt(socketFd, SOL_SOCKET, SO_SNDBUF, &sendBufferSize, sizeof(sendBufferSize));
 
+        const std::string rawOutputHost = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+        std::string outputHost;
+        int outputPort = cfg.outputPort;
+        if (!normalizeUdpEndpoint(rawOutputHost, cfg.outputPort, outputHost, outputPort)) {
+            error = "invalid UDP output endpoint: " + rawOutputHost + ":" + std::to_string(cfg.outputPort);
+            closeSocket();
+            return;
+        }
         sockaddr_in destination {};
         destination.sin_family = AF_INET;
-        destination.sin_port = htons(static_cast<uint16_t>(cfg.outputPort));
-        if (::inet_pton(AF_INET, cfg.outputHost.c_str(), &destination.sin_addr) != 1) {
-            error = "invalid UDP output host: " + cfg.outputHost;
+        destination.sin_port = htons(static_cast<uint16_t>(outputPort));
+        if (::inet_pton(AF_INET, outputHost.c_str(), &destination.sin_addr) != 1) {
+            error = "invalid UDP output host: " + outputHost;
             closeSocket();
             return;
         }
         destinationAddress = destination;
 
-        const bool multicastOutput = isMulticastHost(cfg.outputHost);
+        const bool multicastOutput = isMulticastHost(outputHost);
         if (!cfg.interfaceAddress.empty()) {
             const std::string ifaceAddress = interfaceAddressFor(cfg.interfaceAddress);
             in_addr localAddress {};
@@ -150,7 +158,15 @@ public:
         }
 
         ready = true;
-        senderThread = std::thread(&UdpTsSender::sendLoop, this);
+        try {
+            senderThread = std::thread(&UdpTsSender::sendLoop, this);
+        } catch (const std::exception& ex) {
+            error = std::string("failed to create UDP sender thread: ") + ex.what();
+            std::cerr << "Resource guard: " << error << std::endl;
+            ready = false;
+            closeSocket();
+            return;
+        }
     }
 
     ~UdpTsSender() {

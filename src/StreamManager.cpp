@@ -2401,7 +2401,14 @@ void startHttpMpegTsInput(StreamState* state) {
     auto httpState = std::static_pointer_cast<HttpMpegTsCurlInputState>(state->httpMpegTsInputState);
     if (!httpState || httpState->worker.joinable() ||
         httpState->stopping.load(std::memory_order_relaxed)) return;
-    httpState->worker = std::thread(runHttpMpegTsCurlInput, httpState);
+    try {
+        httpState->worker = std::thread(runHttpMpegTsCurlInput, httpState);
+    } catch (const std::exception& ex) {
+        httpState->stopping.store(true, std::memory_order_relaxed);
+        const std::string message = std::string("HTTP MPEG-TS worker thread creation failed: ") + ex.what();
+        std::cerr << "Resource guard: " << message << std::endl;
+        postHttpMpegTsError(httpState.get(), message);
+    }
 }
 
 size_t hlsProbeWrite(char* ptr, size_t size, size_t nmemb, void* userData) {
@@ -3180,8 +3187,9 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
         ? "127.0.0.1"
         : cfg.outputHost;
     const std::string bindHost = cfg.interfaceAddress.empty() ? "0.0.0.0" : cfg.interfaceAddress;
+    const int effectivePort = (cfg.outputPort > 0 && cfg.outputPort <= 65535) ? cfg.outputPort : 7001;
     const std::string uri = "srt://" + (caller ? targetHost : bindHost) + ":" +
-        std::to_string(cfg.outputPort) + "?mode=" + mode;
+        std::to_string(effectivePort) + "?mode=" + mode;
 
     g_object_set(sink,
         "uri", uri.c_str(),
@@ -3195,7 +3203,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
     setBooleanPropertyIfPresent(sink, "wait-for-connection", FALSE);
     if (!caller) {
         setBooleanPropertyIfPresent(sink, "keep-listening", TRUE);
-        setUIntPropertyIfPresent(sink, "localport", static_cast<guint>(cfg.outputPort));
+        setUIntPropertyIfPresent(sink, "localport", static_cast<guint>(effectivePort));
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
@@ -3220,7 +3228,7 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
     std::cerr << "SRT output: mode=" << mode
               << " uri=" << uri
               << " advertised=" << (cfg.outputHost.empty() ? "auto" : cfg.outputHost)
-              << ":" << cfg.outputPort
+              << ":" << effectivePort
               << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
               << " auth=" << (accessFilteringEnabled ? "on" : "off")
               << " transcode=" << (transcoded ? "yes" : "no")
@@ -3497,7 +3505,7 @@ uint32_t pidFromDemuxPadName(GstPad* pad) {
 }
 
 void updateMuxProgramMap(RemapContext* ctx) {
-    if (!ctx || !ctx->mux || ctx->flvMux || ctx->programMapApplied) {
+    if (!ctx || !ctx->mux || ctx->flvMux || ctx->rtspPush || ctx->programMapApplied) {
         return;
     }
 
@@ -3650,8 +3658,7 @@ GstElement* makeCapsFilter(const char* capsDescription) {
 
 bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
     return tvs::protocols::outputKind(outputConfig) == tvs::protocols::OutputKind::Srt &&
-           tvs::protocols::srtOutputMode(outputConfig) != "caller" &&
-           outputConfig.outputPort > 0;
+           tvs::protocols::srtOutputMode(outputConfig) != "caller";
 }
 
 } // namespace
@@ -4385,7 +4392,7 @@ void StreamManager::attachSrtConnectionMonitoring(GstElement* sink, const Stream
         ctx, nullptr, static_cast<GConnectFlags>(0));
 
     std::cerr << "SRT connection monitoring attached for stream " << cfg.id
-              << " port=" << cfg.outputPort
+              << " port=" << ((cfg.outputPort > 0 && cfg.outputPort <= 65535) ? cfg.outputPort : 7001)
               << " filtering=" << (configManager.subscribers.filteringEnabled ? "on" : "off")
               << std::endl;
 }
@@ -4472,7 +4479,7 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
     std::cerr << "Transcoded SRT output relay: stream=" << cfg.id
               << " udp=127.0.0.1:" << relayPort
               << " -> srt=" << (cfg.outputHost.empty() ? "auto" : cfg.outputHost)
-              << ":" << cfg.outputPort
+              << ":" << ((cfg.outputPort > 0 && cfg.outputPort <= 65535) ? cfg.outputPort : 7001)
               << " mode=" << tvs::protocols::srtOutputMode(cfg)
               << " monitoring=direct-callbacks"
               << std::endl;
@@ -4770,7 +4777,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 duplicateStart = true;
             } else {
                 streams[streamConfig.id] = std::move(state);
-                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+                try {
+                    streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+                } catch (const std::exception& ex) {
+                    std::cerr << "Resource guard: bus monitor thread unavailable for stream="
+                              << streamConfig.id << " error=" << ex.what()
+                              << " action=keep-stream-running-without-bus-monitor" << std::endl;
+                }
             }
         }
         if (duplicateStart) {
@@ -4843,7 +4856,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
                 duplicateStart = true;
             } else {
                 streams[streamConfig.id] = std::move(state);
-                streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+                try {
+                    streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+                } catch (const std::exception& ex) {
+                    std::cerr << "Resource guard: bus monitor thread unavailable for stream="
+                              << streamConfig.id << " error=" << ex.what()
+                              << " action=keep-stream-running-without-bus-monitor" << std::endl;
+                }
             }
         }
         if (duplicateStart) {
@@ -4950,7 +4969,13 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
             duplicateStart = true;
         } else {
             streams[streamConfig.id] = std::move(state);
-            streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+            try {
+                    streams[streamConfig.id]->busThread = std::thread(&StreamManager::monitorBus, this, streamConfig.id);
+                } catch (const std::exception& ex) {
+                    std::cerr << "Resource guard: bus monitor thread unavailable for stream="
+                              << streamConfig.id << " error=" << ex.what()
+                              << " action=keep-stream-running-without-bus-monitor" << std::endl;
+                }
         }
     }
     if (duplicateStart) {
@@ -6746,6 +6771,9 @@ bool StreamManager::buildOutputBranch(
     if (type == "rtmp" || type == "youtube") {
         return buildRtmpOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
+    if (type == "rtsp") {
+        return buildRtspOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+    }
 
     // A transcoded stream is already a finished single-program MPEG-TS produced by
     // TranscoderModule. Re-demuxing and remuxing it separately for UDP/SRT/HTTP/HLS
@@ -7035,6 +7063,51 @@ bool StreamManager::buildRemapPipeline(
     return true;
 }
 
+bool StreamManager::buildRtspOutputPipeline(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
+    if (!state || !pipeline || !sourceTail) return false;
+    for (const char* factory : {"tsparse", "queue", "tsdemux", "rtspclientsink"}) {
+        if (!hasElementFactory(factory)) {
+            std::cerr << missingElementStatus(factory) << " required for RTSP Push" << std::endl;
+            return false;
+        }
+    }
+
+    const StreamConfig& cfg = outputConfig;
+    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("rtsp_tsparse", branchIndex).c_str());
+    GstElement* queue = gst_element_factory_make("queue", branchName("rtsp_pre_demux_queue", branchIndex).c_str());
+    GstElement* demux = gst_element_factory_make("tsdemux", branchName("rtsp_ts_demux", branchIndex).c_str());
+    GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("rtsp_client_sink", branchIndex));
+    if (!tsparse || !queue || !demux || !sink) return false;
+
+    if (!addElementOrFail(pipeline, tsparse) || !addElementOrFail(pipeline, queue) ||
+        !addElementOrFail(pipeline, demux)) return false;
+    configureTsPacketAlignment(tsparse);
+    configureQueue(queue);
+    if (!gst_element_link_many(sourceTail, tsparse, queue, demux, nullptr)) {
+        std::cerr << "RTSP Push pipeline link failed before tsdemux" << std::endl;
+        return false;
+    }
+
+    auto context = std::make_unique<RemapContext>();
+    context->mux = sink;
+    context->sink = sink;
+    context->config = cfg;
+    context->rtspPush = true;
+    RemapContext* contextPtr = context.get();
+    state->outputContexts.push_back(std::move(context));
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
+
+    std::cerr << "RTSP Push passthrough: tsdemux -> elementary parsers -> rtspclientsink"
+              << " location=" << tvs::protocols::rtspOutputLocation(cfg)
+              << " listener=off" << std::endl;
+    return true;
+}
+
 bool StreamManager::buildRtmpOutputPipeline(
     StreamState* state,
     GstElement* pipeline,
@@ -7136,6 +7209,8 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         factory = "multifdsink";
     } else if (type == "hls") {
         factory = "hlssink";
+    } else if (type == "rtsp") {
+        factory = "rtspclientsink";
     } else if (type == "rtmp" || type == "youtube") {
         factory = "rtmpsink";
     }
@@ -7157,6 +7232,12 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         configureHttpSink(sink, cfg);
     } else if (type == "hls") {
         configureHlsSink(sink, cfg);
+    } else if (type == "rtsp") {
+        const std::string location = tvs::protocols::rtspOutputLocation(cfg);
+        g_object_set(sink, "location", location.c_str(), nullptr);
+        setIntPropertyIfPresent(sink, "protocols", 4);
+        setUIntPropertyIfPresent(sink, "latency", 200);
+        std::cerr << "RTSP Push output: location=" << location << " transport=tcp listener=off" << std::endl;
     } else if (type == "rtmp" || type == "youtube") {
         configureRtmpSink(sink, cfg);
     }
@@ -7355,6 +7436,8 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         if (reservedPad) {
             muxSinkPad = GST_PAD(gst_object_ref(reservedPad));
         }
+    } else if (ctx->rtspPush) {
+        muxSinkPad = gst_element_request_pad_simple(ctx->mux, "sink_%u");
     } else {
         muxSinkPad = ctx->flvMux
             ? requestFlvMuxSinkPad(ctx->mux, isVideo)
@@ -7368,7 +7451,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
-        std::cerr << "remap linked " << (isAudio ? "audio" : "video")
+        std::cerr << (ctx->rtspPush ? "RTSP push linked " : "remap linked ") << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
@@ -7385,7 +7468,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             ctx->audioLinked = true;
             ctx->audioPadName = padName ? padName : "";
         }
-        updateMuxProgramMap(ctx);
+        if (!ctx->rtspPush) updateMuxProgramMap(ctx);
     }
 
     gst_object_unref(parserSrcPad);
