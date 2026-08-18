@@ -6743,7 +6743,13 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
         return false;
     }
     if (outputs.size() == 1) {
-        return buildOutputBranch(state, pipeline, sourceTail, outputs.front(), 0);
+        const std::string type = outputType(outputs.front());
+        std::cerr << "Multi-output branch build: index=0 type=" << type
+                  << " role=primary" << std::endl;
+        const bool ok = buildOutputBranch(state, pipeline, sourceTail, outputs.front(), 0);
+        std::cerr << "Multi-output branch result: index=0 type=" << type
+                  << " role=primary result=" << (ok ? "ready" : "failed") << std::endl;
+        return ok;
     }
 
     if (!hasElementFactory("tee")) {
@@ -6755,13 +6761,50 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
     if (!addElementOrFail(pipeline, tee)) {
         return false;
     }
+    setBooleanPropertyIfPresent(tee, "allow-not-linked", TRUE);
     if (!gst_element_link(sourceTail, tee)) {
         return false;
     }
 
+    auto isolateFailedAdditionalBranch = [pipeline](GstElement* branchQueue, size_t index, const std::string& type) {
+        if (!branchQueue) return false;
+
+        GstPad* queueSrc = gst_element_get_static_pad(branchQueue, "src");
+        if (!queueSrc) return false;
+        GstPad* peer = gst_pad_get_peer(queueSrc);
+        if (peer) {
+            gst_pad_unlink(queueSrc, peer);
+            gst_object_unref(peer);
+        }
+        gst_object_unref(queueSrc);
+
+        const std::string sinkName = branchName("disabled_output_sink", index);
+        GstElement* sink = gst_element_factory_make("fakesink", sinkName.c_str());
+        if (!sink || !addElementOrFail(pipeline, sink)) {
+            if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+            return false;
+        }
+        g_object_set(sink, "sync", FALSE, "async", FALSE, nullptr);
+        if (!gst_element_link(branchQueue, sink)) {
+            return false;
+        }
+        std::cerr << "Multi-output branch isolated: index=" << index
+                  << " type=" << type
+                  << " replacement=fakesink primary_stream=kept-running" << std::endl;
+        return true;
+    };
+
     for (size_t i = 0; i < outputs.size(); ++i) {
+        const std::string type = outputType(outputs[i]);
+        const bool primary = i == 0;
+        std::cerr << "Multi-output branch build: index=" << i
+                  << " type=" << type
+                  << " role=" << (primary ? "primary" : "additional") << std::endl;
+
         GstElement* queue = gst_element_factory_make("queue", branchName("tee_queue", i).c_str());
         if (!addElementOrFail(pipeline, queue)) {
+            std::cerr << "Multi-output branch failed: index=" << i
+                      << " type=" << type << " stage=tee-queue-create" << std::endl;
             return false;
         }
         configureQueue(queue);
@@ -6771,18 +6814,41 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
         if (!teeSrcPad || !queueSinkPad) {
             if (teeSrcPad) gst_object_unref(teeSrcPad);
             if (queueSinkPad) gst_object_unref(queueSinkPad);
+            std::cerr << "Multi-output branch failed: index=" << i
+                      << " type=" << type << " stage=tee-pad-request" << std::endl;
             return false;
         }
         const bool linked = gst_pad_link(teeSrcPad, queueSinkPad) == GST_PAD_LINK_OK;
         gst_object_unref(teeSrcPad);
         gst_object_unref(queueSinkPad);
         if (!linked) {
+            std::cerr << "Multi-output branch failed: index=" << i
+                      << " type=" << type << " stage=tee-link" << std::endl;
             return false;
         }
 
         if (!buildOutputBranch(state, pipeline, queue, outputs[i], i)) {
+            std::cerr << "Multi-output branch failed: index=" << i
+                      << " type=" << type << " stage=protocol-build"
+                      << " role=" << (primary ? "primary" : "additional") << std::endl;
+
+            // The primary output defines whether the tile itself can run.  A
+            // broken optional HTTP/HLS branch must not take a healthy SRT/UDP
+            // primary off-air.  Detach any partially linked downstream chain
+            // from the tee queue and terminate that queue in a fakesink.  The
+            // orphaned protocol elements stay in the pipeline but receive no
+            // data, avoiding a not-linked error while preserving the primary.
+            const bool softFailAllowed = !primary && (type == "http" || type == "hls");
+            if (softFailAllowed && isolateFailedAdditionalBranch(queue, i, type)) {
+                continue;
+            }
             return false;
         }
+
+        std::cerr << "Multi-output branch result: index=" << i
+                  << " type=" << type
+                  << " role=" << (primary ? "primary" : "additional")
+                  << " result=ready" << std::endl;
     }
 
     return true;
@@ -6877,7 +6943,19 @@ bool StreamManager::buildPassthroughPipeline(
         ? nullptr
         : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
     GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
-    const bool cbrPacingActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
+    // v195: HTTP TS is already a live byte stream and must not inherit the
+    // legacy global CBR identity pacer.  That pacer uses sync=TRUE and datarate
+    // timestamps; it remained in front of the v194 tcpserversink relay and could
+    // stall video/audio even though the public HTTP socket itself was no longer
+    // clock-synchronised.  Keep the legacy pacer behaviour for other protocols
+    // (notably the already working SRT path) and bypass it only for HTTP TS.
+    const bool continuousHttpTs = outputType(cfg) == "http";
+    const bool cbrPacingActive = !isUdpOutput(cfg) && !continuousHttpTs && cbrMuxEnabled(cfg);
+    if (continuousHttpTs && cfg.cbr && cfg.targetBitrate > 0) {
+        std::cerr << "HTTP MPEG-TS output: inherited CBR identity pacer bypassed"
+                  << " target_bitrate=" << cfg.targetBitrate
+                  << " transport=source-paced-live-ts" << std::endl;
+    }
     GstElement* pacer = cbrPacingActive
         ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str())
         : nullptr;
