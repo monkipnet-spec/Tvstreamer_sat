@@ -2062,7 +2062,7 @@ std::string HttpServer::renderIndexPage() {
 html{font-size:14px}
 body{font-family:Arial,Helvetica,sans-serif;background:#0f1218;color:#EEE;margin:0;padding:0;min-height:100vh}
 body:before{content:'';position:fixed;inset:0;background:radial-gradient(circle at top left,rgba(40,160,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(120,90,255,.15),transparent 22%),linear-gradient(180deg,#10131a 0%,#090c12 100%);pointer-events:none;z-index:-1}
-header{position:relative;z-index:100000;overflow:visible;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:rgba(19,23,31,.95);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap}
+header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:rgba(19,23,31,.98);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap;box-sizing:border-box;box-shadow:0 8px 24px rgba(0,0,0,.22)}
 .header-left{display:flex;align-items:flex-start;gap:10px}
 .header-left .title{font-size:1.05rem;font-weight:700;letter-spacing:.02em;color:#fff}
 .header-left .subtitle{font-size:.78rem;color:#9aa3b1;margin-top:2px}
@@ -2072,7 +2072,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .system-load strong{color:#fff;font-size:.76rem}
 .system-load .metric{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;line-height:1.2}
 .system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
-.system-load .listener-metric span{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
 .network-button:hover{background:rgba(57,189,248,.24)}
 .restart-button{border-color:rgba(255,184,77,.28);color:#ffe0a3;background:rgba(255,184,77,.1)}
@@ -2096,7 +2095,7 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 .button-primary.save-dirty{background:#ffbd4a;color:#161b25;box-shadow:0 0 0 2px rgba(255,189,74,.18)}
 .button-primary.save-dirty:hover{background:#ffc968}
 .button-secondary:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
-.container{padding:10px 12px 12px;max-width:1180px;margin:0 auto}
+.container{padding:calc(var(--header-height,58px) + 10px) 12px 12px;max-width:1180px;margin:0 auto;box-sizing:border-box}
 .stats-panel{display:grid;grid-template-columns:repeat(2,minmax(100px,1fr));gap:10px;padding:8px 12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px}
 .stats-panel .status{display:flex;flex-direction:column;gap:3px;font-size:.78rem;color:#d1d9ed}
 .stats-panel .status strong{color:#fff;font-size:.78rem}
@@ -2296,7 +2295,6 @@ header{position:relative;z-index:100000;overflow:visible;display:flex;align-item
 <span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
 <span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
 <span class="metric"><strong>PROC</strong> <span id="procLoad">—</span></span>
-<span class="metric listener-metric"><strong>LISTEN</strong> <span id="listenerStatus">—</span></span>
 </div>
 <div class="stats-panel">
 <div class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></div>
@@ -2803,15 +2801,6 @@ function updateLiveTiles() {
   const activeCount = document.getElementById('activeCount');
   if (totalCount) totalCount.textContent = state.stream_count ?? (state.streams || []).length;
   if (activeCount) activeCount.textContent = state.active_count ?? (state.streams || []).filter(stream => stream.active).length;
-  const listenerStatus = document.getElementById('listenerStatus');
-  if (listenerStatus) {
-    const items = Array.isArray(state.listeners) ? state.listeners : [];
-    listenerStatus.textContent = items.length
-      ? items.map(item => `${item.protocol} ${item.port} ${item.state || 'LISTEN'}`).join(' · ')
-      : '—';
-    listenerStatus.title = items.map(item => `${item.protocol}/${item.transport} ${item.bind}:${item.port} ${item.state || ''}`).join('\n');
-  }
-
   const tiles = document.getElementById('tiles');
   if (!tiles) return;
   const tileElements = Array.from(tiles.querySelectorAll('.tile[data-stream-id]'));
@@ -3142,7 +3131,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 63'} / ${state.program_version||'v192'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 64'} / ${state.program_version||'v193'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
