@@ -29,6 +29,7 @@ struct RemapContext {
     bool audioLinked = false;
     bool flvMux = false;
     bool rtspPush = false;
+    bool hlsSink2 = false;
     bool programMapApplied = false;
     GstPad* preallocatedVideoMuxPad = nullptr;
     GstPad* preallocatedAudioMuxPad = nullptr;
@@ -191,6 +192,7 @@ private:
     bool buildPassthroughPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRemapPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRtmpOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
+    bool buildHlsOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     bool buildRtspOutputPipeline(StreamState* state, GstElement* pipeline, GstElement* sourceTail, const StreamConfig& outputConfig, size_t branchIndex);
     GstElement* createOutputSink(StreamState* state, const StreamConfig& cfg, GstElement* pipeline, const std::string& sinkName);
     GstElement* createExternalSrtOutputPipeline(const StreamConfig& cfg, std::string& error);

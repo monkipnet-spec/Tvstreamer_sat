@@ -3269,20 +3269,46 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
     (void)cfg;
-    // multifdsink must follow the incoming buffer timestamps. With sync disabled
-    // it writes every available MPEG-TS buffer immediately, producing short
-    // network bursts followed by idle gaps. Timestamp-synchronised delivery
-    // smooths HTTP output without modifying the transport stream itself.
+    // Continuous HTTP MPEG-TS must not use GstBaseSink clock scheduling here.
+    // The transport is already paced by its source / optional CBR pacer, while
+    // GstBuffer timestamps on passthrough MPEG-TS are not guaranteed to form a
+    // monotonic network clock.  sync=TRUE can therefore stop multifdsink after
+    // the first few seconds even though TS bytes are still arriving upstream.
+    // SRT uses the same finished TS with sync=FALSE and is the reference path.
     g_object_set(sink,
-        "sync", TRUE,
+        "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         nullptr);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
+
+    // Bound per-client lag so one slow HTTP receiver cannot grow memory without
+    // limit.  Resynchronise lagging clients to recent data instead of blocking
+    // or destabilising the stream pipeline.
+    setIntPropertyIfPresent(sink, "buffers-soft-max", 256);
+    setIntPropertyIfPresent(sink, "buffers-max", 512);
+    setIntPropertyIfPresent(sink, "recover-policy", 1); // latest
+    setUInt64PropertyIfPresent(sink, "timeout", 0);
 }
 
 void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
-    std::filesystem::create_directories(hlsDirectory(cfg));
+    const std::filesystem::path directory(hlsDirectory(cfg));
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    // A restarted HLS stream must never expose the previous run's playlist or
+    // fragments while the new mux is waiting for its first keyframe.
+    if (!ec) {
+        for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            const std::string name = entry.path().filename().string();
+            if (name == "video.m3u8" ||
+                (name.rfind("segment", 0) == 0 && entry.path().extension() == ".ts")) {
+                std::error_code removeEc;
+                std::filesystem::remove(entry.path(), removeEc);
+            }
+        }
+    }
     const std::string playlist = hlsDirectory(cfg) + "/video.m3u8";
     const std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
     g_object_set(sink,
@@ -3291,6 +3317,8 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
         "target-duration", 4,
         "max-files", 8,
         nullptr);
+    setUIntPropertyIfPresent(sink, "playlist-length", 5);
+    setBooleanPropertyIfPresent(sink, "send-keyframe-requests", TRUE);
 }
 
 GstElement* createRtpMpegTsSink(const StreamConfig& cfg, const std::string& sinkName) {
@@ -3505,7 +3533,7 @@ uint32_t pidFromDemuxPadName(GstPad* pad) {
 }
 
 void updateMuxProgramMap(RemapContext* ctx) {
-    if (!ctx || !ctx->mux || ctx->flvMux || ctx->rtspPush || ctx->programMapApplied) {
+    if (!ctx || !ctx->mux || ctx->flvMux || ctx->rtspPush || ctx->hlsSink2 || ctx->programMapApplied) {
         return;
     }
 
@@ -5278,7 +5306,7 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 }
 
 bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
-    std::lock_guard<std::mutex> lock(managerMutex);
+    std::unique_lock<std::mutex> lock(managerMutex);
     auto found = streams.find(id);
     if (found == streams.end()) {
         close(fd);
@@ -5332,9 +5360,11 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
         gst_object_unref(sinks[i]);
     }
 
-    g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
-    g_signal_emit_by_name(sink, "add", fd);
+    // Register ownership before handing the descriptor to multifdsink so an
+    // immediate removal callback cannot leave a stale closed fd in the map.
     httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
+    lock.unlock();
+    g_signal_emit_by_name(sink, "add", fd);
     gst_object_unref(sink);
     return true;
 }
@@ -5375,9 +5405,17 @@ bool StreamManager::removeStreamSession(const std::string& streamId, const std::
 void StreamManager::onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData) {
     (void)sink;
     auto* manager = static_cast<StreamManager*>(userData);
-    if (!manager) return;
-    std::lock_guard<std::mutex> lock(manager->managerMutex);
-    manager->httpClients.erase(fd);
+    if (!manager) {
+        if (fd >= 0) ::close(fd);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(manager->managerMutex);
+        manager->httpClients.erase(fd);
+    }
+    // multifdsink explicitly leaves ownership of the descriptor to the
+    // application. client-fd-removed is the safe point at which it can close.
+    if (fd >= 0) ::close(fd);
 }
 
 void StreamManager::pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now) {
@@ -6774,6 +6812,9 @@ bool StreamManager::buildOutputBranch(
     if (type == "rtsp") {
         return buildRtspOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
     }
+    if (type == "hls") {
+        return buildHlsOutputPipeline(state, pipeline, sourceTail, outputConfig, branchIndex);
+    }
 
     // A transcoded stream is already a finished single-program MPEG-TS produced by
     // TranscoderModule. Re-demuxing and remuxing it separately for UDP/SRT/HTTP/HLS
@@ -7063,6 +7104,89 @@ bool StreamManager::buildRemapPipeline(
     return true;
 }
 
+bool StreamManager::buildHlsOutputPipeline(
+    StreamState* state,
+    GstElement* pipeline,
+    GstElement* sourceTail,
+    const StreamConfig& outputConfig,
+    size_t branchIndex) {
+    if (!state || !pipeline || !sourceTail) return false;
+    const StreamConfig& cfg = outputConfig;
+
+    // Explicit PID/SID remapping still needs our mpegtsmux so the configured
+    // output mapping is preserved.  Feeding that freshly remuxed TS to the old
+    // hlssink is safe because the mux now generates key-unit aware output.
+    if (cfg.remapEnabled || !hasElementFactory("hlssink2")) {
+        if (!hasElementFactory("hlssink2")) {
+            std::cerr << "HLS: hlssink2 unavailable, using mpegtsmux -> hlssink fallback" << std::endl;
+        } else {
+            std::cerr << "HLS: explicit remap enabled, using mpegtsmux -> hlssink to preserve SID/PIDs" << std::endl;
+        }
+        return buildRemapPipeline(state, pipeline, sourceTail, cfg, branchIndex);
+    }
+
+    for (const char* factory : {"tsparse", "queue", "tsdemux", "hlssink2"}) {
+        if (!hasElementFactory(factory)) {
+            std::cerr << missingElementStatus(factory) << " required for HLS" << std::endl;
+            return false;
+        }
+    }
+
+    GstElement* tsparse = gst_element_factory_make("tsparse", branchName("hls_tsparse", branchIndex).c_str());
+    GstElement* queue = gst_element_factory_make("queue", branchName("hls_pre_demux_queue", branchIndex).c_str());
+    GstElement* demux = gst_element_factory_make("tsdemux", branchName("hls_ts_demux", branchIndex).c_str());
+    GstElement* sink = gst_element_factory_make("hlssink2", branchName("hls_sink2", branchIndex).c_str());
+    if (!tsparse || !queue || !demux || !sink) {
+        if (tsparse) gst_object_unref(tsparse);
+        if (queue) gst_object_unref(queue);
+        if (demux) gst_object_unref(demux);
+        if (sink) gst_object_unref(sink);
+        return false;
+    }
+
+    if (!addElementOrFail(pipeline, tsparse) ||
+        !addElementOrFail(pipeline, queue) ||
+        !addElementOrFail(pipeline, demux) ||
+        !addElementOrFail(pipeline, sink)) {
+        if (tsparse && !GST_OBJECT_PARENT(tsparse)) gst_object_unref(tsparse);
+        if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
+        if (demux && !GST_OBJECT_PARENT(demux)) gst_object_unref(demux);
+        if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+        return false;
+    }
+
+    configureTsPacketAlignment(tsparse);
+    configureQueue(queue);
+    configureHlsSink(sink, cfg);
+
+    const bool sourceAlreadySingleProgram =
+        cfg.testPattern ||
+        tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(cfg));
+    if (!sourceAlreadySingleProgram && cfg.inputServiceId > 0) {
+        setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(cfg.inputServiceId));
+    }
+
+    if (!gst_element_link_many(sourceTail, tsparse, queue, demux, nullptr)) {
+        std::cerr << "HLS pipeline link failed before tsdemux" << std::endl;
+        return false;
+    }
+
+    auto context = std::make_unique<RemapContext>();
+    context->mux = sink;
+    context->sink = sink;
+    context->config = cfg;
+    context->hlsSink2 = true;
+    RemapContext* contextPtr = context.get();
+    state->outputContexts.push_back(std::move(context));
+    g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
+
+    std::cerr << "HLS output: tsdemux -> elementary parsers -> hlssink2"
+              << " target_duration=4 playlist_length=5 max_files=8"
+              << " source_keyframes=preserved remux=internal"
+              << std::endl;
+    return true;
+}
+
 bool StreamManager::buildRtspOutputPipeline(
     StreamState* state,
     GstElement* pipeline,
@@ -7230,6 +7354,9 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         configureSrtSink(sink, cfg, configManager.subscribers.filteringEnabled);
     } else if (type == "http") {
         configureHttpSink(sink, cfg);
+        // Connect once per sink.  multifdsink never closes client descriptors
+        // itself; onHttpClientFdRemoved owns that final close.
+        g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
     } else if (type == "hls") {
         configureHlsSink(sink, cfg);
     } else if (type == "rtsp") {
@@ -7436,6 +7563,8 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         if (reservedPad) {
             muxSinkPad = GST_PAD(gst_object_ref(reservedPad));
         }
+    } else if (ctx->hlsSink2) {
+        muxSinkPad = gst_element_request_pad_simple(ctx->mux, isVideo ? "video" : "audio");
     } else if (ctx->rtspPush) {
         muxSinkPad = gst_element_request_pad_simple(ctx->mux, "sink_%u");
     } else {
@@ -7451,7 +7580,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
-        std::cerr << (ctx->rtspPush ? "RTSP push linked " : "remap linked ") << (isAudio ? "audio" : "video")
+        std::cerr << (ctx->hlsSink2 ? "HLS linked " : (ctx->rtspPush ? "RTSP push linked " : "remap linked ")) << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
@@ -7468,7 +7597,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             ctx->audioLinked = true;
             ctx->audioPadName = padName ? padName : "";
         }
-        if (!ctx->rtspPush) updateMuxProgramMap(ctx);
+        if (!ctx->rtspPush && !ctx->hlsSink2) updateMuxProgramMap(ctx);
     }
 
     gst_object_unref(parserSrcPad);
