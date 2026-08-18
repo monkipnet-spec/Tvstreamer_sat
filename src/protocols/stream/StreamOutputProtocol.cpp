@@ -55,7 +55,7 @@ std::vector<const char*> requiredElementsForOutput(OutputProtocolKind kind) {
         case OutputProtocolKind::Rtp:
             return {"rtpmp2tpay", "udpsink"};
         case OutputProtocolKind::Http:
-            return {"multifdsink"};
+            return {"tcpserversink"};
         case OutputProtocolKind::Hls:
             return {"hlssink"};
         case OutputProtocolKind::Srt:

@@ -489,7 +489,11 @@ void HttpServer::handleSession(tcp::socket socket) {
         res.set(http::field::content_type, "text/html; charset=UTF-8");
         res.set(http::field::cache_control, "no-store");
         res.set(http::field::pragma, "no-cache");
-        res.keep_alive(req.keep_alive());
+        // One accepted socket is handled for exactly one HTTP request in this
+        // implementation. Advertising keep-alive while closing the socket after
+        // the response makes HLS clients reuse a connection that no longer has a
+        // request loop and can stall playlist/segment fetching after a few seconds.
+        res.keep_alive(false);
 
         const std::string target(req.target());
         if (requiresAuthentication(target) && !isAuthorized(req)) {
@@ -1522,11 +1526,13 @@ bool HttpServer::serveHlsFile(const tcp::socket& socket, const std::string& targ
     }
     if (filePath.extension() == ".m3u8") {
         res.set(http::field::content_type, "application/vnd.apple.mpegurl");
-        res.set(http::field::cache_control, "no-cache");
+        res.set(http::field::cache_control, "no-cache, no-store, must-revalidate");
     } else {
         res.set(http::field::content_type, "video/MP2T");
-        res.set(http::field::cache_control, "no-cache");
+        res.set(http::field::cache_control, "no-cache, no-store, must-revalidate");
     }
+    res.set("Access-Control-Allow-Origin", "*");
+    res.keep_alive(false);
     return true;
 }
 
@@ -3131,7 +3137,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 64'} / ${state.program_version||'v193'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 65'} / ${state.program_version||'v194'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

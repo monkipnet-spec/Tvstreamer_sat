@@ -3268,27 +3268,30 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
 }
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
-    (void)cfg;
-    // Continuous HTTP MPEG-TS must not use GstBaseSink clock scheduling here.
-    // The transport is already paced by its source / optional CBR pacer, while
-    // GstBuffer timestamps on passthrough MPEG-TS are not guaranteed to form a
-    // monotonic network clock.  sync=TRUE can therefore stop multifdsink after
-    // the first few seconds even though TS bytes are still arriving upstream.
-    // SRT uses the same finished TS with sync=FALSE and is the reference path.
+    if (!sink) return;
+    // v194: public HTTP delivery is no longer attached directly to a
+    // multifdsink.  The proven transcoder HTTP path already uses a private
+    // tcpserversink and a plain socket relay in HttpServer; use the same
+    // architecture for passthrough MPEG-TS as well.  This isolates public HTTP
+    // clients from the GStreamer pipeline and avoids multifdsink client queue /
+    // recovery semantics affecting a long-running TS connection.
+    const guint internalPort = static_cast<guint>(tvs::protocols::transcodedHttpInternalPort(cfg));
     g_object_set(sink,
+        "host", "127.0.0.1",
+        "port", internalPort,
         "sync", FALSE,
         "async", FALSE,
         "qos", FALSE,
         nullptr);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
-
-    // Bound per-client lag so one slow HTTP receiver cannot grow memory without
-    // limit.  Resynchronise lagging clients to recent data instead of blocking
-    // or destabilising the stream pipeline.
-    setIntPropertyIfPresent(sink, "buffers-soft-max", 256);
-    setIntPropertyIfPresent(sink, "buffers-max", 512);
-    setIntPropertyIfPresent(sink, "recover-policy", 1); // latest
+    setIntPropertyIfPresent(sink, "buffers-soft-max", 512);
+    setIntPropertyIfPresent(sink, "buffers-max", 1024);
+    setIntPropertyIfPresent(sink, "recover-policy", 1);
     setUInt64PropertyIfPresent(sink, "timeout", 0);
+    std::cerr << "HTTP MPEG-TS output: transport=tcpserversink-relay"
+              << " internal=127.0.0.1:" << internalPort
+              << " public_port=" << cfg.outputPort
+              << " gst_public_client=off" << std::endl;
 }
 
 void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
@@ -5306,25 +5309,39 @@ std::string StreamManager::buildPipelineDescription(const StreamConfig& cfg) {
 }
 
 bool StreamManager::addHttpClient(const std::string& id, int fd, const std::string& clientIp) {
-    std::unique_lock<std::mutex> lock(managerMutex);
-    auto found = streams.find(id);
-    if (found == streams.end()) {
-        close(fd);
+    uint16_t relayPort = 0;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        auto found = streams.find(id);
+        if (found == streams.end()) {
+            ::close(fd);
+            return false;
+        }
+        if (!hasTranscodedHttpOutput(found->second->config)) {
+            ::close(fd);
+            return false;
+        }
+        // Both passthrough and transcoded HTTP now terminate in the same private
+        // tcpserversink port.  HttpServer owns the public HTTP socket and relays
+        // raw MPEG-TS bytes from this local-only endpoint.
+        relayPort = tvs::protocols::transcodedHttpInternalPort(found->second->config);
+    }
+
+    std::string relayError;
+    int upstreamFd = connectLocalTcpWithRetry(relayPort, relayError);
+    if (upstreamFd < 0) {
+        std::cerr << "HTTP relay failed for stream " << id
+                  << ": " << relayError << std::endl;
+        ::close(fd);
         return false;
     }
 
-    if (!found->second->pipeline && found->second->gstTranscoder && hasTranscodedHttpOutput(found->second->config)) {
-        const uint16_t relayPort = tvs::protocols::transcodedHttpInternalPort(found->second->config);
-        std::string relayError;
-        int upstreamFd = connectLocalTcpWithRetry(relayPort, relayError);
-        if (upstreamFd < 0) {
-            std::cerr << "Transcoded HTTP relay failed for stream " << id
-                      << ": " << relayError << std::endl;
-            close(fd);
-            return false;
-        }
-
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
         httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
+    }
+
+    try {
         std::thread([this, id, fd, upstreamFd]() {
             std::array<char, 65536> buffer {};
             while (true) {
@@ -5341,31 +5358,15 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
             std::lock_guard<std::mutex> relayLock(managerMutex);
             httpClients.erase(fd);
         }).detach();
-        return true;
-    }
-
-    if (!found->second->pipeline) {
-        close(fd);
+    } catch (const std::exception& ex) {
+        std::cerr << "Resource guard: HTTP relay thread creation failed stream="
+                  << id << " error=" << ex.what() << std::endl;
+        ::close(upstreamFd);
+        ::close(fd);
+        std::lock_guard<std::mutex> lock(managerMutex);
+        httpClients.erase(fd);
         return false;
     }
-
-    auto sinks = findSinksByFactory(found->second->pipeline, "multifdsink");
-    if (sinks.empty()) {
-        close(fd);
-        return false;
-    }
-
-    GstElement* sink = sinks.front();
-    for (size_t i = 1; i < sinks.size(); ++i) {
-        gst_object_unref(sinks[i]);
-    }
-
-    // Register ownership before handing the descriptor to multifdsink so an
-    // immediate removal callback cannot leave a stale closed fd in the map.
-    httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
-    lock.unlock();
-    g_signal_emit_by_name(sink, "add", fd);
-    gst_object_unref(sink);
     return true;
 }
 
@@ -5478,7 +5479,7 @@ size_t StreamManager::activeSubscriberSessions(const SubscriberConfig& subscribe
 }
 
 size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
-    std::vector<std::pair<GstElement*, int>> sinks;
+    std::vector<int> httpFds;
     size_t removed = 0;
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     {
@@ -5489,13 +5490,9 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
                 ++it;
                 continue;
             }
-            auto found = streams.find(it->second.streamId);
-            if (found != streams.end() && found->second->pipeline) {
-                auto foundSinks = findSinksByFactory(found->second->pipeline, "multifdsink");
-                for (auto* sink : foundSinks) {
-                    sinks.emplace_back(sink, it->first);
-                }
-            }
+            // The relay thread owns close(fd). shutdown() wakes a blocked write
+            // without risking a double-close after the descriptor is recycled.
+            httpFds.push_back(it->first);
             ++removed;
             it = httpClients.erase(it);
         }
@@ -5508,15 +5505,14 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
             }
         }
     }
-    for (const auto& [sink, fd] : sinks) {
-        g_signal_emit_by_name(sink, "remove", fd);
-        gst_object_unref(sink);
+    for (int fd : httpFds) {
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
     }
     return removed;
 }
 
 size_t StreamManager::enforceSubscriberAccess() {
-    std::vector<std::pair<GstElement*, int>> sinks;
+    std::vector<int> httpFds;
     std::vector<std::string> srtStreams;
     size_t removed = 0;
     {
@@ -5530,13 +5526,7 @@ size_t StreamManager::enforceSubscriberAccess() {
             std::cerr << "Disconnecting unauthorized " << it->second.protocol
                       << " session stream=" << it->second.streamId
                       << " ip=" << it->second.clientIp << std::endl;
-            auto found = streams.find(it->second.streamId);
-            if (found != streams.end() && found->second->pipeline) {
-                auto foundSinks = findSinksByFactory(found->second->pipeline, "multifdsink");
-                for (auto* sink : foundSinks) {
-                    sinks.emplace_back(sink, it->first);
-                }
-            }
+            httpFds.push_back(it->first);
             ++removed;
             it = httpClients.erase(it);
         }
@@ -5557,9 +5547,8 @@ size_t StreamManager::enforceSubscriberAccess() {
         }
     }
 
-    for (const auto& [sink, fd] : sinks) {
-        g_signal_emit_by_name(sink, "remove", fd);
-        gst_object_unref(sink);
+    for (int fd : httpFds) {
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
     }
     if (!srtStreams.empty()) {
         restartSrtOutputsForStreams(srtStreams);
@@ -7156,8 +7145,14 @@ bool StreamManager::buildHlsOutputPipeline(
     }
 
     configureTsPacketAlignment(tsparse);
-    configureQueue(queue);
+    configureQueue(queue, 10000000000ULL);
     configureHlsSink(sink, cfg);
+    // Broadcast/IP passthrough already contains regular GOP keyframes. Sending
+    // ForceKeyUnit events upstream cannot make a source encoder create a new
+    // frame and can leave some live passthrough chains waiting on an event they
+    // can never satisfy. Keep requests only when our own transcoder is active.
+    const bool canRequestKeyframes = state->config.transcodeEnabled || state->config.testPattern;
+    setBooleanPropertyIfPresent(sink, "send-keyframe-requests", canRequestKeyframes ? TRUE : FALSE);
 
     const bool sourceAlreadySingleProgram =
         cfg.testPattern ||
@@ -7183,6 +7178,7 @@ bool StreamManager::buildHlsOutputPipeline(
     std::cerr << "HLS output: tsdemux -> elementary parsers -> hlssink2"
               << " target_duration=4 playlist_length=5 max_files=8"
               << " source_keyframes=preserved remux=internal"
+              << " force_keyunit=" << (canRequestKeyframes ? "on" : "off")
               << std::endl;
     return true;
 }
@@ -7330,7 +7326,7 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
 
     const char* factory = "srtsink";
     if (type == "http") {
-        factory = "multifdsink";
+        factory = "tcpserversink";
     } else if (type == "hls") {
         factory = "hlssink";
     } else if (type == "rtsp") {
@@ -7354,9 +7350,6 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         configureSrtSink(sink, cfg, configManager.subscribers.filteringEnabled);
     } else if (type == "http") {
         configureHttpSink(sink, cfg);
-        // Connect once per sink.  multifdsink never closes client descriptors
-        // itself; onHttpClientFdRemoved owns that final close.
-        g_signal_connect(sink, "client-fd-removed", G_CALLBACK(StreamManager::onHttpClientFdRemoved), this);
     } else if (type == "hls") {
         configureHlsSink(sink, cfg);
     } else if (type == "rtsp") {
@@ -7501,7 +7494,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         setBooleanPropertyIfPresent(audioClockSync, "sync-to-first", TRUE);
     }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
-        g_object_set(parser, "config-interval", 1, nullptr);
+        g_object_set(parser, "config-interval", ctx->hlsSink2 ? -1 : 1, nullptr);
     }
     gst_element_sync_state_with_parent(queue);
     gst_element_sync_state_with_parent(parser);
