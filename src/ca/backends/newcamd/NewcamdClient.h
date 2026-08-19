@@ -16,6 +16,12 @@
 class NewcamdClient {
 public:
     using KeyUpdateCallback = std::function<void(uint16_t, uint8_t, const uint8_t*)>;
+    using EmmAckCallback = std::function<void(uint16_t, uint8_t)>;
+
+    struct ProviderInfo {
+        uint32_t ident = 0;
+        std::array<uint8_t, 8> sa{};
+    };
 
     NewcamdClient(const std::string& host, int port, const std::string& user, const std::string& pass, const std::string& des);
     ~NewcamdClient();
@@ -23,13 +29,23 @@ public:
     bool connect();
     bool login();
     bool send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm, uint16_t* message_id = nullptr);
+    bool send_emm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& emm, uint16_t* message_id = nullptr);
     void disconnect();
     void start_receiver();
     void set_key_update_callback(KeyUpdateCallback cb) {
         std::lock_guard<std::mutex> lock(mutex_);
         callback_ = std::move(cb);
     }
+    void set_emm_ack_callback(EmmAckCallback cb) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        emm_ack_callback_ = std::move(cb);
+    }
     bool authenticated() const { return authenticated_; }
+    bool au_enabled() const { return au_enabled_; }
+    uint16_t card_caid() const { return card_caid_; }
+    const std::array<uint8_t, 8>& card_ua() const { return card_ua_; }
+    const std::vector<ProviderInfo>& providers() const { return providers_; }
+    bool matches_irdeto_emm(const std::vector<uint8_t>& emm) const;
     size_t pending_ecms() const { return pending_ecms_.load(std::memory_order_relaxed); }
     std::string last_error() const;
 
@@ -55,12 +71,17 @@ private:
     mutable std::mutex mutex_;
     std::mutex write_mutex_;
     KeyUpdateCallback callback_;
+    EmmAckCallback emm_ack_callback_;
     std::string last_error_;
     std::array<uint8_t, 14> base_des_key_{};
     std::array<uint8_t, 16> session_key_{};
     uint16_t msg_id_ = 0;
     bool des_key_ready_ = false;
     bool session_key_ready_ = false;
+    bool au_enabled_ = false;
+    uint16_t card_caid_ = 0;
+    std::array<uint8_t, 8> card_ua_{};
+    std::vector<ProviderInfo> providers_;
     std::atomic<bool> running_{false};
     std::atomic<bool> authenticated_{false};
     std::atomic<size_t> pending_ecms_{0};

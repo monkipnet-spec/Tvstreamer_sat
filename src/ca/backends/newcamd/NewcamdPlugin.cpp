@@ -43,6 +43,9 @@ struct EcmDescriptor {
         if (caid != other.caid) return caid < other.caid;
         return provid < other.provid;
     }
+    bool operator==(const EcmDescriptor& other) const {
+        return pid == other.pid && caid == other.caid && provid == other.provid;
+    }
 };
 
 struct SectionAssembler {
@@ -133,6 +136,8 @@ struct ServiceBinding {
     uint16_t defaultCaid = 0;
     uint32_t defaultProvid = 0;
     std::set<EcmDescriptor> ecmPids;
+    std::set<EcmDescriptor> emmPids;
+    bool catRoutingAnnounced = false;
     // Elementary/PCR PIDs belonging to this selected service.  In full-MPTS
     // mode the CA hook sees the transponder before software service filtering,
     // so never apply this service's CW to scrambled packets of other services.
@@ -191,6 +196,15 @@ struct EcmQueueItem {
     uint16_t irdetoChid = 0;
 };
 
+struct EmmQueueItem {
+    std::string streamId;
+    uint16_t serviceId = 0;
+    EcmDescriptor descriptor;
+    std::vector<uint8_t> section;
+    std::string signature;
+    uint64_t queuedMs = 0;
+};
+
 struct NewcamdSession {
     std::unique_ptr<NewcamdClient> client;
     std::atomic<bool> connected{false};
@@ -225,11 +239,43 @@ struct ReaderConfig {
     std::string user = "user";
     std::string pass = "pass";
     std::string des = "0102030405060708091011121314";
+    uint16_t caid = 0;
+    uint32_t provid = 0;
+};
+
+struct NewcamdAuSession {
+    std::unique_ptr<NewcamdClient> client;
+    std::atomic<bool> connected{false};
+    std::mutex mutex;
+    std::deque<EmmQueueItem> emmQueue;
+    bool emmInFlight = false;
+    uint16_t currentMessageId = 0;
+    uint8_t currentTableId = 0;
+    std::string currentSignature;
+    std::string currentStreamId;
+    uint64_t currentStartedMs = 0;
+    std::map<std::string, uint64_t> recentEmms;
+    uint64_t emmSent = 0;
+    uint64_t emmAcked = 0;
+    uint64_t emmDuplicateDrops = 0;
+    uint64_t emmQueueDrops = 0;
+    uint64_t emmFilterDrops = 0;
+    uint64_t emmSendErrors = 0;
+
+    ~NewcamdAuSession() {
+        if (client) {
+            client->set_emm_ack_callback({});
+            client.reset();
+        }
+    }
 };
 
 struct NewcamdInstance {
     std::mutex mutex;
     std::map<std::string, ReaderConfig> readersByClient;
+    // One dedicated AU/EMM connection per reader.  Service ECM connections
+    // remain independent (v166) and never wait behind entitlement updates.
+    std::map<std::string, std::shared_ptr<NewcamdAuSession>> auSessionsByClient;
     // v166: one independent Newcamd TCP session per active service.  This
     // prevents message ids, receiver state and ECM latency from one service
     // affecting any other service that uses the same OSCam reader/account.
@@ -238,6 +284,9 @@ struct NewcamdInstance {
 };
 
 constexpr size_t kMaxSessionsPerReader = 10;
+constexpr uint64_t kEmmDuplicateTtlMs = 30000;
+constexpr size_t kMaxRecentEmms = 512;
+constexpr size_t kMaxQueuedEmms = 64;
 
 void write_error(char* error, size_t error_size, const std::string& message) {
     if (!error || error_size == 0) return;
@@ -269,6 +318,18 @@ uint64_t monotonic_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+uint32_t parse_hex_value(const char* text, uint32_t maxValue) {
+    if (!text || !*text) return 0;
+    try {
+        std::string value(text);
+        if (value.rfind("0x", 0) == 0 || value.rfind("0X", 0) == 0) value.erase(0, 2);
+        const unsigned long parsed = std::stoul(value, nullptr, 16);
+        return parsed <= maxValue ? static_cast<uint32_t>(parsed) : 0;
+    } catch (...) {
+        return 0;
+    }
 }
 
 bool is_irdeto_caid(uint16_t caid) {
@@ -322,6 +383,40 @@ void collect_ca_descriptors(const uint8_t* data, size_t size, std::set<EcmDescri
             if (ecm.pid > 0 && ecm.pid < kNullPid) out.insert(ecm);
         }
         pos += len;
+    }
+}
+
+void keep_reader_caid(std::set<EcmDescriptor>& descriptors, uint16_t caid) {
+    if (caid == 0) return;
+    for (auto it = descriptors.begin(); it != descriptors.end();) {
+        if (it->caid != caid) it = descriptors.erase(it);
+        else ++it;
+    }
+}
+
+void parse_cat_section(const std::vector<uint8_t>& section, ServiceBinding& binding) {
+    if (section.size() < 12 || section[0] != 0x01) return;
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    const size_t sectionTotal = 3 + sectionLength;
+    if (sectionLength < 9 || sectionTotal > section.size()) return;
+    const size_t descriptorsStart = 8;
+    const size_t crcStart = sectionTotal - 4;
+    if (descriptorsStart > crcStart) return;
+
+    std::set<EcmDescriptor> newEmmPids;
+    collect_ca_descriptors(section.data() + descriptorsStart,
+                           crcStart - descriptorsStart, newEmmPids);
+    keep_reader_caid(newEmmPids, binding.defaultCaid);
+    if (newEmmPids.empty()) return;
+
+    const bool changed = newEmmPids != binding.emmPids;
+    binding.emmPids = std::move(newEmmPids);
+    if (changed || !binding.catRoutingAnnounced) {
+        std::cerr << "NEWCAMD CAT EMM SELECT: stream_service=" << binding.serviceId
+                  << " reader_caid=0x" << std::hex << binding.defaultCaid << std::dec
+                  << " emm_pids=" << binding.emmPids.size()
+                  << " au=astra-irdeto-filter" << std::endl;
+        binding.catRoutingAnnounced = true;
     }
 }
 
@@ -385,6 +480,10 @@ void parse_pmt_section(const std::vector<uint8_t>& section, ServiceBinding& bind
         pos += esInfoLength;
     }
 
+    // A PMT can advertise several CAIDs for the same service.  This reader
+    // has a fixed CAID (e.g. Pervy1=0652), so do not send unrelated 0662 ECMs
+    // to OSCam only to have them rejected on every rotation.
+    keep_reader_caid(newEcmPids, binding.defaultCaid);
     binding.ecmPids = std::move(newEcmPids);
     binding.servicePayloadPids = std::move(newPayloadPids);
     if (!binding.pmtRoutingAnnounced) {
@@ -410,6 +509,22 @@ std::string ecm_signature(const std::vector<uint8_t>& section) {
 
 EcmDescriptor descriptor_for_pid(const ServiceBinding& binding, uint16_t pid) {
     for (const auto& item : binding.ecmPids) {
+        if (item.pid == pid) {
+            EcmDescriptor result = item;
+            if (result.caid == 0) result.caid = binding.defaultCaid;
+            if (result.provid == 0) result.provid = binding.defaultProvid;
+            return result;
+        }
+    }
+    EcmDescriptor fallback;
+    fallback.pid = pid;
+    fallback.caid = binding.defaultCaid;
+    fallback.provid = binding.defaultProvid;
+    return fallback;
+}
+
+EcmDescriptor descriptor_for_emm_pid(const ServiceBinding& binding, uint16_t pid) {
+    for (const auto& item : binding.emmPids) {
         if (item.pid == pid) {
             EcmDescriptor result = item;
             if (result.caid == 0) result.caid = binding.defaultCaid;
@@ -505,6 +620,130 @@ void enqueue_ecm(NewcamdInstance* inst, const std::string& clientKey,
         shouldPump = !session->ecmInFlight;
     }
     if (shouldPump) pump_ecm_queue(inst, clientKey, session);
+}
+
+void pump_emm_queue(const std::string& clientKey,
+                    const std::shared_ptr<NewcamdAuSession>& auSession) {
+    if (!auSession || !auSession->connected.load() || !auSession->client) return;
+
+    while (true) {
+        EmmQueueItem item;
+        uint16_t messageId = 0;
+        uint64_t sentCount = 0;
+        std::string sendError;
+        {
+            // Hold the AU mutex across send_emm and ownership publication, just
+            // like the ECM scheduler.  A localhost OSCam reply can be extremely
+            // fast; its callback waits until currentMessageId is installed.
+            std::unique_lock<std::mutex> lock(auSession->mutex);
+            if (auSession->emmInFlight || auSession->emmQueue.empty()) return;
+            item = std::move(auSession->emmQueue.front());
+            auSession->emmQueue.pop_front();
+
+            if (!auSession->client->send_emm(item.serviceId, item.descriptor.caid,
+                                             item.descriptor.provid, item.section,
+                                             &messageId)) {
+                sendError = auSession->client->last_error();
+                ++auSession->emmSendErrors;
+                auSession->recentEmms.erase(item.signature);
+            } else {
+                auSession->emmInFlight = true;
+                auSession->currentMessageId = messageId;
+                auSession->currentTableId = item.section.empty() ? 0 : item.section[0];
+                auSession->currentSignature = item.signature;
+                auSession->currentStreamId = item.streamId;
+                auSession->currentStartedMs = monotonic_ms();
+                sentCount = ++auSession->emmSent;
+            }
+        }
+
+        if (!sendError.empty()) {
+            std::cerr << "NEWCAMD EMM DROP: client=" << clientKey
+                      << " stream=" << item.streamId
+                      << " pid=" << item.descriptor.pid
+                      << " caid=0x" << std::hex << item.descriptor.caid << std::dec
+                      << " type=0x" << std::hex
+                      << static_cast<unsigned>(item.section.empty() ? 0 : item.section[0])
+                      << std::dec
+                      << " reason=send-failed detail=" << sendError << std::endl;
+            // Try the next queued update; failed signatures are no longer in the
+            // dedup cache and will also be eligible on the next broadcast copy.
+            continue;
+        }
+
+        if (sentCount <= 20 || (sentCount % 100) == 0 || caDiagnosticsEnabled()) {
+            std::cerr << "NEWCAMD EMM SEND: client=" << clientKey
+                      << " stream=" << item.streamId
+                      << " sid=" << item.serviceId
+                      << " msg=" << messageId
+                      << " pid=" << item.descriptor.pid
+                      << " caid=0x" << std::hex << item.descriptor.caid << std::dec
+                      << " provid=0x" << std::hex << item.descriptor.provid << std::dec
+                      << " type=0x" << std::hex
+                      << static_cast<unsigned>(item.section.empty() ? 0 : item.section[0])
+                      << std::dec
+                      << " bytes=" << item.section.size()
+                      << " total=" << sentCount
+                      << " au=dedicated-reader serial=one-in-flight" << std::endl;
+        }
+        return;
+    }
+}
+
+bool forward_irdeto_emm(const std::string& clientKey, const std::string& streamId,
+                        uint16_t serviceId, const EcmDescriptor& descriptor,
+                        const std::vector<uint8_t>& section,
+                        const std::shared_ptr<NewcamdAuSession>& auSession) {
+    if (!auSession || !auSession->connected.load() || !auSession->client) return false;
+    if (!auSession->client->au_enabled() || !auSession->client->matches_irdeto_emm(section)) {
+        std::lock_guard<std::mutex> lock(auSession->mutex);
+        ++auSession->emmFilterDrops;
+        return false;
+    }
+
+    const uint64_t now = monotonic_ms();
+    const std::string signature = ecm_signature(section);
+    bool shouldPump = false;
+    {
+        std::lock_guard<std::mutex> lock(auSession->mutex);
+        for (auto it = auSession->recentEmms.begin(); it != auSession->recentEmms.end();) {
+            if (now >= it->second && now - it->second >= kEmmDuplicateTtlMs)
+                it = auSession->recentEmms.erase(it);
+            else
+                ++it;
+        }
+        auto duplicate = auSession->recentEmms.find(signature);
+        if (duplicate != auSession->recentEmms.end() &&
+            now >= duplicate->second && now - duplicate->second < kEmmDuplicateTtlMs) {
+            ++auSession->emmDuplicateDrops;
+            return false;
+        }
+        if (auSession->recentEmms.size() >= kMaxRecentEmms) {
+            auSession->recentEmms.erase(auSession->recentEmms.begin());
+        }
+        auSession->recentEmms[signature] = now;
+
+        if (auSession->emmQueue.size() >= kMaxQueuedEmms) {
+            // Do not ever block the TS/CSA hot path on a slow card.  Drop the
+            // oldest queued (not in-flight) EMM and let its next broadcast copy
+            // become eligible again.
+            auSession->recentEmms.erase(auSession->emmQueue.front().signature);
+            auSession->emmQueue.pop_front();
+            ++auSession->emmQueueDrops;
+        }
+
+        EmmQueueItem item;
+        item.streamId = streamId;
+        item.serviceId = serviceId;
+        item.descriptor = descriptor;
+        item.section = section;
+        item.signature = signature;
+        item.queuedMs = now;
+        auSession->emmQueue.push_back(std::move(item));
+        shouldPump = !auSession->emmInFlight;
+    }
+    if (shouldPump) pump_emm_queue(clientKey, auSession);
+    return true;
 }
 
 void configure_service_callback(NewcamdInstance* inst,
@@ -705,27 +944,100 @@ static int newcamd_open_reader(void* instance, const struct tvs_ca_reader_info_v
     readerConfig.user = config.get("user", "user").asString();
     readerConfig.pass = config.get("pass", "pass").asString();
     readerConfig.des = config.get("des", "0102030405060708091011121314").asString();
+    readerConfig.caid = static_cast<uint16_t>(parse_hex_value(reader->caid, 0xFFFFu));
+    readerConfig.provid = parse_hex_value(reader->provider, 0xFFFFFFu);
 
-    // Probe credentials/server once when the reader is opened. The probe is
-    // immediately closed; actual persistent connections are created per service.
-    NewcamdClient probe(readerConfig.host, readerConfig.port, readerConfig.user,
-                        readerConfig.pass, readerConfig.des);
-    if (!probe.connect() || !probe.login()) {
-        const std::string detail = probe.last_error();
+    // v196: keep the reader probe alive as a dedicated AU/EMM Newcamd
+    // connection.  Astra forwards addressed Irdeto EMMs over its CAM session;
+    // the old TVStreammerSAT5 probe disconnected immediately and therefore the
+    // card never received entitlement updates while our service sessions ran.
+    auto auSession = std::make_shared<NewcamdAuSession>();
+    auSession->client = std::make_unique<NewcamdClient>(
+        readerConfig.host, readerConfig.port, readerConfig.user,
+        readerConfig.pass, readerConfig.des);
+    if (!auSession->client->connect() || !auSession->client->login()) {
+        const std::string detail = auSession->client->last_error();
         write_error(error, error_size,
                     detail.empty() ? "Newcamd connect/login failed"
                                    : "Newcamd connect/login failed: " + detail);
         return TVS_CA_RESULT_ERROR;
     }
-    probe.disconnect();
 
+    const uint16_t cardCaid = auSession->client->card_caid();
+    if (cardCaid != 0) readerConfig.caid = cardCaid;
+    auSession->client->set_emm_ack_callback(
+        [clientKey, weakAu = std::weak_ptr<NewcamdAuSession>(auSession)]
+        (uint16_t messageId, uint8_t tableId) {
+            auto au = weakAu.lock();
+            if (!au) return;
+
+            uint64_t acked = 0;
+            uint64_t latencyMs = 0;
+            std::string streamId;
+            bool matched = false;
+            {
+                std::lock_guard<std::mutex> lock(au->mutex);
+                if (au->emmInFlight && au->currentMessageId == messageId) {
+                    const uint64_t now = monotonic_ms();
+                    latencyMs = now >= au->currentStartedMs ? now - au->currentStartedMs : 0;
+                    streamId = au->currentStreamId;
+                    au->emmInFlight = false;
+                    au->currentMessageId = 0;
+                    au->currentTableId = 0;
+                    au->currentSignature.clear();
+                    au->currentStreamId.clear();
+                    au->currentStartedMs = 0;
+                    acked = ++au->emmAcked;
+                    matched = true;
+                }
+            }
+            if (!matched) {
+                std::cerr << "NEWCAMD EMM ACK DROP: client=" << clientKey
+                          << " msg=" << messageId
+                          << " type=0x" << std::hex << static_cast<unsigned>(tableId) << std::dec
+                          << " reason=transaction-mismatch" << std::endl;
+                return;
+            }
+            if (acked <= 20 || (acked % 100) == 0 || caDiagnosticsEnabled()) {
+                std::cerr << "NEWCAMD EMM ACK: client=" << clientKey
+                          << " stream=" << streamId
+                          << " msg=" << messageId
+                          << " type=0x" << std::hex << static_cast<unsigned>(tableId) << std::dec
+                          << " latency_ms=" << latencyMs
+                          << " total=" << acked << std::endl;
+            }
+            pump_emm_queue(clientKey, au);
+        });
+    auSession->client->start_receiver();
+    auSession->connected = true;
+
+    std::shared_ptr<NewcamdAuSession> replacedAuSession;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
-        inst->readersByClient[clientKey] = std::move(readerConfig);
+        auto old = inst->auSessionsByClient.find(clientKey);
+        if (old != inst->auSessionsByClient.end()) replacedAuSession = old->second;
+        inst->readersByClient[clientKey] = readerConfig;
+        inst->auSessionsByClient[clientKey] = auSession;
     }
+    replacedAuSession.reset();
+
     std::cerr << "NEWCAMD READER READY: client=" << clientKey
               << " session_mode=per-service max_sessions=" << kMaxSessionsPerReader
+              << " reader_caid=0x" << std::hex << readerConfig.caid << std::dec
               << std::endl;
+    std::cerr << "NEWCAMD AU SESSION: client=" << clientKey
+              << " mode=dedicated-reader-tcp"
+              << " au=" << (auSession->client->au_enabled() ? "enabled" : "disabled")
+              << " card_caid=0x" << std::hex << auSession->client->card_caid() << std::dec
+              << " providers=" << auSession->client->providers().size()
+              << " emm_filter=astra-irdeto-address"
+              << " emm_dedup_ttl_ms=" << kEmmDuplicateTtlMs
+              << std::endl;
+    if (!auSession->client->au_enabled()) {
+        std::cerr << "NEWCAMD AU WARNING: client=" << clientKey
+                  << " server reported AU disabled; ECM decoding remains available but EMM will not be sent"
+                  << std::endl;
+    }
     return TVS_CA_RESULT_OK;
 }
 
@@ -735,6 +1047,7 @@ static void newcamd_close_reader(void* instance, const char* reader_key) {
 
     const std::string clientKey = reader_key;
     std::vector<std::shared_ptr<NewcamdSession>> removedSessions;
+    std::shared_ptr<NewcamdAuSession> removedAuSession;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         for (auto it = inst->servicesByStream.begin(); it != inst->servicesByStream.end();) {
@@ -749,9 +1062,15 @@ static void newcamd_close_reader(void* instance, const char* reader_key) {
                 ++it;
             }
         }
+        auto auIt = inst->auSessionsByClient.find(clientKey);
+        if (auIt != inst->auSessionsByClient.end()) {
+            removedAuSession = auIt->second;
+            inst->auSessionsByClient.erase(auIt);
+        }
         inst->readersByClient.erase(clientKey);
     }
     removedSessions.clear();
+    removedAuSession.reset();
 }
 
 static int newcamd_start_service(void* instance, const char* reader_key,
@@ -789,6 +1108,8 @@ static int newcamd_start_service(void* instance, const char* reader_key,
     binding->clientKey = clientKey;
     binding->serviceId = service->service_id <= 0xFFFF
         ? static_cast<uint16_t>(service->service_id) : 0;
+    binding->defaultCaid = config.caid;
+    binding->defaultProvid = config.provid;
 
     auto session = std::make_shared<NewcamdSession>();
     session->client = std::make_unique<NewcamdClient>(
@@ -827,6 +1148,7 @@ static int newcamd_start_service(void* instance, const char* reader_key,
     std::cerr << "NEWCAMD SERVICE SESSION: client=" << clientKey
               << " stream=" << streamId
               << " sid=" << binding->serviceId
+              << " caid=0x" << std::hex << binding->defaultCaid << std::dec
               << " mode=independent-tcp session=" << (activeForReader + 1)
               << "/" << kMaxSessionsPerReader
               << " csa=adaptive-scalar-bitslice"
@@ -859,6 +1181,7 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
     auto* inst = static_cast<NewcamdInstance*>(instance);
     std::shared_ptr<ServiceBinding> bindingPtr;
     std::shared_ptr<NewcamdSession> session;
+    std::shared_ptr<NewcamdAuSession> auSession;
     {
         // Resolve stable shared objects under the global lock, then release it.
         // Each service has its own lock so multiple channels can descramble and
@@ -870,6 +1193,8 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         auto sessionIt = inst->sessionsByStream.find(stream_id);
         if (sessionIt == inst->sessionsByStream.end() || !sessionIt->second) return TVS_CA_RESULT_PASSTHROUGH;
         session = sessionIt->second;
+        auto auIt = inst->auSessionsByClient.find(bindingPtr->clientKey);
+        if (auIt != inst->auSessionsByClient.end()) auSession = auIt->second;
     }
     if (!session->connected.load() || !session->client) return TVS_CA_RESULT_PASSTHROUGH;
     std::lock_guard<std::mutex> serviceLock(bindingPtr->mutex);
@@ -957,12 +1282,19 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     break;
                 }
             }
+            bool knownEmmPid = false;
+            for (const auto& emm : binding.emmPids) {
+                if (emm.pid == pid) {
+                    knownEmmPid = true;
+                    break;
+                }
+            }
 
-            // Full-MPTS CA path: parse only PAT, the PAT-selected PMT and known
-            // ECM PIDs.  Never feed video/audio/other-service payload into the
-            // PSI section assembler.  Besides lowering CPU this prevents random
-            // PES bytes from being mistaken for CA sections during MPTS warmup.
-            const bool parsePsiPid = pid == 0x0000 || pid == binding.pmtPid || knownEcmPid ||
+            // v196 adds CAT (PID 1) and the CAT-selected EMM PIDs to the same
+            // low-volume PSI path. Video/audio packets still never enter the
+            // section assembler, preserving the v180 CA hot path.
+            const bool parsePsiPid = pid == 0x0000 || pid == 0x0001 ||
+                pid == binding.pmtPid || knownEcmPid || knownEmmPid ||
                 (binding.serviceId == 0 && binding.pmtPid == kNullPid);
             if (parsePsiPid) {
                 auto sections = binding.assemblers[pid].push(payload, payloadSize, payloadStart);
@@ -970,6 +1302,14 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                     if (section.empty()) continue;
                     if (pid == 0x0000 && section[0] == 0x00) {
                         parse_pat_section(section, binding);
+                    } else if (pid == 0x0001 && section[0] == 0x01) {
+                        parse_cat_section(section, binding);
+                    } else if (knownEmmPid && section[0] >= 0x82 && section[0] <= 0x8F) {
+                        const EcmDescriptor emm = descriptor_for_emm_pid(binding, pid);
+                        if (is_irdeto_caid(emm.caid)) {
+                            (void)forward_irdeto_emm(binding.clientKey, stream_id,
+                                                     binding.serviceId, emm, section, auSession);
+                        }
                     } else if (section[0] == 0x02) {
                         const uint16_t sectionServiceId = section.size() >= 5
                             ? static_cast<uint16_t>((section[3] << 8) | section[4]) : 0;
@@ -1143,12 +1483,14 @@ static const char* newcamd_status_json(void* instance) {
     }
 
     std::vector<std::shared_ptr<NewcamdSession>> sessions;
+    std::vector<std::shared_ptr<NewcamdAuSession>> auSessions;
     std::vector<std::shared_ptr<ServiceBinding>> services;
     size_t readers = 0;
     {
         std::lock_guard<std::mutex> lock(inst->mutex);
         readers = inst->readersByClient.size();
         for (const auto& entry : inst->sessionsByStream) if (entry.second) sessions.push_back(entry.second);
+        for (const auto& entry : inst->auSessionsByClient) if (entry.second) auSessions.push_back(entry.second);
         for (const auto& entry : inst->servicesByStream) if (entry.second) services.push_back(entry.second);
     }
 
@@ -1164,6 +1506,28 @@ static const char* newcamd_status_json(void* instance) {
         std::lock_guard<std::mutex> queueLock(session->ecmMutex);
         pendingEcms += session->ecmQueue.size() + (session->ecmInFlight ? 1 : 0);
     }
+    size_t auConnected = 0;
+    size_t auEnabled = 0;
+    uint64_t emmSent = 0;
+    uint64_t emmAcked = 0;
+    uint64_t emmQueued = 0;
+    uint64_t emmDuplicateDrops = 0;
+    uint64_t emmQueueDrops = 0;
+    uint64_t emmFilterDrops = 0;
+    uint64_t emmSendErrors = 0;
+    for (const auto& au : auSessions) {
+        if (!au) continue;
+        if (au->connected.load()) ++auConnected;
+        if (au->client && au->client->au_enabled()) ++auEnabled;
+        std::lock_guard<std::mutex> auLock(au->mutex);
+        emmSent += au->emmSent;
+        emmAcked += au->emmAcked;
+        emmQueued += au->emmQueue.size() + (au->emmInFlight ? 1 : 0);
+        emmDuplicateDrops += au->emmDuplicateDrops;
+        emmQueueDrops += au->emmQueueDrops;
+        emmFilterDrops += au->emmFilterDrops;
+        emmSendErrors += au->emmSendErrors;
+    }
     for (const auto& binding : services) {
         std::lock_guard<std::mutex> serviceLock(binding->mutex);
         if (binding->even.valid) ++evenKeys;
@@ -1176,6 +1540,15 @@ static const char* newcamd_status_json(void* instance) {
              ",\"service_sessions\":" + std::to_string(connected) +
              ",\"max_sessions_per_reader\":" + std::to_string(kMaxSessionsPerReader) +
              ",\"session_mode\":\"per-service-tcp\"" +
+             ",\"au_sessions\":" + std::to_string(auConnected) +
+             ",\"au_enabled\":" + std::to_string(auEnabled) +
+             ",\"emm_sent\":" + std::to_string(emmSent) +
+             ",\"emm_acked\":" + std::to_string(emmAcked) +
+             ",\"emm_queued\":" + std::to_string(emmQueued) +
+             ",\"emm_duplicate_drops\":" + std::to_string(emmDuplicateDrops) +
+             ",\"emm_queue_drops\":" + std::to_string(emmQueueDrops) +
+             ",\"emm_filter_drops\":" + std::to_string(emmFilterDrops) +
+             ",\"emm_send_errors\":" + std::to_string(emmSendErrors) +
              ",\"authenticated_clients\":" + std::to_string(authenticated) +
              ",\"streams\":" + std::to_string(services.size()) +
              ",\"pending_ecms\":" + std::to_string(pendingEcms) +

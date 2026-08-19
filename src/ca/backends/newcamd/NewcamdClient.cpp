@@ -363,6 +363,33 @@ bool NewcamdClient::login() {
             set_error("Newcamd CARD_DATA_REQ expected CARD_DATA, got " + command_name(cardData.payload[0]));
             return false;
         }
+        if (cardData.payload.size() < 15) {
+            set_error("Newcamd CARD_DATA response is too short");
+            return false;
+        }
+
+        // Astra-compatible CARD_DATA parsing.  OSCam advertises whether AU/EMM
+        // is accepted by this Newcamd account, the reader CAID, UA and provider
+        // shared addresses.  Keep these values so the plugin can apply the same
+        // Irdeto EMM address filter as Astra before forwarding updates.
+        au_enabled_ = cardData.payload[3] == 1;
+        card_caid_ = static_cast<uint16_t>(
+            (static_cast<uint16_t>(cardData.payload[4]) << 8) | cardData.payload[5]);
+        std::copy_n(cardData.payload.begin() + 6, card_ua_.size(), card_ua_.begin());
+        providers_.clear();
+        const size_t advertisedProviders = std::min<size_t>(cardData.payload[14], 16);
+        size_t providerOffset = 15;
+        for (size_t i = 0; i < advertisedProviders; ++i) {
+            if (providerOffset + 11 > cardData.payload.size()) break;
+            ProviderInfo info;
+            info.ident = (static_cast<uint32_t>(cardData.payload[providerOffset]) << 16) |
+                         (static_cast<uint32_t>(cardData.payload[providerOffset + 1]) << 8) |
+                         static_cast<uint32_t>(cardData.payload[providerOffset + 2]);
+            std::copy_n(cardData.payload.begin() + providerOffset + 3,
+                        info.sa.size(), info.sa.begin());
+            providers_.push_back(info);
+            providerOffset += 11;
+        }
 
         authenticated_ = true;
         set_error({});
@@ -374,6 +401,33 @@ bool NewcamdClient::login() {
         set_error("Newcamd login failed");
         return false;
     }
+}
+
+bool NewcamdClient::matches_irdeto_emm(const std::vector<uint8_t>& emm) const {
+    if (!authenticated_ || !au_enabled_ || emm.size() < 4) return false;
+    if (emm[0] < 0x82 || emm[0] > 0x8F) return false;
+
+    // Same address test used by Astra's softcam/cas/irdeto.c.  Irdeto encodes
+    // the address length in the low 3 bits and chooses UA (card) vs SA
+    // (provider) with bit 0x10 of the base.  Real Irdeto addresses used here
+    // are at most three bytes after a[5]; cap the comparison to the 8-byte
+    // CARD_DATA address to avoid accepting malformed EMM sections.
+    const uint8_t addressLength = emm[3] & 0x07;
+    const uint8_t addressBase = emm[3] >> 3;
+    if (addressLength > 3 || 4u + addressLength > emm.size()) return false;
+
+    const auto matches = [&](const std::array<uint8_t, 8>& address) {
+        if (addressBase != address[4]) return false;
+        return addressLength == 0 ||
+               std::equal(emm.begin() + 4, emm.begin() + 4 + addressLength,
+                          address.begin() + 5);
+    };
+
+    if (addressBase & 0x10) return matches(card_ua_);
+    for (const auto& provider : providers_) {
+        if (matches(provider.sa)) return true;
+    }
+    return false;
 }
 
 bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid, const std::vector<uint8_t>& ecm, uint16_t* message_id) {
@@ -409,6 +463,38 @@ bool NewcamdClient::send_ecm(uint16_t service_id, uint16_t caid, uint32_t provid
     return true;
 }
 
+bool NewcamdClient::send_emm(uint16_t service_id, uint16_t caid, uint32_t provid,
+                               const std::vector<uint8_t>& emm, uint16_t* message_id) {
+    if (!authenticated_) {
+        set_error("Newcamd EMM request skipped: client is not authenticated");
+        return false;
+    }
+    if (!au_enabled_) {
+        set_error("Newcamd EMM request skipped: AU is disabled by server");
+        return false;
+    }
+    if (emm.size() < 4 || emm[0] < 0x82 || emm[0] > 0x8F) {
+        set_error("Newcamd EMM request is not a valid Irdeto EMM section");
+        return false;
+    }
+
+    // EMM uses the same Newcamd wire envelope as ECM.  This AU connection is
+    // dedicated to EMM, so it never contends with the one-in-flight ECM
+    // scheduler of the per-service sessions.  OSCam replies are consumed by
+    // receiver_loop() and intentionally need no CW callback.
+    // Astra zeroes CAID/provider in the Newcamd envelope for EMM and lets the
+    // server/card-data context route the addressed EMM.  Mirror that proven
+    // OSCam path; CAID/provider are still used by the plugin to select/filter
+    // the correct EMM PID before this call.
+    (void)caid;
+    (void)provid;
+    if (!send_message(emm, service_id, 0, 0, true, message_id)) {
+        return false;
+    }
+    set_error({});
+    return true;
+}
+
 void NewcamdClient::start_receiver() {
     if (running_) return;
     running_ = true;
@@ -428,25 +514,32 @@ void NewcamdClient::receiver_loop() {
         if (message.payload.empty()) continue;
 
         KeyUpdateCallback callback;
+        EmmAckCallback emmAckCallback;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             callback = callback_;
+            emmAckCallback = emm_ack_callback_;
         }
-        if (!callback) continue;
 
         const uint8_t command = message.payload[0];
         if (command == 0x80 || command == 0x81) {
             const size_t pending = pending_ecms_.load(std::memory_order_relaxed);
             if (pending > 0) pending_ecms_.fetch_sub(1, std::memory_order_acq_rel);
-        }
-        if ((command == 0x80 || command == 0x81) && message.payload.size() >= 19) {
-            callback(message.id, 0, message.payload.data() + 3);
-            callback(message.id, 1, message.payload.data() + 11);
-        } else if (command == 0x80 || command == 0x81) {
-            set_error("Newcamd ECM response did not contain a control word");
-            // Notify the plugin that this transaction completed negatively.
-            // 0xFF is an internal sentinel and is never a DVB CSA parity.
-            callback(message.id, 0xFF, nullptr);
+            if (!callback) continue;
+            if (message.payload.size() >= 19) {
+                callback(message.id, 0, message.payload.data() + 3);
+                callback(message.id, 1, message.payload.data() + 11);
+            } else {
+                set_error("Newcamd ECM response did not contain a control word");
+                // Notify the plugin that this transaction completed negatively.
+                // 0xFF is an internal sentinel and is never a DVB CSA parity.
+                callback(message.id, 0xFF, nullptr);
+            }
+        } else if (command >= 0x82 && command <= 0x8F && emmAckCallback) {
+            // Astra serializes EMM requests and waits for the matching Newcamd
+            // response before sending the next update.  Surface that response
+            // to the dedicated AU queue; no control word is expected.
+            emmAckCallback(message.id, command);
         }
     }
     running_ = false;
@@ -456,6 +549,10 @@ void NewcamdClient::disconnect() {
     running_ = false;
     authenticated_ = false;
     pending_ecms_ = 0;
+    au_enabled_ = false;
+    card_caid_ = 0;
+    card_ua_.fill(0);
+    providers_.clear();
     if (socket_) {
         // Wake a synchronous receive before joining the receiver thread.
         // close() alone is not a reliable cross-thread interruption for an
