@@ -1408,10 +1408,10 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
                          std::vector<struct dvbcsa_bs_batch_s>& batch, size_t& count) {
         if (!slot.valid || !slot.scalarKey || !slot.bsKey || count == 0) return;
 
-        // The current dispatcher normally hands CA 7 TS packets at a time.
-        // A wide bitslice implementation (often 32/64/128 lanes) can be slower
-        // when only a few lanes are populated, so keep the scalar fast path for
-        // small groups and use bitslice automatically once a useful batch exists.
+        // v198 accumulates up to 28 selected TS packets per service before CA.
+        // This normally gives each parity enough lanes to reach the bitslice
+        // threshold while retaining the scalar fast path for genuinely small
+        // tail batches flushed when a service stops.
         const size_t nativeBatch = std::max<size_t>(1, dvbcsa_bs_batch_size());
         const size_t bitsliceThreshold = std::min<size_t>(nativeBatch, 8);
         if (count >= bitsliceThreshold) {

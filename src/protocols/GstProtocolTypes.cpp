@@ -58,6 +58,17 @@ bool isRtspOutput(OutputKind kind) {
     return kind == OutputKind::Rtsp;
 }
 
+bool transportCbrEnabled(const StreamConfig& cfg) {
+    const OutputKind kind = outputKind(cfg);
+    if (kind == OutputKind::UdpCbr) {
+        return cfg.targetBitrate > 0;
+    }
+    if (kind == OutputKind::Http || kind == OutputKind::Hls || kind == OutputKind::Srt) {
+        return cfg.cbr && cfg.targetBitrate > 0;
+    }
+    return false;
+}
+
 StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
     StreamOutputConfig output;
     output.outputType = cfg.outputType;

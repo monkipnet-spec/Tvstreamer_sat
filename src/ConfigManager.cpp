@@ -8,6 +8,15 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <array>
+#include <vector>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 
 namespace {
@@ -25,6 +34,206 @@ void normalizeOutputEndpoint(std::string& outputHost, int& outputPort, const std
         outputHost = normalizedHost;
         outputPort = normalizedPort;
     }
+}
+
+constexpr const char* kUiPasswordPrefix = "enc:v1:";
+constexpr size_t kUiPasswordKeyBytes = 32;
+constexpr size_t kUiPasswordNonceBytes = 12;
+constexpr size_t kUiPasswordTagBytes = 16;
+
+std::filesystem::path uiPasswordKeyPath(const std::filesystem::path& configPath) {
+    return configPath.parent_path() / "tvstreammersat5-ui.key";
+}
+
+std::string hexEncode(const unsigned char* data, size_t size) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out;
+    out.resize(size * 2);
+    for (size_t i = 0; i < size; ++i) {
+        out[i * 2] = digits[(data[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = digits[data[i] & 0x0F];
+    }
+    return out;
+}
+
+int hexNibble(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+bool hexDecode(const std::string& text, std::vector<unsigned char>& out) {
+    if ((text.size() & 1U) != 0) return false;
+    out.resize(text.size() / 2);
+    for (size_t i = 0; i < out.size(); ++i) {
+        const int hi = hexNibble(text[i * 2]);
+        const int lo = hexNibble(text[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<unsigned char>((hi << 4) | lo);
+    }
+    return true;
+}
+
+bool readUiPasswordKey(
+    const std::filesystem::path& path,
+    std::array<unsigned char, kUiPasswordKeyBytes>& key) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) return false;
+    input.read(reinterpret_cast<char*>(key.data()), static_cast<std::streamsize>(key.size()));
+    if (input.gcount() != static_cast<std::streamsize>(key.size())) return false;
+    char extra = 0;
+    if (input.read(&extra, 1)) return false;
+    ::chmod(path.c_str(), S_IRUSR | S_IWUSR);
+    return true;
+}
+
+bool createUiPasswordKey(
+    const std::filesystem::path& path,
+    std::array<unsigned char, kUiPasswordKeyBytes>& key) {
+    if (RAND_bytes(key.data(), static_cast<int>(key.size())) != 1) {
+        std::cerr << "Unable to generate UI password encryption key" << std::endl;
+        return false;
+    }
+
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        if (errno == EEXIST) return readUiPasswordKey(path, key);
+        std::cerr << "Unable to create UI password key " << path
+                  << ": " << std::strerror(errno) << std::endl;
+        return false;
+    }
+
+    size_t offset = 0;
+    while (offset < key.size()) {
+        const ssize_t written = ::write(fd, key.data() + offset, key.size() - offset);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "Unable to write UI password key " << path
+                      << ": " << std::strerror(errno) << std::endl;
+            ::close(fd);
+            ::unlink(path.c_str());
+            return false;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    ::fsync(fd);
+    ::close(fd);
+    ::chmod(path.c_str(), S_IRUSR | S_IWUSR);
+    return true;
+}
+
+bool loadUiPasswordKey(
+    const std::filesystem::path& configPath,
+    bool allowCreate,
+    std::array<unsigned char, kUiPasswordKeyBytes>& key) {
+    const auto path = uiPasswordKeyPath(configPath);
+    if (readUiPasswordKey(path, key)) return true;
+    if (!allowCreate) {
+        std::cerr << "UI password is encrypted but key file is missing or invalid: "
+                  << path << std::endl;
+        return false;
+    }
+    return createUiPasswordKey(path, key);
+}
+
+bool encryptUiPassword(
+    const std::filesystem::path& configPath,
+    const std::string& plaintext,
+    std::string& encoded) {
+    std::array<unsigned char, kUiPasswordKeyBytes> key{};
+    if (!loadUiPasswordKey(configPath, true, key)) return false;
+
+    std::array<unsigned char, kUiPasswordNonceBytes> nonce{};
+    std::array<unsigned char, kUiPasswordTagBytes> tag{};
+    if (RAND_bytes(nonce.data(), static_cast<int>(nonce.size())) != 1) return false;
+
+    std::vector<unsigned char> ciphertext(plaintext.size() + 16);
+    int produced = 0;
+    int total = 0;
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    bool ok =
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(nonce.size()), nullptr) == 1 &&
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) == 1 &&
+        EVP_EncryptUpdate(ctx, ciphertext.data(), &produced,
+            reinterpret_cast<const unsigned char*>(plaintext.data()),
+            static_cast<int>(plaintext.size())) == 1;
+    if (ok) {
+        total = produced;
+        ok = EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &produced) == 1;
+        total += produced;
+    }
+    if (ok) {
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
+            static_cast<int>(tag.size()), tag.data()) == 1;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) return false;
+    ciphertext.resize(static_cast<size_t>(total));
+
+    std::vector<unsigned char> blob;
+    blob.reserve(nonce.size() + ciphertext.size() + tag.size());
+    blob.insert(blob.end(), nonce.begin(), nonce.end());
+    blob.insert(blob.end(), ciphertext.begin(), ciphertext.end());
+    blob.insert(blob.end(), tag.begin(), tag.end());
+    encoded = std::string(kUiPasswordPrefix) + hexEncode(blob.data(), blob.size());
+    return true;
+}
+
+bool decryptUiPassword(
+    const std::filesystem::path& configPath,
+    const std::string& encoded,
+    std::string& plaintext) {
+    if (encoded.rfind(kUiPasswordPrefix, 0) != 0) {
+        plaintext = encoded;
+        return true;
+    }
+
+    std::array<unsigned char, kUiPasswordKeyBytes> key{};
+    if (!loadUiPasswordKey(configPath, false, key)) return false;
+
+    std::vector<unsigned char> blob;
+    if (!hexDecode(encoded.substr(std::strlen(kUiPasswordPrefix)), blob) ||
+        blob.size() < kUiPasswordNonceBytes + kUiPasswordTagBytes) {
+        std::cerr << "Invalid encrypted UI password format" << std::endl;
+        return false;
+    }
+
+    const unsigned char* nonce = blob.data();
+    const size_t ciphertextSize = blob.size() - kUiPasswordNonceBytes - kUiPasswordTagBytes;
+    const unsigned char* ciphertext = blob.data() + kUiPasswordNonceBytes;
+    const unsigned char* tag = blob.data() + kUiPasswordNonceBytes + ciphertextSize;
+    std::vector<unsigned char> output(ciphertextSize + 1);
+    int produced = 0;
+    int total = 0;
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    bool ok =
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN,
+            static_cast<int>(kUiPasswordNonceBytes), nullptr) == 1 &&
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) == 1 &&
+        EVP_DecryptUpdate(ctx, output.data(), &produced, ciphertext,
+            static_cast<int>(ciphertextSize)) == 1;
+    if (ok) {
+        total = produced;
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
+            static_cast<int>(kUiPasswordTagBytes), const_cast<unsigned char*>(tag)) == 1;
+    }
+    if (ok) {
+        ok = EVP_DecryptFinal_ex(ctx, output.data() + total, &produced) == 1;
+        total += produced;
+    }
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) {
+        std::cerr << "Unable to decrypt UI password: authentication tag mismatch" << std::endl;
+        return false;
+    }
+    plaintext.assign(reinterpret_cast<const char*>(output.data()), static_cast<size_t>(total));
+    return true;
 }
 
 } // namespace
@@ -308,6 +517,7 @@ bool ConfigManager::load() {
         return loadSubscribers();
     }
 
+    bool migratePlaintextPassword = false;
     {
         std::lock_guard<std::mutex> lock(fileMutex);
         std::ifstream input(configPath);
@@ -322,7 +532,23 @@ bool ConfigManager::load() {
             std::cerr << "Failed to parse config: " << errs << std::endl;
             return false;
         }
+
+        const std::string storedPassword = root.get("password", "admin").asString();
+        std::string runtimePassword;
+        if (!decryptUiPassword(configPath, storedPassword, runtimePassword)) {
+            return false;
+        }
+        root["password"] = runtimePassword;
+        migratePlaintextPassword = storedPassword.rfind(kUiPasswordPrefix, 0) != 0;
         config = AppConfig::fromJson(root);
+    }
+
+    // Transparently migrate older plaintext configurations on the first load.
+    // Authentication continues to use the plaintext password only in memory.
+    if (migratePlaintextPassword) {
+        if (!save()) return false;
+        std::cerr << "UI password storage migrated to AES-256-GCM; key="
+                  << uiPasswordKeyPath(configPath) << " mode=0600" << std::endl;
     }
     return loadSubscribers();
 }
@@ -349,15 +575,30 @@ bool ConfigManager::loadSubscribers() {
 
 bool ConfigManager::save() {
     std::lock_guard<std::mutex> lock(fileMutex);
-    std::ofstream output(configPath);
+
+    Json::Value root = config.toJson();
+    std::string encryptedPassword;
+    if (!encryptUiPassword(configPath, config.password, encryptedPassword)) {
+        std::cerr << "Unable to encrypt UI password; configuration was not written" << std::endl;
+        return false;
+    }
+    root["password"] = encryptedPassword;
+
+    std::ofstream output(configPath, std::ios::trunc);
     if (!output.is_open()) {
         std::cerr << "Unable to open config file for writing: " << configPath << std::endl;
         return false;
     }
     Json::StreamWriterBuilder writer;
     writer["indentation"] = "  ";
-    std::string str = Json::writeString(writer, config.toJson());
-    output << str;
+    output << Json::writeString(writer, root);
+    output.flush();
+    if (!output.good()) {
+        std::cerr << "Unable to write config file: " << configPath << std::endl;
+        return false;
+    }
+    output.close();
+    ::chmod(configPath.c_str(), S_IRUSR | S_IWUSR);
     return true;
 }
 

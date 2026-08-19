@@ -57,11 +57,11 @@ void appendMpegTsMux(std::vector<std::string>& args, const StreamConfig& cfg) {
         "si-interval=9000"
     });
 
-    // Every MPEG-TS output produced by the external transcoder uses one
-    // deterministic transport-stream bitrate. mpegtsmux inserts NULL packets
-    // when the encoded A/V payload is below the selected mux rate, so UDP,
-    // SRT, HTTP, HLS, RTP and relay outputs all leave the transcoder as CBR.
-    args.push_back("bitrate=" + std::to_string(muxBitrate(cfg)));
+    // Transport CBR is explicit in v198: UDP-CBR plus HTTP/HLS/SRT when the
+    // stream CBR checkbox is enabled. Other protocols keep mpegtsmux unstuffed.
+    // NULL packets are therefore inserted only where a constant MPEG-TS rate
+    // was actually requested.
+    args.push_back("bitrate=" + std::to_string(transportCbrEnabled(cfg) ? muxBitrate(cfg) : 0));
 
     // Remap belongs to the MPEG-TS mux, not to the network sink.  Requesting
     // sink_<PID> pads fixes the elementary PIDs.  prog-map then places both
@@ -91,6 +91,7 @@ void appendTsSmoother(std::vector<std::string>& args, const std::string& name, u
 }
 
 void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name) {
+    if (!transportCbrEnabled(cfg)) return;
     const uint64_t bytesPerSecond64 = std::max<uint64_t>(muxBitrate(cfg) / 8, 1);
     const uint64_t maxIdentityRate = static_cast<uint64_t>(std::numeric_limits<int>::max());
     const int bytesPerSecond = static_cast<int>(std::min<uint64_t>(bytesPerSecond64, maxIdentityRate));
@@ -106,6 +107,22 @@ void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, con
         "single-segment=true",
         "sync=true",
         "datarate=" + std::to_string(bytesPerSecond),
+        "!"
+    });
+}
+
+void appendNetworkCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name) {
+    if (!transportCbrEnabled(cfg)) return;
+
+    // HTTP/SRT CBR uses PCR-derived timestamps from the preceding tsparse and
+    // clocksync for wall-clock release. This avoids the old identity/datarate
+    // pacer which could stall long-lived HTTP connections while preserving
+    // mpegtsmux NULL stuffing at the requested transport bitrate.
+    args.insert(args.end(), {
+        "clocksync",
+        "name=" + name,
+        "sync=true",
+        "sync-to-first=true",
         "!"
     });
 }

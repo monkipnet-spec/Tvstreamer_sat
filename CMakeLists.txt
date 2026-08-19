@@ -101,6 +101,7 @@ target_link_libraries(TVStreammerSAT5
     ${LIBCURL_LIBRARIES}
     ${JSONCPP_LIBRARIES}
     ${Boost_LIBRARIES}
+    OpenSSL::Crypto
     pthread
     dl
     glib-2.0

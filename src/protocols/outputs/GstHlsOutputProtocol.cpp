@@ -3,6 +3,7 @@
 #include "protocols/GstProtocolTypes.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 namespace tvs::protocols::outputs {
@@ -19,6 +20,28 @@ uint32_t hlsAudioPid(const StreamConfig& cfg) {
 
 uint32_t hlsServiceId(const StreamConfig& cfg) {
     return std::max<uint32_t>(cfg.serviceId, 1);
+}
+
+std::string hlsPublicPathName(const StreamConfig& cfg) {
+    const std::string raw = !cfg.name.empty() ? cfg.name : (!cfg.serviceName.empty() ? cfg.serviceName : cfg.id);
+    std::string result;
+    bool underscore = false;
+    for (unsigned char ch : raw) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_') {
+            result.push_back(static_cast<char>(ch));
+            underscore = false;
+        } else if (!result.empty() && !underscore) {
+            result.push_back('_');
+            underscore = true;
+        }
+    }
+    while (!result.empty() && result.back() == '_') result.pop_back();
+    if (result.empty()) {
+        for (unsigned char ch : cfg.id) {
+            if (std::isalnum(ch) || ch == '-' || ch == '_') result.push_back(static_cast<char>(ch));
+        }
+    }
+    return result.empty() ? "stream" : result;
 }
 
 std::string prepareHlsDirectory(const StreamConfig& cfg) {
@@ -43,11 +66,11 @@ void appendHlsMux(std::vector<std::string>& args, const StreamConfig& cfg, GstOu
         "pmt-interval=9000",
         "pcr-interval=1800",
         "si-interval=9000",
-        "bitrate=" + std::to_string(muxBitrate(cfg))
+        "bitrate=" + std::to_string(transportCbrEnabled(cfg) ? muxBitrate(cfg) : 0)
     });
 
-    // HLS uses the same transport-stream CBR policy as the other transcoded
-    // MPEG-TS outputs. Null-packet stuffing keeps segment size/rate stable.
+    // When CBR is enabled for HLS, NULL-packet stuffing keeps the MPEG-TS
+    // segment transport rate deterministic. With CBR disabled the mux stays VBR.
 
     if (cfg.remapEnabled) {
         // mpegtsmux uses the numeric suffix of a requested sink_<PID> pad as
@@ -73,8 +96,7 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     // generic mux helper. This keeps PID/service remapping deterministic for
     // every newly generated segment.
     appendHlsMux(args, cfg, spec);
-    appendTsSmoother(args, "transcode_hls_ts_smoother", 500000);
-    appendCbrPacer(args, cfg, "transcode_hls_cbr_pacer");
+    appendTsSmoother(args, "transcode_hls_ts_smoother", 100000);
     appendOutputQueueWithTime(args, "transcode_hls_output_queue", 8000000000ULL, false);
 
     // Remove an old playlist and stale .ts files before starting a new HLS
@@ -85,9 +107,10 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "hlssink",
         "playlist-location=" + dir + "/video.m3u8",
         "location=" + dir + "/segment%05d.ts",
-        "target-duration=6",
+        "playlist-root=/" + hlsPublicPathName(cfg) + "/",
+        "target-duration=2",
         "max-files=6",
-        "playlist-length=3"
+        "playlist-length=4"
     });
 
     spec.description = "hls@" + dir + "/video.m3u8";

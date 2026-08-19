@@ -17,6 +17,7 @@
 #include <mutex>
 #include <set>
 #include <chrono>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -45,11 +46,18 @@ namespace {
 
 constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
+constexpr guint kCaBatchPackets = 28;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
-constexpr auto kInputFailoverDelay = std::chrono::seconds(5);
-constexpr auto kPrimaryRetryInterval = std::chrono::seconds(10);
+constexpr auto kInputFailoverDelay = std::chrono::seconds(3);
+constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
+constexpr long kHttpConnectTimeoutMs = 3000;
+constexpr long kHttpLowSpeedTimeSeconds = 8;
+constexpr int kNetworkSourceTimeoutSeconds = 5;
+constexpr int kSrtInputLatencyMs = 200;
+constexpr int kSrtOutputLatencyMs = 150;
+constexpr int kSrtTranscodedOutputLatencyMs = 700;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
 constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
@@ -1785,8 +1793,14 @@ struct SharedDvbDispatchConsumer {
     sockaddr_in destination{};
     bool caEnabled = false;
     unsigned slot = 0;
+    // Network packetization remains 7x188 (1316 bytes), but CA-enabled DVB
+    // services accumulate a wider TS batch before descrambling.  This lets
+    // libdvbcsa use its bitslice path instead of calling scalar dvbcsa_decrypt
+    // for every tiny 7-packet localhost datagram.
     std::array<uint8_t, kTsPacketSize * kTsPacketsPerUdpBuffer> datagram{};
     size_t datagramBytes = 0;
+    std::array<uint8_t, kTsPacketSize * kCaBatchPackets> caBatch{};
+    size_t caBatchBytes = 0;
     uint64_t inputPackets = 0;
     uint64_t outputPackets = 0;
     uint64_t udpDatagrams = 0;
@@ -1837,46 +1851,90 @@ void rebuildSharedDvbPidRoutes(SharedDvbDispatcherState& dispatcher) {
     }
 }
 
-bool flushSharedDvbConsumerDatagram(SharedDvbDispatchConsumer& consumer, bool force) {
-    if (consumer.datagramBytes == 0) return true;
-    const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
-    if (!force && consumer.datagramBytes < fullDatagram) return true;
-
-    // The existing CA backend remains exactly per service and sees only the
-    // selected SPTS.  The v176 Irdeto CHID autoselect/Newcamd implementation is
-    // untouched; this merely changes where its TS callback is invoked.
-    if (consumer.caEnabled) {
-        (void)CaBackendManager::instance().processTransport(
-            consumer.streamId, consumer.datagram.data(), consumer.datagramBytes);
-    }
-
+bool sendSharedDvbConsumerDatagram(
+    SharedDvbDispatchConsumer& consumer, const uint8_t* data, size_t size) {
+    if (!data || size == 0) return true;
     const ssize_t sent = ::sendto(
         consumer.socketFd,
-        consumer.datagram.data(),
-        consumer.datagramBytes,
+        data,
+        size,
         MSG_NOSIGNAL,
         reinterpret_cast<const sockaddr*>(&consumer.destination),
         sizeof(consumer.destination));
-    if (sent != static_cast<ssize_t>(consumer.datagramBytes)) {
+    if (sent != static_cast<ssize_t>(size)) {
         ++consumer.udpErrors;
         if (consumer.udpErrors <= 5 || (consumer.udpErrors % 100) == 0) {
             std::cerr << "Shared DVB dispatcher UDP warning: stream=" << consumer.streamId
                       << " sent=" << sent
-                      << " expected=" << consumer.datagramBytes
+                      << " expected=" << size
                       << " errno=" << errno
                       << " errors=" << consumer.udpErrors << std::endl;
         }
-        consumer.datagramBytes = 0;
         return false;
     }
     ++consumer.udpDatagrams;
-    consumer.datagramBytes = 0;
     return true;
+}
+
+bool flushSharedDvbConsumerDatagram(SharedDvbDispatchConsumer& consumer, bool force) {
+    const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
+
+    if (consumer.caEnabled) {
+        if (consumer.caBatchBytes == 0) return true;
+        const size_t fullCaBatch = kTsPacketSize * kCaBatchPackets;
+        if (!force && consumer.caBatchBytes < fullCaBatch) return true;
+
+        // Keep CA per selected service, but call it with a wide batch.  With
+        // 28 TS packets the even/odd groups normally exceed the plugin's
+        // 8-packet bitslice threshold, so libdvbcsa can process them in one
+        // dvbcsa_bs_decrypt() operation.  The decrypted bytes are then split
+        // back into unchanged 7x188 network datagrams.
+        (void)CaBackendManager::instance().processTransport(
+            consumer.streamId, consumer.caBatch.data(), consumer.caBatchBytes);
+
+        bool ok = true;
+        size_t offset = 0;
+        while (offset < consumer.caBatchBytes) {
+            const size_t chunk = std::min(fullDatagram, consumer.caBatchBytes - offset);
+            if (!sendSharedDvbConsumerDatagram(
+                    consumer, consumer.caBatch.data() + offset, chunk)) {
+                ok = false;
+            }
+            offset += chunk;
+        }
+        consumer.caBatchBytes = 0;
+        return ok;
+    }
+
+    if (consumer.datagramBytes == 0) return true;
+    if (!force && consumer.datagramBytes < fullDatagram) return true;
+    const bool ok = sendSharedDvbConsumerDatagram(
+        consumer, consumer.datagram.data(), consumer.datagramBytes);
+    consumer.datagramBytes = 0;
+    return ok;
 }
 
 void appendSharedDvbConsumerPacket(
     SharedDvbDispatchConsumer& consumer, const uint8_t* packet) {
     if (!packet || packet[0] != 0x47) return;
+
+    if (consumer.caEnabled) {
+        const size_t fullCaBatch = kTsPacketSize * kCaBatchPackets;
+        if (consumer.caBatchBytes + kTsPacketSize > fullCaBatch) {
+            flushSharedDvbConsumerDatagram(consumer, true);
+        }
+        std::memcpy(
+            consumer.caBatch.data() + consumer.caBatchBytes,
+            packet,
+            kTsPacketSize);
+        consumer.caBatchBytes += kTsPacketSize;
+        ++consumer.outputPackets;
+        if (consumer.caBatchBytes == fullCaBatch) {
+            flushSharedDvbConsumerDatagram(consumer, false);
+        }
+        return;
+    }
+
     const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
     if (consumer.datagramBytes + kTsPacketSize > fullDatagram) {
         flushSharedDvbConsumerDatagram(consumer, true);
@@ -1891,6 +1949,7 @@ void appendSharedDvbConsumerPacket(
         flushSharedDvbConsumerDatagram(consumer, false);
     }
 }
+
 
 bool prepareSharedDvbServicePacket(
     const uint8_t* inputPacket,
@@ -2056,6 +2115,7 @@ GstPadProbeReturn sharedDvbDispatcherProbe(
                   << " per-service-full-mpts=off"
                   << " internal-multicast=off"
                   << " udp_packet_group=7x188"
+                  << " ca_batch_packets=" << kCaBatchPackets
                   << " ca_stage=selected-spts-before-local-udp" << std::endl;
         dispatcher->announced = true;
     }
@@ -2220,7 +2280,7 @@ void configureHlsHttpSource(GstElement* element, const StreamConfig& cfg) {
     setStringPropertyIfPresent(element, "user-agent", cfg.hlsUserAgent);
     setBooleanPropertyIfPresent(element, "keep-alive", TRUE);
     setBooleanPropertyIfPresent(element, "compress", TRUE);
-    setIntPropertyIfPresent(element, "timeout", 15);
+    setIntPropertyIfPresent(element, "timeout", kNetworkSourceTimeoutSeconds);
 
     if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() &&
         !cfg.hlsAccessKeyValue.empty() && hasProperty(element, "extra-headers")) {
@@ -2347,11 +2407,11 @@ void runHttpMpegTsCurlInput(const std::shared_ptr<HttpMpegTsCurlInputState>& sta
     curl_easy_setopt(curl, CURLOPT_URL, state->location.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, kHttpConnectTimeoutMs);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, kHttpLowSpeedTimeSeconds);
     curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, httpMpegTsCurlWrite);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, state.get());
@@ -2532,14 +2592,19 @@ bool udpCbrOutputEnabled(const StreamConfig& cfg) {
 }
 
 bool cbrMuxEnabled(const StreamConfig& cfg) {
+    // v198: CBR is supported for UDP-CBR and for HTTP/HLS/SRT when the stream
+    // CBR checkbox is enabled. RTSP/RTMP/YouTube/RTP/FIFO remain source-paced.
     const std::string type = outputType(cfg);
-    if (type == "udp-vbr") {
-        return false;
-    }
-    if (type == "udp-cbr") {
-        return cfg.targetBitrate > 0;
-    }
-    return cfg.cbr && cfg.targetBitrate > 0;
+    if (type == "udp-cbr") return cfg.targetBitrate > 0;
+    if (type == "udp-vbr") return false;
+    if (type == "udp") return cfg.cbr && cfg.targetBitrate > 0;
+    return (type == "http" || type == "hls" || type == "srt") &&
+           cfg.cbr && cfg.targetBitrate > 0;
+}
+
+bool wallClockNetworkCbrEnabled(const StreamConfig& cfg) {
+    const std::string type = outputType(cfg);
+    return (type == "http" || type == "srt") && cbrMuxEnabled(cfg);
 }
 
 std::string srtOutputMode(const StreamConfig& cfg);
@@ -2612,7 +2677,7 @@ bool hasTranscodedHttpOutput(const StreamConfig& cfg) {
 }
 
 int connectLocalTcpWithRetry(uint16_t port, std::string& error) {
-    for (int attempt = 0; attempt < 30; ++attempt) {
+    for (int attempt = 0; attempt < 20; ++attempt) {
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             error = std::string("socket failed: ") + std::strerror(errno);
@@ -2635,7 +2700,7 @@ int connectLocalTcpWithRetry(uint16_t port, std::string& error) {
         error = std::string("connect to transcoded HTTP relay tcp://127.0.0.1:") +
             std::to_string(port) + " failed: " + std::strerror(errno);
         ::close(fd);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return -1;
 }
@@ -2802,6 +2867,29 @@ bool isMpegTsFile(const std::string& input) {
 
 std::string hlsDirectory(const StreamConfig& cfg) {
     return "/tmp/tvstreammersat5-hls/" + cfg.id;
+}
+
+std::string hlsPublicPathName(const StreamConfig& cfg) {
+    const std::string raw = !cfg.name.empty() ? cfg.name : (!cfg.serviceName.empty() ? cfg.serviceName : cfg.id);
+    std::string result;
+    result.reserve(raw.size());
+    bool underscore = false;
+    for (unsigned char ch : raw) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_') {
+            result.push_back(static_cast<char>(ch));
+            underscore = false;
+        } else if (!result.empty() && !underscore) {
+            result.push_back('_');
+            underscore = true;
+        }
+    }
+    while (!result.empty() && result.back() == '_') result.pop_back();
+    if (result.empty()) {
+        for (unsigned char ch : cfg.id) {
+            if (std::isalnum(ch) || ch == '-' || ch == '_') result.push_back(static_cast<char>(ch));
+        }
+    }
+    return result.empty() ? "stream" : result;
 }
 
 std::string telegramEscape(const std::string& value) {
@@ -3207,23 +3295,17 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
     }
     setBooleanPropertyIfPresent(sink, "auto-reconnect", TRUE);
     setBooleanPropertyIfPresent(sink, "qos", FALSE);
-    setIntPropertyIfPresent(sink, "latency", transcoded ? 2500 : 250);
+    const int srtLatency = transcoded ? kSrtTranscodedOutputLatencyMs : kSrtOutputLatencyMs;
+    setIntPropertyIfPresent(sink, "latency", srtLatency);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
     setStringPropertyIfPresent(sink, "localaddress", cfg.interfaceAddress);
     if (caller) {
         setUIntPropertyIfPresent(sink, "localport", 0);
     }
 
-    if (transcoded) {
-        // The external transcoder already produces and clock-paces a CBR TS.
-        // Do not apply GstBaseSink max-bitrate here: targetBitrate may still
-        // contain the UI default (for example 2 Mbit/s) while the transcoder
-        // is producing 6+ Mbit/s. Throttling the public SRT sink below the
-        // real mux bitrate creates periodic queue build-up and A/V stutter.
-        setUInt64PropertyIfPresent(sink, "max-bitrate", 0);
-    } else if (cfg.targetBitrate > 0) {
-        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
-    }
+    // CBR timing is performed upstream from PCR-derived timestamps. Never use
+    // GstBaseSink max-bitrate as a second independent limiter.
+    setUInt64PropertyIfPresent(sink, "max-bitrate", 0);
 
     std::cerr << "SRT output: mode=" << mode
               << " uri=" << uri
@@ -3232,7 +3314,8 @@ void configureSrtSink(GstElement* sink, const StreamConfig& cfg, bool accessFilt
               << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
               << " auth=" << (accessFilteringEnabled ? "on" : "off")
               << " transcode=" << (transcoded ? "yes" : "no")
-              << " latency-ms=" << (transcoded ? 2500 : 250)
+              << " latency-ms=" << srtLatency
+              << " transport_cbr=" << (cbrMuxEnabled(cfg) ? std::to_string(cfg.targetBitrate) : "off")
               << std::endl;
 }
 
@@ -3262,9 +3345,7 @@ void configureRtmpSink(GstElement* sink, const StreamConfig& cfg) {
         "qos", FALSE,
         nullptr);
     setInt64PropertyIfPresent(sink, "max-lateness", -1);
-    if (cfg.targetBitrate > 0) {
-        setUInt64PropertyIfPresent(sink, "max-bitrate", static_cast<guint64>(cfg.targetBitrate * 12 / 10));
-    }
+    setUInt64PropertyIfPresent(sink, "max-bitrate", 0);
 }
 
 void configureHttpSink(GstElement* sink, const StreamConfig& cfg) {
@@ -3314,13 +3395,15 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
     }
     const std::string playlist = hlsDirectory(cfg) + "/video.m3u8";
     const std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
+    const std::string playlistRoot = "/" + hlsPublicPathName(cfg) + "/";
     g_object_set(sink,
         "playlist-location", playlist.c_str(),
         "location", location.c_str(),
-        "target-duration", 4,
-        "max-files", 8,
+        "playlist-root", playlistRoot.c_str(),
+        "target-duration", 2,
+        "max-files", 6,
         nullptr);
-    setUIntPropertyIfPresent(sink, "playlist-length", 5);
+    setUIntPropertyIfPresent(sink, "playlist-length", 4);
     setBooleanPropertyIfPresent(sink, "send-keyframe-requests", TRUE);
 }
 
@@ -3402,6 +3485,19 @@ void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
 
 void configureTsPacketAlignment(GstElement* element) {
     setIntPropertyIfPresent(element, "alignment", static_cast<gint>(kTsPacketsPerUdpBuffer));
+}
+
+void configureNetworkCbrTimestamping(GstElement* tsparse) {
+    if (!tsparse) return;
+    configureTsPacketAlignment(tsparse);
+    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+    setUIntPropertyIfPresent(tsparse, "smoothing-latency", 100000U);
+}
+
+void configureNetworkCbrClock(GstElement* clockSync) {
+    if (!clockSync) return;
+    setBooleanPropertyIfPresent(clockSync, "sync", TRUE);
+    setBooleanPropertyIfPresent(clockSync, "sync-to-first", TRUE);
 }
 
 void configureCbrPacer(GstElement* pacer, const StreamConfig& cfg) {
@@ -4285,6 +4381,7 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
               << " slot=" << consumer->slot
               << " service_pids=" << (servicePidFilter.empty() ? "dynamic" : servicePidFilter)
               << " ca=" << (consumer->caEnabled ? "selected-spts" : "off")
+              << " ca_batch_packets=" << (consumer->caEnabled ? kCaBatchPackets : 0)
               << " source=" << state->sharedDvbServiceRelayUri
               << " per_service_gstreamer_relay=off"
               << " full_mpts_copy=off" << std::endl;
@@ -5378,7 +5475,8 @@ bool StreamManager::addStreamSession(const std::string& streamId, const std::str
     std::lock_guard<std::mutex> lock(managerMutex);
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     const auto now = std::chrono::steady_clock::now();
-    const std::string key = protocol == "hls"
+    const bool perClientProtocol = protocol == "hls" || protocol == "srt";
+    const std::string key = perClientProtocol
         ? protocol + ":" + streamId + ":" + normalizedClientIp
         : protocol + ":" + streamId + ":" + normalizedClientIp + ":" + std::to_string(nextSessionId.fetch_add(1, std::memory_order_relaxed));
     adHocSessions[key] = {streamId, normalizedClientIp, protocol, now};
@@ -5392,15 +5490,17 @@ bool StreamManager::removeStreamSession(const std::string& streamId, const std::
 
     std::lock_guard<std::mutex> lock(managerMutex);
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
+    bool removed = false;
     for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
         const auto& session = it->second;
         if (session.streamId == streamId && session.clientIp == normalizedClientIp && session.protocol == protocol) {
             it = adHocSessions.erase(it);
-            return true;
+            removed = true;
+            continue;
         }
         ++it;
     }
-    return false;
+    return removed;
 }
 
 void StreamManager::onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData) {
@@ -6293,7 +6393,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         g_object_set(src,
             "location", input.c_str(),
             "do-timestamp", TRUE,
-            "timeout", 15,
+            "timeout", kNetworkSourceTimeoutSeconds,
             nullptr);
         configureQueue(outputQueue);
         configureTsMux(mux, cfg);
@@ -6336,7 +6436,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             "latency", 300,
             "do-rtsp-keep-alive", TRUE,
             nullptr);
-        setUInt64PropertyIfPresent(src, "timeout", 15000000);
+        setUInt64PropertyIfPresent(src, "timeout", 5000000);
         setBooleanPropertyIfPresent(src, "ntp-sync", FALSE);
         configureQueue(outputQueue, 5000000000ULL);
         configureTsMux(mux, cfg);
@@ -6375,7 +6475,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         g_object_set(src, "uri", input.c_str(), nullptr);
         setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
-        setIntPropertyIfPresent(src, "latency", 500);
+        setIntPropertyIfPresent(src, "latency", kSrtInputLatencyMs);
         setStringPropertyIfPresent(src, "localaddress", inputInterface);
         if (mode == "listener") {
             setIntPropertyIfPresent(src, "mode", 2);
@@ -6489,7 +6589,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         g_object_set(src, "location", location.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
-        setIntPropertyIfPresent(src, "timeout", 15);
+        setIntPropertyIfPresent(src, "timeout", kNetworkSourceTimeoutSeconds);
         if (!inputInterface.empty()) {
             std::cerr << "HLS input: input_iface=" << inputInterface
                       << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
@@ -6542,7 +6642,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         configureHlsHttpSource(src, cfg);
         // Never request gzip/deflate for a continuous MPEG-TS byte stream.
         setBooleanPropertyIfPresent(src, "compress", FALSE);
-        setIntPropertyIfPresent(src, "timeout", 15);
+        setIntPropertyIfPresent(src, "timeout", kNetworkSourceTimeoutSeconds);
         setUIntPropertyIfPresent(src, "blocksize", kTsPacketsPerUdpBuffer * kTsPacketSize);
 
         GstCaps* tsCaps = gst_caps_from_string(
@@ -6895,8 +6995,13 @@ bool StreamManager::buildOutputBranch(
     // or a generic multi-program input.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
+    // NETUP Stream Processor is less tolerant than VLC of a live TS that begins
+    // in the middle of a GOP/PSI cycle.  HTTP Progressive and SRT therefore get
+    // a clean single-program remux with frequent PAT/PMT/PCR even when explicit
+    // PID/SID remapping is disabled.  This does not touch UDP/WISI output.
+    const bool strictTsNetworkOutput = (type == "http" || type == "srt") && !transcodedInput;
     const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
-    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied) || stableUdpRemux) && !transcodedInput;
+    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied) || stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
     if (remapAlreadyApplied && outputConfig.remapEnabled) {
         std::cerr << "DVB remap passthrough: packet-level PID/SID rewrite already applied"
                   << " service_id=" << outputConfig.serviceId
@@ -6905,6 +7010,14 @@ bool StreamManager::buildOutputBranch(
                   << " demux=off remux=off" << std::endl;
     }
     if (needsRemux) {
+        if (strictTsNetworkOutput) {
+            std::cerr << "NETUP TS compatibility: rebuilding " << type
+                      << " as clean SPTS with periodic PAT/PMT/PCR"
+                      << " input_service_id=" << outputConfig.inputServiceId
+                      << " cbr=" << (cbrMuxEnabled(outputConfig) ? std::to_string(outputConfig.targetBitrate) : "off")
+                      << " pacing=" << (wallClockNetworkCbrEnabled(outputConfig) ? "pcr-clocksync" : "source-clock")
+                      << std::endl;
+        }
         if (stableUdpRemux) {
             std::cerr << "Unified UDP: rebuilding passthrough TS as a clean single-program transport"
                       << " mode=" << (udpCbrOutputEnabled(outputConfig) ? "CBR" : "VBR")
@@ -6943,21 +7056,11 @@ bool StreamManager::buildPassthroughPipeline(
         ? nullptr
         : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
     GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
-    // v195: HTTP TS is already a live byte stream and must not inherit the
-    // legacy global CBR identity pacer.  That pacer uses sync=TRUE and datarate
-    // timestamps; it remained in front of the v194 tcpserversink relay and could
-    // stall video/audio even though the public HTTP socket itself was no longer
-    // clock-synchronised.  Keep the legacy pacer behaviour for other protocols
-    // (notably the already working SRT path) and bypass it only for HTTP TS.
-    const bool continuousHttpTs = outputType(cfg) == "http";
-    const bool cbrPacingActive = !isUdpOutput(cfg) && !continuousHttpTs && cbrMuxEnabled(cfg);
-    if (continuousHttpTs && cfg.cbr && cfg.targetBitrate > 0) {
-        std::cerr << "HTTP MPEG-TS output: inherited CBR identity pacer bypassed"
-                  << " target_bitrate=" << cfg.targetBitrate
-                  << " transport=source-paced-live-ts" << std::endl;
-    }
+    // A transcoded HTTP/SRT stream is already a CBR MPEG-TS. Pace it from the
+    // embedded PCR timeline with tsparse + clocksync instead of identity/datarate.
+    const bool cbrPacingActive = wallClockNetworkCbrEnabled(cfg);
     GstElement* pacer = cbrPacingActive
-        ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str())
+        ? gst_element_factory_make("clocksync", branchName("cbr_clock", branchIndex).c_str())
         : nullptr;
     GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
 
@@ -6972,7 +7075,13 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     configureOutputQueue(queue, cfg);
-    configureCbrPacer(pacer, cfg);
+    if (cbrPacingActive) {
+        configureNetworkCbrTimestamping(tsparse);
+        configureNetworkCbrClock(pacer);
+        std::cerr << "Network CBR pacing: type=" << outputType(cfg)
+                  << " target_bitrate=" << cfg.targetBitrate
+                  << " clock=pcr-tsparse+clocksync smoothing_us=100000" << std::endl;
+    }
 
     const bool finalDvbRemapContinuity = directStableUdpTs &&
         state->dvbTsRemapApplied && cfg.remapEnabled;
@@ -7052,12 +7161,19 @@ bool StreamManager::buildRemapPipeline(
     GstElement* preDemuxQueue = gst_element_factory_make("queue", branchName("remap_pre_demux_queue", branchIndex).c_str());
     GstElement* demux = gst_element_factory_make("tsdemux", branchName("demux", branchIndex).c_str());
     GstElement* mux = gst_element_factory_make("mpegtsmux", branchName("mux", branchIndex).c_str());
-    const bool cbrActive = !isUdpOutput(cfg) && cbrMuxEnabled(cfg);
+    const std::string networkType = outputType(cfg);
+    const bool strictTsNetworkOutput = networkType == "http" || networkType == "srt";
+    const bool cbrActive = wallClockNetworkCbrEnabled(cfg);
+    GstElement* cbrTsparse = cbrActive
+        ? gst_element_factory_make("tsparse", branchName("cbr_tsparse", branchIndex).c_str())
+        : nullptr;
+    GstElement* pacer = cbrActive
+        ? gst_element_factory_make("clocksync", branchName("cbr_clock", branchIndex).c_str())
+        : nullptr;
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
-    GstElement* pacer = cbrActive ? gst_element_factory_make("identity", branchName("cbr_pacer", branchIndex).c_str()) : nullptr;
     GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
-        (cbrActive && !pacer)) {
+        (cbrActive && (!cbrTsparse || !pacer))) {
         return false;
     }
 
@@ -7065,15 +7181,38 @@ bool StreamManager::buildRemapPipeline(
         !addElementOrFail(pipeline, preDemuxQueue) ||
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, outputQueue) ||
-        (pacer && !addElementOrFail(pipeline, pacer))) {
+        (cbrTsparse && !addElementOrFail(pipeline, cbrTsparse)) ||
+        (pacer && !addElementOrFail(pipeline, pacer)) ||
+        !addElementOrFail(pipeline, outputQueue)) {
         return false;
     }
 
     configureQueue(preDemuxQueue);
     configureOutputQueue(outputQueue, cfg);
-    configureCbrPacer(pacer, cfg);
     configureTsMux(mux, cfg);
+    if (cbrActive) {
+        configureNetworkCbrTimestamping(cbrTsparse);
+        configureNetworkCbrClock(pacer);
+    }
+    if (strictTsNetworkOutput) {
+        std::cerr << "NETUP TS compatibility mux: type=" << networkType
+                  << " alignment=7 pcr_interval=1800 pat_pmt_interval=9000"
+                  << " mux_bitrate=" << (cbrMuxEnabled(cfg) ? cfg.targetBitrate : 0)
+                  << " cbr_clock=" << (cbrActive ? "pcr-tsparse+clocksync" : "off")
+                  << std::endl;
+    }
+
+    const bool sourceAlreadySingleProgramForDemux =
+        cfg.testPattern ||
+        (state && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty() &&
+         state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri) ||
+        (state && isDirectHttpMpegTsConfig(state->runtimeConfig)) ||
+        (state && tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(state->runtimeConfig)) &&
+         state->runtimeConfig.inputServiceId > 0);
+    const uint32_t selectedInputServiceId = sourceAlreadySingleProgramForDemux ? 0U : cfg.inputServiceId;
+    if (selectedInputServiceId > 0) {
+        setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(selectedInputServiceId));
+    }
 
     if (usesStableUdpShaper(cfg)) {
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
@@ -7110,8 +7249,8 @@ bool StreamManager::buildRemapPipeline(
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    const bool outputLinked = pacer
-        ? gst_element_link_many(mux, outputQueue, pacer, sink, nullptr)
+    const bool outputLinked = cbrActive
+        ? gst_element_link_many(mux, cbrTsparse, pacer, outputQueue, sink, nullptr)
         : gst_element_link_many(mux, outputQueue, sink, nullptr);
     if (!outputLinked) {
         return false;
@@ -7183,10 +7322,14 @@ bool StreamManager::buildHlsOutputPipeline(
     // Explicit PID/SID remapping still needs our mpegtsmux so the configured
     // output mapping is preserved.  Feeding that freshly remuxed TS to the old
     // hlssink is safe because the mux now generates key-unit aware output.
-    if (cfg.remapEnabled || !hasElementFactory("hlssink2")) {
-        if (!hasElementFactory("hlssink2")) {
+    if (cfg.remapEnabled || cbrMuxEnabled(cfg) || !hasElementFactory("hlssink2")) {
+        if (cbrMuxEnabled(cfg)) {
+            std::cerr << "HLS CBR: using explicit mpegtsmux -> hlssink"
+                      << " target_bitrate=" << cfg.targetBitrate
+                      << " null_stuffing=on" << std::endl;
+        } else if (!hasElementFactory("hlssink2")) {
             std::cerr << "HLS: hlssink2 unavailable, using mpegtsmux -> hlssink fallback" << std::endl;
-        } else {
+        } else if (cfg.remapEnabled) {
             std::cerr << "HLS: explicit remap enabled, using mpegtsmux -> hlssink to preserve SID/PIDs" << std::endl;
         }
         return buildRemapPipeline(state, pipeline, sourceTail, cfg, branchIndex);
@@ -7254,8 +7397,9 @@ bool StreamManager::buildHlsOutputPipeline(
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
 
     std::cerr << "HLS output: tsdemux -> elementary parsers -> hlssink2"
-              << " target_duration=4 playlist_length=5 max_files=8"
+              << " target_duration=2 playlist_length=4 max_files=6"
               << " source_keyframes=preserved remux=internal"
+              << " playlist_root=/" << hlsPublicPathName(cfg) << "/"
               << " force_keyunit=" << (canRequestKeyframes ? "on" : "off")
               << std::endl;
     return true;

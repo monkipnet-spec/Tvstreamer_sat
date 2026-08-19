@@ -34,6 +34,7 @@ bool isUdpOutput(OutputKind kind);
 bool isTsOutput(OutputKind kind);
 bool isFlvOutput(OutputKind kind);
 bool isRtspOutput(OutputKind kind);
+bool transportCbrEnabled(const StreamConfig& cfg);
 
 StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg);
 StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig& output);

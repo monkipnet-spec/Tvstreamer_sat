@@ -503,6 +503,57 @@ void HttpServer::handleSession(tcp::socket socket) {
             return;
         }
 
+        if (req.method() == http::verb::head) {
+            // Strict URL receivers (including NetUP Stream Processor) may probe
+            // HTTP Progressive/HLS URLs with HEAD before opening the media GET.
+            // Answer those probes without creating a playback session.
+            if (target.rfind("/stream/", 0) == 0) {
+                if (!isStreamClientAllowed(socket, target)) {
+                    res.result(http::status::forbidden);
+                    res.set(http::field::content_type, "text/plain");
+                } else {
+                    res.result(http::status::ok);
+                    res.set(http::field::content_type, "video/MP2T");
+                    res.set(http::field::cache_control, "no-cache, no-store, must-revalidate");
+                }
+                res.keep_alive(false);
+                http::write(socket, res);
+                return;
+            }
+
+            std::string hlsId;
+            std::string hlsFile;
+            if (resolveHlsTarget(configManager.config.streams, target, hlsId, hlsFile)) {
+                if (!isStreamClientAllowed(socket, target)) {
+                    res.result(http::status::forbidden);
+                    res.set(http::field::content_type, "text/plain");
+                    res.keep_alive(false);
+                    http::write(socket, res);
+                    return;
+                }
+                const std::filesystem::path filePath =
+                    std::filesystem::path("/tmp/tvstreammersat5-hls") / hlsId / hlsFile;
+                if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+                    res.result(http::status::not_found);
+                    res.set(http::field::content_type, "text/plain");
+                    res.keep_alive(false);
+                    http::write(socket, res);
+                    return;
+                }
+                res.result(http::status::ok);
+                if (filePath.extension() == ".m3u8") {
+                    res.set(http::field::content_type, "application/vnd.apple.mpegurl");
+                } else {
+                    res.set(http::field::content_type, "video/MP2T");
+                }
+                res.set(http::field::cache_control, "no-cache, no-store, must-revalidate");
+                res.set("Access-Control-Allow-Origin", "*");
+                res.keep_alive(false);
+                http::write(socket, res);
+                return;
+            }
+        }
+
         if (req.method() == http::verb::get) {
           if (target.rfind("/stream/", 0) == 0) {
             if (!isStreamClientAllowed(socket, target)) {
@@ -3137,7 +3188,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 67'} / ${state.program_version||'v196'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 69'} / ${state.program_version||'v198'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -3982,7 +4033,7 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${(stream.transcode_enabled && transcoderAvailable) ? 'checked' : ''} ${transcoderAvailable ? '' : 'disabled'} onchange="updateTranscodeControls()" /><span>Транскодировать видео в H.264 CBR, устранить черезстрочность и перекодировать звук</span></div><small style="color:${transcoderAvailable ? '#7ee2a8' : '#ff9f9f'}">${transcoderStatus}</small></div>
         <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><div class="row-inline compact-row" style="margin-top:8px"><select id="streamTranscodeAudioCodec" onchange="updateTranscodeAudioControls()"><option value="copy" ${stream.transcode_audio_codec==='copy'?'selected':''}>Проброс оригинальной дорожки</option><option value="aac" ${(stream.transcode_audio_codec||'aac')==='aac'?'selected':''} ${transcoderInfo.aac_encoder?'':'disabled'}>AAC-LC${transcoderInfo.aac_encoder?'':' (недоступен)'}</option><option value="mp3" ${stream.transcode_audio_codec==='mp3'?'selected':''} ${transcoderInfo.mp3_encoder?'':'disabled'}>MP3${transcoderInfo.mp3_encoder?'':' (недоступен)'}</option></select><select id="streamTranscodeAudioBitrate" ${stream.transcode_audio_codec==='copy'?'disabled':''}><option value="96000" ${(stream.transcode_audio_bitrate||192000)===96000?'selected':''}>96 кбит/с</option><option value="128000" ${(stream.transcode_audio_bitrate||192000)===128000?'selected':''}>128 кбит/с</option><option value="160000" ${(stream.transcode_audio_bitrate||192000)===160000?'selected':''}>160 кбит/с</option><option value="192000" ${(stream.transcode_audio_bitrate||192000)===192000?'selected':''}>192 кбит/с</option><option value="256000" ${(stream.transcode_audio_bitrate||192000)===256000?'selected':''}>256 кбит/с</option><option value="320000" ${(stream.transcode_audio_bitrate||192000)===320000?'selected':''}>320 кбит/с</option></select><span>аудио</span></div><small>Видео всегда преобразуется в прогрессивный режим 25p. По умолчанию: Full HD — 6000 кбит/с, звук AAC 192 кбит/с. В режиме проброса исходная аудиодорожка не перекодируется.</small></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
-        <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} onchange="syncUdpCbrModeFromCheckbox()" /><span>CBR</span></div></div>
+        <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} onchange="syncUdpCbrModeFromCheckbox()" /><span>CBR</span></div><small>CBR поддерживается для UDP, HTTP, HLS и SRT.</small></div>
         <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div><small>Для MPEG-TS: SID входа 0 = автоопределение программы из PAT; ненулевой SID выбирает конкретный входной канал. SID выхода всегда задаётся отдельно и используется для Remap в PAT/PMT/SDT. V-PID и A-PID задают выходные PID.</small></div>
       </div>
       <div class="modal-actions">
@@ -4104,11 +4155,18 @@ function updateOutputHints() {
   if (cbrInput && cbrRow) {
     const primaryType = rows[0]?.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
     const udpMode = primaryType === 'udp-cbr' || primaryType === 'udp-vbr';
+    const networkCbrMode = primaryType === 'http' || primaryType === 'hls' || primaryType === 'srt';
+    const cbrSupported = udpMode || networkCbrMode;
     if (udpMode) cbrInput.checked = primaryType === 'udp-cbr';
-    cbrInput.disabled = false;
+    if (!cbrSupported) cbrInput.checked = false;
+    cbrInput.disabled = !cbrSupported;
     cbrRow.style.display = '';
     const bitrateInput = document.getElementById('streamBitrate');
-    if (bitrateInput) bitrateInput.disabled = udpMode && !cbrInput.checked;
+    if (bitrateInput) bitrateInput.disabled = !cbrSupported || !cbrInput.checked;
+    const hint = cbrRow.querySelector('small');
+    if (hint) hint.textContent = networkCbrMode
+      ? 'CBR MPEG-TS для HTTP/HLS/SRT: NULL stuffing + PAT/PMT/PCR; HTTP/SRT дополнительно синхронизируются по PCR.'
+      : (udpMode ? 'UDP CBR использует StableUdpOutput; UDP VBR следует входному битрейту.' : 'CBR для этого типа выхода не применяется.');
   }
   syncOutputHostWithInterface();
 }

@@ -15,6 +15,7 @@ std::string listenerBindHost(const StreamConfig& cfg);
 void appendMpegTsMux(std::vector<std::string>& args, const StreamConfig& cfg);
 void appendTsSmoother(std::vector<std::string>& args, const std::string& name, uint32_t smoothingLatencyUs = 200000);
 void appendCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name);
+void appendNetworkCbrPacer(std::vector<std::string>& args, const StreamConfig& cfg, const std::string& name);
 void appendPostMuxAvReservoir(
     std::vector<std::string>& args,
     const std::string& name,
