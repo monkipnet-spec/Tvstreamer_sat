@@ -2616,7 +2616,7 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
 
     std::cerr << "Stable UDP audio reservoir startup complete: "
               << "startup_reservoir_ms=1500 min_threshold_ms=0 "
-              << "steady_state=clocksync-only" << std::endl;
+              << "steady_state=source-timestamps audio_clocksync=off" << std::endl;
 }
 
 std::string outputType(const StreamConfig& cfg) {
@@ -7341,7 +7341,7 @@ bool StreamManager::buildRemapPipeline(
                   << " output_sid=" << cfg.serviceId
                   << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1500 : 0)
                   << " audio_reservoir_mode=" << (udpCbrOutputEnabled(cfg) ? "startup-only" : "off")
-                  << " audio_pacer=" << (udpCbrOutputEnabled(cfg) ? "clocksync" : "off")
+                  << " audio_pacer=off"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
     }
@@ -7756,22 +7756,19 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    GstElement* audioClockSync = stableUdpAudioReservoir
-        ? gst_element_factory_make("clocksync", nullptr)
-        : nullptr;
-
+    // v201: the startup audio reservoir must not leave a permanent audio-only
+    // clocksync in the elementary-stream path.  Keeping audio wall-clock paced
+    // while video follows the original DVB/PCR timeline can turn a tiny clock
+    // difference into a steadily growing A/V offset.  The queue below is only
+    // a one-time startup prebuffer; after its threshold is released both audio
+    // and video continue on their original timestamps into the same TS mux.
     if (!queue || !parser ||
-        (stableUdpAudioReservoir && (!audioReservoirQueue || !audioClockSync))) {
-        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString;
-        if (stableUdpAudioReservoir && !audioClockSync) {
-            std::cerr << " (clocksync unavailable for Stable UDP audio reservoir)";
-        }
-        std::cerr << std::endl;
+        (stableUdpAudioReservoir && !audioReservoirQueue)) {
+        std::cerr << "remap skipped unsupported elementary stream caps: " << capsString << std::endl;
         if (queue) gst_object_unref(queue);
         if (parser) gst_object_unref(parser);
         if (capsfilter) gst_object_unref(capsfilter);
         if (audioReservoirQueue) gst_object_unref(audioReservoirQueue);
-        if (audioClockSync) gst_object_unref(audioClockSync);
         drainDynamicPad(ctx->mux, pad);
         return;
     }
@@ -7785,13 +7782,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (!gst_bin_add(GST_BIN(pipeline), queue) ||
         !gst_bin_add(GST_BIN(pipeline), parser) ||
         (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter)) ||
-        (audioReservoirQueue && !gst_bin_add(GST_BIN(pipeline), audioReservoirQueue)) ||
-        (audioClockSync && !gst_bin_add(GST_BIN(pipeline), audioClockSync))) {
+        (audioReservoirQueue && !gst_bin_add(GST_BIN(pipeline), audioReservoirQueue))) {
         if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
         if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
         if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
         if (audioReservoirQueue && !GST_OBJECT_PARENT(audioReservoirQueue)) gst_object_unref(audioReservoirQueue);
-        if (audioClockSync && !GST_OBJECT_PARENT(audioClockSync)) gst_object_unref(audioClockSync);
         gst_object_unref(pipeline);
         return;
     }
@@ -7813,8 +7808,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             G_CALLBACK(onStableUdpAudioReservoirRunning),
             nullptr);
 
-        setBooleanPropertyIfPresent(audioClockSync, "sync", TRUE);
-        setBooleanPropertyIfPresent(audioClockSync, "sync-to-first", TRUE);
     }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         g_object_set(parser, "config-interval", ctx->hlsSink2 ? -1 : 1, nullptr);
@@ -7827,9 +7820,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (audioReservoirQueue) {
         gst_element_sync_state_with_parent(audioReservoirQueue);
     }
-    if (audioClockSync) {
-        gst_element_sync_state_with_parent(audioClockSync);
-    }
+
 
     const bool parserLinked = capsfilter
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
@@ -7842,7 +7833,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     GstElement* parserTail = capsfilter ? capsfilter : parser;
     if (stableUdpAudioReservoir &&
-        !gst_element_link_many(parserTail, audioReservoirQueue, audioClockSync, nullptr)) {
+        !gst_element_link(parserTail, audioReservoirQueue)) {
         std::cerr << "Stable UDP audio reservoir link failed" << std::endl;
         gst_object_unref(pipeline);
         drainDynamicPad(ctx->mux, pad);
@@ -7869,7 +7860,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
 
     GstElement* muxSourceElement =
-        stableUdpAudioReservoir ? audioClockSync : parserTail;
+        stableUdpAudioReservoir ? audioReservoirQueue : parserTail;
     GstPad* parserSrcPad = gst_element_get_static_pad(muxSourceElement, "src");
     GstPad* muxSinkPad = nullptr;
     const bool stableUdpPreMapped = !ctx->flvMux && usesStableUdpShaper(ctx->config) &&
@@ -7901,7 +7892,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << " pid=" << requestedPid
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
                   << (stableUdpAudioReservoir
-                      ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=clocksync(sync-to-first)"
+                      ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=off"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
