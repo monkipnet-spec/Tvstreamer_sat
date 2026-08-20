@@ -134,6 +134,19 @@ struct StreamState {
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
+    // v200: overload recovery watchdog.  It uses raw TS byte/continuity counters
+    // rather than CPU percentage, so it detects the actual damage caused by a
+    // scheduling stall.  Recovery is armed while errors are occurring and is
+    // executed only after the TS has been clean again for a short settle time.
+    uint64_t overloadWatchInputBytes = 0;
+    uint64_t overloadWatchOutputBytes = 0;
+    uint64_t overloadWatchInputCcErrors = 0;
+    uint64_t overloadWatchOutputCcErrors = 0;
+    unsigned overloadBadWindows = 0;
+    bool overloadRecoveryArmed = false;
+    std::chrono::steady_clock::time_point overloadWatchSample = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point overloadDamageLastSeen = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point lastOverloadRecovery = std::chrono::steady_clock::time_point::min();
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
     std::vector<uint8_t> inputTsRemainder;

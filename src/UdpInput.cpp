@@ -208,10 +208,15 @@ std::string effectiveInputInterfaceAddress(
 }
 
 void configureQueue(GstElement* queue) {
+    // UDP is a live source.  Keeping several seconds of old datagrams after a
+    // CPU overload is worse than dropping them: once the scheduler recovers the
+    // old queue is replayed as a burst, sockets overflow and the decoder can
+    // remain corrupted.  Keep at most 750 ms and discard the oldest buffers.
     g_object_set(queue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(3 * GST_SECOND),
+        "max-size-time", static_cast<guint64>(750 * GST_MSECOND),
+        "leaky", 2,
         nullptr);
 }
 
@@ -310,7 +315,7 @@ GstElement* build(
             std::cerr << " loopback_multicast=on";
         }
     }
-    std::cerr << std::endl;
+    std::cerr << " live_queue_ms=750 leaky=downstream" << std::endl;
 
     if (toLower(match[1].str()) == "rtp") {
         GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");

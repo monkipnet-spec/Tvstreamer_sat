@@ -64,6 +64,8 @@ constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr GstClockTime kFastDvbReleaseWait = 250 * GST_MSECOND;
 constexpr const char* kTestPatternUri = "test://bars";
 
+void resetOverloadRecoveryWatch(StreamState* state, bool startCooldown);
+
 bool dvbDiagnosticsEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("TVS_DVB_DIAGNOSTICS");
@@ -3551,6 +3553,17 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
         nullptr);
 }
 
+// Live transport queues must never preserve seconds of stale TS after the CPU
+// is temporarily saturated.  A non-leaky queue turns a short scheduling stall
+// into a long replay burst; the downstream UDP/socket queues then overflow and
+// MPEG-TS continuity can remain damaged until the pipeline is rebuilt.  Keep
+// only the newest live data.  leaky=2 is GST_QUEUE_LEAK_DOWNSTREAM (drop oldest).
+void configureLiveQueue(GstElement* queue, guint64 maxSizeTime = 750000000ULL) {
+    if (!queue) return;
+    configureQueue(queue, maxSizeTime);
+    setIntPropertyIfPresent(queue, "leaky", 2);
+}
+
 void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
     configureQueue(queue, isUdpOutput(cfg) ? kUdpQueueLatency : 3000000000ULL);
 }
@@ -4081,7 +4094,13 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         }
     }
 
-    configureQueue(queue, 12000000000ULL);
+    // v200 overload resilience: this is a live frontend.  Do not accumulate a
+    // 12-second MPTS backlog when the dispatcher loses CPU time.  Dropping the
+    // oldest queued buffer causes a bounded continuity gap, but the dispatcher
+    // immediately resumes from current satellite data instead of replaying a
+    // stale burst for many seconds.
+    configureLiveQueue(queue, 750000000ULL);
+    std::cerr << "Shared DVB live queue: max_latency_ms=750 leaky=downstream overload_backlog=disabled" << std::endl;
     g_object_set(sink,
         "sync", FALSE,
         "async", FALSE,
@@ -6123,6 +6142,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     if (oldPipeline) {
         gst_object_unref(oldPipeline);
     }
+    resetOverloadRecoveryWatch(state, true);
     return true;
 }
 
@@ -6264,6 +6284,7 @@ bool StreamManager::restartTranscodedInput(
               << state->activeInputUri
               << " using_backup=" << (state->usingBackup ? "yes" : "no")
               << std::endl;
+    resetOverloadRecoveryWatch(state, true);
     return true;
 }
 
@@ -6333,12 +6354,13 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     const std::string inputLower = toLower(input);
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
 
-    auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL) -> GstElement* {
+    auto addQueue = [&](const char* name, guint64 maxSizeTime = 3000000000ULL, bool live = false) -> GstElement* {
         GstElement* queue = gst_element_factory_make("queue", name);
         if (!addElementOrFail(pipeline, queue)) {
             return nullptr;
         }
-        configureQueue(queue, maxSizeTime);
+        if (live) configureLiveQueue(queue, maxSizeTime);
+        else configureQueue(queue, maxSizeTime);
         return queue;
     };
 
@@ -6403,7 +6425,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
         configureTsPacketAlignment(parse);
-        configureQueue(queue, 3000000000ULL);
+        configureLiveQueue(queue, 750000000ULL);
         if (!gst_element_link_many(src, parse, queue, nullptr)) {
             std::cerr << "DVB input pipeline link failed: dvbsrc -> tsparse -> queue" << std::endl;
             return nullptr;
@@ -6452,7 +6474,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make("rtmpsrc", "input_src");
-        GstElement* inputQueue = addQueue("input_queue", 5000000000ULL);
+        GstElement* inputQueue = addQueue("input_queue", 1000000000ULL, true);
         GstElement* demux = gst_element_factory_make("flvdemux", "input_flv_demux");
         GstElement* mux = gst_element_factory_make("mpegtsmux", "input_rtmp_ts_mux");
         GstElement* outputQueue = gst_element_factory_make("queue", "input_rtmp_ts_queue");
@@ -6512,7 +6534,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             nullptr);
         setUInt64PropertyIfPresent(src, "timeout", 5000000);
         setBooleanPropertyIfPresent(src, "ntp-sync", FALSE);
-        configureQueue(outputQueue, 5000000000ULL);
+        configureLiveQueue(outputQueue, 1000000000ULL);
         configureTsMux(mux, cfg);
 
         if (!gst_element_link(mux, outputQueue)) {
@@ -6541,7 +6563,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make(factory, "input_src");
-        GstElement* queue = addQueue("input_queue");
+        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
@@ -6577,7 +6599,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         // appsrc.  This creates exactly one provider request and avoids a
         // build-time dependency on souphttpsrc/caps negotiation for opaque URLs.
         GstElement* src = gst_element_factory_make("appsrc", "input_src");
-        GstElement* queue = addQueue("input_queue");
+        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
             std::cerr << "HTTP MPEG-TS input: failed to create appsrc/queue" << std::endl;
@@ -6654,7 +6676,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
         GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
-        GstElement* queue = addQueue("input_queue", 5000000000ULL);
+        GstElement* queue = addQueue("input_queue", 2000000000ULL, true);
         if (!src || !demux || !mux || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, demux) ||
@@ -6700,7 +6722,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* capsFilter = gst_element_factory_make("capsfilter", "input_http_ts_caps");
-        GstElement* queue = addQueue("input_queue");
+        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
         if (!src || !capsFilter || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, capsFilter)) {
@@ -6981,7 +7003,12 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
                       << " type=" << type << " stage=tee-queue-create" << std::endl;
             return false;
         }
-        configureQueue(queue);
+        // Isolate live output branches from one another.  A slow HTTP/HLS/SRT
+        // client or temporary CPU starvation must not hold the tee for several
+        // seconds and poison every other output with stale TS.  Drop the oldest
+        // pre-protocol data; each branch can then resynchronize from current TS.
+        if (type == "fifo") configureQueue(queue);
+        else configureLiveQueue(queue, 1000000000ULL);
 
         GstPad* teeSrcPad = gst_element_request_pad_simple(tee, "src_%u");
         GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
@@ -8260,6 +8287,24 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
     return GST_PAD_PROBE_OK;
 }
 
+namespace {
+
+void resetOverloadRecoveryWatch(StreamState* state, bool startCooldown) {
+    if (!state) return;
+    const auto now = std::chrono::steady_clock::now();
+    state->overloadWatchInputBytes = state->inputBytes.load(std::memory_order_relaxed);
+    state->overloadWatchOutputBytes = state->outputBytes.load(std::memory_order_relaxed);
+    state->overloadWatchInputCcErrors = state->inputCcErrors.load(std::memory_order_relaxed);
+    state->overloadWatchOutputCcErrors = state->outputCcErrors.load(std::memory_order_relaxed);
+    state->overloadBadWindows = 0;
+    state->overloadRecoveryArmed = false;
+    state->overloadWatchSample = now;
+    state->overloadDamageLastSeen = std::chrono::steady_clock::time_point::min();
+    if (startCooldown) state->lastOverloadRecovery = now;
+}
+
+} // namespace
+
 void StreamManager::monitorBus(const std::string& id) {
     auto found = streams.find(id);
     if (found == streams.end()) {
@@ -8268,6 +8313,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
     StreamState* state = found->second.get();
     GstBus* bus = state->bus;
+    resetOverloadRecoveryWatch(state, true);
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
@@ -8371,6 +8417,97 @@ void StreamManager::monitorBus(const std::string& id) {
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
+
+        // v200 overload self-healing.  Do not restart while the machine is
+        // still overloaded: continuity damage keeps refreshing
+        // overloadDamageLastSeen.  Once media is flowing cleanly again for a
+        // short staggered settle interval, rebuild only this stream pipeline.
+        // This clears stale queues, tsparse/mux state and CBR clocks without
+        // restarting the process or the shared DVB frontend.
+        if (now - state->overloadWatchSample >= std::chrono::seconds(1)) {
+            const uint64_t inputNow = state->inputBytes.load(std::memory_order_relaxed);
+            const uint64_t outputNow = state->outputBytes.load(std::memory_order_relaxed);
+            const uint64_t inputCcNow = state->inputCcErrors.load(std::memory_order_relaxed);
+            const uint64_t outputCcNow = state->outputCcErrors.load(std::memory_order_relaxed);
+            const uint64_t inputDelta = inputNow - state->overloadWatchInputBytes;
+            const uint64_t outputDelta = outputNow - state->overloadWatchOutputBytes;
+            const uint64_t inputCcDelta = inputCcNow - state->overloadWatchInputCcErrors;
+            const uint64_t outputCcDelta = outputCcNow - state->overloadWatchOutputCcErrors;
+
+            state->overloadWatchInputBytes = inputNow;
+            state->overloadWatchOutputBytes = outputNow;
+            state->overloadWatchInputCcErrors = inputCcNow;
+            state->overloadWatchOutputCcErrors = outputCcNow;
+            state->overloadWatchSample = now;
+
+            constexpr uint64_t kActiveInputBytesPerWindow = 64 * 1024;
+            constexpr uint64_t kMinimumOutputBytesPerWindow = 7 * 188;
+            constexpr uint64_t kCcDamageThreshold = 25;
+            constexpr uint64_t kCcSevereThreshold = 250;
+            const bool mediaActive = inputDelta >= kActiveInputBytesPerWindow;
+            const bool continuityDamage =
+                inputCcDelta >= kCcDamageThreshold || outputCcDelta >= kCcDamageThreshold;
+            const bool severeDamage =
+                inputCcDelta >= kCcSevereThreshold || outputCcDelta >= kCcSevereThreshold;
+            const bool outputStalled = mediaActive && outputDelta < kMinimumOutputBytesPerWindow;
+            const bool damaged = continuityDamage || outputStalled;
+
+            if (damaged) {
+                state->overloadDamageLastSeen = now;
+                ++state->overloadBadWindows;
+                if (!state->overloadRecoveryArmed &&
+                    (severeDamage || state->overloadBadWindows >= 2)) {
+                    state->overloadRecoveryArmed = true;
+                    std::cerr << "OVERLOAD RECOVERY armed: stream=" << id
+                              << " input_cc_delta=" << inputCcDelta
+                              << " output_cc_delta=" << outputCcDelta
+                              << " input_bytes=" << inputDelta
+                              << " output_bytes=" << outputDelta
+                              << " action=wait-for-clean-live-ts" << std::endl;
+                }
+            } else {
+                if (state->overloadBadWindows > 0) --state->overloadBadWindows;
+
+                if (state->overloadRecoveryArmed && mediaActive &&
+                    state->overloadDamageLastSeen != std::chrono::steady_clock::time_point::min()) {
+                    const auto staggerMs = 1500 +
+                        static_cast<int>(std::hash<std::string>{}(id) % 1500);
+                    const auto cleanFor = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now - state->overloadDamageLastSeen);
+                    const auto sinceRecovery = state->lastOverloadRecovery == std::chrono::steady_clock::time_point::min()
+                        ? std::chrono::hours(24)
+                        : now - state->lastOverloadRecovery;
+
+                    if (cleanFor >= std::chrono::milliseconds(staggerMs) &&
+                        sinceRecovery >= std::chrono::seconds(15)) {
+                        const bool useBackup = state->usingBackup;
+                        std::string recoveryUri = useBackup ? state->activeInputUri : state->primaryInputUri;
+                        if (recoveryUri.empty()) recoveryUri = state->activeInputUri;
+
+                        std::cerr << "OVERLOAD RECOVERY executing: stream=" << id
+                                  << " clean_ms=" << cleanFor.count()
+                                  << " mode=pipeline-rebuild shared_dvb_frontend=preserve"
+                                  << std::endl;
+                        state->statusMessage = "recovering after CPU overload";
+                        if (!recoveryUri.empty() && restartActiveInput(state, recoveryUri, useBackup)) {
+                            bus = state->bus;
+                            resetOverloadRecoveryWatch(state, true);
+                            state->statusMessage = useBackup ? "running on backup" : "running";
+                            std::cerr << "OVERLOAD RECOVERY complete: stream=" << id
+                                      << " result=running" << std::endl;
+                            continue;
+                        }
+
+                        state->lastOverloadRecovery = now;
+                        state->overloadRecoveryArmed = false;
+                        state->overloadBadWindows = 0;
+                        std::cerr << "OVERLOAD RECOVERY failed: stream=" << id
+                                  << " action=normal-watchdog-continues" << std::endl;
+                    }
+                }
+            }
+        }
+
         if (state->gstTranscoder) {
             if (!state->gstTranscoder->isRunning()) {
                 if (!state->usingBackup &&
