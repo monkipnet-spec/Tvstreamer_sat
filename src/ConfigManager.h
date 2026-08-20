@@ -30,9 +30,6 @@ struct StreamConfig {
     std::string interfaceAddress;
     std::string inputInterfaceAddress;
     bool inputInterfaceAddressConfigured = false;
-    // Optional IPv4 source filter for multicast UDP/RTP input (SSM).
-    // Empty = accept any source (ASM, backwards-compatible).
-    std::string inputSourceAddress;
     std::string inputMode = "auto";
     // Per-stream HTTP access credentials for HLS manifests, segments and EXT-X-KEY URIs.
     // mode: none | header | query. The value is stored per stream and never shared.

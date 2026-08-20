@@ -288,7 +288,6 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.interfaceAddress = root.get("interface_address", "").asString();
     config.inputInterfaceAddressConfigured = root.isMember("input_interface_address");
     config.inputInterfaceAddress = root.get("input_interface_address", "").asString();
-    config.inputSourceAddress = normalizeIpAddress(root.get("input_source_address", "").asString());
     config.inputMode = root.get("input_mode", "auto").asString();
     config.hlsAccessKeyMode = root.get("hls_access_key_mode", "none").asString();
     if (config.hlsAccessKeyMode != "header" && config.hlsAccessKeyMode != "query") {
@@ -358,7 +357,6 @@ Json::Value StreamConfig::toJson() const {
     if (inputInterfaceAddressConfigured) {
         root["input_interface_address"] = inputInterfaceAddress;
     }
-    root["input_source_address"] = inputSourceAddress;
     root["input_mode"] = inputMode;
     root["hls_access_key_mode"] = hlsAccessKeyMode;
     root["hls_access_key_name"] = hlsAccessKeyName;

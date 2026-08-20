@@ -3,17 +3,21 @@
 #include <gio/gio.h>
 
 #include <algorithm>
-#include <arpa/inet.h>
+#include <iostream>
+#include <regex>
 #include <cerrno>
 #include <cstring>
-#include <iostream>
 #include <netinet/in.h>
-#include <regex>
 #include <sys/socket.h>
 #include <unordered_set>
 #include <vector>
 
 #include "utils.h"
+
+#if defined(__linux__) && !defined(IP_MULTICAST_ALL)
+// Linux socket option ABI; glibc netinet/in.h does not expose it on every build.
+#define IP_MULTICAST_ALL 49
+#endif
 
 namespace {
 
@@ -72,76 +76,6 @@ std::string joinedInterfaceNames(const std::vector<std::string>& interfaces) {
     return result;
 }
 
-bool parseIpv4(const std::string& text, in_addr& address) {
-    return !text.empty() && inet_pton(AF_INET, text.c_str(), &address) == 1;
-}
-
-std::string interfaceIpv4Address(const std::string& interfaceName) {
-    for (const auto& iface : enumerateNetworkInterfaces(true)) {
-        if (iface.name == interfaceName) {
-            return iface.address;
-        }
-    }
-    return "";
-}
-
-bool joinSourceSpecificMulticast(
-    GSocket* socket,
-    const std::string& group,
-    const std::string& source,
-    const std::string& interfaceName,
-    std::string& error) {
-#if defined(IP_ADD_SOURCE_MEMBERSHIP)
-    ip_mreq_source request{};
-    if (!parseIpv4(group, request.imr_multiaddr)) {
-        error = "invalid IPv4 multicast group: " + group;
-        return false;
-    }
-    if (!parseIpv4(source, request.imr_sourceaddr)) {
-        error = "invalid IPv4 multicast source address: " + source;
-        return false;
-    }
-
-    const std::string interfaceAddress = interfaceName.empty()
-        ? std::string()
-        : interfaceIpv4Address(interfaceName);
-    if (!interfaceName.empty() && interfaceAddress.empty()) {
-        error = "failed to resolve IPv4 address for multicast interface: " + interfaceName;
-        return false;
-    }
-    if (interfaceAddress.empty()) {
-        request.imr_interface.s_addr = htonl(INADDR_ANY);
-    } else if (!parseIpv4(interfaceAddress, request.imr_interface)) {
-        error = "invalid IPv4 address for multicast interface " + interfaceName + ": " + interfaceAddress;
-        return false;
-    }
-
-    const int fd = g_socket_get_fd(socket);
-    if (fd < 0 || setsockopt(
-            fd,
-            IPPROTO_IP,
-            IP_ADD_SOURCE_MEMBERSHIP,
-            &request,
-            sizeof(request)) != 0) {
-        error = "failed to join source-specific multicast " + source + " -> " + group;
-        if (!interfaceName.empty()) {
-            error += " on " + interfaceName;
-        }
-        error += ": ";
-        error += std::strerror(errno);
-        return false;
-    }
-    return true;
-#else
-    (void)socket;
-    (void)group;
-    (void)source;
-    (void)interfaceName;
-    error = "source-specific multicast is not supported by this platform";
-    return false;
-#endif
-}
-
 std::string gErrorMessage(const std::string& prefix, GError* error) {
     std::string result = prefix;
     if (error && error->message) {
@@ -154,11 +88,142 @@ std::string gErrorMessage(const std::string& prefix, GError* error) {
     return result;
 }
 
+bool disableLinuxMulticastAll(GSocket* socket, std::string& warning) {
+#if defined(__linux__) && defined(IP_MULTICAST_ALL)
+    if (!socket) {
+        warning = "invalid multicast socket";
+        return false;
+    }
+    const int fd = g_socket_get_fd(socket);
+    const int disabled = 0;
+    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &disabled, sizeof(disabled)) != 0) {
+        warning = std::string("failed to set IP_MULTICAST_ALL=0: ") + std::strerror(errno);
+        return false;
+    }
+    return true;
+#else
+    (void)socket;
+    warning = "IP_MULTICAST_ALL is not supported on this platform";
+    return false;
+#endif
+}
+
+bool bindLinuxSocketToDevice(
+    GSocket* socket,
+    const std::string& interfaceName,
+    std::string& warning) {
+#if defined(__linux__) && defined(SO_BINDTODEVICE)
+    if (!socket || interfaceName.empty()) {
+        warning = "invalid socket or interface name";
+        return false;
+    }
+    const int fd = g_socket_get_fd(socket);
+    if (::setsockopt(
+            fd, SOL_SOCKET, SO_BINDTODEVICE,
+            interfaceName.c_str(), static_cast<socklen_t>(interfaceName.size() + 1)) != 0) {
+        warning = std::string("failed to bind UDP input socket to device ") +
+            interfaceName + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+#else
+    (void)socket;
+    (void)interfaceName;
+    warning = "SO_BINDTODEVICE is not supported on this platform";
+    return false;
+#endif
+}
+
+bool resolveSelectedInputInterface(
+    const std::string& configuredInterface,
+    NetworkInterface& selected,
+    std::string& error) {
+    if (configuredInterface.empty()) {
+        return false;
+    }
+    for (const auto& iface : enumerateNetworkInterfaces(true)) {
+        if (iface.name != configuredInterface && iface.address != configuredInterface) {
+            continue;
+        }
+        if (!iface.isUp) {
+            error = "selected UDP input interface is down: " + configuredInterface;
+            return false;
+        }
+        selected = iface;
+        return true;
+    }
+    error = "selected UDP input interface was not found: " + configuredInterface;
+    return false;
+}
+
+GSocket* createDeviceBoundUnicastSocket(
+    int port,
+    const std::string& configuredInterface,
+    std::string& boundDevice,
+    std::string& error) {
+    NetworkInterface selected;
+    if (!resolveSelectedInputInterface(configuredInterface, selected, error)) {
+        return nullptr;
+    }
+
+    GError* socketError = nullptr;
+    GSocket* socket = g_socket_new(
+        G_SOCKET_FAMILY_IPV4,
+        G_SOCKET_TYPE_DATAGRAM,
+        G_SOCKET_PROTOCOL_UDP,
+        &socketError);
+    if (!socket) {
+        error = gErrorMessage("failed to create UDP input socket", socketError);
+        return nullptr;
+    }
+
+    std::string bindWarning;
+    if (!bindLinuxSocketToDevice(socket, selected.name, bindWarning)) {
+        g_object_unref(socket);
+        error = "failed to enforce selected UDP input interface " +
+            configuredInterface + ": " + bindWarning;
+        return nullptr;
+    }
+
+    GInetAddress* anyAddress = g_inet_address_new_any(G_SOCKET_FAMILY_IPV4);
+    GSocketAddress* bindAddress = anyAddress
+        ? g_inet_socket_address_new(anyAddress, static_cast<guint16>(port))
+        : nullptr;
+    if (anyAddress) {
+        g_object_unref(anyAddress);
+    }
+    if (!bindAddress) {
+        g_object_unref(socket);
+        error = "failed to create UDP wildcard bind address";
+        return nullptr;
+    }
+
+    if (!g_socket_bind(socket, bindAddress, TRUE, &socketError)) {
+        g_object_unref(bindAddress);
+        g_object_unref(socket);
+        error = gErrorMessage(
+            "failed to bind selected UDP input device to 0.0.0.0:" + std::to_string(port),
+            socketError);
+        return nullptr;
+    }
+    g_object_unref(bindAddress);
+
+    socketError = nullptr;
+    if (!g_socket_set_option(
+            socket, SOL_SOCKET, SO_RCVBUF, kSocketBufferSize, &socketError)) {
+        std::cerr << "UDP input warning: "
+                  << gErrorMessage("failed to set unicast receive buffer", socketError)
+                  << std::endl;
+    }
+
+    boundDevice = selected.name;
+    return socket;
+}
+
 GSocket* createMulticastSocket(
     const std::string& group,
     int port,
     const std::string& configuredInterface,
-    const std::string& configuredSource,
     std::vector<std::string>& joinedInterfaces,
     std::string& error) {
     GError* socketError = nullptr;
@@ -217,49 +282,40 @@ GSocket* createMulticastSocket(
         return nullptr;
     }
 
-    const std::string sourceAddress = normalizeIpAddress(configuredSource);
-    if (!sourceAddress.empty()) {
-        in_addr parsedSource{};
-        if (!parseIpv4(sourceAddress, parsedSource)) {
-            g_object_unref(groupAddress);
-            g_object_unref(socket);
-            error = "invalid IPv4 multicast source address: " + sourceAddress;
-            return nullptr;
+    // Linux defaults IP_MULTICAST_ALL to 1. With a wildcard bind this can make
+    // a socket receive multicast traffic that was joined by another socket on
+    // a different NIC. That defeats the per-stream "input interface" setting.
+    // Disable that behaviour so this socket receives only its own memberships.
+    std::string multicastAllWarning;
+    const bool multicastAllDisabled = disableLinuxMulticastAll(socket, multicastAllWarning);
+    if (!multicastAllDisabled && !multicastAllWarning.empty()) {
+        std::cerr << "UDP input warning: " << multicastAllWarning << std::endl;
+    }
+
+    // When the user explicitly selected a NIC, also ask Linux to bind the
+    // socket to that device. This is stronger than binding to a local IPv4
+    // address and prevents packets arriving on another NIC from reaching the
+    // stream even when both NICs carry the same multicast group.
+    bool deviceBound = false;
+    if (!configuredInterface.empty() && !interfaces.empty()) {
+        std::string bindDeviceWarning;
+        deviceBound = bindLinuxSocketToDevice(socket, interfaces.front(), bindDeviceWarning);
+        if (!deviceBound && !bindDeviceWarning.empty()) {
+            std::cerr << "UDP input warning: " << bindDeviceWarning << std::endl;
         }
 
-        if (interfaces.empty()) {
-            std::string joinError;
-            if (!joinSourceSpecificMulticast(socket, group, sourceAddress, "", joinError)) {
-                g_object_unref(groupAddress);
-                g_object_unref(socket);
-                error = joinError;
-                return nullptr;
-            }
-            joinedInterfaces.push_back("route-default");
-        } else {
-            for (const auto& iface : interfaces) {
-                std::string joinError;
-                if (joinSourceSpecificMulticast(socket, group, sourceAddress, iface, joinError)) {
-                    joinedInterfaces.push_back(iface);
-                    continue;
-                }
-                if (!configuredInterface.empty()) {
-                    g_object_unref(groupAddress);
-                    g_object_unref(socket);
-                    error = joinError;
-                    return nullptr;
-                }
-                std::cerr << "UDP input warning: " << joinError << std::endl;
-            }
-            if (joinedInterfaces.empty()) {
-                g_object_unref(groupAddress);
-                g_object_unref(socket);
-                error = "failed to join source-specific multicast " + sourceAddress +
-                    " -> " + group + " on any active interface";
-                return nullptr;
-            }
+        // At least IP_MULTICAST_ALL=0 must be active if SO_BINDTODEVICE cannot
+        // be used (for example, because the service lacks CAP_NET_RAW). Without
+        // either filter the selected-interface promise cannot be guaranteed.
+        if (!deviceBound && !multicastAllDisabled) {
+            g_object_unref(groupAddress);
+            g_object_unref(socket);
+            error = "failed to enforce selected multicast input interface: " + configuredInterface;
+            return nullptr;
         }
-    } else if (interfaces.empty()) {
+    }
+
+    if (interfaces.empty()) {
         if (!g_socket_join_multicast_group(socket, groupAddress, FALSE, nullptr, &socketError)) {
             g_object_unref(groupAddress);
             g_object_unref(socket);
@@ -384,26 +440,41 @@ GstElement* build(
     const bool wildcardUriHost = uriHost.empty() || uriHost == "0.0.0.0";
     const std::string inputInterfaceAddress =
         effectiveInputInterfaceAddress(config, multicastInput, wildcardUriHost);
-    const std::string inputSourceAddress = normalizeIpAddress(config.inputSourceAddress);
 
     // Multicast uses a wildcard-bound socket with an explicit group membership
     // created above. A unicast URI host is commonly the sender/destination
     // address (FFmpeg and VLC syntax), and binding a receiving socket to that
-    // remote address fails with EADDRNOTAVAIL. Bind unicast to a selected local
-    // interface or to all local interfaces instead.
-    const std::string listenAddress = multicastInput
-        ? "0.0.0.0"
-        : (inputInterfaceAddress.empty() ? "0.0.0.0" : inputInterfaceAddress);
+    // remote address fails with EADDRNOTAVAIL. With an explicit input NIC we
+    // bind the socket to that Linux device; otherwise receive on all NICs.
+    std::string listenAddress = "0.0.0.0";
+    std::string boundInputDevice;
 
     std::vector<std::string> joinedInterfaces;
     if (multicastInput) {
         GSocket* socket = createMulticastSocket(
-            uriHost, port, inputInterfaceAddress, inputSourceAddress, joinedInterfaces, error);
+            uriHost, port, inputInterfaceAddress, joinedInterfaces, error);
         if (!socket) {
             return nullptr;
         }
         g_object_set(src,
             "address", uriHost.c_str(),
+            "port", port,
+            "socket", socket,
+            "close-socket", TRUE,
+            "reuse", TRUE,
+            "auto-multicast", FALSE,
+            "do-timestamp", FALSE,
+            "buffer-size", kSocketBufferSize,
+            nullptr);
+        g_object_unref(socket);
+    } else if (!inputInterfaceAddress.empty()) {
+        GSocket* socket = createDeviceBoundUnicastSocket(
+            port, inputInterfaceAddress, boundInputDevice, error);
+        if (!socket) {
+            return nullptr;
+        }
+        g_object_set(src,
+            "address", listenAddress.c_str(),
             "port", port,
             "socket", socket,
             "close-socket", TRUE,
@@ -430,13 +501,13 @@ GstElement* build(
     if (multicastInput) {
         std::cerr << " multicast_join=" << uriHost
                   << " multicast_iface=" << joinedInterfaceNames(joinedInterfaces)
-                  << " multicast_source=" << (inputSourceAddress.empty() ? "any" : inputSourceAddress)
-                  << " membership=" << (inputSourceAddress.empty() ? "ASM" : "SSM");
+                  << " strict_iface=" << (inputInterfaceAddress.empty() ? "auto" : inputInterfaceAddress);
         if (std::find(joinedInterfaces.begin(), joinedInterfaces.end(), "lo") != joinedInterfaces.end()) {
             std::cerr << " loopback_multicast=on";
         }
-    } else if (!inputSourceAddress.empty()) {
-        std::cerr << " source_filter_ignored=non-multicast:" << inputSourceAddress;
+    } else if (!inputInterfaceAddress.empty()) {
+        std::cerr << " strict_iface=" << inputInterfaceAddress
+                  << " bound_device=" << boundInputDevice;
     }
     std::cerr << " live_queue_ms=750 leaky=downstream" << std::endl;
 
