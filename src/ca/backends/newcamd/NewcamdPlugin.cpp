@@ -173,6 +173,9 @@ struct ServiceBinding {
     uint64_t diagNonModulo8Payloads = 0;
     uint64_t diagScrambledPackets = 0;
     uint64_t diagScrambledNonModulo8Payloads = 0;
+    uint64_t diagBsFullChunks = 0;
+    uint64_t diagBsTailChunks = 0;
+    uint64_t diagScalarTailPackets = 0;
     uint16_t diagSamplePid = 0;
     uint8_t diagSampleScrambling = 0;
     uint8_t diagSampleAdaptation = 0;
@@ -1151,8 +1154,9 @@ static int newcamd_start_service(void* instance, const char* reader_key,
               << " caid=0x" << std::hex << binding->defaultCaid << std::dec
               << " mode=independent-tcp session=" << (activeForReader + 1)
               << "/" << kMaxSessionsPerReader
-              << " csa=adaptive-scalar-bitslice"
+              << " csa=native-bitslice-chunked"
               << " bs_batch_size=" << dvbcsa_bs_batch_size()
+              << " full_native_batch=on"
               << " ecm_duplicate_suppression=on"
               << " ca_diagnostics=" << (caDiagnosticsEnabled() ? "on" : "off")
               << std::endl;
@@ -1174,6 +1178,41 @@ static void newcamd_stop_service(void* instance, const char* stream_id) {
         }
     }
     removedSession.reset();
+}
+
+static void decrypt_csa_batch_chunk(ControlWordSlot& slot,
+                                    std::vector<struct dvbcsa_bs_batch_s>& batch,
+                                    size_t& count,
+                                    bool fullNativeChunk,
+                                    ServiceBinding& binding,
+                                    bool diagnostics) {
+    if (!slot.valid || !slot.scalarKey || !slot.bsKey || count == 0) return;
+
+    const size_t nativeBatch = batch.empty() ? 0 : (batch.size() - 1);
+    if (nativeBatch == 0) return;
+    const size_t bitsliceThreshold = std::min<size_t>(nativeBatch, 8);
+
+    // dvbcsa_bs_decrypt() expects a null sentinel after the last valid lane.
+    // DvbcsaBatchScratch reserves nativeBatch+1 entries specifically for it.
+    batch[count].data = nullptr;
+    batch[count].len = 0;
+
+    if (count >= bitsliceThreshold) {
+        dvbcsa_bs_decrypt(
+            slot.bsKey, batch.data(), static_cast<unsigned int>(kTsPacketSize - 4));
+        if (diagnostics) {
+            if (fullNativeChunk && count == nativeBatch) ++binding.diagBsFullChunks;
+            else ++binding.diagBsTailChunks;
+        }
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            if (batch[i].data && batch[i].len) {
+                dvbcsa_decrypt(slot.scalarKey, batch[i].data, batch[i].len);
+                if (diagnostics) ++binding.diagScalarTailPackets;
+            }
+        }
+    }
+    count = 0;
 }
 
 static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* data, size_t size, struct tvs_ca_ts_result_v1* result) {
@@ -1388,13 +1427,17 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         auto& batch = scramblingControl == 3 ? binding.csaBatch.odd : binding.csaBatch.even;
         size_t& batchCount = scramblingControl == 3 ? binding.csaBatch.oddCount : binding.csaBatch.evenCount;
         const size_t batchCapacity = binding.csaBatch.capacity();
-        if (batchCapacity == 0 || batchCount >= batchCapacity) {
+        if (batchCapacity == 0) {
             waitingForKey = true;
             continue;
         }
 
         // Persistent scratch only: pointers reference the caller-owned TS buffer
         // and remain valid until process_ts returns. No allocations occur here.
+        // v199 immediately decrypts a *full native* bitslice chunk, resets the
+        // scratch counter, then keeps scanning the same caller buffer.  This is
+        // safe for arbitrary process_ts sizes and eliminates v198's overflow
+        // guard that could leave packets untouched once one parity hit capacity.
         batch[batchCount].data = scrambledPayload;
         batch[batchCount].len = static_cast<unsigned int>(scrambledPayloadSize);
         ++batchCount;
@@ -1402,33 +1445,21 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
         packet[3] &= 0x3F;
         result->packets_changed++;
         changed = true;
+
+        if (batchCount == batchCapacity) {
+            decrypt_csa_batch_chunk(
+                slot, batch, batchCount, true, binding, diagnostics);
+        }
     }
 
-    auto flushBatch = [](ControlWordSlot& slot,
-                         std::vector<struct dvbcsa_bs_batch_s>& batch, size_t& count) {
-        if (!slot.valid || !slot.scalarKey || !slot.bsKey || count == 0) return;
-
-        // v198 accumulates up to 28 selected TS packets per service before CA.
-        // This normally gives each parity enough lanes to reach the bitslice
-        // threshold while retaining the scalar fast path for genuinely small
-        // tail batches flushed when a service stops.
-        const size_t nativeBatch = std::max<size_t>(1, dvbcsa_bs_batch_size());
-        const size_t bitsliceThreshold = std::min<size_t>(nativeBatch, 8);
-        if (count >= bitsliceThreshold) {
-            batch[count].data = nullptr;
-            batch[count].len = 0;
-            dvbcsa_bs_decrypt(slot.bsKey, batch.data(), static_cast<unsigned int>(kTsPacketSize - 4));
-        } else {
-            for (size_t i = 0; i < count; ++i) {
-                if (batch[i].data && batch[i].len) {
-                    dvbcsa_decrypt(slot.scalarKey, batch[i].data, batch[i].len);
-                }
-            }
-        }
-        count = 0;
-    };
-    flushBatch(binding.even, binding.csaBatch.even, binding.csaBatch.evenCount);
-    flushBatch(binding.odd, binding.csaBatch.odd, binding.csaBatch.oddCount);
+    // Flush only the residual parity tails here. Full native chunks were
+    // already decrypted in-place while scanning the wide CA input batch.
+    decrypt_csa_batch_chunk(
+        binding.even, binding.csaBatch.even, binding.csaBatch.evenCount,
+        false, binding, diagnostics);
+    decrypt_csa_batch_chunk(
+        binding.odd, binding.csaBatch.odd, binding.csaBatch.oddCount,
+        false, binding, diagnostics);
 
     const uint64_t diagNowMs = diagnostics ? monotonic_ms() : 0;
     if (diagnostics && (binding.diagLastLogMs == 0 || diagNowMs - binding.diagLastLogMs >= 1000)) {
@@ -1446,6 +1477,10 @@ static int newcamd_process_ts(void* instance, const char* stream_id, uint8_t* da
             << " nonmod8=" << binding.diagNonModulo8Payloads
             << " scrambled=" << binding.diagScrambledPackets
             << " scrambled_nonmod8=" << binding.diagScrambledNonModulo8Payloads
+            << " bs_native=" << dvbcsa_bs_batch_size()
+            << " bs_full_chunks=" << binding.diagBsFullChunks
+            << " bs_tail_chunks=" << binding.diagBsTailChunks
+            << " scalar_tail_packets=" << binding.diagScalarTailPackets
             << " sample_pid=" << binding.diagSamplePid
             << " sample_sc=" << static_cast<unsigned>(binding.diagSampleScrambling)
             << " sample_afc=" << static_cast<unsigned>(binding.diagSampleAdaptation)

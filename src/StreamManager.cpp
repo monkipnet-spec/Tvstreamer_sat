@@ -46,7 +46,7 @@ namespace {
 
 constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
-constexpr guint kCaBatchPackets = 28;
+constexpr guint kCaBatchPackets = 77;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
@@ -1794,9 +1794,10 @@ struct SharedDvbDispatchConsumer {
     bool caEnabled = false;
     unsigned slot = 0;
     // Network packetization remains 7x188 (1316 bytes), but CA-enabled DVB
-    // services accumulate a wider TS batch before descrambling.  This lets
-    // libdvbcsa use its bitslice path instead of calling scalar dvbcsa_decrypt
-    // for every tiny 7-packet localhost datagram.
+    // services accumulate 77 TS packets before descrambling (11 complete UDP groups).  The Newcamd
+    // backend chunks that buffer by the native dvbcsa_bs_batch_size(), so full
+    // bitslice lanes are used whenever possible without ever dropping an
+    // overflow packet.  Decrypted data is still emitted as 7x188 UDP datagrams.
     std::array<uint8_t, kTsPacketSize * kTsPacketsPerUdpBuffer> datagram{};
     size_t datagramBytes = 0;
     std::array<uint8_t, kTsPacketSize * kCaBatchPackets> caBatch{};
@@ -1876,6 +1877,84 @@ bool sendSharedDvbConsumerDatagram(
     return true;
 }
 
+bool sendSharedDvbConsumerBatch(
+    SharedDvbDispatchConsumer& consumer, const uint8_t* data, size_t size) {
+    if (!data || size == 0) return true;
+
+    constexpr size_t kDatagramBytes = kTsPacketSize * kTsPacketsPerUdpBuffer;
+    constexpr size_t kMaxMessages =
+        (kCaBatchPackets + kTsPacketsPerUdpBuffer - 1) / kTsPacketsPerUdpBuffer;
+
+    std::array<struct mmsghdr, kMaxMessages> messages{};
+    std::array<struct iovec, kMaxMessages> iovecs{};
+    std::array<size_t, kMaxMessages> expected{};
+
+    size_t offset = 0;
+    unsigned int messageCount = 0;
+    while (offset < size && messageCount < kMaxMessages) {
+        const size_t chunk = std::min(kDatagramBytes, size - offset);
+        iovecs[messageCount].iov_base = const_cast<uint8_t*>(data + offset);
+        iovecs[messageCount].iov_len = chunk;
+        messages[messageCount].msg_hdr.msg_name = &consumer.destination;
+        messages[messageCount].msg_hdr.msg_namelen = sizeof(consumer.destination);
+        messages[messageCount].msg_hdr.msg_iov = &iovecs[messageCount];
+        messages[messageCount].msg_hdr.msg_iovlen = 1;
+        expected[messageCount] = chunk;
+        offset += chunk;
+        ++messageCount;
+    }
+
+    if (offset != size || messageCount == 0) {
+        // Defensive fallback: kMaxMessages is derived from the compile-time CA
+        // batch size, so this should never be reached.  Preserve the stream if
+        // the constants are changed incorrectly in a future release.
+        bool ok = true;
+        for (size_t pos = 0; pos < size; pos += kDatagramBytes) {
+            const size_t chunk = std::min(kDatagramBytes, size - pos);
+            ok = sendSharedDvbConsumerDatagram(consumer, data + pos, chunk) && ok;
+        }
+        return ok;
+    }
+
+    const int sentMessages = ::sendmmsg(
+        consumer.socketFd, messages.data(), messageCount, MSG_NOSIGNAL);
+    if (sentMessages < 0) {
+        ++consumer.udpErrors;
+        if (consumer.udpErrors <= 5 || (consumer.udpErrors % 100) == 0) {
+            std::cerr << "Shared DVB dispatcher sendmmsg warning: stream=" << consumer.streamId
+                      << " messages=" << messageCount
+                      << " errno=" << errno
+                      << " errors=" << consumer.udpErrors
+                      << " fallback=sendto" << std::endl;
+        }
+        bool ok = true;
+        for (unsigned int i = 0; i < messageCount; ++i) {
+            ok = sendSharedDvbConsumerDatagram(
+                     consumer, static_cast<const uint8_t*>(iovecs[i].iov_base), expected[i]) && ok;
+        }
+        return ok;
+    }
+
+    bool ok = true;
+    const unsigned int completed = static_cast<unsigned int>(sentMessages);
+    for (unsigned int i = 0; i < completed; ++i) {
+        if (messages[i].msg_len != expected[i]) {
+            ++consumer.udpErrors;
+            ok = false;
+        } else {
+            ++consumer.udpDatagrams;
+        }
+    }
+
+    // sendmmsg() is allowed to complete only a prefix.  Finish the unsent
+    // datagrams with the proven sendto() path instead of dropping TS packets.
+    for (unsigned int i = completed; i < messageCount; ++i) {
+        ok = sendSharedDvbConsumerDatagram(
+                 consumer, static_cast<const uint8_t*>(iovecs[i].iov_base), expected[i]) && ok;
+    }
+    return ok;
+}
+
 bool flushSharedDvbConsumerDatagram(SharedDvbDispatchConsumer& consumer, bool force) {
     const size_t fullDatagram = kTsPacketSize * kTsPacketsPerUdpBuffer;
 
@@ -1884,24 +1963,15 @@ bool flushSharedDvbConsumerDatagram(SharedDvbDispatchConsumer& consumer, bool fo
         const size_t fullCaBatch = kTsPacketSize * kCaBatchPackets;
         if (!force && consumer.caBatchBytes < fullCaBatch) return true;
 
-        // Keep CA per selected service, but call it with a wide batch.  With
-        // 28 TS packets the even/odd groups normally exceed the plugin's
-        // 8-packet bitslice threshold, so libdvbcsa can process them in one
-        // dvbcsa_bs_decrypt() operation.  The decrypted bytes are then split
-        // back into unchanged 7x188 network datagrams.
+        // Keep CA per selected service, but call it with a 77-packet batch (11x7).
+        // Newcamd v199 consumes native full bitslice chunks and safely decrypts
+        // any remaining tail.  Network packetization is unchanged: sendmmsg()
+        // only batches syscalls; every UDP message remains 7x188 (1316 bytes).
         (void)CaBackendManager::instance().processTransport(
             consumer.streamId, consumer.caBatch.data(), consumer.caBatchBytes);
 
-        bool ok = true;
-        size_t offset = 0;
-        while (offset < consumer.caBatchBytes) {
-            const size_t chunk = std::min(fullDatagram, consumer.caBatchBytes - offset);
-            if (!sendSharedDvbConsumerDatagram(
-                    consumer, consumer.caBatch.data() + offset, chunk)) {
-                ok = false;
-            }
-            offset += chunk;
-        }
+        const bool ok = sendSharedDvbConsumerBatch(
+            consumer, consumer.caBatch.data(), consumer.caBatchBytes);
         consumer.caBatchBytes = 0;
         return ok;
     }
@@ -2116,6 +2186,8 @@ GstPadProbeReturn sharedDvbDispatcherProbe(
                   << " internal-multicast=off"
                   << " udp_packet_group=7x188"
                   << " ca_batch_packets=" << kCaBatchPackets
+                  << " ca_chunking=native-dvbcsa-bitslice"
+                  << " udp_send=sendmmsg"
                   << " ca_stage=selected-spts-before-local-udp" << std::endl;
         dispatcher->announced = true;
     }
@@ -4382,6 +4454,8 @@ bool StreamManager::startDvbServiceRelay(StreamState* state, std::string& error)
               << " service_pids=" << (servicePidFilter.empty() ? "dynamic" : servicePidFilter)
               << " ca=" << (consumer->caEnabled ? "selected-spts" : "off")
               << " ca_batch_packets=" << (consumer->caEnabled ? kCaBatchPackets : 0)
+              << " ca_chunking=" << (consumer->caEnabled ? "native-dvbcsa-bitslice" : "off")
+              << " udp_send=" << (consumer->caEnabled ? "sendmmsg" : "sendto")
               << " source=" << state->sharedDvbServiceRelayUri
               << " per_service_gstreamer_relay=off"
               << " full_mpts_copy=off" << std::endl;
