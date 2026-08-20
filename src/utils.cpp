@@ -43,6 +43,25 @@ std::string normalizeIpAddress(const std::string& value) {
 }
 
 
+std::string normalizeInputUri(const std::string& value) {
+    std::string normalized = value;
+    boost::algorithm::trim(normalized);
+
+    // Copy/paste from shell/config examples may include a matching quote pair.
+    // Strip it only for URI-like values so legitimate local filenames are not
+    // silently rewritten.
+    if (normalized.size() >= 2 &&
+        ((normalized.front() == '"' && normalized.back() == '"') ||
+         (normalized.front() == '\'' && normalized.back() == '\''))) {
+        std::string inner = normalized.substr(1, normalized.size() - 2);
+        boost::algorithm::trim(inner);
+        if (inner.find("://") != std::string::npos) {
+            normalized = std::move(inner);
+        }
+    }
+    return normalized;
+}
+
 
 bool normalizeUdpEndpoint(const std::string& rawHost, int configuredPort,
                           std::string& host, int& port) {

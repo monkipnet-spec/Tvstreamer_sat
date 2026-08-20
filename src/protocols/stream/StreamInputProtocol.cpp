@@ -15,7 +15,8 @@
 namespace tvs::stream_protocols {
 
 InputProtocolKind inputKind(const StreamConfig& cfg) {
-    const std::string input = toLower(cfg.inputUri);
+    const std::string normalizedInput = normalizeInputUri(cfg.inputUri);
+    const std::string input = toLower(normalizedInput);
     const std::string mode = toLower(cfg.inputMode);
     if (inputs::isTestInput(input, mode, cfg.testPattern)) return InputProtocolKind::TestPattern;
     if (inputs::isUdpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Udp;
@@ -25,7 +26,7 @@ InputProtocolKind inputKind(const StreamConfig& cfg) {
     if (inputs::isRtmpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Rtmp;
     if (inputs::isHlsInput(input, mode, cfg.testPattern)) return InputProtocolKind::Hls;
     if (inputs::isHttpInput(input, mode, cfg.testPattern)) return InputProtocolKind::Http;
-    if (DvbSatellite::isDvbUri(cfg.inputUri)) return InputProtocolKind::Dvb;
+    if (DvbSatellite::isDvbUri(normalizedInput)) return InputProtocolKind::Dvb;
     if (inputs::isFileInput(input, mode, cfg.testPattern)) return InputProtocolKind::File;
     return InputProtocolKind::Unknown;
 }

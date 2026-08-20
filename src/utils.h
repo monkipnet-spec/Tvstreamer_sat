@@ -13,6 +13,9 @@ struct NetworkInterface {
 std::string toLower(const std::string& value);
 std::string gstQuote(const std::string& value);
 std::string normalizeIpAddress(const std::string& value);
+// Normalize a user-entered input URI before protocol detection.
+// Trims pasted whitespace/CRLF and a matching quote pair around URI schemes.
+std::string normalizeInputUri(const std::string& value);
 std::vector<NetworkInterface> enumerateNetworkInterfaces(bool includeLoopback = false);
 
 // Accept UDP/RTP destinations entered either as separate host+port fields or

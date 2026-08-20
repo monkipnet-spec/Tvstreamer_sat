@@ -235,9 +235,10 @@ GstElement* build(
     GstElement*& terminalElement,
     std::string& error) {
     terminalElement = nullptr;
+    const std::string inputUri = normalizeInputUri(config.inputUri);
     std::regex uriPattern(R"(^(udp|rtp)://@?([^:/]*):(\d+).*$)", std::regex::icase);
     std::smatch match;
-    if (!std::regex_match(config.inputUri, match, uriPattern) || match.size() < 4) {
+    if (!std::regex_match(inputUri, match, uriPattern) || match.size() < 4) {
         error = "invalid UDP/RTP input URI";
         return nullptr;
     }

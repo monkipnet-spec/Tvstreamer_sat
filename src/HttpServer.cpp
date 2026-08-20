@@ -3188,7 +3188,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 72'} / ${state.program_version||'v201'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 73'} / ${state.program_version||'v202'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
@@ -4230,13 +4230,13 @@ function saveStream(id) {
   const payload = {
     id: id,
     name: document.getElementById('streamName').value,
-    input_uri: document.getElementById('streamInput').value,
+    input_uri: document.getElementById('streamInput').value.trim(),
     output_type: selectedOutputType,
     output_mode: primaryOutput.output_mode,
     output_host: primaryOutput.output_host,
     output_port: primaryOutput.output_port,
     additional_outputs: outputs.slice(1),
-    backup_input_uri: document.getElementById('streamBackupInput').value,
+    backup_input_uri: document.getElementById('streamBackupInput').value.trim(),
     backup_input_type: document.getElementById('streamBackupInputType').value,
     backup_file_loop: document.getElementById('streamBackupInputType').value === 'file' && document.getElementById('streamBackupFileLoop').checked,
     interface_address: document.getElementById('streamInterface').value,

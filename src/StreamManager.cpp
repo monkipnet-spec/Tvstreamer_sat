@@ -6350,7 +6350,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return nullptr;
     }
     const StreamConfig& cfg = state->runtimeConfig;
-    const std::string input = cfg.testPattern ? kTestPatternUri : cfg.inputUri;
+    const std::string input = cfg.testPattern ? kTestPatternUri : normalizeInputUri(cfg.inputUri);
     const std::string inputLower = toLower(input);
     const auto inputProtocol = tvs::stream_protocols::inputKind(cfg);
 
@@ -6768,14 +6768,27 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (UdpInput::handles(input)) {
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Udp ||
+        inputProtocol == tvs::stream_protocols::InputProtocolKind::Rtp) {
         std::string error;
         GstElement* src = UdpInput::build(pipeline, cfg, terminalElement, error);
         if (!src) {
-            std::cerr << error << std::endl;
+            std::cerr << "UDP/RTP input build failed: uri=" << input
+                      << " error=" << error << std::endl;
         }
         return src;
     }
+
+    // Never reinterpret an unknown URI scheme as a local file.  Apart from
+    // producing a misleading GstFileSrc "No such file" error, that made a
+    // perfectly valid UDP URI with pasted whitespace look like a filename.
+    if (inputProtocol != tvs::stream_protocols::InputProtocolKind::File) {
+        std::cerr << "Unsupported input URI/protocol: raw=\"" << cfg.inputUri
+                  << "\" normalized=\"" << input << "\" mode=" << cfg.inputMode
+                  << std::endl;
+        return nullptr;
+    }
+
     const std::string location = fileLocationFromInput(input);
     GstElement* src = gst_element_factory_make("filesrc", "input_src");
     if (!src || !addElementOrFail(pipeline, src)) {
