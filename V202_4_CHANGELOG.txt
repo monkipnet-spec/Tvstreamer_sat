@@ -1,0 +1,11 @@
+TVStreammerSAT5 v202.4
+
+HLS input -> Stable UDP A/V timing fix:
+- HLS real TS packet pacing now follows PCR-derived service bitrate exactly.
+- Generic reservoir occupancy correction is disabled for HLS once PCR lock is available.
+- HLS source PCR is preserved even for CBR UDP; CBR is produced with NULL stuffing only.
+- Synthetic periodic PCR insertion/stripping is disabled for segmented HLS input.
+- Direct non-remapped HLS preserves provider continuity counters and discontinuity flags.
+
+Expected log:
+HLS UDP pacing v202.4: reservoir_correction=off real_pace=PCR ... pcr_mode=source-passthrough cc_mode=source-preserved

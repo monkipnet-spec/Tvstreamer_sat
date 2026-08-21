@@ -600,11 +600,14 @@ public:
           caCleanStartEnabled(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
-          // StableUdpOutput creates a new paced UDP transport domain for every
-          // source, not only Remap ON. Normalize final CC for both IP and DVB
-          // inputs so periodic PCR insertion, reservoir pacing and upstream
-          // buffer boundaries cannot expose broken continuity at the receiver.
-          normalizeOutputContinuity(true),
+          // v202.4: a direct MPEG-TS HLS input already has its own continuity
+          // domain.  Rewriting every CC and clearing the discontinuity flag hid
+          // real HLS segment boundaries from the decoder: missing/restarted PES
+          // then looked continuous and AAC could be decoded as garbage (scratching)
+          // while video waited for the next clean random-access picture.  Preserve
+          // provider CC/discontinuity for non-remapped HLS; remapped and all other
+          // inputs still use the final transport-domain continuity guard.
+          normalizeOutputContinuity(cfg.remapEnabled || !isSegmentedHlsInput(cfg)),
           remapPsiNormalization(cfg.remapEnabled),
           remapOutputServiceId(static_cast<uint16_t>(
               (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU)),
@@ -1390,6 +1393,44 @@ private:
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
+        if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
+            // v202.4: HLS arrives in HTTP bursts, so reservoir occupancy is not a
+            // clock signal.  v202.3 correctly derived the nominal service rate
+            // from PCR but then still added the generic occupancy correction,
+            // accelerating a freshly downloaded segment and slowing the stream
+            // again between downloads.  That changes the real-packet timeline
+            // relative to embedded PTS/PCR and is especially visible as audio
+            // leading video.  Pace useful TS at exactly the PCR-derived rate.
+            const uint64_t hlsPaceCeiling = mode == UdpShapingMode::Cbr
+                ? configuredTargetBitrate
+                : maxRealPaceBitrate();
+            currentRealPaceBitrate = std::min<uint64_t>(
+                pcrDerivedInputBitrate, hlsPaceCeiling);
+            realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
+            updateTransportBitrate();
+            targetReservoirBytes.store(targetBufferBytes, std::memory_order_relaxed);
+
+            const uint64_t bufferMs = estimate > 0
+                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, estimate)
+                : 0;
+            reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
+
+            if (!hlsExactPacingAnnounced) {
+                std::cerr << "HLS UDP pacing v202.4: reservoir_correction=off"
+                          << " real_pace=PCR"
+                          << " source_bitrate=" << pcrDerivedInputBitrate
+                          << " real_pace_bitrate=" << currentRealPaceBitrate
+                          << " transport_bitrate="
+                          << transportBitrate.load(std::memory_order_relaxed)
+                          << " pcr_mode=source-passthrough"
+                          << " cc_mode="
+                          << (normalizeOutputContinuity ? "normalized" : "source-preserved")
+                          << std::endl;
+                hlsExactPacingAnnounced = true;
+            }
+            return;
+        }
+
         int64_t errorBytes = 0;
         if (bufferNow >= targetBufferBytes) {
             const uint64_t diff = bufferNow - targetBufferBytes;
@@ -1474,8 +1515,8 @@ private:
             // clock creates an unnecessary second time base and can produce A/V offset
             // under multi-channel load. CBR still uses periodic synthetic PCR because
             // stuffing changes the transport clock by design.
-            if (mode == UdpShapingMode::Cbr && periodicPcrInitialized &&
-                slotTime >= nextPeriodicPcrNanoseconds) {
+            if (mode == UdpShapingMode::Cbr && !segmentedHlsInput &&
+                periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
                 makePeriodicPcrPacket(outputPacket, slotTime);
                 ++counts.periodicPcr;
 
@@ -1525,7 +1566,7 @@ private:
                             nextPeriodicPcrNanoseconds =
                                 slotTime + kPeriodicPcrIntervalNanoseconds;
                             periodicPcrInitialized = true;
-                            if (mode == UdpShapingMode::Cbr) {
+                            if (mode == UdpShapingMode::Cbr && !segmentedHlsInput) {
                                 writePcr(packet.bytes, periodicPcrOriginTicks);
                                 ++rewrittenPcrPackets;
                             }
@@ -1533,13 +1574,15 @@ private:
                                       << " pcr_pid=" << periodicPcrPid
                                       << " source=selected-PMT"
                                       << " mode="
-                                      << (mode == UdpShapingMode::Vbr
-                                              ? "source-passthrough"
-                                              : "synthetic-cbr")
+                                      << (segmentedHlsInput
+                                              ? "source-passthrough-hls"
+                                              : (mode == UdpShapingMode::Vbr
+                                                    ? "source-passthrough"
+                                                    : "synthetic-cbr"))
                                       << std::endl;
                         }
                     } else if (packet.pid == periodicPcrPid &&
-                               mode == UdpShapingMode::Cbr) {
+                               mode == UdpShapingMode::Cbr && !segmentedHlsInput) {
                         // CBR owns a synthetic transport clock because stuffing changes
                         // the wire time base. VBR keeps every source PCR untouched.
                         clearPcrFlag(packet.bytes);
@@ -1792,6 +1835,7 @@ private:
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
     const bool segmentedHlsInput = false;
+    bool hlsExactPacingAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
     bool caCleanStartVideoSeen = false;
