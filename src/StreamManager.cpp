@@ -6676,7 +6676,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
         GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
-        GstElement* queue = addQueue("input_queue", 2000000000ULL, true);
+        // v202.1: HLS is burst-delivered segment media, not a datagram live source.
+        // A short leaky queue drops valid TS whenever a segment is downloaded faster
+        // than downstream consumes it, producing CC/PES damage (audible scratching)
+        // and apparent input-bitrate collapses. Preserve up to 12 seconds and use
+        // normal back-pressure into hlsdemux instead of discarding segment data.
+        GstElement* queue = addQueue("input_queue", 12000000000ULL, false);
         if (!src || !demux || !mux || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, demux) ||
@@ -6693,6 +6698,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
         setIntPropertyIfPresent(demux, "connection-speed", static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1)));
         configureTsMux(mux, cfg);
+        std::cerr << "HLS input: queue_ms=12000 leaky=off backpressure=on" << std::endl;
 
         if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
             return nullptr;
