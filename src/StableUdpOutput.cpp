@@ -187,6 +187,11 @@ struct TimedTsPacket {
     uint64_t dueNanoseconds = 0;
 };
 
+struct HlsTimestampRatePoint {
+    uint64_t mediaTimestampNanoseconds = 0;
+    uint64_t cumulativeBytes = 0;
+};
+
 bool parsePcr(const std::array<guint8, kTsPacketSize>& packet,
               uint64_t& pcrTicks,
               bool& discontinuity) {
@@ -1052,9 +1057,12 @@ private:
                 // Once two PCR samples are available, use the transport rate derived
                 // from PCR distance and byte distance so audio/video remain on the
                 // broadcaster's clock.
-                estimatedInputBitrate = segmentedHlsInput && pcrDerivedInputBitrate > 0
-                    ? pcrDerivedInputBitrate
-                    : arrivalRate;
+                const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
+                estimatedInputBitrate = segmentedHlsInput && hlsPtsRate > 0
+                    ? hlsPtsRate
+                    : (segmentedHlsInput && pcrDerivedInputBitrate > 0
+                        ? pcrDerivedInputBitrate
+                        : arrivalRate);
                 if (estimatedInputBitrate == 0) {
                     estimatedInputBitrate = mode == UdpShapingMode::Cbr
                         ? std::min<uint64_t>(configuredTargetBitrate, 1000000ULL)
@@ -1104,6 +1112,11 @@ private:
         if (chunk.bytes.empty() && inputRemainder.empty()) {
             return;
         }
+
+        // v202.6: HLS buffers already carry the demuxer's media running-time.
+        // Estimate the useful TS rate from bytes per media-time, never from HTTP
+        // arrival bursts and never from short PCR byte-density on a VBR service.
+        observeHlsTimestampRate(chunk);
 
         // Gst/UDP buffers are usually 7x188, but remap/probe/queue boundaries
         // are not guaranteed to preserve a whole TS packet in every GstBuffer.
@@ -1174,6 +1187,67 @@ private:
                 resyncDiscardedBytes.fetch_add(discard, std::memory_order_relaxed);
                 queueSpace.notify_all();
             }
+        }
+    }
+
+    void observeHlsTimestampRate(const TimedChunk& chunk) {
+        if (!segmentedHlsInput || !chunk.timestampValid || chunk.bytes.empty()) return;
+
+        hlsTimestampBytesSeen += chunk.bytes.size();
+        const uint64_t ts = chunk.mediaTimestampNanoseconds;
+
+        if (!hlsTimestampRateWindow.empty()) {
+            const uint64_t previous = hlsTimestampRateWindow.back().mediaTimestampNanoseconds;
+            // A real HLS discontinuity/variant switch may restart the GStreamer
+            // running-time. Do not turn that jump into a bogus bitrate sample.
+            if (ts + 100ULL * 1000ULL * 1000ULL < previous) {
+                hlsTimestampRateWindow.clear();
+                hlsTimestampDerivedInputBitrate = 0;
+                ++hlsTimestampRateResets;
+            } else if (ts <= previous) {
+                // Several 7x188 buffers may legitimately share one running-time.
+                // Keep the newest cumulative byte position for that timestamp.
+                hlsTimestampRateWindow.back().cumulativeBytes = hlsTimestampBytesSeen;
+                return;
+            }
+        }
+
+        hlsTimestampRateWindow.push_back({ts, hlsTimestampBytesSeen});
+        constexpr uint64_t kHlsTimestampRateWindowNs = 6ULL * 1000ULL * 1000ULL * 1000ULL;
+        constexpr uint64_t kHlsTimestampRateMinNs = 2ULL * 1000ULL * 1000ULL * 1000ULL;
+        while (hlsTimestampRateWindow.size() > 2 &&
+               ts > hlsTimestampRateWindow.front().mediaTimestampNanoseconds &&
+               ts - hlsTimestampRateWindow.front().mediaTimestampNanoseconds >
+                   kHlsTimestampRateWindowNs) {
+            hlsTimestampRateWindow.pop_front();
+        }
+
+        if (hlsTimestampRateWindow.size() < 2) return;
+        const auto& first = hlsTimestampRateWindow.front();
+        const auto& last = hlsTimestampRateWindow.back();
+        if (last.mediaTimestampNanoseconds <= first.mediaTimestampNanoseconds) return;
+        const uint64_t deltaNs = last.mediaTimestampNanoseconds - first.mediaTimestampNanoseconds;
+        if (deltaNs < kHlsTimestampRateMinNs || last.cumulativeBytes <= first.cumulativeBytes) return;
+
+        const uint64_t deltaBytes = last.cumulativeBytes - first.cumulativeBytes;
+        const uint64_t sampleBitrate = multiplyDivide(
+            deltaBytes * 8ULL, 1000000000ULL, deltaNs);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstLock = hlsTimestampDerivedInputBitrate == 0;
+        // The six-second media-time window already removes segment download
+        // bursts. A small EWMA additionally prevents one GOP from moving the
+        // playout rate abruptly while still following genuine service changes.
+        hlsTimestampDerivedInputBitrate = firstLock
+            ? sampleBitrate
+            : (hlsTimestampDerivedInputBitrate * 3ULL + sampleBitrate) / 4ULL;
+        ++hlsTimestampBitrateSamples;
+        if (firstLock) {
+            std::cerr << "HLS UDP pacing v202.6: source_rate=GST_PTS_6s_window"
+                      << " bitrate=" << hlsTimestampDerivedInputBitrate
+                      << " PCR=clock-only"
+                      << " http_arrival_rate=ignored"
+                      << std::endl;
         }
     }
 
@@ -1356,9 +1430,16 @@ private:
                 ? multiplyDivide(deltaBytes * 8ULL, 1000000000ULL, deltaTime)
                 : 0;
 
-            if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
-                // v202.3: never chase HLS HTTP burst speed.  Follow the TS rate
-                // encoded by the provider PCR timeline instead.
+            const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
+            if (segmentedHlsInput && hlsPtsRate > 0) {
+                // v202.6: hlsdemux's PTS/DTS running-time is the playout clock.
+                // A multi-second media-time window gives the useful TS rate even
+                // when HTTP downloads a whole segment in one burst and even when
+                // the service itself is VBR between adjacent PCR packets.
+                estimatedInputBitrate = hlsPtsRate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
+                // Startup/fallback only until enough timestamp history exists.
                 estimatedInputBitrate = pcrDerivedInputBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (instantBitrate > 0) {
@@ -1392,19 +1473,17 @@ private:
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
-        if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
-            // v202.5: keep useful HLS TS packets on the provider PCR-derived rate.
-            // Do not chase HTTP segment burst occupancy: that was the source of the
-            // audio/video drift in v202.3. In CBR mode, however, the *wire* PCR must
-            // remain continuous even during a brief HLS gap, so fillDatagram() below
-            // restores the periodic 20 ms synthetic PCR clock while NULL packets fill
-            // the remaining transport slots. This prevents the video clock from
-            // freezing between downloaded HLS segments without speeding/slowing PES.
-            const uint64_t hlsPaceCeiling = mode == UdpShapingMode::Cbr
-                ? maxRealPaceBitrate()
-                : maxRealPaceBitrate();
+        const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
+        const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
+        if (segmentedHlsInput && hlsSourceRate > 0) {
+            // v202.6: keep useful HLS TS on a rate derived from *media time*.
+            // PCR remains the transport clock source, but byte density between
+            // adjacent PCR packets is not a bitrate meter on a VBR HLS service.
+            // The six-second Gst PTS/DTS window is stable across HTTP segment
+            // bursts and keeps audio/video playout from oscillating.
+            const uint64_t hlsPaceCeiling = maxRealPaceBitrate();
             currentRealPaceBitrate = std::min<uint64_t>(
-                pcrDerivedInputBitrate, hlsPaceCeiling);
+                hlsSourceRate, hlsPaceCeiling);
             realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
             updateTransportBitrate();
             targetReservoirBytes.store(targetBufferBytes, std::memory_order_relaxed);
@@ -1415,9 +1494,10 @@ private:
             reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
 
             if (!hlsExactPacingAnnounced) {
-                std::cerr << "HLS UDP pacing v202.5: reservoir_correction=off"
-                          << " real_pace=PCR"
-                          << " source_bitrate=" << pcrDerivedInputBitrate
+                std::cerr << "HLS UDP pacing v202.6: reservoir_correction=off"
+                          << " real_pace=GST_PTS_6s_window"
+                          << " source_bitrate=" << hlsSourceRate
+                          << " pcr_diagnostic_bitrate=" << pcrDerivedInputBitrate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " transport_bitrate="
                           << transportBitrate.load(std::memory_order_relaxed)
@@ -1812,7 +1892,10 @@ private:
                   << " pcr_pid=" << periodicPcrPid
                   << " pcr_declared=" << (declaredPcrPidValid ? declaredPcrPid : 0x1FFF)
                   << " pcr_program=" << declaredPcrProgram
-                  << " timing=reservoir_rate_controller_periodic_pcr"
+                  << " timing="
+                  << (segmentedHlsInput
+                          ? "hls_pts_window_periodic_pcr"
+                          : "reservoir_rate_controller_periodic_pcr")
                   << " pcr_clock="
                   << (mode == UdpShapingMode::Vbr
                           ? "source_passthrough"
@@ -1827,6 +1910,9 @@ private:
                   << " underflow_slots=" << realUnderflowSlots.load(std::memory_order_relaxed)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
+                  << " hls_pts_rate=" << (segmentedHlsInput ? hlsTimestampDerivedInputBitrate : 0)
+                  << " hls_pts_samples=" << hlsTimestampBitrateSamples.load(std::memory_order_relaxed)
+                  << " hls_pts_resets=" << hlsTimestampRateResets.load(std::memory_order_relaxed)
                   << " hls_pcr_rate=" << (segmentedHlsInput ? pcrDerivedInputBitrate : 0)
                   << " hls_pcr_samples=" << pcrDerivedBitrateSamples.load(std::memory_order_relaxed)
                   << " timeline_shift_ms="
@@ -1910,6 +1996,9 @@ private:
 
     uint64_t estimatedInputBitrate = 0;
     uint64_t pcrDerivedInputBitrate = 0;
+    uint64_t hlsTimestampDerivedInputBitrate = 0;
+    uint64_t hlsTimestampBytesSeen = 0;
+    std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
     uint64_t hlsPcrBytesSinceSample = 0;
     uint64_t hlsLastPcrTicks = 0;
     uint16_t hlsPcrSamplePid = 0x1FFF;
@@ -1934,6 +2023,8 @@ private:
     std::atomic<uint64_t> inputBytesReceived{0};
     std::atomic<uint64_t> inputBitrateEstimate{0};
     std::atomic<uint64_t> pcrDerivedBitrateSamples{0};
+    std::atomic<uint64_t> hlsTimestampBitrateSamples{0};
+    std::atomic<uint64_t> hlsTimestampRateResets{0};
     std::atomic<uint64_t> realPaceBitrate{0};
     std::atomic<uint64_t> reservoirMilliseconds{0};
     std::atomic<uint64_t> targetReservoirBytes{0};
@@ -2036,7 +2127,7 @@ GstElement* createSink(
               << " startup_pcr_min=1 startup_pcr_grace_ms=2000"
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
-              << (isSegmentedHlsInput(config) ? "hls-pcr-rate-controller" : "reservoir-rate-controller")
+              << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
               << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
