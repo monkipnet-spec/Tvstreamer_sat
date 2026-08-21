@@ -1,0 +1,29 @@
+TVStreammerSAT5 Release 73 / v202.7
+
+HLS -> UDP video freeze stabilization
+
+Problem observed on v202.6:
+- audio became stable;
+- no UDP underflow, TS resync or CC verification errors;
+- video still froze periodically;
+- HLS real_pace followed the 6 s PTS bitrate estimate and moved by several percent
+  (about 2.58..2.92 Mbit/s in the captured log) while the 20 ms CBR PCR clock
+  remained continuous.
+
+v202.7 changes:
+- keep the v202.5/v202.6 HLS queue, CC handling and continuous 20 ms CBR PCR;
+- replace direct 6-second PTS-rate chasing with a slow HLS playout PLL;
+- lock a long-lived base useful-TS pace;
+- update the PLL only every 5 seconds;
+- long-term PTS rate changes enter the base at 1/32 per update;
+- reservoir correction is limited to +/-1.5%;
+- actual pace change is limited to 0.2% per 5-second update;
+- HLS reservoir target is 8 seconds to absorb segment burstiness without
+  modulating video packet spacing;
+- add hls_pll_base and hls_pll_correction telemetry.
+
+Expected log marker:
+HLS UDP pacing v202.7: mode=slow-playout-pll ...
+
+Expected stats marker:
+timing=hls_slow_playout_pll_periodic_pcr
