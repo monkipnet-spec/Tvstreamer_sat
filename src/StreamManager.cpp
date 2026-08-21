@@ -7126,9 +7126,12 @@ bool StreamManager::buildOutputBranch(
     const bool sharedDvbSpts = state && state->sharedDvbInput &&
         !state->sharedDvbServiceRelayUri.empty() &&
         state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri;
+    const bool hlsTransportTs = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
+        state->runtimeConfig.inputServiceId == 0;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
-        isDirectHttpMpegTsConfig(state->runtimeConfig) ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
@@ -7136,6 +7139,10 @@ bool StreamManager::buildOutputBranch(
     // tsdemux/mpegtsmux cycle can drop valid/private streams and is not required
     // by StableUdpOutput/WISI shaping. Remux only for explicit PID/SID remapping
     // or a generic multi-program input.
+    // v202.3: the HLS input stage already ends in one complete MPEG-TS stream:
+    // either provider TS direct-passthrough or the compatibility mpegtsmux
+    // fallback.  Do not immediately demux/remux that TS again for Stable UDP.
+    // Explicit PID/SID remap still takes the normal remux path below.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
     // NETUP Stream Processor is less tolerant than VLC of a live TS that begins

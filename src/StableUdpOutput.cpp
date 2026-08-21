@@ -91,6 +91,19 @@ const char* shapingModeName(UdpShapingMode mode) {
     return mode == UdpShapingMode::Cbr ? "CBR" : "VBR";
 }
 
+bool isSegmentedHlsInput(const StreamConfig& cfg) {
+    std::string uri = cfg.inputUri;
+    std::string mode = cfg.inputMode;
+    std::transform(uri.begin(), uri.end(), uri.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return mode == "hls" || uri.rfind("hls://", 0) == 0 ||
+           uri.find(".m3u8") != std::string::npos;
+}
+
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
     return std::regex_search(host, pattern);
@@ -585,6 +598,7 @@ public:
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
           caCleanStartEnabled(!cfg.conditionalAccessClient.empty()),
+          segmentedHlsInput(isSegmentedHlsInput(cfg)),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // StableUdpOutput creates a new paced UDP transport domain for every
           // source, not only Remap ON. Normalize final CC for both IP and DVB
@@ -1029,8 +1043,16 @@ private:
                 startupReservoirBytes.store(startupBytes, std::memory_order_relaxed);
                 startupPcrSamples.store(startupPcrPackets, std::memory_order_relaxed);
                 const uint64_t elapsed = std::max<uint64_t>(1ULL, now - firstArrival);
-                estimatedInputBitrate = multiplyDivide(
+                const uint64_t arrivalRate = multiplyDivide(
                     startupBytes * 8ULL, 1000000000ULL, elapsed);
+                // HLS media is downloaded a segment at a time.  Wall-clock bytes/sec
+                // therefore measures HTTP burst speed, not the MPEG-TS playback rate.
+                // Once two PCR samples are available, use the transport rate derived
+                // from PCR distance and byte distance so audio/video remain on the
+                // broadcaster's clock.
+                estimatedInputBitrate = segmentedHlsInput && pcrDerivedInputBitrate > 0
+                    ? pcrDerivedInputBitrate
+                    : arrivalRate;
                 if (estimatedInputBitrate == 0) {
                     estimatedInputBitrate = mode == UdpShapingMode::Cbr
                         ? std::min<uint64_t>(configuredTargetBitrate, 1000000ULL)
@@ -1131,6 +1153,9 @@ private:
             observeDeclaredPcrFromPmt(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
+            if (segmentedHlsInput) {
+                observeHlsPcrRate(packet);
+            }
             realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
         }
@@ -1147,6 +1172,63 @@ private:
                 resyncDiscardedBytes.fetch_add(discard, std::memory_order_relaxed);
                 queueSpace.notify_all();
             }
+        }
+    }
+
+    void observeHlsPcrRate(const TimedTsPacket& packet) {
+        // Count transport bytes independently of HTTP delivery timing.  HLS
+        // segments can arrive many times faster than real time, then pause until
+        // the next segment.  The byte distance between two PCR values gives the
+        // actual MPEG-TS transport rate and is stable across those bursts.
+        hlsPcrBytesSinceSample += kTsPacketSize;
+        if (!packet.hasPcr || packet.discontinuity) {
+            if (packet.discontinuity) {
+                hlsPcrSampleValid = false;
+                hlsPcrBytesSinceSample = 0;
+            }
+            return;
+        }
+
+        const uint16_t wantedPid = declaredPcrPidValid ? declaredPcrPid : packet.pid;
+        if (packet.pid != wantedPid) return;
+
+        if (!hlsPcrSampleValid || hlsPcrSamplePid != packet.pid) {
+            hlsPcrSampleValid = true;
+            hlsPcrSamplePid = packet.pid;
+            hlsLastPcrTicks = packet.sourcePcrTicks;
+            hlsPcrBytesSinceSample = 0;
+            return;
+        }
+
+        const uint64_t deltaTicks = packet.sourcePcrTicks >= hlsLastPcrTicks
+            ? packet.sourcePcrTicks - hlsLastPcrTicks
+            : (kPcrTicksModulus - hlsLastPcrTicks) + packet.sourcePcrTicks;
+        const uint64_t bytes = hlsPcrBytesSinceSample;
+        hlsLastPcrTicks = packet.sourcePcrTicks;
+        hlsPcrBytesSinceSample = 0;
+
+        // Ignore duplicate/implausible PCR samples.  The accepted range is much
+        // wider than normal broadcast services but rejects corrupt timestamp jumps.
+        if (deltaTicks < kPcrClockHz / 1000ULL || bytes < kTsPacketSize) return;
+        const uint64_t sampleBitrate = multiplyDivide(bytes * 8ULL, kPcrClockHz, deltaTicks);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstRateLock = pcrDerivedInputBitrate == 0;
+        if (firstRateLock) {
+            pcrDerivedInputBitrate = sampleBitrate;
+        } else {
+            // Gentle EWMA smooths normal VBR multiplex variation without following
+            // HLS download bursts, because the sample itself is PCR-derived.
+            pcrDerivedInputBitrate =
+                (pcrDerivedInputBitrate * 7ULL + sampleBitrate) / 8ULL;
+        }
+        pcrDerivedBitrateSamples.fetch_add(1, std::memory_order_relaxed);
+        if (firstRateLock) {
+            std::cerr << "HLS UDP pacing: source_rate=PCR"
+                      << " pcr_pid=" << packet.pid
+                      << " bitrate=" << pcrDerivedInputBitrate
+                      << " http_arrival_rate=ignored"
+                      << std::endl;
         }
     }
 
@@ -1272,12 +1354,17 @@ private:
                 ? multiplyDivide(deltaBytes * 8ULL, 1000000000ULL, deltaTime)
                 : 0;
 
-            if (instantBitrate > 0) {
+            if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
+                // v202.3: never chase HLS HTTP burst speed.  Follow the TS rate
+                // encoded by the provider PCR timeline instead.
+                estimatedInputBitrate = pcrDerivedInputBitrate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (instantBitrate > 0) {
                 if (estimatedInputBitrate == 0) {
                     estimatedInputBitrate = instantBitrate;
                 } else {
                     // 8-sample EWMA: reacts to real service-rate changes without
-                    // following the short mpegtsmux output bursts that upset UDP.
+                    // following short producer bursts on non-HLS inputs.
                     estimatedInputBitrate =
                         (estimatedInputBitrate * 7ULL + instantBitrate) / 8ULL;
                 }
@@ -1677,6 +1764,8 @@ private:
                   << " underflow_slots=" << realUnderflowSlots.load(std::memory_order_relaxed)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
+                  << " hls_pcr_rate=" << (segmentedHlsInput ? pcrDerivedInputBitrate : 0)
+                  << " hls_pcr_samples=" << pcrDerivedBitrateSamples.load(std::memory_order_relaxed)
                   << " timeline_shift_ms="
                   << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " clock_resets=" << schedulerResets.load(std::memory_order_relaxed)
@@ -1702,6 +1791,7 @@ private:
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
+    const bool segmentedHlsInput = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
     bool caCleanStartVideoSeen = false;
@@ -1755,6 +1845,11 @@ private:
     uint64_t firstChunkArrivalNanoseconds = 0;
 
     uint64_t estimatedInputBitrate = 0;
+    uint64_t pcrDerivedInputBitrate = 0;
+    uint64_t hlsPcrBytesSinceSample = 0;
+    uint64_t hlsLastPcrTicks = 0;
+    uint16_t hlsPcrSamplePid = 0x1FFF;
+    bool hlsPcrSampleValid = false;
     uint64_t currentRealPaceBitrate = 0;
     uint64_t realTokenAccumulator = 0;
     uint64_t lastRateSampleNanoseconds = 0;
@@ -1774,6 +1869,7 @@ private:
     uint64_t lastStatsNanoseconds = 0;
     std::atomic<uint64_t> inputBytesReceived{0};
     std::atomic<uint64_t> inputBitrateEstimate{0};
+    std::atomic<uint64_t> pcrDerivedBitrateSamples{0};
     std::atomic<uint64_t> realPaceBitrate{0};
     std::atomic<uint64_t> reservoirMilliseconds{0};
     std::atomic<uint64_t> targetReservoirBytes{0};
@@ -1875,7 +1971,8 @@ GstElement* createSink(
               << " packetization=7x188 startup_reservoir_ms=5000"
               << " startup_pcr_min=1 startup_pcr_grace_ms=2000"
               << " target_reservoir_ms=2500 low_watermark_ms=800"
-              << " null_pid=0x1fff source_timing=reservoir-rate-controller"
+              << " null_pid=0x1fff source_timing="
+              << (isSegmentedHlsInput(config) ? "hls-pcr-rate-controller" : "reservoir-rate-controller")
               << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
