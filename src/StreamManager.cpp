@@ -3475,9 +3475,9 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
         "location", location.c_str(),
         "playlist-root", playlistRoot.c_str(),
         "target-duration", 2,
-        "max-files", 6,
+        "max-files", 9,
         nullptr);
-    setUIntPropertyIfPresent(sink, "playlist-length", 4);
+    setUIntPropertyIfPresent(sink, "playlist-length", 7);
     setBooleanPropertyIfPresent(sink, "send-keyframe-requests", TRUE);
 }
 
@@ -7511,7 +7511,7 @@ bool StreamManager::buildHlsOutputPipeline(
     g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), contextPtr);
 
     std::cerr << "HLS output: tsdemux -> elementary parsers -> hlssink2"
-              << " target_duration=2 playlist_length=4 max_files=6"
+              << " target_duration=2 playlist_length=7 max_files=9"
               << " source_keyframes=preserved remux=internal"
               << " playlist_root=/" << hlsPublicPathName(cfg) << "/"
               << " force_keyunit=" << (canRequestKeyframes ? "on" : "off")

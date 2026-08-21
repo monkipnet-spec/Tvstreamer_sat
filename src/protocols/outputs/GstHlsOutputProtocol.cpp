@@ -109,8 +109,8 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
         "location=" + dir + "/segment%05d.ts",
         "playlist-root=/" + hlsPublicPathName(cfg) + "/",
         "target-duration=2",
-        "max-files=6",
-        "playlist-length=4"
+        "max-files=9",
+        "playlist-length=7"
     });
 
     spec.description = "hls@" + dir + "/video.m3u8";
