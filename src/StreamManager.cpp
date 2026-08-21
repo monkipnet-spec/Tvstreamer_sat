@@ -1826,6 +1826,8 @@ struct SharedDvbDispatcherState {
     uint64_t inputPackets = 0;
     uint64_t routedPackets = 0;
     uint64_t droppedPackets = 0;
+    uint64_t directMediaPackets = 0;
+    uint64_t rewrittenPackets = 0;
     uint64_t resyncs = 0;
     bool announced = false;
     std::chrono::steady_clock::time_point statsStarted = std::chrono::steady_clock::now();
@@ -2107,16 +2109,38 @@ void dispatchSharedDvbPacket(
     }
 
     bool routesChanged = false;
-    std::array<uint8_t, kTsPacketSize> packetCopy{};
+    std::array<uint8_t, kTsPacketSize> packetCopy;
     while (routes) {
         const unsigned slot = static_cast<unsigned>(__builtin_ctzll(routes));
         routes &= routes - 1;
         if (slot >= dispatcher.slots.size()) continue;
         const auto& consumer = dispatcher.slots[slot];
         if (!consumer) continue;
+
+        // v202.8: the overwhelmingly common DVB path is an already-selected
+        // media/PCR PID with no PID remap.  pidRoutes[] was built from this
+        // consumer's allowed PID set, so ordinary ES/PCR packets need neither
+        // PSI parsing nor a temporary 188-byte copy.  appendSharedDvbConsumerPacket()
+        // copies once into the 7x188/CA batch owned by the consumer.  Keeping this
+        // hot path short reduces dispatcher CPU pressure and prevents the shared
+        // frontend queue from overflowing during short scheduler stalls.
+        const auto& psi = consumer->psi;
+        const bool ordinaryMedia =
+            pid != 0x0000 && pid != 0x0011 && pid != psi.pmtPid;
+        const bool directMedia = ordinaryMedia && !psi.remapEnabled &&
+            pid < psi.allowedPids.size() && psi.allowedPids[pid];
+        if (directMedia) {
+            ++consumer->inputPackets;
+            appendSharedDvbConsumerPacket(*consumer, packet);
+            ++dispatcher.routedPackets;
+            ++dispatcher.directMediaPackets;
+            continue;
+        }
+
         if (prepareSharedDvbServicePacket(packet, *consumer, packetCopy, routesChanged)) {
             appendSharedDvbConsumerPacket(*consumer, packetCopy.data());
             ++dispatcher.routedPackets;
+            ++dispatcher.rewrittenPackets;
         }
     }
     if (routesChanged) rebuildSharedDvbPidRoutes(dispatcher);
@@ -2201,6 +2225,8 @@ GstPadProbeReturn sharedDvbDispatcherProbe(
             std::cerr << "Shared DVB dispatcher stats: input_packets=" << dispatcher->inputPackets
                       << " routed_packets=" << dispatcher->routedPackets
                       << " dropped_packets=" << dispatcher->droppedPackets
+                      << " direct_media_packets=" << dispatcher->directMediaPackets
+                      << " rewritten_packets=" << dispatcher->rewrittenPackets
                       << " resyncs=" << dispatcher->resyncs
                       << " services=" << dispatcher->streamSlots.size() << std::endl;
             dispatcher->statsStarted = now;
@@ -4094,13 +4120,17 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         }
     }
 
-    // v200 overload resilience: this is a live frontend.  Do not accumulate a
-    // 12-second MPTS backlog when the dispatcher loses CPU time.  Dropping the
-    // oldest queued buffer causes a bounded continuity gap, but the dispatcher
-    // immediately resumes from current satellite data instead of replaying a
-    // stale burst for many seconds.
-    configureLiveQueue(queue, 750000000ULL);
-    std::cerr << "Shared DVB live queue: max_latency_ms=750 leaky=downstream overload_backlog=disabled" << std::endl;
+    // v202.8 DVB A/V-sync: do not discard transport packets between dvbsrc and
+    // the in-process dispatcher.  The former 750 ms leaky=downstream queue could
+    // drop an arbitrary part of a video GOP during a short CPU stall while audio
+    // continued to decode, producing a 2-3 second apparent audio lead that was
+    // cleared only by rebuilding the channel.  Keep a bounded 2.5 s reserve and
+    // use normal back-pressure instead.  The dispatcher media fast-path below
+    // substantially lowers the chance of ever reaching this bound.
+    configureQueue(queue, 2500000000ULL);
+    setIntPropertyIfPresent(queue, "leaky", 0);
+    std::cerr << "Shared DVB queue v202.8: max_latency_ms=2500 leaky=off"
+              << " packet_drop=disabled backpressure=on avsync=preserve" << std::endl;
     g_object_set(sink,
         "sync", FALSE,
         "async", FALSE,

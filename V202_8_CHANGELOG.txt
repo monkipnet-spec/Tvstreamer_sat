@@ -1,0 +1,17 @@
+TVStreammerSAT5 Release 73 / v202.8
+
+DVB A/V sync fix only. HLS v202.7 behaviour is unchanged.
+
+v202.8 changes:
+- Shared DVB frontend queue: 750 ms leaky=downstream -> 2500 ms non-leaky/backpressure.
+  This prevents arbitrary TS/GOP loss during short CPU scheduling stalls.
+- Shared DVB dispatcher ordinary media/PCR fast-path avoids the temporary 188-byte
+  copy and PSI work for non-remapped ES/PCR packets.
+- DVB diagnostics now report direct_media_packets and rewritten_packets.
+
+Expected runtime log:
+  Shared DVB queue v202.8: max_latency_ms=2500 leaky=off packet_drop=disabled backpressure=on avsync=preserve
+
+Optional diagnostics:
+  TVS_DVB_DIAGNOSTICS=1
+  Shared DVB dispatcher stats: ... direct_media_packets=... rewritten_packets=... resyncs=...
