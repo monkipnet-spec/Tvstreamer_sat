@@ -380,11 +380,34 @@ std::string effectiveInputInterfaceAddress(
     return (multicastInput || wildcardUriHost) ? config.interfaceAddress : "";
 }
 
-void configureQueue(GstElement* queue) {
-    // UDP is a live source.  Keeping several seconds of old datagrams after a
-    // CPU overload is worse than dropping them: once the scheduler recovers the
-    // old queue is replayed as a burst, sockets overflow and the decoder can
-    // remain corrupted.  Keep at most 750 ms and discard the oldest buffers.
+void configureQueue(GstElement* queue, bool preserveLoopbackTransport) {
+    if (!queue) return;
+
+    if (preserveLoopbackTransport) {
+        // Shared DVB single-pass services are fed back into the normal stream
+        // pipeline over udp://127.0.0.1.  This is an in-process transport handoff,
+        // not an unreliable external live source.  Dropping the oldest buffers
+        // here (the generic 750 ms leaky policy) removes real TS packets whenever
+        // the host is briefly CPU-starved.  Video is much more sensitive to those
+        // losses than audio, so the visible symptom is audio running ahead while
+        // video waits for the next decodable reference/random-access picture.
+        //
+        // Keep a bounded non-leaky queue instead.  Back-pressure moves into the
+        // large udpsrc kernel receive buffer and the downstream 5 s WISI reservoir
+        // can absorb the recovery burst without continuity loss.
+        g_object_set(queue,
+            "max-size-buffers", 0,
+            "max-size-bytes", 0,
+            "max-size-time", static_cast<guint64>(2 * GST_SECOND),
+            "leaky", 0,
+            nullptr);
+        return;
+    }
+
+    // External UDP is a live source. Keeping several seconds of old datagrams
+    // after a CPU overload is worse than dropping them: once the scheduler
+    // recovers the old queue is replayed as a burst. Keep at most 750 ms and
+    // discard the oldest buffers for real network inputs.
     g_object_set(queue,
         "max-size-buffers", 0,
         "max-size-bytes", 0,
@@ -422,8 +445,6 @@ GstElement* build(
         error = "failed to create UDP input elements";
         return nullptr;
     }
-    configureQueue(queue);
-
     int port = 0;
     try {
         port = std::stoi(match[3].str());
@@ -438,6 +459,8 @@ GstElement* build(
     const std::string uriHost = match[2].str();
     const bool multicastInput = isMulticastHost(uriHost);
     const bool wildcardUriHost = uriHost.empty() || uriHost == "0.0.0.0";
+    const bool loopbackTransport = uriHost == "127.0.0.1" || uriHost == "localhost";
+    configureQueue(queue, loopbackTransport);
     const std::string inputInterfaceAddress =
         effectiveInputInterfaceAddress(config, multicastInput, wildcardUriHost);
 
@@ -509,7 +532,12 @@ GstElement* build(
         std::cerr << " strict_iface=" << inputInterfaceAddress
                   << " bound_device=" << boundInputDevice;
     }
-    std::cerr << " live_queue_ms=750 leaky=downstream" << std::endl;
+    if (loopbackTransport) {
+        std::cerr << " live_queue_ms=2000 leaky=off transport=loopback-preserve";
+    } else {
+        std::cerr << " live_queue_ms=750 leaky=downstream";
+    }
+    std::cerr << std::endl;
 
     if (toLower(match[1].str()) == "rtp") {
         GstElement* depay = gst_element_factory_make("rtpmp2tdepay", "rtp_depay");
