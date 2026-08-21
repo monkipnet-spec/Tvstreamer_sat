@@ -600,14 +600,13 @@ public:
           caCleanStartEnabled(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
-          // v202.4: a direct MPEG-TS HLS input already has its own continuity
-          // domain.  Rewriting every CC and clearing the discontinuity flag hid
-          // real HLS segment boundaries from the decoder: missing/restarted PES
-          // then looked continuous and AAC could be decoded as garbage (scratching)
-          // while video waited for the next clean random-access picture.  Preserve
-          // provider CC/discontinuity for non-remapped HLS; remapped and all other
-          // inputs still use the final transport-domain continuity guard.
-          normalizeOutputContinuity(cfg.remapEnabled || !isSegmentedHlsInput(cfg)),
+          // v202.5: normalize the outgoing continuity domain for every Stable UDP
+          // stream, including direct MPEG-TS HLS. HLS segmenters commonly restart
+          // source CC values at segment boundaries; forwarding those restarts as-is
+          // makes downstream decoders report packet loss and can corrupt audio PES.
+          // The HLS-specific path below still preserves a real discontinuity flag
+          // and uses it as a continuity reset marker instead of masking it.
+          normalizeOutputContinuity(true),
           remapPsiNormalization(cfg.remapEnabled),
           remapOutputServiceId(static_cast<uint16_t>(
               (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId) & 0xFFFFU)),
@@ -1394,15 +1393,15 @@ private:
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
         if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
-            // v202.4: HLS arrives in HTTP bursts, so reservoir occupancy is not a
-            // clock signal.  v202.3 correctly derived the nominal service rate
-            // from PCR but then still added the generic occupancy correction,
-            // accelerating a freshly downloaded segment and slowing the stream
-            // again between downloads.  That changes the real-packet timeline
-            // relative to embedded PTS/PCR and is especially visible as audio
-            // leading video.  Pace useful TS at exactly the PCR-derived rate.
+            // v202.5: keep useful HLS TS packets on the provider PCR-derived rate.
+            // Do not chase HTTP segment burst occupancy: that was the source of the
+            // audio/video drift in v202.3. In CBR mode, however, the *wire* PCR must
+            // remain continuous even during a brief HLS gap, so fillDatagram() below
+            // restores the periodic 20 ms synthetic PCR clock while NULL packets fill
+            // the remaining transport slots. This prevents the video clock from
+            // freezing between downloaded HLS segments without speeding/slowing PES.
             const uint64_t hlsPaceCeiling = mode == UdpShapingMode::Cbr
-                ? configuredTargetBitrate
+                ? maxRealPaceBitrate()
                 : maxRealPaceBitrate();
             currentRealPaceBitrate = std::min<uint64_t>(
                 pcrDerivedInputBitrate, hlsPaceCeiling);
@@ -1416,15 +1415,17 @@ private:
             reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
 
             if (!hlsExactPacingAnnounced) {
-                std::cerr << "HLS UDP pacing v202.4: reservoir_correction=off"
+                std::cerr << "HLS UDP pacing v202.5: reservoir_correction=off"
                           << " real_pace=PCR"
                           << " source_bitrate=" << pcrDerivedInputBitrate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " transport_bitrate="
                           << transportBitrate.load(std::memory_order_relaxed)
-                          << " pcr_mode=source-passthrough"
-                          << " cc_mode="
-                          << (normalizeOutputContinuity ? "normalized" : "source-preserved")
+                          << " pcr_mode="
+                          << (mode == UdpShapingMode::Cbr
+                                  ? "synthetic-20ms-cbr"
+                                  : "source-passthrough-vbr")
+                          << " cc_mode=normalized-hls-aware"
                           << std::endl;
                 hlsExactPacingAnnounced = true;
             }
@@ -1515,7 +1516,7 @@ private:
             // clock creates an unnecessary second time base and can produce A/V offset
             // under multi-channel load. CBR still uses periodic synthetic PCR because
             // stuffing changes the transport clock by design.
-            if (mode == UdpShapingMode::Cbr && !segmentedHlsInput &&
+            if (mode == UdpShapingMode::Cbr &&
                 periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
                 makePeriodicPcrPacket(outputPacket, slotTime);
                 ++counts.periodicPcr;
@@ -1566,7 +1567,7 @@ private:
                             nextPeriodicPcrNanoseconds =
                                 slotTime + kPeriodicPcrIntervalNanoseconds;
                             periodicPcrInitialized = true;
-                            if (mode == UdpShapingMode::Cbr && !segmentedHlsInput) {
+                            if (mode == UdpShapingMode::Cbr) {
                                 writePcr(packet.bytes, periodicPcrOriginTicks);
                                 ++rewrittenPcrPackets;
                             }
@@ -1574,15 +1575,15 @@ private:
                                       << " pcr_pid=" << periodicPcrPid
                                       << " source=selected-PMT"
                                       << " mode="
-                                      << (segmentedHlsInput
-                                              ? "source-passthrough-hls"
-                                              : (mode == UdpShapingMode::Vbr
-                                                    ? "source-passthrough"
+                                      << (mode == UdpShapingMode::Vbr
+                                              ? "source-passthrough"
+                                              : (segmentedHlsInput
+                                                    ? "synthetic-cbr-hls-20ms"
                                                     : "synthetic-cbr"))
                                       << std::endl;
                         }
                     } else if (packet.pid == periodicPcrPid &&
-                               mode == UdpShapingMode::Cbr && !segmentedHlsInput) {
+                               mode == UdpShapingMode::Cbr) {
                         // CBR owns a synthetic transport clock because stuffing changes
                         // the wire time base. VBR keeps every source PCR untouched.
                         clearPcrFlag(packet.bytes);
@@ -1655,15 +1656,24 @@ private:
             const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
             if (adaptationControl == 0) continue;
 
-            // IP remap through mpegtsmux creates a fresh transport continuity
-            // domain.  For DVB packet-level remap do the same: an upstream
-            // discontinuity flag must not reset the newly-normalized output CC.
-            // Clear the flag after absorbing it into the new transport domain.
-            if ((adaptationControl == 2 || adaptationControl == 3) &&
+            const bool sourceDiscontinuity =
+                (adaptationControl == 2 || adaptationControl == 3) &&
                 packet[4] > 0 && packet[4] <= 183 &&
-                (packet[5] & 0x80U) != 0) {
-                packet[5] = static_cast<guint8>(packet[5] & ~0x80U);
-                ++finalDiscontinuitiesCleared;
+                (packet[5] & 0x80U) != 0;
+
+            // v202.5 HLS continuity policy:
+            //  * smooth bare CC restarts that occur at HLS segment boundaries;
+            //  * when the broadcaster explicitly marks a discontinuity, keep the
+            //    flag and start a new output CC baseline on that PID.
+            // Remapped/non-HLS transports still absorb the discontinuity into the
+            // freshly-normalized output continuity domain as before.
+            if (sourceDiscontinuity) {
+                if (segmentedHlsInput && !remapPsiNormalization) {
+                    finalContinuityValid[pid] = false;
+                } else {
+                    packet[5] = static_cast<guint8>(packet[5] & ~0x80U);
+                    ++finalDiscontinuitiesCleared;
+                }
             }
 
             const guint8 incoming = static_cast<guint8>(packet[3] & 0x0F);
@@ -1690,7 +1700,10 @@ private:
             std::cerr << "UDP final TS continuity guard: scope=all-stable-udp stage=pre-send"
                       << " remap=" << (remapPsiNormalization ? "on" : "off")
                       << " all-pids=normalized after-PCR-insertion"
-                      << " discontinuity=absorbed-and-cleared"
+                      << " discontinuity="
+                      << (segmentedHlsInput && !remapPsiNormalization
+                              ? "preserved-reset-marker"
+                              : "absorbed-and-cleared")
                       << " profile=single-output-transport-domain"
                       << std::endl;
             finalContinuityAnnounced = true;
@@ -1710,6 +1723,13 @@ private:
 
             const guint8 cc = static_cast<guint8>(packet[3] & 0x0F);
             const bool hasPayload = adaptationControl == 1 || adaptationControl == 3;
+            const bool sourceDiscontinuity =
+                (adaptationControl == 2 || adaptationControl == 3) &&
+                packet[4] > 0 && packet[4] <= 183 &&
+                (packet[5] & 0x80U) != 0;
+            if (segmentedHlsInput && !remapPsiNormalization && sourceDiscontinuity) {
+                finalVerifyContinuityValid[pid] = false;
+            }
             if (!finalVerifyContinuityValid[pid]) {
                 finalVerifyContinuity[pid] = cc;
                 finalVerifyContinuityValid[pid] = true;
