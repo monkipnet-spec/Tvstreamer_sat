@@ -30,6 +30,14 @@ struct RemapContext {
     bool flvMux = false;
     bool rtspPush = false;
     bool hlsSink2 = false;
+    // v202.2 HLS input: if hlsdemux exposes complete MPEG-TS fragments, route
+    // them byte-for-byte through this selector instead of demuxing/remuxing.
+    // The mux branch remains the fallback for HLS variants that expose
+    // elementary audio/video pads.
+    GstElement* hlsInputSelector = nullptr;
+    GstPad* hlsMuxSelectorPad = nullptr;
+    GstPad* hlsDirectSelectorPad = nullptr;
+    bool hlsDirectTsActive = false;
     bool programMapApplied = false;
     GstPad* preallocatedVideoMuxPad = nullptr;
     GstPad* preallocatedAudioMuxPad = nullptr;
@@ -37,6 +45,8 @@ struct RemapContext {
     std::string audioPadName;
 
     ~RemapContext() {
+        if (hlsMuxSelectorPad) gst_object_unref(hlsMuxSelectorPad);
+        if (hlsDirectSelectorPad) gst_object_unref(hlsDirectSelectorPad);
         if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);
         if (preallocatedAudioMuxPad) gst_object_unref(preallocatedAudioMuxPad);
     }

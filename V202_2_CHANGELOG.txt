@@ -1,0 +1,11 @@
+TVStreammerSAT5 v202.2
+
+HLS input fixes:
+- keeps v202.1 12-second non-leaky HLS input queue;
+- adds direct MPEG-TS HLS passthrough via input-selector;
+- preserves provider PAT/PMT/PCR/PTS/continuity for MPEG-TS HLS segments;
+- avoids tsdemux -> parser -> mpegtsmux reconstruction when hlsdemux already exposes MPEG-TS;
+- retains the legacy remux path as fallback for HLS sources exposing elementary streams.
+
+Expected runtime log for MPEG-TS HLS:
+HLS input: transport=mpegts direct_passthrough=on remux=off preserve_pcr_pts=on preserve_cc=on
