@@ -2711,6 +2711,15 @@ bool udpCbrOutputEnabled(const StreamConfig& cfg) {
     return type == "udp" && cfg.cbr && cfg.targetBitrate > 0;
 }
 
+bool directNetworkVbrOutput(const StreamConfig& cfg) {
+    if (!isUdpOutputType(outputType(cfg)) || udpCbrOutputEnabled(cfg) || cfg.remapEnabled) {
+        return false;
+    }
+    const auto input = tvs::stream_protocols::inputKind(cfg);
+    return input == tvs::stream_protocols::InputProtocolKind::Srt ||
+           input == tvs::stream_protocols::InputProtocolKind::Http;
+}
+
 bool cbrMuxEnabled(const StreamConfig& cfg) {
     // v198: CBR is supported for UDP-CBR and for HTTP/HLS/SRT when the stream
     // CBR checkbox is enabled. RTSP/RTMP/YouTube/RTP/FIFO remain source-paced.
@@ -3585,6 +3594,33 @@ GstElement* createRtpMpegTsSink(const StreamConfig& cfg, const std::string& sink
               << " iface=" << (cfg.interfaceAddress.empty() ? "auto" : cfg.interfaceAddress)
               << std::endl;
     return bin;
+}
+
+GstElement* createDirectUdpVbrSink(const StreamConfig& cfg, const std::string& sinkName) {
+    if (!hasElementFactory("udpsink")) {
+        std::cerr << missingElementStatus("udpsink") << std::endl;
+        return nullptr;
+    }
+
+    GstElement* sink = gst_element_factory_make("udpsink", sinkName.c_str());
+    if (!sink) return nullptr;
+
+    const std::string host = cfg.outputHost.empty() ? "127.0.0.1" : cfg.outputHost;
+    g_object_set(sink,
+        "host", host.c_str(),
+        "port", static_cast<gint>(cfg.outputPort),
+        "sync", FALSE,
+        "async", FALSE,
+        "qos", FALSE,
+        "auto-multicast", TRUE,
+        "ttl-mc", 32,
+        "buffer-size", 8 * 1024 * 1024,
+        nullptr);
+    setInt64PropertyIfPresent(sink, "max-lateness", -1);
+    if (!cfg.interfaceAddress.empty()) {
+        setStringPropertyIfPresent(sink, "bind-address", cfg.interfaceAddress);
+    }
+    return sink;
 }
 
 void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
@@ -7345,7 +7381,8 @@ bool StreamManager::buildPassthroughPipeline(
     // Bitrate Out=0.  Feed the already-normalised MPEG-TS directly to the
     // reservoir for UDP; all source chains reaching this function expose TS,
     // and DVB/test chains are already packet-aligned upstream.
-    const bool directStableUdpTs = usesStableUdpShaper(cfg);
+    const bool directVbr = directNetworkVbrOutput(cfg);
+    const bool directStableUdpTs = usesStableUdpShaper(cfg) && !directVbr;
     GstElement* tsparse = directStableUdpTs
         ? nullptr
         : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
@@ -7431,6 +7468,13 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     configureTsPacketAlignment(tsparse);
+    if (directVbr) {
+        std::cerr << "Direct network UDP VBR: stream=" << cfg.id
+                  << " input=" << tvs::stream_protocols::inputKindName(
+                         tvs::stream_protocols::inputKind(cfg))
+                  << " packetization=tsparse-1316 pacing=source-arrival"
+                  << " remap=off stable_shaper=bypassed" << std::endl;
+    }
     return pacer
         ? gst_element_link_many(sourceTail, tsparse, queue, pacer, sink, nullptr)
         : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
@@ -7812,7 +7856,15 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
         return nullptr;
     }
     if (isUdpOutputType(type)) {
-        // UDP-CBR and UDP-VBR share one stable MPEG-TS reservoir/shaper. CBR
+        if (directNetworkVbrOutput(cfg)) {
+            GstElement* sink = createDirectUdpVbrSink(cfg, sinkName);
+            if (!sink || !addElementOrFail(pipeline, sink)) {
+                if (sink && !GST_OBJECT_PARENT(sink)) gst_object_unref(sink);
+                return nullptr;
+            }
+            return sink;
+        }
+        // UDP-CBR and shaped UDP-VBR share one stable MPEG-TS reservoir/shaper. CBR
         // uses Target bitrate with NULL padding; VBR follows the measured source
         // rate with the same startup reservoir, packetization and periodic PCR.
         std::string error;

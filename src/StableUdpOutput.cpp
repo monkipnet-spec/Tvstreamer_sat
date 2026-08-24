@@ -634,7 +634,9 @@ std::size_t findPatOffset(const guint8* data, std::size_t size, std::size_t mini
 class StableUdpSender {
 public:
     StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
-        : networkBytes(networkBytesCounter),
+        : streamId(cfg.id),
+          srtInput(tvs::protocols::inputs::isSrtInput(cfg)),
+          networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
           caCleanStartEnabled(true),
@@ -696,6 +698,7 @@ public:
             closeSocket();
             return;
         }
+        outputEndpoint = outputHost + ":" + std::to_string(outputPort);
         destinationAddress.sin_family = AF_INET;
         destinationAddress.sin_port = htons(static_cast<uint16_t>(outputPort));
         if (::inet_pton(AF_INET, outputHost.c_str(), &destinationAddress.sin_addr) != 1) {
@@ -927,6 +930,9 @@ public:
         inputBytesReceived.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
 
         std::unique_lock<std::mutex> lock(queueMutex);
+        const bool backpressured =
+            bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() > kMaxBufferedBytes;
+        const uint64_t backpressureStarted = backpressured ? monotonicNanoseconds() : 0;
         queueSpace.wait(lock, [&]() {
             return stopping.load(std::memory_order_relaxed) ||
                    bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() <= kMaxBufferedBytes;
@@ -935,7 +941,22 @@ public:
             return GST_FLOW_FLUSHING;
         }
 
-        bufferedBytes.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
+        if (backpressured) {
+            backpressureEvents.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t now = monotonicNanoseconds();
+            if (now > backpressureStarted) {
+                backpressureWaitNanoseconds.fetch_add(
+                    now - backpressureStarted, std::memory_order_relaxed);
+            }
+        }
+
+        const std::size_t bufferedAfter =
+            bufferedBytes.fetch_add(chunk.bytes.size(), std::memory_order_relaxed) + chunk.bytes.size();
+        std::size_t previousHighWater = maxBufferedBytesObserved.load(std::memory_order_relaxed);
+        while (bufferedAfter > previousHighWater &&
+               !maxBufferedBytesObserved.compare_exchange_weak(
+                   previousHighWater, bufferedAfter, std::memory_order_relaxed)) {
+        }
         if (firstChunkArrivalNanoseconds == 0) {
             firstChunkArrivalNanoseconds = chunk.arrivalNanoseconds;
         }
@@ -2012,7 +2033,10 @@ private:
             ? multiplyDivide(sentBytesNow * 8ULL, 1000000000ULL, elapsed)
             : 0;
 
-        std::cerr << "UDP shaper stats: mode=" << shapingModeName(mode)
+        std::cerr << "UDP shaper stats: stream=" << streamId
+                  << " output=" << outputEndpoint
+                  << " input=" << (srtInput ? "srt" : (segmentedHlsInput ? "hls" : "other"))
+                  << " mode=" << shapingModeName(mode)
                   << " configured_target=" << configuredTargetBitrate
                   << " transport=" << transportBitrate.load(std::memory_order_relaxed)
                   << " real=" << realBitrate
@@ -2024,6 +2048,11 @@ private:
                   << " buffered=" << bufferedBytes.load(std::memory_order_relaxed) << "B"
                   << " buffer_ms=" << reservoirMilliseconds.load(std::memory_order_relaxed)
                   << " target_buffer=" << targetReservoirBytes.load(std::memory_order_relaxed) << "B"
+                  << " buffer_high_water=" << maxBufferedBytesObserved.load(std::memory_order_relaxed) << "B"
+                  << " buffer_limit=" << kMaxBufferedBytes << "B"
+                  << " backpressure_events=" << backpressureEvents.load(std::memory_order_relaxed)
+                  << " backpressure_wait_ms="
+                  << (backpressureWaitNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " null_packets=" << nulls
                   << " pcr_rewritten=" << rewrittenPcrPackets.load(std::memory_order_relaxed)
                   << " pcr_inserted=" << insertedPeriodicPcrPackets.load(std::memory_order_relaxed)
@@ -2080,6 +2109,9 @@ private:
         ready = false;
     }
 
+    std::string streamId;
+    std::string outputEndpoint;
+    const bool srtInput = false;
     std::atomic<uint64_t>* networkBytes = nullptr;
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
@@ -2133,6 +2165,9 @@ private:
 
     std::atomic<bool> stopping{false};
     std::atomic<std::size_t> bufferedBytes{0};
+    std::atomic<std::size_t> maxBufferedBytesObserved{0};
+    std::atomic<uint64_t> backpressureEvents{0};
+    std::atomic<uint64_t> backpressureWaitNanoseconds{0};
     std::thread senderThread;
     std::mutex queueMutex;
     std::condition_variable queueReady;

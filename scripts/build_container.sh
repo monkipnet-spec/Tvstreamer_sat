@@ -7,7 +7,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:202.15}"
+IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:202.16}"
 
 # Use the repository root even when this script is launched from another cwd.
 docker build --pull -f "${ROOT_DIR}/Dockerfile" -t "${IMAGE_NAME}" "${ROOT_DIR}"
