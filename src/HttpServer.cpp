@@ -647,6 +647,14 @@ void HttpServer::handleSession(tcp::socket socket) {
               handleResetSubscriber(req.body());
               res.set(http::field::content_type, "application/json");
               res.body() = "{\"result\": \"ok\"}";
+            } else if (target == "/api/block-stream-client") {
+              handleBlockStreamClient(req.body(), true);
+              res.set(http::field::content_type, "application/json");
+              res.body() = R"json({"result":"ok"})json";
+            } else if (target == "/api/unblock-stream-client") {
+              handleBlockStreamClient(req.body(), false);
+              res.set(http::field::content_type, "application/json");
+              res.body() = R"json({"result":"ok"})json";
             } else if (target == "/api/cam-client-settings") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleCamClientSettings(req.body());
@@ -713,12 +721,16 @@ bool HttpServer::isAuthorized(const http::request<http::string_body>& req) const
 }
 
 bool HttpServer::isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const {
-  if (!configManager.subscribers.filteringEnabled) {
-    return true;
-  }
   const std::string normalizedClientIp = normalizeIpAddress(clientIp);
   if (streamId.empty() || normalizedClientIp.empty()) {
     return false;
+  }
+  if (std::find(configManager.subscribers.blockedIps.begin(), configManager.subscribers.blockedIps.end(), normalizedClientIp) !=
+      configManager.subscribers.blockedIps.end()) {
+    return false;
+  }
+  if (!configManager.subscribers.filteringEnabled) {
+    return true;
   }
   for (const auto& subscriber : configManager.subscribers.subscribers) {
     const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
@@ -1055,6 +1067,9 @@ std::string HttpServer::currentState() {
     root["active_count"] = Json::UInt(streamManager.activeStreams().size());
     root["ca_manager"] = CardManager::instance().snapshot();
     root["subscriber_filtering_enabled"] = configManager.subscribers.filteringEnabled;
+    Json::Value blockedIps(Json::arrayValue);
+    for (const auto& ip : configManager.subscribers.blockedIps) blockedIps.append(ip);
+    root["blocked_ips"] = blockedIps;
     static const auto transcoderCapabilities = TranscoderModule::inspectCapabilities();
     Json::Value transcoder;
     transcoder["available"] = transcoderCapabilities.available;
@@ -1068,12 +1083,60 @@ std::string HttpServer::currentState() {
     for (const auto& element : transcoderCapabilities.missingElements) missing.append(element);
     transcoder["missing_elements"] = missing;
     root["transcoder"] = transcoder;
+    const auto activeStreamSessions = streamManager.activeStreamSessions();
+    std::map<std::string, size_t> streamNumbers;
+    std::map<std::string, std::string> streamNames;
+    for (size_t index = 0; index < configManager.config.streams.size(); ++index) {
+      const auto& stream = configManager.config.streams[index];
+      streamNumbers[stream.id] = index + 1;
+      streamNames[stream.id] = stream.name.empty() ? stream.id : stream.name;
+    }
+    auto sessionToJson = [&](const ActiveStreamSession& session) {
+      Json::Value item;
+      item["client_ip"] = session.clientIp;
+      item["stream_id"] = session.streamId;
+      item["stream_number"] = Json::UInt64(streamNumbers[session.streamId]);
+      item["stream_name"] = streamNames.count(session.streamId) ? streamNames[session.streamId] : session.streamId;
+      item["protocol"] = session.protocol == "mpegts" ? "http" : session.protocol;
+      item["connections"] = Json::UInt64(session.connections);
+      return item;
+    };
+
+    std::set<std::string> registeredIps;
+    for (const auto& subscriber : configManager.subscribers.subscribers) {
+      const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
+      const std::string backupIp = normalizeIpAddress(subscriber.backupIp);
+      if (!primaryIp.empty()) registeredIps.insert(primaryIp);
+      if (!backupIp.empty()) registeredIps.insert(backupIp);
+    }
+
+    Json::Value allSessions(Json::arrayValue);
+    Json::Value unknownSessions(Json::arrayValue);
+    for (const auto& session : activeStreamSessions) {
+      allSessions.append(sessionToJson(session));
+      if (!session.clientIp.empty() && registeredIps.count(normalizeIpAddress(session.clientIp)) == 0) {
+        unknownSessions.append(sessionToJson(session));
+      }
+    }
+    root["stream_sessions"] = allSessions;
+    root["unknown_stream_sessions"] = unknownSessions;
+
     Json::Value subscribers(Json::arrayValue);
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       Json::Value item = subscriber.toJson();
       const size_t activeSessions = streamManager.activeSubscriberSessions(subscriber);
       item["active_sessions"] = Json::UInt64(activeSessions);
       item["session_active"] = activeSessions > 0;
+      Json::Value subscriberStreams(Json::arrayValue);
+      const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
+      const std::string backupIp = normalizeIpAddress(subscriber.backupIp);
+      for (const auto& session : activeStreamSessions) {
+        const std::string sessionIp = normalizeIpAddress(session.clientIp);
+        if (sessionIp == primaryIp || (!backupIp.empty() && sessionIp == backupIp)) {
+          subscriberStreams.append(sessionToJson(session));
+        }
+      }
+      item["active_streams"] = subscriberStreams;
       subscribers.append(item);
     }
     root["subscribers"] = subscribers;
@@ -2050,6 +2113,16 @@ void HttpServer::handleRestartProgram() {
     }
     SubscriberListConfig next;
     next.filteringEnabled = root.get("filtering_enabled", false).asBool();
+    if (root["blocked_ips"].isArray()) {
+      for (const auto& item : root["blocked_ips"]) {
+        const std::string ip = normalizeIpAddress(item.asString());
+        if (!ip.empty() && std::find(next.blockedIps.begin(), next.blockedIps.end(), ip) == next.blockedIps.end()) {
+          next.blockedIps.push_back(ip);
+        }
+      }
+    } else {
+      next.blockedIps = configManager.subscribers.blockedIps;
+    }
     if (root["subscribers"].isArray()) {
       for (const auto& item : root["subscribers"]) {
         auto subscriber = SubscriberConfig::fromJson(item);
@@ -2094,6 +2167,43 @@ void HttpServer::handleRestartProgram() {
       std::cerr << "Reset subscriber sessions: " << name << " (" << reset
                 << "), restarted_srt_outputs=" << restarted << std::endl;
       return;
+    }
+  }
+
+  void HttpServer::handleBlockStreamClient(const std::string& body, bool blocked) {
+    Json::CharReaderBuilder readerBuilder;
+    Json::Value root;
+    std::string errs;
+    std::istringstream ss(body);
+    if (!Json::parseFromStream(readerBuilder, ss, &root, &errs)) {
+      std::cerr << "Invalid stream client block payload: " << errs << std::endl;
+      return;
+    }
+
+    const std::string ip = normalizeIpAddress(root.get("ip", "").asString());
+    boost::system::error_code addressError;
+    boost::asio::ip::make_address(ip, addressError);
+    if (ip.empty() || addressError) {
+      std::cerr << "Invalid stream client IP: " << ip << std::endl;
+      return;
+    }
+
+    auto& blockedIps = configManager.subscribers.blockedIps;
+    const auto found = std::find(blockedIps.begin(), blockedIps.end(), ip);
+    if (blocked && found == blockedIps.end()) {
+      blockedIps.push_back(ip);
+    } else if (!blocked && found != blockedIps.end()) {
+      blockedIps.erase(found);
+    } else {
+      return;
+    }
+    configManager.saveSubscribers();
+
+    if (blocked) {
+      const size_t reset = streamManager.enforceSubscriberAccess();
+      std::cerr << "Blocked stream client " << ip << ", reset_sessions=" << reset << std::endl;
+    } else {
+      std::cerr << "Unblocked stream client " << ip << std::endl;
     }
   }
 
@@ -2300,11 +2410,11 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .network-table th:first-child,.network-table td:first-child{text-align:left}
 .network-table th{color:#9aa3b1;font-weight:600}
 .network-empty{padding:22px 0;text-align:center;color:#9aa3b1}
-.subscriber-list{display:grid;gap:8px;min-width:1020px}
-.subscriber-row{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(145px,auto) 34px;gap:6px;align-items:center}
+.subscriber-list{display:grid;gap:8px;min-width:1120px}
+.subscriber-row{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(250px,1.4fr) 34px;gap:6px;align-items:center}
 .subscriber-row input{width:100%;box-sizing:border-box;padding:7px 8px;background:#121825;border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#EEE;font-size:.78rem}
 .subscriber-row .remove-subscriber{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
-.subscriber-head{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(145px,auto) 34px;gap:6px;color:#9aa3b1;font-size:.72rem;margin-bottom:4px;min-width:1020px}
+.subscriber-head{display:grid;grid-template-columns:minmax(190px,1.8fr) minmax(180px,1fr) minmax(180px,1fr) minmax(120px,auto) 86px minmax(250px,1.4fr) 34px;gap:6px;color:#9aa3b1;font-size:.72rem;margin-bottom:4px;min-width:1120px}
 .subscriber-streams{grid-column:1/-1;display:flex;gap:5px;flex-wrap:wrap;padding:4px 0 8px 4px;border-bottom:1px solid rgba(255,255,255,.08)}
 .subscriber-streams label{display:flex;align-items:center;gap:4px;color:#cfd8ea;font-size:.72rem}
 .subscriber-stream-picker{position:relative;min-width:0}
@@ -2316,9 +2426,24 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .subscriber-stream-options input[type="checkbox"]{flex:0 0 15px;width:15px;height:15px;margin:0}
 .subscriber-enabled{display:flex;align-items:center;justify-content:center;gap:4px;color:#b6f7c2;font-size:.72rem;white-space:nowrap}
 .subscriber-enabled input{width:15px;height:15px}
-.subscriber-session{display:flex;align-items:center;gap:6px;white-space:nowrap;color:#9aa3b1;font-size:.72rem}
+.subscriber-session{display:flex;align-items:center;gap:6px;min-width:0;color:#9aa3b1;font-size:.72rem}
+.subscriber-session span{min-width:0;overflow-wrap:anywhere}
 .subscriber-session.active{color:#b6f7c2}
 .reset-session{padding:5px 7px;border:1px solid rgba(255,184,77,.25);border-radius:7px;background:rgba(255,184,77,.12);color:#ffe0a3;cursor:pointer;font-size:.7rem}
+.connection-monitor{margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,.1)}
+.connection-monitor-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.connection-monitor-head h3{margin:0;font-size:.9rem;color:#f3f6fb}
+.connection-monitor-hint{color:#8f99aa;font-size:.7rem}
+.unknown-connection-head,.unknown-connection-row{display:grid;grid-template-columns:minmax(150px,1fr) minmax(230px,1.7fr) 80px 72px minmax(170px,auto);gap:8px;align-items:center;padding:8px 6px}
+.unknown-connection-head{color:#8f99aa;font-size:.68rem}
+.unknown-connection-row{border-top:1px solid rgba(255,255,255,.07);font-size:.76rem}
+.unknown-connection-stream{color:#fff;font-weight:600}
+.unknown-connection-actions{display:flex;justify-content:flex-end;gap:6px}
+.unknown-connection-actions button,.blocked-ip-row button{padding:5px 8px;font-size:.7rem}
+.block-client{border-color:rgba(255,95,95,.3);background:rgba(255,95,95,.13);color:#ffc2c2}
+.blocked-ip-list{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:10px}
+.blocked-ip-label{color:#8f99aa;font-size:.72rem}
+.blocked-ip-row{display:inline-flex;align-items:center;gap:6px;padding:4px 5px 4px 8px;border:1px solid rgba(255,95,95,.25);border-radius:8px;color:#ffc2c2;font-size:.72rem}
 
 .modal.satellite-open{top:var(--header-height,58px);height:auto;align-items:flex-start;overflow:auto;padding-top:12px}
 .modal-content.satellite-modal{width:min(920px,100%);max-height:calc(100% - 12px);margin:0 auto}
@@ -2400,6 +2525,34 @@ const translations = {
     about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', donateWallet:'Telegram-кошелёк', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
 };
+Object.assign(translations.en, {
+  connectionMonitoring:'Unregistered connections',
+  monitoringHint:'HTTP, HLS and SRT sessions are visible. UDP receivers cannot be detected.',
+  clientIp:'Client IP',
+  protocol:'Protocol',
+  connections:'Connections',
+  actions:'Actions',
+  addFromConnection:'Add',
+  blockClient:'Block',
+  blockedIps:'Blocked IPs',
+  unblockClient:'Unblock',
+  noUnknownConnections:'No unregistered connections',
+  streamNumber:'Stream'
+});
+Object.assign(translations.ru, {
+  connectionMonitoring:'\u041d\u0435\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f',
+  monitoringHint:'\u0412\u0438\u0434\u043d\u044b \u0441\u0435\u0441\u0441\u0438\u0438 HTTP, HLS \u0438 SRT. \u041f\u043e\u043b\u0443\u0447\u0430\u0442\u0435\u043b\u0435\u0439 UDP \u043e\u043f\u0440\u0435\u0434\u0435\u043b\u0438\u0442\u044c \u043d\u0435\u043b\u044c\u0437\u044f.',
+  clientIp:'IP \u043a\u043b\u0438\u0435\u043d\u0442\u0430',
+  protocol:'\u041f\u0440\u043e\u0442\u043e\u043a\u043e\u043b',
+  connections:'\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f',
+  actions:'\u0414\u0435\u0439\u0441\u0442\u0432\u0438\u044f',
+  addFromConnection:'\u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c',
+  blockClient:'\u0417\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
+  blockedIps:'\u0417\u0430\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0435 IP',
+  unblockClient:'\u0420\u0430\u0437\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u0430\u0442\u044c',
+  noUnknownConnections:'\u041d\u0435\u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0445 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0439 \u043d\u0435\u0442',
+  streamNumber:'\u041f\u043e\u0442\u043e\u043a'
+});
 function normalizeLanguage(value) {
   return value === 'ru' ? 'ru' : 'en';
 }
@@ -3034,6 +3187,7 @@ function openSubscribersModal() {
       <div class="checkbox-inline"><input id="subscriberFiltering" type="checkbox" ${state.subscriber_filtering_enabled ? 'checked' : ''} /><span>${t('filtering')}</span></div>
       <div class="subscriber-head"><span>${t('subscriberName')}</span><span>${t('primaryIp')}</span><span>${t('backupIp')}</span><span>${t('streams')}</span><span>${t('enabled')}</span><span>${t('session')}</span><span></span></div>
       <div id="subscriberList" class="subscriber-list">${rows}</div>
+      <div id="connectionMonitoring" class="connection-monitor"></div>
       <div class="modal-actions">
         <button class="button-secondary" onclick="addSubscriber()">+ ${t('addSubscriber')}</button>
         <button class="button-secondary" onclick="exportSubscribers()">${t('exportSubscribers')}</button>
@@ -3066,7 +3220,11 @@ function collectSubscriberPayload() {
       stream_ids:[...row.querySelectorAll('[data-stream-id]:checked')].map(input=>input.dataset.streamId)
     };
   });
-  return {filtering_enabled:document.getElementById('subscriberFiltering')?.checked === true, subscribers};
+  return {
+    filtering_enabled:document.getElementById('subscriberFiltering')?.checked === true,
+    subscribers,
+    blocked_ips:[...(state.blocked_ips || [])]
+  };
 }
 function wireSubscriberDirtyTracking() {
   const list = document.getElementById('subscriberList');
@@ -3090,10 +3248,158 @@ function refreshSubscriberSessions() {
     const session = row?.querySelector('.subscriber-session');
     const text = session?.querySelector('span');
     if (!session || !text) return;
-    const active = !!subscriber.session_active;
+    const activeStreams = subscriber.active_streams || [];
+    const observedSessions = activeStreams.reduce((total, item) => total + Number(item.connections || 0), 0);
+    const active = observedSessions > 0;
     session.classList.toggle('active', active);
-    text.textContent = active ? `${t('activeSession')} (${subscriber.active_sessions || 0})` : t('offlineSession');
+    const streamText = activeStreams.map(item => {
+      const number = Number(item.stream_number || 0);
+      const label = number > 0 ? '#' + number + ' ' + (item.stream_name || item.stream_id) : (item.stream_name || item.stream_id);
+      return label + ' (' + String(item.protocol || '').toUpperCase() + ')';
+    }).join(', ');
+    text.textContent = active
+      ? t('activeSession') + ' (' + observedSessions + ')' + (streamText ? ': ' + streamText : '')
+      : t('offlineSession');
+    text.title = streamText;
   });
+  refreshConnectionMonitoring();
+}
+function refreshConnectionMonitoring() {
+  if (!subscribersModalOpen) return;
+  const panel = document.getElementById('connectionMonitoring');
+  if (!panel) return;
+  panel.replaceChildren();
+
+  const heading = document.createElement('div');
+  heading.className = 'connection-monitor-head';
+  const title = document.createElement('h3');
+  title.textContent = t('connectionMonitoring');
+  const hint = document.createElement('span');
+  hint.className = 'connection-monitor-hint';
+  hint.textContent = t('monitoringHint');
+  heading.append(title, hint);
+  panel.appendChild(heading);
+
+  const columns = document.createElement('div');
+  columns.className = 'unknown-connection-head';
+  [t('clientIp'), t('streamNumber'), t('protocol'), t('connections'), t('actions')].forEach(label => {
+    const cell = document.createElement('span');
+    cell.textContent = label;
+    columns.appendChild(cell);
+  });
+  panel.appendChild(columns);
+
+  const unknown = state.unknown_stream_sessions || [];
+  if (!unknown.length) {
+    const empty = document.createElement('div');
+    empty.className = 'network-empty';
+    empty.textContent = t('noUnknownConnections');
+    panel.appendChild(empty);
+  }
+  unknown.forEach(item => {
+    const row = document.createElement('div');
+    row.className = 'unknown-connection-row';
+    const number = Number(item.stream_number || 0);
+    const values = [
+      item.client_ip || '',
+      (number > 0 ? '#' + number + ' ' : '') + (item.stream_name || item.stream_id || ''),
+      String(item.protocol || '').toUpperCase(),
+      String(Number(item.connections || 0))
+    ];
+    values.forEach((value, index) => {
+      const cell = document.createElement('span');
+      if (index === 1) cell.className = 'unknown-connection-stream';
+      cell.textContent = value;
+      row.appendChild(cell);
+    });
+    const actions = document.createElement('span');
+    actions.className = 'unknown-connection-actions';
+    const add = document.createElement('button');
+    add.className = 'button-secondary';
+    add.textContent = t('addFromConnection');
+    add.addEventListener('click', () => addObservedClient(item.client_ip, item.stream_id));
+    const block = document.createElement('button');
+    block.className = 'block-client';
+    block.textContent = t('blockClient');
+    block.addEventListener('click', () => setStreamClientBlocked(item.client_ip, true));
+    actions.append(add, block);
+    row.appendChild(actions);
+    panel.appendChild(row);
+  });
+
+  const blockedIps = state.blocked_ips || [];
+  if (blockedIps.length) {
+    const blockedList = document.createElement('div');
+    blockedList.className = 'blocked-ip-list';
+    const label = document.createElement('span');
+    label.className = 'blocked-ip-label';
+    label.textContent = t('blockedIps') + ':';
+    blockedList.appendChild(label);
+    blockedIps.forEach(ip => {
+      const item = document.createElement('span');
+      item.className = 'blocked-ip-row';
+      const address = document.createElement('span');
+      address.textContent = ip;
+      const unblock = document.createElement('button');
+      unblock.className = 'button-secondary';
+      unblock.textContent = t('unblockClient');
+      unblock.addEventListener('click', () => setStreamClientBlocked(ip, false));
+      item.append(address, unblock);
+      blockedList.appendChild(item);
+    });
+    panel.appendChild(blockedList);
+  }
+}
+async function addObservedClient(ip, streamId) {
+  try {
+    const payload = collectSubscriberPayload();
+    let subscriber = payload.subscribers.find(item => item.primary_ip === ip || item.backup_ip === ip);
+    if (!subscriber) {
+      subscriber = {
+        name:'IP ' + ip,
+        primary_ip:ip,
+        backup_ip:'',
+        added_at:new Date().toISOString().slice(0, 10),
+        enabled:true,
+        stream_ids:[]
+      };
+      payload.subscribers.push(subscriber);
+    }
+    if (streamId && !subscriber.stream_ids.includes(streamId)) subscriber.stream_ids.push(streamId);
+    payload.blocked_ips = payload.blocked_ips.filter(item => item !== ip);
+    await fetchJson('/api/save-subscribers', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)
+    });
+    await fetchState();
+    state.subscribers = payload.subscribers;
+    state.blocked_ips = payload.blocked_ips;
+    state.unknown_stream_sessions = (state.unknown_stream_sessions || []).filter(item => item.client_ip !== ip);
+    openSubscribersModal();
+  } catch (error) {
+    uiError(error?.message || error);
+  }
+}
+async function setStreamClientBlocked(ip, blocked) {
+  try {
+    await fetchJson(blocked ? '/api/block-stream-client' : '/api/unblock-stream-client', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ip})
+    });
+    await fetchState();
+    const currentBlocked = state.blocked_ips || [];
+    state.blocked_ips = blocked
+      ? [...new Set([...currentBlocked, ip])]
+      : currentBlocked.filter(item => item !== ip);
+    if (blocked) {
+      state.unknown_stream_sessions = (state.unknown_stream_sessions || []).filter(item => item.client_ip !== ip);
+    }
+    refreshSubscriberSessions();
+  } catch (error) {
+    uiError(error?.message || error);
+  }
 }
 function addSubscriber() {
   const payload = collectSubscriberPayload();

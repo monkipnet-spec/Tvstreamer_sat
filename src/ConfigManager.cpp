@@ -491,6 +491,9 @@ Json::Value SubscriberListConfig::toJson() const {
         list.append(subscriber.toJson());
     }
     root["subscribers"] = list;
+    Json::Value blocked(Json::arrayValue);
+    for (const auto& ip : blockedIps) blocked.append(ip);
+    root["blocked_ips"] = blocked;
     return root;
 }
 
@@ -500,6 +503,14 @@ SubscriberListConfig SubscriberListConfig::fromJson(const Json::Value& root) {
     if (root["subscribers"].isArray()) {
         for (const auto& item : root["subscribers"]) {
             config.subscribers.push_back(SubscriberConfig::fromJson(item));
+        }
+    }
+    if (root["blocked_ips"].isArray()) {
+        for (const auto& item : root["blocked_ips"]) {
+            const std::string ip = normalizeIpAddress(item.asString());
+            if (!ip.empty() && std::find(config.blockedIps.begin(), config.blockedIps.end(), ip) == config.blockedIps.end()) {
+                config.blockedIps.push_back(ip);
+            }
         }
     }
     return config;

@@ -52,6 +52,13 @@ struct RemapContext {
     }
 };
 
+struct ActiveStreamSession {
+    std::string streamId;
+    std::string clientIp;
+    std::string protocol;
+    size_t connections = 0;
+};
+
 
 struct ExternalSrtOutputState {
     StreamConfig config;
@@ -194,6 +201,7 @@ public:
     bool removeStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol);
     size_t activeHttpSessions(const std::string& clientIp) const;
     size_t activeSubscriberSessions(const SubscriberConfig& subscriber);
+    std::vector<ActiveStreamSession> activeStreamSessions();
     size_t resetHttpSessions(const std::string& clientIp);
     size_t enforceSubscriberAccess();
     size_t restartSrtOutputsForStreams(const std::vector<std::string>& streamIds);

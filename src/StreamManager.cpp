@@ -5672,6 +5672,37 @@ size_t StreamManager::activeSubscriberSessions(const SubscriberConfig& subscribe
     return count;
 }
 
+std::vector<ActiveStreamSession> StreamManager::activeStreamSessions() {
+    std::lock_guard<std::mutex> lock(managerMutex);
+    pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::now());
+
+    std::map<std::string, ActiveStreamSession> grouped;
+    auto add = [&grouped](const HttpClientSession& session) {
+        const std::string key = session.clientIp + "\n" + session.streamId + "\n" + session.protocol;
+        auto& item = grouped[key];
+        item.streamId = session.streamId;
+        item.clientIp = session.clientIp;
+        item.protocol = session.protocol;
+        ++item.connections;
+    };
+    for (const auto& [fd, session] : httpClients) {
+        (void)fd;
+        add(session);
+    }
+    for (const auto& [key, session] : adHocSessions) {
+        (void)key;
+        add(session);
+    }
+
+    std::vector<ActiveStreamSession> result;
+    result.reserve(grouped.size());
+    for (auto& [key, session] : grouped) {
+        (void)key;
+        result.push_back(std::move(session));
+    }
+    return result;
+}
+
 size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
     std::vector<int> httpFds;
     size_t removed = 0;
@@ -5825,12 +5856,16 @@ size_t StreamManager::restartAllSrtOutputs() {
 }
 
 bool StreamManager::isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const {
-    if (!configManager.subscribers.filteringEnabled) {
-        return true;
-    }
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     if (streamId.empty() || normalizedClientIp.empty()) {
         return false;
+    }
+    if (std::find(configManager.subscribers.blockedIps.begin(), configManager.subscribers.blockedIps.end(), normalizedClientIp) !=
+        configManager.subscribers.blockedIps.end()) {
+        return false;
+    }
+    if (!configManager.subscribers.filteringEnabled) {
+        return true;
     }
     for (const auto& subscriber : configManager.subscribers.subscribers) {
         const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);

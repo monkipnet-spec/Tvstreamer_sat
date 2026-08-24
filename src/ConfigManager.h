@@ -102,6 +102,7 @@ struct SubscriberConfig {
 struct SubscriberListConfig {
     bool filteringEnabled = false;
     std::vector<SubscriberConfig> subscribers;
+    std::vector<std::string> blockedIps;
 
     Json::Value toJson() const;
     static SubscriberListConfig fromJson(const Json::Value& root);

@@ -72,6 +72,7 @@ private:
     void handleDeleteStream(const std::string& body);
     void handleSaveSubscribers(const std::string& body);
     void handleResetSubscriber(const std::string& body);
+    void handleBlockStreamClient(const std::string& body, bool blocked);
     std::string renderIndexPage();
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
