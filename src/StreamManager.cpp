@@ -57,8 +57,9 @@ constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
 constexpr long kHttpConnectTimeoutMs = 3000;
 constexpr long kHttpLowSpeedTimeSeconds = 8;
 constexpr int kNetworkSourceTimeoutSeconds = 5;
-constexpr int kSrtInputLatencyMs = 500;
-constexpr guint64 kSrtInputQueueMax = 3 * GST_SECOND;
+constexpr int kSrtInputLatencyMs = 1000;
+constexpr guint64 kSrtInputStartupBuffer = 2 * GST_SECOND;
+constexpr guint64 kSrtInputQueueMax = 8 * GST_SECOND;
 constexpr int kSrtOutputLatencyMs = 150;
 constexpr int kSrtTranscodedOutputLatencyMs = 700;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
@@ -2648,6 +2649,18 @@ void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
     g_object_set_data(G_OBJECT(queue), "tvs-hls-prebuffer-started", GINT_TO_POINTER(1));
     setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
     std::cerr << "HLS input startup buffer ready: startup_buffer_ms=1000 "
+              << "steady_state_min_threshold_ms=0" << std::endl;
+}
+
+void onSrtInputPrebufferRunning(GstElement* queue, gpointer userData) {
+    (void)userData;
+    if (!queue || g_object_get_data(G_OBJECT(queue), "tvs-srt-prebuffer-started")) {
+        return;
+    }
+
+    g_object_set_data(G_OBJECT(queue), "tvs-srt-prebuffer-started", GINT_TO_POINTER(1));
+    setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
+    std::cerr << "SRT caller input buffer ready: startup_buffer_ms=2000 "
               << "steady_state_min_threshold_ms=0" << std::endl;
 }
 
@@ -6655,11 +6668,15 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             setIntPropertyIfPresent(src, "mode", 1);
             setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
             setUIntPropertyIfPresent(src, "localport", 0);
+            setUInt64PropertyIfPresent(queue, "min-threshold-time", kSrtInputStartupBuffer);
+            g_signal_connect(queue, "running", G_CALLBACK(onSrtInputPrebufferRunning), nullptr);
         }
 
         std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
                   << " latency_ms=" << kSrtInputLatencyMs
-                  << " queue_ms=3000 leaky=off backpressure=on"
+                  << " queue_ms=8000 startup_buffer_ms="
+                  << (mode == "listener" ? 0 : 2000)
+                  << " leaky=off backpressure=on"
                   << " source_timestamping=srt-sender-clock" << std::endl;
 
         if (!gst_element_link(src, queue)) {
