@@ -3678,6 +3678,11 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
+    if (tvs::stream_protocols::inputKind(cfg) ==
+        tvs::stream_protocols::InputProtocolKind::Srt) {
+        setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
+        setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
+    }
     const bool externalUdpShaper = usesStableUdpShaper(cfg);
     if (externalUdpShaper) {
         // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
@@ -8039,8 +8044,19 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             nullptr);
 
     }
+    const bool srtVideoParser =
+        isVideo &&
+        tvs::stream_protocols::inputKind(ctx->config) ==
+            tvs::stream_protocols::InputProtocolKind::Srt &&
+        (parserFactory == "h264parse" || parserFactory == "h265parse");
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
-        g_object_set(parser, "config-interval", ctx->hlsSink2 ? -1 : 1, nullptr);
+        // SRT packet loss can leave a decoder without the parameter sets needed
+        // to resume at the next keyframe. Repeat them with every IDR and force the
+        // parser to process the stream instead of negotiating passthrough.
+        g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
+        if (srtVideoParser) {
+            setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
+        }
     }
     gst_element_sync_state_with_parent(queue);
     gst_element_sync_state_with_parent(parser);
@@ -8123,6 +8139,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << (stableUdpPreMapped ? " output_sid=" + std::to_string(ctx->config.serviceId) : "")
                   << (stableUdpAudioReservoir
                       ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=off"
+                      : "")
+                  << (srtVideoParser
+                      ? " srt_parameter_sets=every-idr parser_passthrough=off"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);

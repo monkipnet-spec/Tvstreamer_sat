@@ -1,6 +1,6 @@
 # TVStreammerSAT5
 
-**Версия: 202.13**
+**Версия: 202.14**
 
 TVStreammerSAT5 - сервер маршрутизации, мониторинга и преобразования телевизионных потоков на базе C++17 и GStreamer. Программа принимает сетевые и спутниковые источники, формирует один или несколько выходов для каждого канала и управляется через встроенную русско-английскую веб-панель.
 
@@ -215,13 +215,13 @@ TVS_UDP_FORCE_SYNTHETIC_PCR=1
 ### Сборка образа
 
 ```bash
-docker build --pull -t tvstreammersat5:202.13 .
+docker build --pull -t tvstreammersat5:202.14 .
 ```
 
 Для полной пересборки без использования слоёв кеша:
 
 ```bash
-docker build --pull --no-cache -t tvstreammersat5:202.13 .
+docker build --pull --no-cache -t tvstreammersat5:202.14 .
 ```
 
 ### Фоновый запуск
@@ -236,7 +236,7 @@ mkdir -p /opt/tvstreammersat5
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
 RECREATE=1 \
-IMAGE_NAME=tvstreammersat5:202.13 \
+IMAGE_NAME=tvstreammersat5:202.14 \
 CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
 bash ./scripts/run_container.sh
 
@@ -257,7 +257,7 @@ networking, подключает каталог данных и автомати
 Интерактивный временный запуск остаётся доступен без `DETACH=1`:
 
 ```bash
-IMAGE_NAME=tvstreammersat5:202.13 \
+IMAGE_NAME=tvstreammersat5:202.14 \
 CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
 ./scripts/run_container.sh
 ```
@@ -296,12 +296,12 @@ docker inspect tvstreammersat5
 cd ~/Tvstreamer_sat
 
 git pull origin main
-docker build --pull -t tvstreammersat5:202.13 .
+docker build --pull -t tvstreammersat5:202.14 .
 
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
 RECREATE=1 \
-IMAGE_NAME=tvstreammersat5:202.13 \
+IMAGE_NAME=tvstreammersat5:202.14 \
 CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
 bash ./scripts/run_container.sh
 

@@ -1,5 +1,6 @@
 #include "StableUdpOutput.h"
 #include "TsCcStageTrace.h"
+#include "protocols/inputs/GstSrtInputProtocol.h"
 
 #include <gst/app/gstappsink.h>
 
@@ -639,7 +640,12 @@ public:
           caCleanStartEnabled(true),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
-          forceSyntheticPcr(forceSyntheticCbrPcr()),
+          // SRT is remuxed before StableUdpOutput, then its useful packets are
+          // spread across a newly generated CBR transport. Preserve source PCR
+          // for VBR, but generate a continuous output PCR for CBR so receivers
+          // do not see the remux clock arrive at a different packet cadence.
+          forceSyntheticPcr(
+              forceSyntheticCbrPcr() || tvs::protocols::inputs::isSrtInput(cfg)),
           startupReservoirDurationNanoseconds(startupReservoirNanoseconds()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // v202.5: normalize the outgoing continuity domain for every Stable UDP
@@ -2266,7 +2272,9 @@ GstElement* createSink(
 
     const bool syntheticPcr =
         mode == UdpShapingMode::Cbr &&
-        (isSegmentedHlsInput(config) || forceSyntheticCbrPcr());
+        (isSegmentedHlsInput(config) ||
+         tvs::protocols::inputs::isSrtInput(config) ||
+         forceSyntheticCbrPcr());
     std::cerr << "Unified UDP reservoir TS shaper: mode="
               << shapingModeName(mode)
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
