@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# TVStreammerSAT5 Release 7 host build/runtime dependencies for Ubuntu/Debian.
+# TVStreammerSAT5 host build/runtime dependencies for Ubuntu/Debian.
 # This script intentionally installs only libraries used by the current CMake
 # target plus GStreamer runtime plugins used by the protocol/transcoder modules.
 
@@ -26,7 +26,7 @@ if apt-cache show libboost-system-dev >/dev/null 2>&1; then
 fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Installing TVStreammerSAT5 Release 7 dependencies..."
+echo "Installing TVStreammerSAT5 dependencies..."
 
 "${APT_GET[@]}" update
 "${APT_GET[@]}" install -y --no-install-recommends \

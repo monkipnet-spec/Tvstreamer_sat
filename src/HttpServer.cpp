@@ -35,7 +35,6 @@
 
 namespace {
 
-constexpr const char* kProgramRelease = tvs::app::kProgramRelease;
 constexpr const char* kProgramVersion = tvs::app::kProgramVersion;
 
 struct CaDecodeUiMemory {
@@ -1035,7 +1034,6 @@ std::string HttpServer::currentState() {
     Json::Value camClients(Json::arrayValue);
     for (const auto& client : configManager.config.camClients) camClients.append(client.toJson());
     root["cam_clients"] = camClients;
-    root["program_release"] = kProgramRelease;
     root["program_version"] = kProgramVersion;
     Json::Value interfaces(Json::arrayValue);
     for (const auto& iface : enumerateNetworkInterfaces()) {
@@ -3188,7 +3186,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_release||'Release 73'} / ${state.program_version||'v202.8'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.8'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

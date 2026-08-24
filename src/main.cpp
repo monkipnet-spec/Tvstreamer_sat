@@ -11,8 +11,7 @@
 
 int main() {
     std::cerr << tvs::app::kProductName
-              << " " << tvs::app::kProgramRelease
-              << " / " << tvs::app::kProgramVersion
+              << " " << tvs::app::kProgramVersion
               << " | support=" << tvs::app::kSupportEmail << std::endl;
     std::cerr << "main() entered" << std::endl;
 

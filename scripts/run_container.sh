@@ -7,7 +7,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:release2}"
+IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:202.8}"
 CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/tvstreammersat5-config.json}"
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then

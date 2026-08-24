@@ -65,8 +65,6 @@ struct SharedDvbFrontendState {
     GstElement* pipeline = nullptr;
     GstElement* source = nullptr;
     GstBus* bus = nullptr;
-    std::string multicastAddress;
-    uint16_t multicastPort = 0;
     size_t consumers = 0;
     std::map<std::string, std::set<uint16_t>> consumerPids;
     std::string requestedPids;
@@ -104,11 +102,8 @@ struct StreamState {
     StreamConfig runtimeConfig;
     bool sharedDvbInput = false;
     std::string sharedDvbFrontendKey;
-    std::string sharedDvbMulticastAddress;
-    uint16_t sharedDvbMulticastPort = 0;
     std::string sharedDvbServiceRelayUri;
     std::string sharedDvbServicePids;
-    bool sharedDvbPreferFullTsCapture = false;
     bool dvbTsRemapApplied = false;
     std::unique_ptr<DvbServiceRelayState> dvbServiceRelay;
     // Runtime PAT result used only when input_service_id=0 (Auto).
@@ -241,7 +236,6 @@ private:
     void monitorBus(const std::string& id);
     void monitorExternalSrtBus(const std::string& id, size_t outputIndex);
     GstElement* createTranscodedUdpRelayPipeline(StreamState* state, std::string& error);
-    uint64_t queryPipelineBitrate(GstElement* pipeline);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
     static GstPadProbeReturn inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);

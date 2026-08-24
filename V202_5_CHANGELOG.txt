@@ -1,9 +1,0 @@
-TVStreammerSAT5 v202.5
-
-HLS -> UDP stability fix:
-- keep useful HLS TS pacing locked to PCR-derived source bitrate
-- restore periodic 20 ms synthetic PCR for CBR HLS so the output clock does not disappear during short HLS gaps
-- fill CBR headroom/gaps with NULL PID only
-- normalize HLS continuity counters across bare segment CC restarts
-- preserve a real MPEG-TS discontinuity_indicator as an explicit per-PID continuity reset marker
-- no return to the old +/- reservoir speed modulation
