@@ -57,7 +57,8 @@ constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
 constexpr long kHttpConnectTimeoutMs = 3000;
 constexpr long kHttpLowSpeedTimeSeconds = 8;
 constexpr int kNetworkSourceTimeoutSeconds = 5;
-constexpr int kSrtInputLatencyMs = 200;
+constexpr int kSrtInputLatencyMs = 500;
+constexpr guint64 kSrtInputQueueMax = 3 * GST_SECOND;
 constexpr int kSrtOutputLatencyMs = 150;
 constexpr int kSrtTranscodedOutputLatencyMs = 700;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
@@ -6618,7 +6619,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         GstElement* src = gst_element_factory_make(factory, "input_src");
-        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
+        // SRT already releases packets through its latency/retransmission
+        // window. A downstream-leaky queue after srtsrc discards recovered TS
+        // packets during short CPU stalls and turns them into visible PES/CC
+        // damage. Keep a bounded non-leaky reserve and apply back-pressure.
+        GstElement* queue = addQueue("input_queue", kSrtInputQueueMax, false);
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
@@ -6637,6 +6642,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
             setUIntPropertyIfPresent(src, "localport", 0);
         }
+
+        std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
+                  << " latency_ms=" << kSrtInputLatencyMs
+                  << " queue_ms=3000 leaky=off backpressure=on"
+                  << " source_timestamping=arrival" << std::endl;
 
         if (!gst_element_link(src, queue)) {
             return nullptr;
