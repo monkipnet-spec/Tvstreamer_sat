@@ -6622,7 +6622,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
     if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Srt) {
         std::string mode = toLower(cfg.inputMode);
         const std::string inputInterface = configuredInputInterfaceAddress(cfg);
-        const char* factory = (mode == "listener") ? "srtsrc" : "srtclientsrc";
+        const char* factory = "srtsrc";
         if (!hasElementFactory(factory)) {
             std::cerr << missingElementStatus(factory) << std::endl;
             return nullptr;
@@ -6639,7 +6639,11 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         }
 
         g_object_set(src, "uri", input.c_str(), nullptr);
-        setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
+        // srtsrc derives each buffer timestamp from the SRT sender time and
+        // measured transport delay. Keep GstBaseSrc timestamping disabled so
+        // recovered packets retain that smooth source timeline instead of
+        // being retimed from bursty local delivery.
+        setBooleanPropertyIfPresent(src, "do-timestamp", FALSE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
         setIntPropertyIfPresent(src, "latency", kSrtInputLatencyMs);
         setStringPropertyIfPresent(src, "localaddress", inputInterface);
@@ -6656,7 +6660,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
                   << " latency_ms=" << kSrtInputLatencyMs
                   << " queue_ms=3000 leaky=off backpressure=on"
-                  << " source_timestamping=arrival" << std::endl;
+                  << " source_timestamping=srt-sender-clock" << std::endl;
 
         if (!gst_element_link(src, queue)) {
             return nullptr;
