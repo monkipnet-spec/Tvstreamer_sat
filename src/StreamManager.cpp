@@ -6685,12 +6685,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         // packets during short CPU stalls and turns them into visible PES/CC
         // damage. Keep a bounded non-leaky reserve and apply back-pressure.
         GstElement* queue = addQueue("input_queue", kSrtInputQueueMax, false);
-        GstElement* inputPacer = mode == "listener"
-            ? nullptr
-            : gst_element_factory_make("clocksync", "input_srt_clock");
-        if (!src || !queue || (mode != "listener" && !inputPacer) ||
-            !addElementOrFail(pipeline, src) ||
-            (inputPacer && !addElementOrFail(pipeline, inputPacer))) {
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
             return nullptr;
         }
 
@@ -6702,6 +6697,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         setBooleanPropertyIfPresent(src, "do-timestamp", FALSE);
         setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
         setIntPropertyIfPresent(src, "latency", kSrtInputLatencyMs);
+        setUIntPropertyIfPresent(src, "blocksize", kTsPacketsPerUdpBuffer * 188U);
         setStringPropertyIfPresent(src, "localaddress", inputInterface);
         if (mode == "listener") {
             setIntPropertyIfPresent(src, "mode", 2);
@@ -6713,7 +6709,6 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             setUIntPropertyIfPresent(src, "localport", 0);
             setUInt64PropertyIfPresent(queue, "min-threshold-time", kSrtInputStartupBuffer);
             g_signal_connect(queue, "running", G_CALLBACK(onSrtInputPrebufferRunning), nullptr);
-            configureNetworkCbrClock(inputPacer);
         }
 
         std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
@@ -6721,17 +6716,15 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                   << " queue_ms=8000 startup_buffer_ms="
                   << (mode == "listener" ? 0 : 2000)
                   << " leaky=off backpressure=on"
-                  << " input_pacing=" << (inputPacer ? "sender-clock" : "off")
+                  << " blocksize=" << (kTsPacketsPerUdpBuffer * 188U)
+                  << " input_pacing=off"
                   << " source_timestamping=srt-sender-clock" << std::endl;
 
-        const bool linked = inputPacer
-            ? gst_element_link_many(src, queue, inputPacer, nullptr)
-            : gst_element_link(src, queue);
-        if (!linked) {
+        if (!gst_element_link(src, queue)) {
             return nullptr;
         }
 
-        terminalElement = inputPacer ? inputPacer : queue;
+        terminalElement = queue;
         return src;
     }
 
