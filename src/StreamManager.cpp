@@ -4916,6 +4916,16 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     auto state = std::make_unique<StreamState>();
 
     StreamConfig effectiveConfig = streamConfig;
+    const std::string primaryInputUri = normalizeInputUri(effectiveConfig.inputUri);
+    const std::string backupInputUri = normalizeInputUri(effectiveConfig.backupInputUri);
+    if (!primaryInputUri.empty() && primaryInputUri == backupInputUri) {
+        std::cerr << "Input failover disabled: primary and backup URIs are identical"
+                  << " stream=" << effectiveConfig.id
+                  << " uri=" << primaryInputUri << std::endl;
+        effectiveConfig.backupInputUri.clear();
+        effectiveConfig.backupInputType = "url";
+        effectiveConfig.backupFileLoop = false;
+    }
     // input_service_id == 0 is true AUTO mode. Do not open/probe the live
     // input in a second temporary pipeline before the real stream starts.
     // A preflight PAT probe can consume/exclusively occupy SRT sources and can
