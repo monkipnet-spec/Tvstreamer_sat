@@ -655,13 +655,17 @@ public:
           networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
-          caCleanStartEnabled(true),
+          // 202.20: ordinary clear SRT/HTTP is already a complete MPEG-TS
+          // transport and must not be held behind the CA/keyframe startup gate.
+          // Keep the clean-start gate for HLS/DVB and for explicitly configured CA.
+          caCleanStartEnabled(
+              !isContinuousNetworkMpegTsInput(cfg) || !cfg.conditionalAccessClient.empty()),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           continuousNetworkMpegTsInput(isContinuousNetworkMpegTsInput(cfg)),
-          // Synthetic PCR remains available as an explicit diagnostic override.
-          // Continuous SRT/HTTP MPEG-TS uses in-place PCR rewriting by default so
-          // PCR continuity does not consume extra TS slots or reduce useful CBR.
+          // Synthetic PCR remains an explicit diagnostic override for legacy
+          // non-network paths. SRT/HTTP preserves the source PCR timeline so it
+          // stays aligned with untouched source PTS/DTS.
           forceSyntheticPcr(forceSyntheticCbrPcr()),
           startupReservoirDurationNanoseconds(startupReservoirNanoseconds()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
@@ -879,7 +883,7 @@ public:
                 } else {
                     directReleaseOffset = scan.firstMediaOffset;
                 }
-            } else if (!conditionalAccessInput &&
+            } else if ((!conditionalAccessInput || continuousNetworkMpegTsInput) &&
                        !caCleanStartAudioSeen && !caCleanStartVideoSeen &&
                        caCleanStartFirstBufferNanoseconds != 0 &&
                        nowNs >= caCleanStartFirstBufferNanoseconds +
@@ -945,12 +949,21 @@ public:
         inputBytesReceived.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
 
         std::unique_lock<std::mutex> lock(queueMutex);
+        // A single GstBuffer can occasionally exceed the nominal reservoir limit
+        // (notably after SRT reconnect/recovery or HTTP read coalescing). The old
+        // predicate could then never become true even with an empty queue, causing
+        // a permanent appsink/upstream stall: input bitrate was visible but no TS
+        // ever reached the UDP sender. Admit one oversized chunk only when the
+        // reservoir has drained enough instead of waiting on an impossible limit.
+        const std::size_t effectiveBufferLimit =
+            std::max<std::size_t>(kMaxBufferedBytes, chunk.bytes.size());
         const bool backpressured =
-            bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() > kMaxBufferedBytes;
+            bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() > effectiveBufferLimit;
         const uint64_t backpressureStarted = backpressured ? monotonicNanoseconds() : 0;
         queueSpace.wait(lock, [&]() {
             return stopping.load(std::memory_order_relaxed) ||
-                   bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() <= kMaxBufferedBytes;
+                   bufferedBytes.load(std::memory_order_relaxed) + chunk.bytes.size() <=
+                       effectiveBufferLimit;
         });
         if (stopping.load(std::memory_order_relaxed)) {
             return GST_FLOW_FLUSHING;
@@ -995,7 +1008,7 @@ private:
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
     static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
-    // 202.19: SRT/HTTP MPEG-TS pacing is based on a long wall-clock arrival
+    // 202.20: SRT/HTTP MPEG-TS pacing is based on a long wall-clock arrival
     // window. Short PCR byte-density follows VBR GOP size and is diagnostic only.
     static constexpr uint64_t kNetworkArrivalRateWindowNanoseconds =
         15ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -1547,11 +1560,11 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
-        // 202.19: continuous SRT/HTTP CBR no longer loses 100 kbit/s of useful
-        // capacity. PCR is rewritten in existing packets, so no reservation is
-        // needed for synthetic PCR-only TS packets. Keep the legacy reservation
-        // for other synthetic-PCR CBR paths (notably segmented HLS).
-        if (continuousNetworkMpegTsInput && !forceSyntheticPcr) {
+        // 202.20: continuous SRT/HTTP CBR no longer loses 100 kbit/s of useful
+        // capacity. Source PCR is preserved in existing transport packets, so no
+        // reservation is needed for synthetic PCR-only TS packets. Keep the legacy
+        // reservation for other synthetic-PCR CBR paths (notably segmented HLS).
+        if (continuousNetworkMpegTsInput) {
             return configuredTargetBitrate;
         }
         if (configuredTargetBitrate <= 100000ULL) {
@@ -1560,20 +1573,19 @@ private:
         return configuredTargetBitrate - 100000ULL;
     }
 
-    bool rewriteNetworkPcrInPlace() const {
-        return continuousNetworkMpegTsInput && !forceSyntheticPcr;
-    }
-
     bool sourcePcrPassthrough() const {
-        if (rewriteNetworkPcrInPlace()) return false;
-        return mode == UdpShapingMode::Vbr ||
+        // 202.20: SRT/HTTP must stay in the same timing domain as source PTS/DTS.
+        // Rewriting PCR from UDP slot time while leaving PES timestamps untouched
+        // creates a second clock domain and causes video corrections/freezes.
+        // The upstream MPEG-TS/remux already provides PCR; preserve it in both
+        // CBR and VBR. CBR changes only wire stuffing, not media timestamps.
+        return continuousNetworkMpegTsInput ||
+               mode == UdpShapingMode::Vbr ||
                (!segmentedHlsInput && !forceSyntheticPcr);
     }
 
     bool usesPeriodicPcrPackets() const {
-        return mode == UdpShapingMode::Cbr &&
-               !rewriteNetworkPcrInPlace() &&
-               !sourcePcrPassthrough();
+        return mode == UdpShapingMode::Cbr && !sourcePcrPassthrough();
     }
 
     void updateTransportBitrate() {
@@ -1626,7 +1638,7 @@ private:
                 estimatedInputBitrate = pcrDerivedInputBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0) {
-                // 202.19 SRT/HTTP: long-term arrival rate is the pacing source.
+                // 202.20 SRT/HTTP: long-term arrival rate is the pacing source.
                 // PCR byte-density remains visible in stats but never drives pace.
                 estimatedInputBitrate = networkLongTermArrivalBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
@@ -1788,7 +1800,7 @@ private:
                           << " PCR="
                           << (segmentedHlsInput
                                   ? "continuous-20ms-clock"
-                                  : "continuous-inplace-rewrite")
+                                  : "source-timeline-passthrough")
                           << std::endl;
                 hlsExactPacingAnnounced = true;
             }
@@ -1937,32 +1949,15 @@ private:
                                       << " pcr_pid=" << periodicPcrPid
                                       << " source=selected-PMT"
                                       << " mode="
-                                      << (rewriteNetworkPcrInPlace()
-                                              ? (mode == UdpShapingMode::Vbr
-                                                    ? "continuous-inplace-vbr"
-                                                    : "continuous-inplace-cbr")
-                                              : (sourcePcrPassthrough()
-                                                    ? (mode == UdpShapingMode::Vbr
+                                      << (sourcePcrPassthrough()
+                                              ? (continuousNetworkMpegTsInput
+                                                    ? "source-timeline-network"
+                                                    : (mode == UdpShapingMode::Vbr
                                                           ? "source-passthrough-vbr"
-                                                          : "source-passthrough-cbr")
-                                                    : "synthetic-cbr-20ms"))
+                                                          : "source-passthrough-cbr"))
+                                              : "synthetic-cbr-20ms")
                                       << std::endl;
                         }
-                    } else if (packet.pid == periodicPcrPid && rewriteNetworkPcrInPlace()) {
-                        // Keep the provider's PCR packet cadence and payload exactly
-                        // intact, but advance PCR on the continuous output timeline.
-                        // No adaptation-only PCR packet is inserted and no TS slot is
-                        // stolen from useful CBR/VBR media.
-                        const uint64_t elapsedNanoseconds =
-                            slotTime >= periodicPcrOriginNanoseconds
-                                ? slotTime - periodicPcrOriginNanoseconds
-                                : 0;
-                        const uint64_t outputPcrTicks =
-                            (periodicPcrOriginTicks +
-                             nanosecondsToPcrTicks(elapsedNanoseconds)) %
-                            kPcrTicksModulus;
-                        writePcr(packet.bytes, outputPcrTicks);
-                        ++rewrittenPcrPackets;
                     } else if (packet.pid == periodicPcrPid &&
                                !sourcePcrPassthrough()) {
                         clearPcrFlag(packet.bytes);
@@ -2207,18 +2202,16 @@ private:
                   << (segmentedHlsInput
                           ? "hls_slow_playout_pll_periodic_pcr"
                           : (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0
-                                ? "network_arrival_playout_pll_inplace_pcr"
+                                ? "network_arrival_playout_pll_source_pcr"
                                 : (sourcePcrPassthrough()
                                       ? "reservoir_rate_controller_source_pcr"
-                                      : (rewriteNetworkPcrInPlace()
-                                            ? "reservoir_rate_controller_inplace_pcr"
-                                            : "reservoir_rate_controller_periodic_pcr"))))
+                                      : "reservoir_rate_controller_periodic_pcr")))
                   << " pcr_clock="
-                  << (rewriteNetworkPcrInPlace()
-                          ? "continuous_inplace_rewrite"
-                          : (sourcePcrPassthrough()
-                                ? "source_passthrough"
-                                : "continuous_transport_media"))
+                  << (sourcePcrPassthrough()
+                          ? (continuousNetworkMpegTsInput
+                                ? "source_timeline_network"
+                                : "source_passthrough")
+                          : "continuous_transport_media")
                   << " pcr_source_passthrough="
                   << (sourcePcrPassthrough() ? 1 : 0)
                   << " startup_reservoir="
@@ -2468,11 +2461,13 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
+    const bool continuousNetwork = isContinuousNetworkMpegTsInput(config);
     const bool syntheticPcr =
         mode == UdpShapingMode::Cbr &&
         (isSegmentedHlsInput(config) ||
-         tvs::protocols::inputs::isSrtInput(config) ||
-         forceSyntheticCbrPcr());
+         (!continuousNetwork && forceSyntheticCbrPcr()));
+    const bool networkCleanStart =
+        !continuousNetwork || !config.conditionalAccessClient.empty();
     std::cerr << "Unified UDP reservoir TS shaper: mode="
               << shapingModeName(mode)
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
@@ -2484,7 +2479,11 @@ GstElement* createSink(
               << (kStartupPcrGraceNanoseconds / 1000000ULL)
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
-              << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
+              << (isSegmentedHlsInput(config)
+                    ? "hls-pts-window-controller"
+                    : (continuousNetwork
+                          ? "network-arrival-15s-controller"
+                          : "reservoir-rate-controller"))
               << " pcr_mode="
               << (syntheticPcr
                     ? "synthetic-continuous-20ms"
@@ -2497,7 +2496,10 @@ GstElement* createSink(
               << (syntheticPcr ? "continuous-transport-media" : "off")
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
-              << " clean_start=post-dual-media-video-random-access"
+              << " clean_start="
+              << (networkCleanStart
+                    ? "post-dual-media-video-random-access"
+                    : "disabled-clear-network")
               << " conditional_access="
               << (!config.conditionalAccessClient.empty() ? "on" : "off")
               << std::endl;
