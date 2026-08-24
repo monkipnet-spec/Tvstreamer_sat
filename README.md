@@ -180,19 +180,87 @@ backup-files/                     загруженные файлы замены
 
 ## Docker
 
-Соберите образ:
+### Сборка образа
 
 ```bash
 docker build --pull -t tvstreammersat5:202.8 .
 ```
 
-Для запуска подготовьте `tvstreammersat5-config.json`, затем выполните:
+Для полной пересборки без использования слоёв кеша:
 
 ```bash
-IMAGE_NAME=tvstreammersat5:202.8 ./scripts/run_container.sh
+docker build --pull --no-cache -t tvstreammersat5:202.8 .
 ```
 
-Скрипт использует host networking, подключает каталог конфигурации и автоматически передаёт найденные `/dev/dvb` устройства в контейнер.
+### Фоновый запуск
+
+Подготовьте `tvstreammersat5-config.json`, затем запустите именованный контейнер:
+
+```bash
+CONTAINER_NAME=tvstreammersat5 \
+DETACH=1 \
+IMAGE_NAME=tvstreammersat5:202.8 \
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+./scripts/run_container.sh
+```
+
+В фоновом режиме скрипт задаёт политику `unless-stopped`: контейнер автоматически запускается после перезагрузки Docker или сервера. Скрипт использует host networking, подключает каталог конфигурации и автоматически передаёт найденные `/dev/dvb` устройства в контейнер.
+
+Интерактивный временный запуск остаётся доступен без `DETACH=1`:
+
+```bash
+IMAGE_NAME=tvstreammersat5:202.8 \
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+./scripts/run_container.sh
+```
+
+### Управление контейнером
+
+```bash
+# Состояние контейнера
+docker ps -a --filter name=tvstreammersat5
+
+# Текущие и последние 200 строк журнала
+docker logs --tail 200 tvstreammersat5
+docker logs --tail 200 -f tvstreammersat5
+
+# Перезапуск
+docker restart tvstreammersat5
+
+# Остановка и повторный запуск
+docker stop tvstreammersat5
+docker start tvstreammersat5
+
+# Проверка параметров и состояния
+docker inspect tvstreammersat5
+```
+
+### Обновление и пересборка проекта
+
+Выполняйте команды из корня репозитория:
+
+```bash
+git pull origin main
+docker build --pull -t tvstreammersat5:202.8 .
+docker stop tvstreammersat5
+docker rm tvstreammersat5
+
+CONTAINER_NAME=tvstreammersat5 \
+DETACH=1 \
+IMAGE_NAME=tvstreammersat5:202.8 \
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+./scripts/run_container.sh
+```
+
+Конфигурация, ключ UI, список абонентов и файлы замены сохраняются на хосте в каталоге рядом с `CONFIG_FILE`, поэтому удаление и повторное создание контейнера их не удаляет.
+
+Проверка после пересборки:
+
+```bash
+docker ps --filter name=tvstreammersat5
+docker logs --tail 100 tvstreammersat5
+curl http://127.0.0.1:9000/health
+```
 
 ## Проверка и диагностика
 

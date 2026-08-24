@@ -9,6 +9,14 @@ fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_NAME="${IMAGE_NAME:-tvstreammersat5:202.8}"
 CONFIG_FILE="${CONFIG_FILE:-${ROOT_DIR}/tvstreammersat5-config.json}"
+DETACH="${DETACH:-0}"
+CONTAINER_NAME="${CONTAINER_NAME:-tvstreammersat5}"
+RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
+
+if [[ "${DETACH}" != "0" && "${DETACH}" != "1" ]]; then
+    echo "DETACH must be 0 or 1" >&2
+    exit 2
+fi
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
     echo "Config file not found: ${CONFIG_FILE}" >&2
@@ -37,8 +45,6 @@ if [[ -d /dev/dvb ]]; then
 fi
 
 RUN_ARGS=(
-    --rm
-    -it
     --init
     --network host
     "${DEVICE_ARGS[@]}"
@@ -46,5 +52,15 @@ RUN_ARGS=(
     -w /data
     -e "GST_DEBUG=${GST_DEBUG:-1}"
 )
+
+if [[ "${DETACH}" == "1" ]]; then
+    RUN_ARGS+=(
+        -d
+        --name "${CONTAINER_NAME}"
+        --restart "${RESTART_POLICY}"
+    )
+else
+    RUN_ARGS+=(--rm -it)
+fi
 
 exec docker run "${RUN_ARGS[@]}" "${IMAGE_NAME}"
