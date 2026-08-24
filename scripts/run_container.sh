@@ -78,6 +78,9 @@ RUN_ARGS=(
 if [[ -n "${TVS_UDP_STARTUP_BUFFER_MS:-}" ]]; then
     RUN_ARGS+=(-e "TVS_UDP_STARTUP_BUFFER_MS=${TVS_UDP_STARTUP_BUFFER_MS}")
 fi
+if [[ -n "${TVS_UDP_FORCE_SYNTHETIC_PCR:-}" ]]; then
+    RUN_ARGS+=(-e "TVS_UDP_FORCE_SYNTHETIC_PCR=${TVS_UDP_FORCE_SYNTHETIC_PCR}")
+fi
 
 if [[ "${DETACH}" == "1" ]]; then
     if [[ "${RECREATE}" == "1" ]] &&

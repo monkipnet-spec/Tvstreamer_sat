@@ -76,6 +76,14 @@ bool tsDiagnosticsEnabled() {
     return enabled;
 }
 
+bool forceSyntheticCbrPcr() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_UDP_FORCE_SYNTHETIC_PCR");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 uint64_t startupReservoirNanoseconds() {
     static const uint64_t duration = [] {
         uint64_t milliseconds = kDefaultStartupReservoirMilliseconds;
@@ -631,6 +639,7 @@ public:
           caCleanStartEnabled(true),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
+          forceSyntheticPcr(forceSyntheticCbrPcr()),
           startupReservoirDurationNanoseconds(startupReservoirNanoseconds()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // v202.5: normalize the outgoing continuity domain for every Stable UDP
@@ -1450,6 +1459,11 @@ private:
         return configuredTargetBitrate - 100000ULL;
     }
 
+    bool sourcePcrPassthrough() const {
+        return mode == UdpShapingMode::Vbr ||
+               (!segmentedHlsInput && !forceSyntheticPcr);
+    }
+
     void updateTransportBitrate() {
         if (mode == UdpShapingMode::Cbr) {
             transportBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
@@ -1712,12 +1726,13 @@ private:
             // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
 
-            // VBR passthrough keeps the broadcaster's original PCR values intact.
-            // PTS/DTS are not rewritten, so replacing source PCR with a scheduler-derived
-            // clock creates an unnecessary second time base and can produce A/V offset
-            // under multi-channel load. CBR still uses periodic synthetic PCR because
-            // stuffing changes the transport clock by design.
+            // Continuous MPEG-TS keeps the broadcaster's PCR in both VBR and CBR.
+            // NULL stuffing changes the wire bitrate, not the media clock. Replacing
+            // PCR while preserving source PTS/DTS creates two clock domains and was
+            // observed as video corrections and a small A/V offset on DVB services.
+            // Segmented HLS still needs a synthetic continuous PCR across segments.
             if (mode == UdpShapingMode::Cbr &&
+                !sourcePcrPassthrough() &&
                 periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
                 makePeriodicPcrPacket(outputPacket, slotTime);
                 ++counts.periodicPcr;
@@ -1768,7 +1783,7 @@ private:
                             nextPeriodicPcrNanoseconds =
                                 slotTime + kPeriodicPcrIntervalNanoseconds;
                             periodicPcrInitialized = true;
-                            if (mode == UdpShapingMode::Cbr) {
+                            if (!sourcePcrPassthrough()) {
                                 writePcr(packet.bytes, periodicPcrOriginTicks);
                                 ++rewrittenPcrPackets;
                             }
@@ -1776,17 +1791,15 @@ private:
                                       << " pcr_pid=" << periodicPcrPid
                                       << " source=selected-PMT"
                                       << " mode="
-                                      << (mode == UdpShapingMode::Vbr
-                                              ? "source-passthrough"
-                                              : (segmentedHlsInput
-                                                    ? "synthetic-cbr-hls-20ms"
-                                                    : "synthetic-cbr"))
+                                      << (sourcePcrPassthrough()
+                                              ? (mode == UdpShapingMode::Vbr
+                                                    ? "source-passthrough-vbr"
+                                                    : "source-passthrough-cbr")
+                                              : "synthetic-cbr-20ms")
                                       << std::endl;
                         }
                     } else if (packet.pid == periodicPcrPid &&
-                               mode == UdpShapingMode::Cbr) {
-                        // CBR owns a synthetic transport clock because stuffing changes
-                        // the wire time base. VBR keeps every source PCR untouched.
+                               !sourcePcrPassthrough()) {
                         clearPcrFlag(packet.bytes);
                         ++strippedSourcePcrPackets;
                     }
@@ -2016,13 +2029,15 @@ private:
                   << " timing="
                   << (segmentedHlsInput
                           ? "hls_slow_playout_pll_periodic_pcr"
-                          : "reservoir_rate_controller_periodic_pcr")
+                          : (sourcePcrPassthrough()
+                                ? "reservoir_rate_controller_source_pcr"
+                                : "reservoir_rate_controller_periodic_pcr"))
                   << " pcr_clock="
-                  << (mode == UdpShapingMode::Vbr
+                  << (sourcePcrPassthrough()
                           ? "source_passthrough"
                           : "continuous_transport_media")
                   << " pcr_source_passthrough="
-                  << (mode == UdpShapingMode::Vbr ? 1 : 0)
+                  << (sourcePcrPassthrough() ? 1 : 0)
                   << " startup_reservoir="
                   << startupReservoirBytes.load(std::memory_order_relaxed) << "B"
                   << " startup_pcr_samples="
@@ -2065,6 +2080,7 @@ private:
     const bool caCleanStartEnabled = false;
     const bool conditionalAccessInput = false;
     const bool segmentedHlsInput = false;
+    const bool forceSyntheticPcr = false;
     const uint64_t startupReservoirDurationNanoseconds = 0;
     bool hlsExactPacingAnnounced = false;
     bool caCleanStartReleased = false;
@@ -2248,7 +2264,10 @@ GstElement* createSink(
     callbacks.new_sample = onNewSample;
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
-    std::cerr << "Unified UDP periodic-PCR reservoir TS shaper: mode="
+    const bool syntheticPcr =
+        mode == UdpShapingMode::Cbr &&
+        (isSegmentedHlsInput(config) || forceSyntheticCbrPcr());
+    std::cerr << "Unified UDP reservoir TS shaper: mode="
               << shapingModeName(mode)
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
               << " vbr_rate=auto"
@@ -2260,8 +2279,16 @@ GstElement* createSink(
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
               << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
-              << " pcr_mode=periodic-pcr-only-20ms source_pcr=stripped-after-lock"
-              << " pcr_restamp=continuous-transport-media"
+              << " pcr_mode="
+              << (syntheticPcr
+                    ? "synthetic-continuous-20ms"
+                    : "source-passthrough")
+              << " source_pcr="
+              << (syntheticPcr
+                    ? "stripped-after-lock"
+                    : "preserved")
+              << " pcr_restamp="
+              << (syntheticPcr ? "continuous-transport-media" : "off")
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
               << " clean_start=post-dual-media-video-random-access"
