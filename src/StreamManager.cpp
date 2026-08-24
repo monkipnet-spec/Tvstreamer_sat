@@ -50,6 +50,8 @@ constexpr guint kCaBatchPackets = 77;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
+constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
+constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(3);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
 constexpr long kHttpConnectTimeoutMs = 3000;
@@ -2366,6 +2368,11 @@ void configureHlsHttpSource(GstElement* element, const StreamConfig& cfg) {
     setStringPropertyIfPresent(element, "user-agent", cfg.hlsUserAgent);
     setBooleanPropertyIfPresent(element, "keep-alive", TRUE);
     setBooleanPropertyIfPresent(element, "compress", TRUE);
+    // hlsdemux owns the media timeline. Timestamping manifest/segment HTTP
+    // buffers with wall-clock arrival time creates a second clock domain and
+    // can surface as a pause at every segment boundary.
+    setBooleanPropertyIfPresent(element, "is-live", FALSE);
+    setBooleanPropertyIfPresent(element, "do-timestamp", FALSE);
     setIntPropertyIfPresent(element, "timeout", kNetworkSourceTimeoutSeconds);
 
     if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() &&
@@ -2629,6 +2636,18 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
     std::cerr << "Stable UDP audio reservoir startup complete: "
               << "startup_reservoir_ms=1500 min_threshold_ms=0 "
               << "steady_state=source-timestamps audio_clocksync=off" << std::endl;
+}
+
+void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
+    (void)userData;
+    if (!queue || g_object_get_data(G_OBJECT(queue), "tvs-hls-prebuffer-started")) {
+        return;
+    }
+
+    g_object_set_data(G_OBJECT(queue), "tvs-hls-prebuffer-started", GINT_TO_POINTER(1));
+    setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
+    std::cerr << "HLS input startup buffer ready: startup_buffer_ms=1000 "
+              << "steady_state_min_threshold_ms=0" << std::endl;
 }
 
 std::string outputType(const StreamConfig& cfg) {
@@ -6722,7 +6741,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         // than downstream consumes it, producing CC/PES damage (audible scratching)
         // and apparent input-bitrate collapses. Preserve up to 12 seconds and use
         // normal back-pressure into hlsdemux instead of discarding segment data.
-        GstElement* queue = addQueue("input_queue", 12000000000ULL, false);
+        GstElement* queue = addQueue("input_queue", kHlsInputQueueMax, false);
         if (!src || !demux || !mux || !selector || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, demux) ||
@@ -6731,18 +6750,25 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             return nullptr;
         }
 
-        g_object_set(src, "location", location.c_str(), "is-live", TRUE, "do-timestamp", TRUE, nullptr);
+        g_object_set(src, "location", location.c_str(), "is-live", FALSE, "do-timestamp", FALSE, nullptr);
         setIntPropertyIfPresent(src, "timeout", kNetworkSourceTimeoutSeconds);
         if (!inputInterface.empty()) {
             std::cerr << "HLS input: input_iface=" << inputInterface
                       << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
                       << std::endl;
         }
-        setIntPropertyIfPresent(demux, "connection-speed", static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000, 1)));
+        // connection-speed describes measured download capacity, not the
+        // configured output mux rate. Keep zero so hlsdemux measures bandwidth
+        // and does not oscillate between variants around the output bitrate.
+        setUIntPropertyIfPresent(demux, "connection-speed", 0);
         configureTsMux(mux, cfg);
         setBooleanPropertyIfPresent(selector, "sync-streams", FALSE);
         setBooleanPropertyIfPresent(selector, "cache-buffers", FALSE);
-        std::cerr << "HLS input: queue_ms=12000 leaky=off backpressure=on" << std::endl;
+        setUInt64PropertyIfPresent(queue, "min-threshold-time", kHlsInputStartupBuffer);
+        g_signal_connect(queue, "running", G_CALLBACK(onHlsInputPrebufferRunning), nullptr);
+        std::cerr << "HLS input: queue_ms=12000 startup_buffer_ms=1000 "
+                  << "leaky=off backpressure=on source_timestamping=off "
+                  << "adaptive_bandwidth=auto" << std::endl;
 
         if (!gst_element_link(src, demux) || !gst_element_link(selector, queue)) {
             return nullptr;
