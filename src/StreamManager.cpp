@@ -60,6 +60,7 @@ constexpr int kNetworkSourceTimeoutSeconds = 5;
 constexpr int kSrtInputLatencyMs = 1000;
 constexpr guint64 kSrtInputStartupBuffer = 2 * GST_SECOND;
 constexpr guint64 kSrtInputQueueMax = 8 * GST_SECOND;
+constexpr auto kSrtStatsLogInterval = std::chrono::seconds(10);
 constexpr int kSrtOutputLatencyMs = 150;
 constexpr int kSrtTranscodedOutputLatencyMs = 700;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
@@ -3918,6 +3919,38 @@ bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
            tvs::protocols::srtOutputMode(outputConfig) != "caller";
 }
 
+void maybeLogSrtInputStats(
+    StreamState* state,
+    std::chrono::steady_clock::time_point now) {
+    if (!state || !state->pipeline ||
+        tvs::stream_protocols::inputKind(state->runtimeConfig) !=
+            tvs::stream_protocols::InputProtocolKind::Srt ||
+        now - state->lastSrtStatsLog < kSrtStatsLogInterval) {
+        return;
+    }
+    state->lastSrtStatsLog = now;
+
+    GstElement* src = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_src");
+    if (!src) {
+        return;
+    }
+
+    GstStructure* stats = nullptr;
+    g_object_get(src, "stats", &stats, nullptr);
+    gst_object_unref(src);
+    if (!stats) {
+        return;
+    }
+
+    gchar* serialized = gst_structure_to_string(stats);
+    if (serialized) {
+        std::cerr << "SRT input stats: stream=" << state->config.id
+                  << " " << serialized << std::endl;
+        g_free(serialized);
+    }
+    gst_structure_free(stats);
+}
+
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
@@ -6647,7 +6680,12 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         // packets during short CPU stalls and turns them into visible PES/CC
         // damage. Keep a bounded non-leaky reserve and apply back-pressure.
         GstElement* queue = addQueue("input_queue", kSrtInputQueueMax, false);
-        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+        GstElement* inputPacer = mode == "listener"
+            ? nullptr
+            : gst_element_factory_make("clocksync", "input_srt_clock");
+        if (!src || !queue || (mode != "listener" && !inputPacer) ||
+            !addElementOrFail(pipeline, src) ||
+            (inputPacer && !addElementOrFail(pipeline, inputPacer))) {
             return nullptr;
         }
 
@@ -6670,6 +6708,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
             setUIntPropertyIfPresent(src, "localport", 0);
             setUInt64PropertyIfPresent(queue, "min-threshold-time", kSrtInputStartupBuffer);
             g_signal_connect(queue, "running", G_CALLBACK(onSrtInputPrebufferRunning), nullptr);
+            configureNetworkCbrClock(inputPacer);
         }
 
         std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
@@ -6677,13 +6716,17 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
                   << " queue_ms=8000 startup_buffer_ms="
                   << (mode == "listener" ? 0 : 2000)
                   << " leaky=off backpressure=on"
+                  << " input_pacing=" << (inputPacer ? "sender-clock" : "off")
                   << " source_timestamping=srt-sender-clock" << std::endl;
 
-        if (!gst_element_link(src, queue)) {
+        const bool linked = inputPacer
+            ? gst_element_link_many(src, queue, inputPacer, nullptr)
+            : gst_element_link(src, queue);
+        if (!linked) {
             return nullptr;
         }
 
-        terminalElement = queue;
+        terminalElement = inputPacer ? inputPacer : queue;
         return src;
     }
 
@@ -8748,6 +8791,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
             }
         }
+        maybeLogSrtInputStats(state, now);
 
         if (!state->config.testPattern) {
             const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;

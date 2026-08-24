@@ -60,7 +60,7 @@ std::vector<const char*> requiredElementsForInput(InputProtocolKind kind) {
         case InputProtocolKind::Hls:
             return {"souphttpsrc", "hlsdemux", "mpegtsmux"};
         case InputProtocolKind::Srt:
-            return {"srtsrc"};
+            return {"srtsrc", "clocksync"};
         case InputProtocolKind::Rtsp:
             return {"rtspsrc", "mpegtsmux"};
         case InputProtocolKind::Rtmp:

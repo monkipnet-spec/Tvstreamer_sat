@@ -146,6 +146,7 @@ struct StreamState {
     uint64_t lastInputBytesSeen = 0;
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastSrtStatsLog = std::chrono::steady_clock::now();
     // v200: overload recovery watchdog.  It uses raw TS byte/continuity counters
     // rather than CPU percentage, so it detects the actual damage caused by a
     // scheduling stall.  Recovery is armed while errors are occurring and is
