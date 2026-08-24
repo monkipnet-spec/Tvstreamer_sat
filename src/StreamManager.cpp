@@ -6736,7 +6736,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         // appsrc.  This creates exactly one provider request and avoids a
         // build-time dependency on souphttpsrc/caps negotiation for opaque URLs.
         GstElement* src = gst_element_factory_make("appsrc", "input_src");
-        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
+        GstElement* queue = addQueue("input_queue", 8000000000ULL, false);
+        setUIntPropertyIfPresent(queue, "max-size-bytes", 8U * 1024U * 1024U);
         if (!src || !queue || !addElementOrFail(pipeline, src)) {
             if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
             std::cerr << "HTTP MPEG-TS input: failed to create appsrc/queue" << std::endl;
@@ -6756,7 +6757,7 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         g_object_set(src,
             "is-live", TRUE,
             "format", GST_FORMAT_BYTES,
-            "block", FALSE,
+            "block", TRUE,
             "do-timestamp", FALSE,
             nullptr);
 
@@ -6895,7 +6896,8 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
 
         GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
         GstElement* capsFilter = gst_element_factory_make("capsfilter", "input_http_ts_caps");
-        GstElement* queue = addQueue("input_queue", 1000000000ULL, true);
+        GstElement* queue = addQueue("input_queue", 8000000000ULL, false);
+        setUIntPropertyIfPresent(queue, "max-size-bytes", 8U * 1024U * 1024U);
         if (!src || !capsFilter || !queue ||
             !addElementOrFail(pipeline, src) ||
             !addElementOrFail(pipeline, capsFilter)) {
