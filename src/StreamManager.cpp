@@ -8638,6 +8638,9 @@ void StreamManager::monitorBus(const std::string& id) {
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
+        const bool srtInput =
+            tvs::stream_protocols::inputKind(state->config) ==
+            tvs::stream_protocols::InputProtocolKind::Srt;
 
         // v200 overload self-healing.  Do not restart while the machine is
         // still overloaded: continuity damage keeps refreshing
@@ -8645,7 +8648,14 @@ void StreamManager::monitorBus(const std::string& id) {
         // short staggered settle interval, rebuild only this stream pipeline.
         // This clears stale queues, tsparse/mux state and CBR clocks without
         // restarting the process or the shared DVB frontend.
-        if (now - state->overloadWatchSample >= std::chrono::seconds(1)) {
+        // Network loss on SRT legitimately appears as MPEG-TS continuity
+        // damage after the protocol has exhausted retransmission. Rebuilding
+        // the whole pipeline after that damage has already passed disconnects
+        // a healthy SRT session and creates a much longer visible freeze.
+        // srtsrc auto-reconnect and the no-input watchdog remain responsible
+        // for actual connection failures.
+        if (!srtInput &&
+            now - state->overloadWatchSample >= std::chrono::seconds(1)) {
             const uint64_t inputNow = state->inputBytes.load(std::memory_order_relaxed);
             const uint64_t outputNow = state->outputBytes.load(std::memory_order_relaxed);
             const uint64_t inputCcNow = state->inputCcErrors.load(std::memory_order_relaxed);
