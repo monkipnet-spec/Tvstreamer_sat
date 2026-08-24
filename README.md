@@ -205,31 +205,33 @@ docker build --pull --no-cache -t tvstreammersat5:202.8 .
 
 ### Фоновый запуск
 
-Подготовьте `tvstreammersat5-config.json` и укажите его реальный абсолютный путь.
-Путь `/opt/tvstreammersat5/tvstreammersat5-config.json` ниже является только
-примером: если файла там нет, контейнер создан не будет.
+Укажите постоянный каталог данных на хосте. Если стандартного файла
+`tvstreammersat5-config.json` ещё нет, программа создаст его при первом запуске.
 
 ```bash
-cd /путь/к/Tvstreamer_sat
-
-CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json
-test -f "$CONFIG_FILE" || { echo "Не найден конфигурационный файл: $CONFIG_FILE"; exit 1; }
+cd ~/Tvstreamer_sat
+mkdir -p /opt/tvstreammersat5
 
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
+RECREATE=1 \
 IMAGE_NAME=tvstreammersat5:202.8 \
-CONFIG_FILE="$CONFIG_FILE" \
-./scripts/run_container.sh
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+bash ./scripts/run_container.sh
 
 docker ps --filter name=tvstreammersat5
 docker logs --tail 100 tvstreammersat5
 ```
 
-Команда должна вывести идентификатор нового контейнера. В фоновом режиме скрипт
-задаёт политику `unless-stopped`: контейнер автоматически запускается после
-перезагрузки Docker или сервера. Скрипт использует host networking, подключает
-каталог конфигурации и автоматически передаёт найденные `/dev/dvb` устройства
-в контейнер.
+Скрипт проверяет наличие образа до удаления прежнего контейнера и выводит
+идентификатор созданного контейнера. `RECREATE=1` позволяет одной командой
+заменить существующий контейнер либо создать его, если контейнера ещё нет.
+В фоновом режиме действует политика `unless-stopped`. Скрипт использует host
+networking, подключает каталог данных и автоматически передаёт найденные
+`/dev/dvb` устройства в контейнер.
+
+Новая конфигурация создаётся без каналов с учётными данными `admin` / `admin`.
+После первого входа сразу измените пароль.
 
 Интерактивный временный запуск остаётся доступен без `DETACH=1`:
 
@@ -266,25 +268,21 @@ docker inspect tvstreammersat5
 
 ### Обновление и пересборка проекта
 
-Выполняйте весь блок из корня репозитория. Сначала задайте реальный путь к
-существующему конфигурационному файлу. Команда `docker rm -f ... || true`
-работает как при наличии старого контейнера, так и при его отсутствии.
+Выполняйте весь блок из корня репозитория. Новый образ сначала полностью
+собирается и проверяется Docker, и только затем скрипт заменяет контейнер.
 
 ```bash
-cd /путь/к/Tvstreamer_sat
-
-CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json
-test -f "$CONFIG_FILE" || { echo "Не найден конфигурационный файл: $CONFIG_FILE"; exit 1; }
+cd ~/Tvstreamer_sat
 
 git pull origin main
 docker build --pull -t tvstreammersat5:202.8 .
-docker rm -f tvstreammersat5 2>/dev/null || true
 
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
+RECREATE=1 \
 IMAGE_NAME=tvstreammersat5:202.8 \
-CONFIG_FILE="$CONFIG_FILE" \
-./scripts/run_container.sh
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+bash ./scripts/run_container.sh
 
 # Контейнер должен иметь состояние Up
 docker ps --filter name=tvstreammersat5 \
@@ -295,9 +293,9 @@ docker logs --tail 100 tvstreammersat5
 curl --fail http://127.0.0.1:9000/health
 ```
 
-Если `./scripts/run_container.sh` завершился ошибкой, новый контейнер не появится.
-В этом случае сообщение непосредственно перед ошибкой укажет причину, например
-отсутствующий конфигурационный файл, занятое имя контейнера или недоступный образ.
+Если скрипт завершился ошибкой до строки `Removing existing container`, старый
+контейнер остаётся на месте. Сообщение укажет причину, например недоступный образ
+или некорректный путь пользовательского конфигурационного файла.
 
 Конфигурация, ключ UI, список абонентов и файлы замены сохраняются на хосте в
 каталоге рядом с `CONFIG_FILE`, поэтому удаление и повторное создание контейнера
