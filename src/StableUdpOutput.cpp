@@ -238,6 +238,11 @@ struct HlsTimestampRatePoint {
     uint64_t cumulativeBytes = 0;
 };
 
+struct NetworkArrivalRatePoint {
+    uint64_t arrivalNanoseconds = 0;
+    uint64_t cumulativeBytes = 0;
+};
+
 bool parsePcr(const std::array<guint8, kTsPacketSize>& packet,
               uint64_t& pcrTicks,
               bool& discontinuity) {
@@ -654,12 +659,10 @@ public:
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           continuousNetworkMpegTsInput(isContinuousNetworkMpegTsInput(cfg)),
-          // SRT is remuxed before StableUdpOutput, then its useful packets are
-          // spread across a newly generated CBR transport. Preserve source PCR
-          // for VBR, but generate a continuous output PCR for CBR so receivers
-          // do not see the remux clock arrive at a different packet cadence.
-          forceSyntheticPcr(
-              forceSyntheticCbrPcr() || tvs::protocols::inputs::isSrtInput(cfg)),
+          // Synthetic PCR remains available as an explicit diagnostic override.
+          // Continuous SRT/HTTP MPEG-TS uses in-place PCR rewriting by default so
+          // PCR continuity does not consume extra TS slots or reduce useful CBR.
+          forceSyntheticPcr(forceSyntheticCbrPcr()),
           startupReservoirDurationNanoseconds(startupReservoirNanoseconds()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // v202.5: normalize the outgoing continuity domain for every Stable UDP
@@ -992,12 +995,16 @@ private:
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
     static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
-    // TCP and SRT callback cadence is bursty and must not become the media
-    // clock. Track the source PCR and move the playout pace only very slowly.
-    static constexpr uint64_t kNetworkPcrPllUpdateNanoseconds =
+    // 202.19: SRT/HTTP MPEG-TS pacing is based on a long wall-clock arrival
+    // window. Short PCR byte-density follows VBR GOP size and is diagnostic only.
+    static constexpr uint64_t kNetworkArrivalRateWindowNanoseconds =
+        15ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kNetworkArrivalRateMinimumNanoseconds =
+        5ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kNetworkArrivalPllUpdateNanoseconds =
         2ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kNetworkPcrPllMaximumCorrectionPermille = 10ULL;
-    static constexpr uint64_t kNetworkPcrPllMaximumStepPermille = 1ULL;
+    static constexpr uint64_t kNetworkArrivalPllMaximumCorrectionPermille = 10ULL;
+    static constexpr uint64_t kNetworkArrivalPllMaximumStepPermille = 1ULL;
 
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
@@ -1154,16 +1161,13 @@ private:
                 const uint64_t elapsed = std::max<uint64_t>(1ULL, now - firstArrival);
                 const uint64_t arrivalRate = multiplyDivide(
                     startupBytes * 8ULL, 1000000000ULL, elapsed);
-                // HLS media is downloaded a segment at a time.  Wall-clock bytes/sec
-                // therefore measures HTTP burst speed, not the MPEG-TS playback rate.
-                // Once two PCR samples are available, use the transport rate derived
-                // from PCR distance and byte distance so audio/video remain on the
-                // broadcaster's clock.
+                // HLS is segment-bursty and keeps its existing media-time estimator.
+                // Continuous SRT/HTTP MPEG-TS must start from wall-clock arrival rate:
+                // PCR byte-density is VBR/GOP dependent and is never a pacing source.
                 const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
                 estimatedInputBitrate = segmentedHlsInput && hlsPtsRate > 0
                     ? hlsPtsRate
-                    : ((segmentedHlsInput || continuousNetworkMpegTsInput) &&
-                       pcrDerivedInputBitrate > 0
+                    : (segmentedHlsInput && pcrDerivedInputBitrate > 0
                         ? pcrDerivedInputBitrate
                         : arrivalRate);
                 if (estimatedInputBitrate == 0) {
@@ -1359,6 +1363,51 @@ private:
         }
     }
 
+    void observeNetworkArrivalRate(uint64_t nowNanoseconds, uint64_t cumulativeBytes) {
+        if (!continuousNetworkMpegTsInput || nowNanoseconds == 0) return;
+
+        if (!networkArrivalRateWindow.empty() &&
+            nowNanoseconds <= networkArrivalRateWindow.back().arrivalNanoseconds) {
+            networkArrivalRateWindow.back().cumulativeBytes = cumulativeBytes;
+            return;
+        }
+
+        networkArrivalRateWindow.push_back({nowNanoseconds, cumulativeBytes});
+        while (networkArrivalRateWindow.size() > 2 &&
+               nowNanoseconds > networkArrivalRateWindow.front().arrivalNanoseconds &&
+               nowNanoseconds - networkArrivalRateWindow.front().arrivalNanoseconds >
+                   kNetworkArrivalRateWindowNanoseconds) {
+            networkArrivalRateWindow.pop_front();
+        }
+
+        if (networkArrivalRateWindow.size() < 2) return;
+        const auto& first = networkArrivalRateWindow.front();
+        const auto& last = networkArrivalRateWindow.back();
+        if (last.arrivalNanoseconds <= first.arrivalNanoseconds ||
+            last.cumulativeBytes <= first.cumulativeBytes) return;
+
+        const uint64_t deltaNs = last.arrivalNanoseconds - first.arrivalNanoseconds;
+        if (deltaNs < kNetworkArrivalRateMinimumNanoseconds) return;
+        const uint64_t deltaBytes = last.cumulativeBytes - first.cumulativeBytes;
+        const uint64_t sampleBitrate = multiplyDivide(
+            deltaBytes * 8ULL, 1000000000ULL, deltaNs);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstLock = networkLongTermArrivalBitrate == 0;
+        // The 15 s window is already slow. A small EWMA removes callback cadence
+        // noise while still following genuine encoder/service bitrate changes.
+        networkLongTermArrivalBitrate = firstLock
+            ? sampleBitrate
+            : (networkLongTermArrivalBitrate * 3ULL + sampleBitrate) / 4ULL;
+        ++networkArrivalBitrateSamples;
+        if (firstLock) {
+            std::cerr << "Network MPEG-TS rate lock: source_rate=arrival_15s"
+                      << " bitrate=" << networkLongTermArrivalBitrate
+                      << " PCR_density=diagnostic_only"
+                      << std::endl;
+        }
+    }
+
     void observePcrRate(const TimedTsPacket& packet) {
         // Count transport bytes independently of delivery timing. HLS segments,
         // TCP reads and SRT recovery windows all arrive in bursts; PCR does not.
@@ -1406,10 +1455,11 @@ private:
         }
         pcrDerivedBitrateSamples.fetch_add(1, std::memory_order_relaxed);
         if (firstRateLock) {
-            std::cerr << "UDP PCR rate lock: source_rate=PCR"
+            std::cerr << "UDP PCR rate lock: source_rate=PCR-density"
                       << " pcr_pid=" << packet.pid
                       << " bitrate=" << pcrDerivedInputBitrate
-                      << " network_arrival_rate=ignored"
+                      << " diagnostic_only="
+                      << (continuousNetworkMpegTsInput ? 1 : 0)
                       << std::endl;
         }
     }
@@ -1497,15 +1547,33 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
+        // 202.19: continuous SRT/HTTP CBR no longer loses 100 kbit/s of useful
+        // capacity. PCR is rewritten in existing packets, so no reservation is
+        // needed for synthetic PCR-only TS packets. Keep the legacy reservation
+        // for other synthetic-PCR CBR paths (notably segmented HLS).
+        if (continuousNetworkMpegTsInput && !forceSyntheticPcr) {
+            return configuredTargetBitrate;
+        }
         if (configuredTargetBitrate <= 100000ULL) {
             return configuredTargetBitrate;
         }
         return configuredTargetBitrate - 100000ULL;
     }
 
+    bool rewriteNetworkPcrInPlace() const {
+        return continuousNetworkMpegTsInput && !forceSyntheticPcr;
+    }
+
     bool sourcePcrPassthrough() const {
+        if (rewriteNetworkPcrInPlace()) return false;
         return mode == UdpShapingMode::Vbr ||
                (!segmentedHlsInput && !forceSyntheticPcr);
+    }
+
+    bool usesPeriodicPcrPackets() const {
+        return mode == UdpShapingMode::Cbr &&
+               !rewriteNetworkPcrInPlace() &&
+               !sourcePcrPassthrough();
     }
 
     void updateTransportBitrate() {
@@ -1541,6 +1609,10 @@ private:
                 ? multiplyDivide(deltaBytes * 8ULL, 1000000000ULL, deltaTime)
                 : 0;
 
+            if (continuousNetworkMpegTsInput) {
+                observeNetworkArrivalRate(nowNanoseconds, bytesNow);
+            }
+
             const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
             if (segmentedHlsInput && hlsPtsRate > 0) {
                 // v202.6: hlsdemux's PTS/DTS running-time is the playout clock.
@@ -1549,10 +1621,14 @@ private:
                 // the service itself is VBR between adjacent PCR packets.
                 estimatedInputBitrate = hlsPtsRate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
-            } else if ((segmentedHlsInput || continuousNetworkMpegTsInput) &&
-                       pcrDerivedInputBitrate > 0) {
-                // Startup/fallback only until enough timestamp history exists.
+            } else if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
+                // HLS startup fallback only until enough timestamp history exists.
                 estimatedInputBitrate = pcrDerivedInputBitrate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0) {
+                // 202.19 SRT/HTTP: long-term arrival rate is the pacing source.
+                // PCR byte-density remains visible in stats but never drives pace.
+                estimatedInputBitrate = networkLongTermArrivalBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (instantBitrate > 0) {
                 if (estimatedInputBitrate == 0) {
@@ -1587,30 +1663,35 @@ private:
 
         const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
-        const bool networkPcrLocked =
-            mode == UdpShapingMode::Vbr &&
-            continuousNetworkMpegTsInput && pcrDerivedInputBitrate > 0;
-        const uint64_t playoutSourceRate =
-            segmentedHlsInput ? hlsSourceRate : pcrDerivedInputBitrate;
-        if ((segmentedHlsInput || networkPcrLocked) && playoutSourceRate > 0) {
-            // Do not chase HTTP/SRT delivery bursts or every HLS GOP estimate.
-            // Lock a long-lived media-clock pace and let a slow reservoir PLL
-            // correct only long-term drift. This keeps video PES packets from
-            // becoming periodically late against PCR while audio continues.
+        const bool networkArrivalLocked =
+            continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
+        const uint64_t playoutSourceRate = segmentedHlsInput
+            ? hlsSourceRate
+            : networkLongTermArrivalBitrate;
+        if ((segmentedHlsInput || networkArrivalLocked) && playoutSourceRate > 0) {
+            // Do not chase HTTP/SRT callback bursts or every HLS GOP estimate.
+            // HLS follows media time; continuous SRT/HTTP follows the long arrival
+            // window. A slow reservoir PLL corrects only genuine long-term drift.
             const uint64_t hlsPaceCeiling = maxRealPaceBitrate();
             const uint64_t pllTargetReservoirNanoseconds = segmentedHlsInput
                 ? kHlsTargetReservoirNanoseconds : kTargetReservoirNanoseconds;
             const uint64_t pllUpdateNanoseconds = segmentedHlsInput
-                ? kHlsPllUpdateNanoseconds : kNetworkPcrPllUpdateNanoseconds;
+                ? kHlsPllUpdateNanoseconds : kNetworkArrivalPllUpdateNanoseconds;
             const uint64_t pllCorrectionPermille = segmentedHlsInput
                 ? kHlsPllMaximumCorrectionPermille
-                : kNetworkPcrPllMaximumCorrectionPermille;
+                : kNetworkArrivalPllMaximumCorrectionPermille;
             const uint64_t pllStepPermille = segmentedHlsInput
-                ? kHlsPllMaximumStepPermille : kNetworkPcrPllMaximumStepPermille;
+                ? kHlsPllMaximumStepPermille : kNetworkArrivalPllMaximumStepPermille;
             const uint64_t pllFollowDivisor = segmentedHlsInput ? 32ULL : 64ULL;
             if (hlsPllBaseBitrate == 0) {
-                const uint64_t startupPace = currentRealPaceBitrate > 0
-                    ? currentRealPaceBitrate
+                // HLS keeps its proven warm-start behavior. For SRT/HTTP, once
+                // the long arrival window has locked, prefer that measurement
+                // immediately instead of carrying a possibly bursty 1.5 s startup
+                // estimate into a very slow PLL convergence.
+                const uint64_t startupPace = segmentedHlsInput
+                    ? (currentRealPaceBitrate > 0
+                          ? currentRealPaceBitrate
+                          : playoutSourceRate)
                     : playoutSourceRate;
                 hlsPllBaseBitrate = std::min<uint64_t>(startupPace, hlsPaceCeiling);
                 currentRealPaceBitrate = hlsPllBaseBitrate;
@@ -1628,8 +1709,8 @@ private:
                 nowNanoseconds - hlsPllLastUpdateNanoseconds >= pllUpdateNanoseconds) {
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
 
-                // Follow genuine long-term variant/service rate changes extremely
-                // slowly: 1/32 of the PTS estimate every five seconds.
+                // Follow genuine long-term variant/service rate changes slowly.
+                // HLS uses its PTS estimate; SRT/HTTP uses the arrival-window rate.
                 const uint64_t sourceLimited =
                     std::min<uint64_t>(playoutSourceRate, hlsPaceCeiling);
                 hlsPllBaseBitrate =
@@ -1696,7 +1777,7 @@ private:
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
                                   ? "HLS UDP pacing: mode=slow-playout-pll"
-                                  : "Network MPEG-TS UDP pacing: mode=pcr-playout-pll")
+                                  : "Network MPEG-TS UDP pacing: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_clock_bitrate=" << playoutSourceRate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
@@ -1707,7 +1788,7 @@ private:
                           << " PCR="
                           << (segmentedHlsInput
                                   ? "continuous-20ms-clock"
-                                  : "source-passthrough")
+                                  : "continuous-inplace-rewrite")
                           << std::endl;
                 hlsExactPacingAnnounced = true;
             }
@@ -1793,13 +1874,11 @@ private:
             // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
 
-            // Continuous MPEG-TS keeps the broadcaster's PCR in both VBR and CBR.
-            // NULL stuffing changes the wire bitrate, not the media clock. Replacing
-            // PCR while preserving source PTS/DTS creates two clock domains and was
-            // observed as video corrections and a small A/V offset on DVB services.
-            // Segmented HLS still needs a synthetic continuous PCR across segments.
-            if (mode == UdpShapingMode::Cbr &&
-                !sourcePcrPassthrough() &&
+            // Segmented HLS keeps its periodic PCR-only clock. Continuous SRT/HTTP
+            // instead rewrites PCR inside the provider's existing PCR packets, so
+            // continuity costs no extra transport slot. Other inputs retain their
+            // existing source-PCR/synthetic-PCR behavior.
+            if (usesPeriodicPcrPackets() &&
                 periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
                 makePeriodicPcrPacket(outputPacket, slotTime);
                 ++counts.periodicPcr;
@@ -1858,13 +1937,32 @@ private:
                                       << " pcr_pid=" << periodicPcrPid
                                       << " source=selected-PMT"
                                       << " mode="
-                                      << (sourcePcrPassthrough()
+                                      << (rewriteNetworkPcrInPlace()
                                               ? (mode == UdpShapingMode::Vbr
-                                                    ? "source-passthrough-vbr"
-                                                    : "source-passthrough-cbr")
-                                              : "synthetic-cbr-20ms")
+                                                    ? "continuous-inplace-vbr"
+                                                    : "continuous-inplace-cbr")
+                                              : (sourcePcrPassthrough()
+                                                    ? (mode == UdpShapingMode::Vbr
+                                                          ? "source-passthrough-vbr"
+                                                          : "source-passthrough-cbr")
+                                                    : "synthetic-cbr-20ms"))
                                       << std::endl;
                         }
+                    } else if (packet.pid == periodicPcrPid && rewriteNetworkPcrInPlace()) {
+                        // Keep the provider's PCR packet cadence and payload exactly
+                        // intact, but advance PCR on the continuous output timeline.
+                        // No adaptation-only PCR packet is inserted and no TS slot is
+                        // stolen from useful CBR/VBR media.
+                        const uint64_t elapsedNanoseconds =
+                            slotTime >= periodicPcrOriginNanoseconds
+                                ? slotTime - periodicPcrOriginNanoseconds
+                                : 0;
+                        const uint64_t outputPcrTicks =
+                            (periodicPcrOriginTicks +
+                             nanosecondsToPcrTicks(elapsedNanoseconds)) %
+                            kPcrTicksModulus;
+                        writePcr(packet.bytes, outputPcrTicks);
+                        ++rewrittenPcrPackets;
                     } else if (packet.pid == periodicPcrPid &&
                                !sourcePcrPassthrough()) {
                         clearPcrFlag(packet.bytes);
@@ -2108,15 +2206,19 @@ private:
                   << " timing="
                   << (segmentedHlsInput
                           ? "hls_slow_playout_pll_periodic_pcr"
-                          : (mode == UdpShapingMode::Vbr && continuousNetworkMpegTsInput
-                                ? "network_pcr_playout_pll_source_pcr"
+                          : (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0
+                                ? "network_arrival_playout_pll_inplace_pcr"
                                 : (sourcePcrPassthrough()
                                       ? "reservoir_rate_controller_source_pcr"
-                                      : "reservoir_rate_controller_periodic_pcr")))
+                                      : (rewriteNetworkPcrInPlace()
+                                            ? "reservoir_rate_controller_inplace_pcr"
+                                            : "reservoir_rate_controller_periodic_pcr"))))
                   << " pcr_clock="
-                  << (sourcePcrPassthrough()
-                          ? "source_passthrough"
-                          : "continuous_transport_media")
+                  << (rewriteNetworkPcrInPlace()
+                          ? "continuous_inplace_rewrite"
+                          : (sourcePcrPassthrough()
+                                ? "source_passthrough"
+                                : "continuous_transport_media"))
                   << " pcr_source_passthrough="
                   << (sourcePcrPassthrough() ? 1 : 0)
                   << " startup_reservoir="
@@ -2132,11 +2234,17 @@ private:
                   << " hls_pts_resets=" << hlsTimestampRateResets.load(std::memory_order_relaxed)
                   << " hls_pll_base=" << (segmentedHlsInput ? hlsPllBaseBitrate : 0)
                   << " hls_pll_correction=" << (segmentedHlsInput ? hlsPllCorrectionBitrate : 0)
-                  << " network_pcr_pll_base="
+                  << " network_arrival_rate="
+                  << (continuousNetworkMpegTsInput ? networkLongTermArrivalBitrate : 0)
+                  << " network_arrival_samples="
+                  << networkArrivalBitrateSamples.load(std::memory_order_relaxed)
+                  << " network_arrival_pll_base="
                   << (continuousNetworkMpegTsInput ? hlsPllBaseBitrate : 0)
-                  << " network_pcr_pll_correction="
+                  << " network_arrival_pll_correction="
                   << (continuousNetworkMpegTsInput ? hlsPllCorrectionBitrate : 0)
                   << " pcr_rate=" << pcrDerivedInputBitrate
+                  << " pcr_rate_diagnostic="
+                  << (continuousNetworkMpegTsInput ? 1 : 0)
                   << " pcr_rate_samples="
                   << pcrDerivedBitrateSamples.load(std::memory_order_relaxed)
                   << " timeline_shift_ms="
@@ -2231,12 +2339,14 @@ private:
 
     uint64_t estimatedInputBitrate = 0;
     uint64_t pcrDerivedInputBitrate = 0;
+    uint64_t networkLongTermArrivalBitrate = 0;
     uint64_t hlsTimestampDerivedInputBitrate = 0;
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
+    std::deque<NetworkArrivalRatePoint> networkArrivalRateWindow;
     uint64_t hlsPcrBytesSinceSample = 0;
     uint64_t hlsLastPcrTicks = 0;
     uint16_t hlsPcrSamplePid = 0x1FFF;
@@ -2261,6 +2371,7 @@ private:
     std::atomic<uint64_t> inputBytesReceived{0};
     std::atomic<uint64_t> inputBitrateEstimate{0};
     std::atomic<uint64_t> pcrDerivedBitrateSamples{0};
+    std::atomic<uint64_t> networkArrivalBitrateSamples{0};
     std::atomic<uint64_t> hlsTimestampBitrateSamples{0};
     std::atomic<uint64_t> hlsTimestampRateResets{0};
     std::atomic<uint64_t> realPaceBitrate{0};
