@@ -180,6 +180,17 @@ backup-files/                     загруженные файлы замены
 
 ## Docker
 
+Для обычного UDP-выхода программа накапливает 1500 мс данных и начинает передачу
+с ближайшего независимо декодируемого видеокадра. Если конкретному приёмнику нужен
+прежний пятисекундный стартовый запас, задайте переменную окружения:
+
+```bash
+TVS_UDP_STARTUP_BUFFER_MS=5000
+```
+
+Допустимый диапазон: от `250` до `30000` мс. Переменную следует передать процессу
+программы или контейнеру через `docker run -e TVS_UDP_STARTUP_BUFFER_MS=5000 ...`.
+
 ### Сборка образа
 
 ```bash
@@ -194,17 +205,31 @@ docker build --pull --no-cache -t tvstreammersat5:202.8 .
 
 ### Фоновый запуск
 
-Подготовьте `tvstreammersat5-config.json`, затем запустите именованный контейнер:
+Подготовьте `tvstreammersat5-config.json` и укажите его реальный абсолютный путь.
+Путь `/opt/tvstreammersat5/tvstreammersat5-config.json` ниже является только
+примером: если файла там нет, контейнер создан не будет.
 
 ```bash
+cd /путь/к/Tvstreamer_sat
+
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json
+test -f "$CONFIG_FILE" || { echo "Не найден конфигурационный файл: $CONFIG_FILE"; exit 1; }
+
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
 IMAGE_NAME=tvstreammersat5:202.8 \
-CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+CONFIG_FILE="$CONFIG_FILE" \
 ./scripts/run_container.sh
+
+docker ps --filter name=tvstreammersat5
+docker logs --tail 100 tvstreammersat5
 ```
 
-В фоновом режиме скрипт задаёт политику `unless-stopped`: контейнер автоматически запускается после перезагрузки Docker или сервера. Скрипт использует host networking, подключает каталог конфигурации и автоматически передаёт найденные `/dev/dvb` устройства в контейнер.
+Команда должна вывести идентификатор нового контейнера. В фоновом режиме скрипт
+задаёт политику `unless-stopped`: контейнер автоматически запускается после
+перезагрузки Docker или сервера. Скрипт использует host networking, подключает
+каталог конфигурации и автоматически передаёт найденные `/dev/dvb` устройства
+в контейнер.
 
 Интерактивный временный запуск остаётся доступен без `DETACH=1`:
 
@@ -215,6 +240,10 @@ CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
 ```
 
 ### Управление контейнером
+
+`docker restart` перезапускает уже существующий контейнер с тем же образом.
+После пересборки образа эту команду использовать недостаточно: контейнер нужно
+удалить и создать заново по инструкции следующего раздела.
 
 ```bash
 # Состояние контейнера
@@ -237,29 +266,50 @@ docker inspect tvstreammersat5
 
 ### Обновление и пересборка проекта
 
-Выполняйте команды из корня репозитория:
+Выполняйте весь блок из корня репозитория. Сначала задайте реальный путь к
+существующему конфигурационному файлу. Команда `docker rm -f ... || true`
+работает как при наличии старого контейнера, так и при его отсутствии.
 
 ```bash
+cd /путь/к/Tvstreamer_sat
+
+CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json
+test -f "$CONFIG_FILE" || { echo "Не найден конфигурационный файл: $CONFIG_FILE"; exit 1; }
+
 git pull origin main
 docker build --pull -t tvstreammersat5:202.8 .
-docker stop tvstreammersat5
-docker rm tvstreammersat5
+docker rm -f tvstreammersat5 2>/dev/null || true
 
 CONTAINER_NAME=tvstreammersat5 \
 DETACH=1 \
 IMAGE_NAME=tvstreammersat5:202.8 \
-CONFIG_FILE=/opt/tvstreammersat5/tvstreammersat5-config.json \
+CONFIG_FILE="$CONFIG_FILE" \
 ./scripts/run_container.sh
+
+# Контейнер должен иметь состояние Up
+docker ps --filter name=tvstreammersat5 \
+  --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+
+# Проверка запуска программы
+docker logs --tail 100 tvstreammersat5
+curl --fail http://127.0.0.1:9000/health
 ```
 
-Конфигурация, ключ UI, список абонентов и файлы замены сохраняются на хосте в каталоге рядом с `CONFIG_FILE`, поэтому удаление и повторное создание контейнера их не удаляет.
+Если `./scripts/run_container.sh` завершился ошибкой, новый контейнер не появится.
+В этом случае сообщение непосредственно перед ошибкой укажет причину, например
+отсутствующий конфигурационный файл, занятое имя контейнера или недоступный образ.
+
+Конфигурация, ключ UI, список абонентов и файлы замены сохраняются на хосте в
+каталоге рядом с `CONFIG_FILE`, поэтому удаление и повторное создание контейнера
+их не удаляет.
 
 Проверка после пересборки:
 
 ```bash
+docker ps -a --filter name=tvstreammersat5
 docker ps --filter name=tvstreammersat5
 docker logs --tail 100 tvstreammersat5
-curl http://127.0.0.1:9000/health
+curl --fail http://127.0.0.1:9000/health
 ```
 
 ## Проверка и диагностика

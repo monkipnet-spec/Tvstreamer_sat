@@ -37,16 +37,19 @@ namespace {
 constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kTsPacketsPerDatagram = 7;
 constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
-// 8 MiB is still >12 s at 5 Mbit/s and comfortably covers the required
-// 5 s startup reservoir, while bounding worst-case memory for 20-30 outputs.
+// 8 MiB is still >12 s at 5 Mbit/s and comfortably covers the configurable
+// startup reservoir, while bounding worst-case memory for 20-30 outputs.
 constexpr std::size_t kMaxBufferedBytes = 8 * 1024 * 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
-constexpr uint64_t kStartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kStartupPcrGraceNanoseconds = 2000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kDefaultStartupReservoirMilliseconds = 1500ULL;
+constexpr uint64_t kMinimumStartupReservoirMilliseconds = 250ULL;
+constexpr uint64_t kMaximumStartupReservoirMilliseconds = 30000ULL;
+constexpr uint64_t kStartupPcrGraceNanoseconds = 750ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kStartupMinimumPcrSamples = 1;
 constexpr uint64_t kCaCleanStartDualMediaGraceNanoseconds = 1500ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kCaCleanStartRandomAccessWaitNanoseconds = 5000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kClearStartNoMediaGraceNanoseconds = 1500ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kAdaptiveLowWatermarkNanoseconds = 250ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kLateResetIntervals = 4ULL;
 constexpr uint64_t kPcrClockHz = 27000000ULL;
@@ -71,6 +74,29 @@ bool tsDiagnosticsEnabled() {
         return value && *value && std::strcmp(value, "0") != 0;
     }();
     return enabled;
+}
+
+uint64_t startupReservoirNanoseconds() {
+    static const uint64_t duration = [] {
+        uint64_t milliseconds = kDefaultStartupReservoirMilliseconds;
+        const char* value = std::getenv("TVS_UDP_STARTUP_BUFFER_MS");
+        if (value && *value) {
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(value, &end, 10);
+            if (errno == 0 && end != value && *end == '\0') {
+                milliseconds = std::clamp<uint64_t>(
+                    parsed,
+                    kMinimumStartupReservoirMilliseconds,
+                    kMaximumStartupReservoirMilliseconds);
+            } else {
+                std::cerr << "UDP startup: invalid TVS_UDP_STARTUP_BUFFER_MS='"
+                          << value << "', using " << milliseconds << " ms" << std::endl;
+            }
+        }
+        return milliseconds * 1000ULL * 1000ULL;
+    }();
+    return duration;
 }
 
 UdpShapingMode udpShapingMode(const StreamConfig& cfg) {
@@ -602,8 +628,10 @@ public:
         : networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
-          caCleanStartEnabled(!cfg.conditionalAccessClient.empty()),
+          caCleanStartEnabled(true),
+          conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
+          startupReservoirDurationNanoseconds(startupReservoirNanoseconds()),
           mode(udpShapingMode(cfg)), configuredTargetBitrate(cfg.targetBitrate),
           // v202.5: normalize the outgoing continuity domain for every Stable UDP
           // stream, including direct MPEG-TS HLS. HLS segmenters commonly restart
@@ -740,6 +768,9 @@ public:
         if (caCleanStartEnabled && !caCleanStartReleased) {
             const ClearPesScanResult scan = scanClearPesStarts(map.data, map.size);
             const uint64_t nowNs = monotonicNanoseconds();
+            if (caCleanStartFirstBufferNanoseconds == 0) {
+                caCleanStartFirstBufferNanoseconds = nowNs;
+            }
             const bool audioBefore = caCleanStartAudioSeen;
             const bool videoBefore = caCleanStartVideoSeen;
 
@@ -815,6 +846,18 @@ public:
                 } else {
                     directReleaseOffset = scan.firstMediaOffset;
                 }
+            } else if (!conditionalAccessInput &&
+                       !caCleanStartAudioSeen && !caCleanStartVideoSeen &&
+                       caCleanStartFirstBufferNanoseconds != 0 &&
+                       nowNs >= caCleanStartFirstBufferNanoseconds +
+                           kClearStartNoMediaGraceNanoseconds) {
+                // Audio-only, private/non-standard PES and data services must not
+                // be held forever by the A/V startup detector. Prefer a PAT when
+                // this chunk contains one, otherwise release the current TS data.
+                directReleaseOffset = findPatOffset(map.data, map.size, 0);
+                if (directReleaseOffset == std::numeric_limits<std::size_t>::max()) {
+                    directReleaseOffset = 0;
+                }
             }
 
             if (randomAccessRelease || (randomAccessFallback && !caCleanStartCandidate.empty())) {
@@ -832,7 +875,7 @@ public:
 
             caCleanStartReleased = true;
             cleanStartRelease = true;
-            std::cerr << "UDP CA keyframe synchronized clean-start released: first_clear_pes_pid="
+            std::cerr << "UDP keyframe synchronized clean-start released: first_clear_pes_pid="
                       << caCleanStartFirstPid
                       << " audio_pid=" << caCleanStartAudioPid
                       << " video_pid=" << caCleanStartVideoPid
@@ -1026,7 +1069,7 @@ private:
             }
 
             const uint64_t now = monotonicNanoseconds();
-            const uint64_t startAt = firstArrival + kStartupReservoirNanoseconds;
+            const uint64_t startAt = firstArrival + startupReservoirDurationNanoseconds;
             if (now < startAt) {
                 sleepUntilMonotonic(std::min<uint64_t>(
                     startAt, now + 20ULL * 1000ULL * 1000ULL));
@@ -1035,12 +1078,9 @@ private:
 
             moveAvailableChunks();
 
-            // The 5-second startup reservoir is intentional and required by
-            // WISI equipment.  The old code additionally required five PCR
-            // packets before it would send the first UDP datagram.  That could
-            // deadlock forever when a mux produced PCR less frequently (or a
-            // test source had not produced five PCR samples yet).  One PCR is
-            // sufficient to lock the periodic 20 ms output PCR generator.
+            // One PCR is sufficient to lock the periodic 20 ms output PCR
+            // generator. A bounded grace keeps malformed/no-PCR streams from
+            // blocking startup forever.
             std::size_t startupPcrPackets = 0;
             for (const auto& packet : realPackets) {
                 if (packet.hasPcr &&
@@ -1083,13 +1123,18 @@ private:
                 realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
                 updateTransportBitrate();
 
+                const uint64_t startupMilliseconds =
+                    startupReservoirDurationNanoseconds / 1000000ULL;
                 if (havePcrLock) {
-                    std::cerr << "UDP WISI startup: 5s reservoir ready, PCR lock acquired"
+                    std::cerr << "UDP startup: " << startupMilliseconds
+                              << " ms reservoir ready, PCR lock acquired"
                               << " samples=" << startupPcrPackets
                               << " buffered=" << startupBytes << "B" << std::endl;
                 } else {
-                    std::cerr << "UDP WISI startup WARNING: 5s reservoir ready but no PCR"
-                              << " after additional 2s grace; starting TS to avoid deadlock"
+                    std::cerr << "UDP startup WARNING: " << startupMilliseconds
+                              << " ms reservoir ready but no PCR after additional "
+                              << (kStartupPcrGraceNanoseconds / 1000000ULL)
+                              << " ms grace; starting TS to avoid deadlock"
                               << " buffered=" << startupBytes << "B" << std::endl;
                 }
                 return true;
@@ -2018,7 +2063,9 @@ private:
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
+    const bool conditionalAccessInput = false;
     const bool segmentedHlsInput = false;
+    const uint64_t startupReservoirDurationNanoseconds = 0;
     bool hlsExactPacingAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
@@ -2028,6 +2075,7 @@ private:
     uint16_t caCleanStartAudioPid = 0x1FFF;
     uint16_t caCleanStartVideoPid = 0x1FFF;
     uint64_t caCleanStartFirstMediaNanoseconds = 0;
+    uint64_t caCleanStartFirstBufferNanoseconds = 0;
     uint64_t caCleanStartReadyNanoseconds = 0;
     uint64_t caCleanStartDroppedBytes = 0;
     std::size_t caCleanStartReleaseAnchorOffset = 0;
@@ -2204,8 +2252,11 @@ GstElement* createSink(
               << shapingModeName(mode)
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
               << " vbr_rate=auto"
-              << " packetization=7x188 startup_reservoir_ms=5000"
-              << " startup_pcr_min=1 startup_pcr_grace_ms=2000"
+              << " packetization=7x188 startup_reservoir_ms="
+              << (startupReservoirNanoseconds() / 1000000ULL)
+              << " startup_pcr_min=" << kStartupMinimumPcrSamples
+              << " startup_pcr_grace_ms="
+              << (kStartupPcrGraceNanoseconds / 1000000ULL)
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
               << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
@@ -2213,7 +2264,9 @@ GstElement* createSink(
               << " pcr_restamp=continuous-transport-media"
               << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
-              << " ca_clean_start=" << (!config.conditionalAccessClient.empty() ? "post-dual-media-video-random-access" : "off")
+              << " clean_start=post-dual-media-video-random-access"
+              << " conditional_access="
+              << (!config.conditionalAccessClient.empty() ? "on" : "off")
               << std::endl;
     return sink;
 }
