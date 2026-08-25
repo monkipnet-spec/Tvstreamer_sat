@@ -167,6 +167,17 @@ bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
+// 202.29: remapped SRT in UDP-CBR already has a fresh PCR timeline from
+// mpegtsmux. Replacing that PCR with a second sender clock costs one transport
+// slot every 20 ms and leaves less room for the remuxed payload. Preserve the
+// mux PCR only for this exact case; all other TVStreamer5-compatible IP modes
+// keep their proven 202.28 behaviour.
+bool useSrtRemapCbrSourcePcr(const StreamConfig& cfg) {
+    return tvs::protocols::inputs::isSrtInput(cfg) &&
+           cfg.remapEnabled &&
+           udpShapingMode(cfg) == UdpShapingMode::Cbr;
+}
+
 bool isMulticastHost(const std::string& host) {
     static const std::regex pattern(R"(^((22[4-9])|(23[0-9]))\.)");
     return std::regex_search(host, pattern);
@@ -670,6 +681,7 @@ public:
         : streamId(cfg.id),
           srtInput(tvs::protocols::inputs::isSrtInput(cfg)),
           tvStreamer5IpProfile(useTvStreamer5IpShaperProfile(cfg)),
+          srtRemapCbrSourcePcr(useSrtRemapCbrSourcePcr(cfg)),
           networkBytes(networkBytesCounter),
           preSendCcTrace(cfg.id, "PRE_SEND"),
           diagnosticsEnabled(tsDiagnosticsEnabled()),
@@ -681,9 +693,11 @@ public:
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
           // Non-IP streams keep the proven 202.22 source-PCR behaviour.
           forceSyntheticPcr(
-              useTvStreamer5IpShaperProfile(cfg)
-                  ? true
-                  : forceSyntheticCbrPcr()),
+              useSrtRemapCbrSourcePcr(cfg)
+                  ? false
+                  : (useTvStreamer5IpShaperProfile(cfg)
+                        ? true
+                        : forceSyntheticCbrPcr())),
           startupReservoirDurationNanoseconds(
               useTvStreamer5IpShaperProfile(cfg)
                   ? kTvStreamer5StartupReservoirNanoseconds
@@ -1590,7 +1604,8 @@ private:
         // PCR-only slots, so the whole configured CBR rate is available to
         // useful source packets. Keep the legacy reservation for synthetic-PCR
         // paths such as segmented HLS.
-        if (continuousNetworkMpegTsInput && !forceSyntheticPcr) {
+        if (srtRemapCbrSourcePcr ||
+            (continuousNetworkMpegTsInput && !forceSyntheticPcr)) {
             return configuredTargetBitrate;
         }
         if (configuredTargetBitrate <= 100000ULL) {
@@ -1600,6 +1615,7 @@ private:
     }
 
     bool sourcePcrPassthrough() const {
+        if (srtRemapCbrSourcePcr) return true;
         if (tvStreamer5IpProfile) return false;
         return mode == UdpShapingMode::Vbr ||
                (!segmentedHlsInput && !forceSyntheticPcr);
@@ -2282,6 +2298,7 @@ private:
     std::string outputEndpoint;
     const bool srtInput = false;
     const bool tvStreamer5IpProfile = false;
+    const bool srtRemapCbrSourcePcr = false;
     std::atomic<uint64_t>* networkBytes = nullptr;
     TsCcStageTrace preSendCcTrace;
     const bool diagnosticsEnabled = false;
@@ -2481,21 +2498,32 @@ GstElement* createSink(
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
     const bool tv5IpProfile = useTvStreamer5IpShaperProfile(config);
-    const bool syntheticPcr = tv5IpProfile ||
-        (mode == UdpShapingMode::Cbr &&
-         (isSegmentedHlsInput(config) ||
-          tvs::protocols::inputs::isSrtInput(config) ||
-          forceSyntheticCbrPcr()));
+    const bool srtRemapCbrSourcePcr = useSrtRemapCbrSourcePcr(config);
+    const bool syntheticPcr = !srtRemapCbrSourcePcr &&
+        (tv5IpProfile ||
+         (mode == UdpShapingMode::Cbr &&
+          (isSegmentedHlsInput(config) ||
+           tvs::protocols::inputs::isSrtInput(config) ||
+           forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.28: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.29: source="
                   << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"
                   << " timing=reservoir-rate-controller"
-                  << " pcr_mode=periodic-pcr-only-20ms"
-                  << " source_pcr=stripped-after-lock"
+                  << " pcr_mode="
+                  << (srtRemapCbrSourcePcr ? "mpegtsmux-source-pcr" : "periodic-pcr-only-20ms")
+                  << " source_pcr="
+                  << (srtRemapCbrSourcePcr ? "preserved" : "stripped-after-lock")
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
+                  << std::endl;
+    }
+    if (srtRemapCbrSourcePcr) {
+        std::cerr << "SRT remap CBR timing 202.29: source_pcr=mpegtsmux-passthrough"
+                  << " synthetic_pcr=off periodic_pcr_slots=off"
+                  << " useful_rate_ceiling=full-target"
+                  << " scope=srt+remap+cbr-only"
                   << std::endl;
     }
     std::cerr << "Unified UDP reservoir TS shaper: mode="
