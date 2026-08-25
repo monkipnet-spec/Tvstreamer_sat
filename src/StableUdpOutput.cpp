@@ -1,6 +1,7 @@
 #include "StableUdpOutput.h"
 #include "TsCcStageTrace.h"
 #include "protocols/inputs/GstSrtInputProtocol.h"
+#include "protocols/inputs/GstHttpInputProtocol.h"
 
 #include <gst/app/gstappsink.h>
 
@@ -659,6 +660,14 @@ public:
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           continuousNetworkMpegTsInput(isContinuousNetworkMpegTsInput(cfg)),
+          // HTTP is timestamped from PCR by NetworkTsInput 202.24. Remuxed
+          // network SPTS also receives media-time timestamps from mpegtsmux.
+          // Use those timestamps as the useful-data clock instead of TCP/SRT
+          // delivery rate whenever available.
+          networkMediaTimestampInput(
+              !isSegmentedHlsInput(cfg) &&
+              (tvs::protocols::inputs::isHttpInput(cfg) ||
+               (isContinuousNetworkMpegTsInput(cfg) && cfg.remapEnabled))),
           // 202.22: continuous SRT/HTTP MPEG-TS keeps the broadcaster PCR in
           // both CBR and VBR.  Replacing PCR while leaving PTS/DTS untouched
           // creates a second clock domain.  Segmented HLS remains on its proven
@@ -944,6 +953,7 @@ public:
 
         chunk.arrivalNanoseconds = monotonicNanoseconds();
         inputBytesReceived.fetch_add(chunk.bytes.size(), std::memory_order_relaxed);
+        observeNetworkMediaTimestampRate(chunk);
 
         std::unique_lock<std::mutex> lock(queueMutex);
         const bool backpressured =
@@ -1368,6 +1378,63 @@ private:
         }
     }
 
+    void observeNetworkMediaTimestampRate(const TimedChunk& chunk) {
+        if (!networkMediaTimestampInput || !chunk.timestampValid || chunk.bytes.empty()) return;
+
+        networkTimestampBytesSeen += chunk.bytes.size();
+        const uint64_t ts = chunk.mediaTimestampNanoseconds;
+
+        if (!networkTimestampRateWindow.empty()) {
+            const uint64_t previous =
+                networkTimestampRateWindow.back().mediaTimestampNanoseconds;
+            if (ts + kTimestampBackwardToleranceNanoseconds < previous) {
+                networkTimestampRateWindow.clear();
+                networkTimestampDerivedInputBitrate = 0;
+                ++networkTimestampRateResets;
+            } else if (ts <= previous) {
+                networkTimestampRateWindow.back().cumulativeBytes =
+                    networkTimestampBytesSeen;
+                return;
+            }
+        }
+
+        networkTimestampRateWindow.push_back({ts, networkTimestampBytesSeen});
+        constexpr uint64_t kWindowNs = 8ULL * 1000ULL * 1000ULL * 1000ULL;
+        constexpr uint64_t kMinimumNs = 3ULL * 1000ULL * 1000ULL * 1000ULL;
+        while (networkTimestampRateWindow.size() > 2 &&
+               ts > networkTimestampRateWindow.front().mediaTimestampNanoseconds &&
+               ts - networkTimestampRateWindow.front().mediaTimestampNanoseconds > kWindowNs) {
+            networkTimestampRateWindow.pop_front();
+        }
+
+        if (networkTimestampRateWindow.size() < 2) return;
+        const auto& first = networkTimestampRateWindow.front();
+        const auto& last = networkTimestampRateWindow.back();
+        if (last.mediaTimestampNanoseconds <= first.mediaTimestampNanoseconds ||
+            last.cumulativeBytes <= first.cumulativeBytes) return;
+
+        const uint64_t deltaNs =
+            last.mediaTimestampNanoseconds - first.mediaTimestampNanoseconds;
+        if (deltaNs < kMinimumNs) return;
+        const uint64_t deltaBytes = last.cumulativeBytes - first.cumulativeBytes;
+        const uint64_t sampleBitrate = multiplyDivide(
+            deltaBytes * 8ULL, 1000000000ULL, deltaNs);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstLock = networkTimestampDerivedInputBitrate == 0;
+        networkTimestampDerivedInputBitrate = firstLock
+            ? sampleBitrate
+            : (networkTimestampDerivedInputBitrate * 3ULL + sampleBitrate) / 4ULL;
+        ++networkTimestampBitrateSamples;
+
+        if (firstLock) {
+            std::cerr << "Network MPEG-TS media clock 202.24: source_rate=media_timestamp_8s"
+                      << " bitrate=" << networkTimestampDerivedInputBitrate
+                      << " delivery_rate=fallback-only PCR_density=diagnostic_only"
+                      << std::endl;
+        }
+    }
+
     void observeNetworkArrivalRate(uint64_t nowNanoseconds, uint64_t cumulativeBytes) {
         if (!continuousNetworkMpegTsInput || nowNanoseconds == 0) return;
 
@@ -1616,9 +1683,16 @@ private:
                 // HLS startup fallback only until enough timestamp history exists.
                 estimatedInputBitrate = pcrDerivedInputBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (networkMediaTimestampInput &&
+                       networkTimestampDerivedInputBitrate > 0) {
+                // 202.24 HTTP and remuxed network SPTS: post-parser/mux media
+                // timestamps describe playout time. TCP/SRT delivery bursts do not.
+                estimatedInputBitrate = networkTimestampDerivedInputBitrate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0) {
-                // 202.22 SRT/HTTP: long-term arrival rate drives useful-packet
-                // pacing. PCR byte-density remains diagnostic only.
+                // Direct SRT remains on the proven 202.22 long-term arrival path.
+                // For HTTP/remux this is only a startup fallback until media-time
+                // timestamp lock is available.
                 estimatedInputBitrate = networkLongTermArrivalBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (instantBitrate > 0) {
@@ -1654,12 +1728,17 @@ private:
 
         const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
+        const bool networkMediaTimestampLocked =
+            networkMediaTimestampInput && networkTimestampDerivedInputBitrate > 0;
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
         const uint64_t playoutSourceRate = segmentedHlsInput
             ? hlsSourceRate
-            : networkLongTermArrivalBitrate;
-        if ((segmentedHlsInput || networkArrivalLocked) && playoutSourceRate > 0) {
+            : (networkMediaTimestampLocked
+                ? networkTimestampDerivedInputBitrate
+                : networkLongTermArrivalBitrate);
+        if ((segmentedHlsInput || networkMediaTimestampLocked || networkArrivalLocked) &&
+            playoutSourceRate > 0) {
             // Do not chase HTTP/SRT delivery bursts or every HLS GOP estimate.
             // Lock a long-lived media-clock pace and let a slow reservoir PLL
             // correct only long-term drift. This keeps video PES packets from
@@ -1765,7 +1844,9 @@ private:
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
                                   ? "HLS UDP pacing: mode=slow-playout-pll"
-                                  : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
+                                  : (networkMediaTimestampLocked
+                                        ? "Network MPEG-TS UDP pacing 202.24: mode=media-time-playout-pll"
+                                        : "Network MPEG-TS UDP pacing 202.24: mode=arrival-playout-pll"))
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
@@ -2205,6 +2286,12 @@ private:
                   << (continuousNetworkMpegTsInput ? networkLongTermArrivalBitrate : 0)
                   << " network_arrival_samples="
                   << networkArrivalBitrateSamples.load(std::memory_order_relaxed)
+                  << " network_media_rate="
+                  << (networkMediaTimestampInput ? networkTimestampDerivedInputBitrate : 0)
+                  << " network_media_samples="
+                  << networkTimestampBitrateSamples.load(std::memory_order_relaxed)
+                  << " network_media_resets="
+                  << networkTimestampRateResets.load(std::memory_order_relaxed)
                   << " network_arrival_pll_base="
                   << (continuousNetworkMpegTsInput ? hlsPllBaseBitrate : 0)
                   << " network_arrival_pll_correction="
@@ -2244,6 +2331,7 @@ private:
     const bool conditionalAccessInput = false;
     const bool segmentedHlsInput = false;
     const bool continuousNetworkMpegTsInput = false;
+    const bool networkMediaTimestampInput = false;
     const bool forceSyntheticPcr = false;
     const uint64_t startupReservoirDurationNanoseconds = 0;
     bool hlsExactPacingAnnounced = false;
@@ -2306,12 +2394,15 @@ private:
     uint64_t estimatedInputBitrate = 0;
     uint64_t pcrDerivedInputBitrate = 0;
     uint64_t networkLongTermArrivalBitrate = 0;
+    uint64_t networkTimestampDerivedInputBitrate = 0;
+    uint64_t networkTimestampBytesSeen = 0;
     uint64_t hlsTimestampDerivedInputBitrate = 0;
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
+    std::deque<HlsTimestampRatePoint> networkTimestampRateWindow;
     std::deque<NetworkArrivalRatePoint> networkArrivalRateWindow;
     uint64_t hlsPcrBytesSinceSample = 0;
     uint64_t hlsLastPcrTicks = 0;
@@ -2338,6 +2429,8 @@ private:
     std::atomic<uint64_t> inputBitrateEstimate{0};
     std::atomic<uint64_t> pcrDerivedBitrateSamples{0};
     std::atomic<uint64_t> networkArrivalBitrateSamples{0};
+    std::atomic<uint64_t> networkTimestampBitrateSamples{0};
+    std::atomic<uint64_t> networkTimestampRateResets{0};
     std::atomic<uint64_t> hlsTimestampBitrateSamples{0};
     std::atomic<uint64_t> hlsTimestampRateResets{0};
     std::atomic<uint64_t> realPaceBitrate{0};

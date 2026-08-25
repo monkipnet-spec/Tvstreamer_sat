@@ -227,10 +227,6 @@ struct DvbSingleProgramPsiContext {
     uint16_t inputAudioPid = 0;
     bool remapPmtRewritten = false;
     bool remapAnnounced = false;
-    // Generic network SPTS remap can auto-select the only/first PAT program when
-    // inputServiceId=0. DVB always provides an explicit serviceId, so this is
-    // opt-in and cannot change the satellite path.
-    bool autoSelectFirstService = false;
     // When the physical DVB frontend is shared, every service sees the full
     // transponder. Compact the buffer to the PID set discovered by the channel
     // scan instead of remuxing with tsdemux/mpegtsmux. This preserves the
@@ -1238,11 +1234,6 @@ void parsePatForSelectedPmt(const uint8_t* section, size_t total, DvbSingleProgr
     for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
         const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
         const uint16_t mappedPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
-        if (program != 0 && ctx->serviceId == 0 && ctx->autoSelectFirstService) {
-            ctx->serviceId = program;
-            std::cerr << "Network packet remap: auto-selected input SID="
-                      << ctx->serviceId << " from PAT" << std::endl;
-        }
         if (program == ctx->serviceId && mappedPid > 0 && mappedPid < 0x1FFF) {
             if (ctx->pmtPid != mappedPid) {
                 ctx->pmtPid = mappedPid;
@@ -1489,8 +1480,7 @@ void rewriteDvbRemapPmt(uint8_t* packet, DvbSingleProgramPsiContext* ctx) {
 
     if (!ctx->remapAnnounced) {
         const bool pidRemap = ctx->requestedVideoPid && ctx->requestedAudioPid;
-        std::cerr << (ctx->autoSelectFirstService ? "Network packet TS remap: SID=" : "DVB TS remap: SID=")
-                  << ctx->serviceId << "->" << outputSid
+        std::cerr << "DVB TS remap: SID=" << ctx->serviceId << "->" << outputSid
                   << " mode=" << (pidRemap ? "packet-av-pid-rewrite-no-demux-no-remux"
                                              : "packet-sid-only-no-demux-no-remux");
         if (pidRemap) {
@@ -1558,8 +1548,7 @@ void normalizeDvbRemapContinuity(uint8_t* packet, DvbSingleProgramPsiContext* ct
     packet[3] = static_cast<uint8_t>((packet[3] & 0xF0) | (outputCc & 0x0F));
 
     if (!ctx->remapContinuityAnnounced) {
-        std::cerr << (ctx->autoSelectFirstService ? "Network packet remap continuity: SID=" : "DVB remap continuity: SID=")
-                  << ctx->serviceId
+        std::cerr << "DVB remap continuity: SID=" << ctx->serviceId
                   << " output_pid_cc=normalized payload-aware adaptation-only=no-increment"
                   << std::endl;
         ctx->remapContinuityAnnounced = true;
@@ -1679,8 +1668,7 @@ void suppressPatPacketUntilPmtKnown(uint8_t* packet) {
 
 GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
     auto* ctx = static_cast<DvbSingleProgramPsiContext*>(userData);
-    if (!ctx || (ctx->serviceId == 0 && !ctx->autoSelectFirstService) ||
-        !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+    if (!ctx || ctx->serviceId == 0 || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
         return GST_PAD_PROBE_OK;
     }
 
@@ -1750,8 +1738,7 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
             if (ctx->pmtPid > 0 && ctx->pmtPid < 0x1FFF) {
                 writeSingleProgramPat(packet, *ctx);
                 if (!ctx->announced) {
-                    std::cerr << (ctx->autoSelectFirstService ? "Network packet PSI remap: SID=" : "DVB SPTS PSI filter: SID=")
-                              << ctx->serviceId
+                    std::cerr << "DVB SPTS PSI filter: SID=" << ctx->serviceId
                               << " PMT_PID=" << ctx->pmtPid
                               << " PAT=single-program SDT=single-service media=passthrough"
                               << " pid_filter=" << (ctx->filterPids ? "service" : "off")
@@ -7057,17 +7044,9 @@ bool StreamManager::buildOutputBranch(
     // Explicit PID/SID remap still takes the normal remux path below.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
-    const bool httpTransportTs = state && isDirectHttpMpegTsConfig(state->runtimeConfig) &&
-        state->runtimeConfig.inputServiceId == 0;
-    const bool networkPacketRemap = usesStableUdpShaper(outputConfig) &&
-        outputConfig.remapEnabled && outputConfig.serviceId > 0 &&
-        outputConfig.videoPid > 0 && outputConfig.audioPid > 0 &&
-        (srtTransportTs || httpTransportTs);
-    if ((srtTransportTs || httpTransportTs) && usesStableUdpShaper(outputConfig)) {
-        std::cerr << "Unified UDP direct TS 202.23: source="
-                  << (srtTransportTs ? "SRT" : "HTTP")
+    if (srtTransportTs && usesStableUdpShaper(outputConfig) && !outputConfig.remapEnabled) {
+        std::cerr << "Unified UDP direct TS 202.22: source=SRT"
                   << " input_service_id=0 demux=off remux=off source_pcr=preserved"
-                  << " remap=" << (networkPacketRemap ? "packet-level" : "off")
                   << std::endl;
     }
     // NETUP Stream Processor is less tolerant than VLC of a live TS that begins
@@ -7076,11 +7055,7 @@ bool StreamManager::buildOutputBranch(
     // PID/SID remapping is disabled.  This does not touch UDP/WISI output.
     const bool strictTsNetworkOutput = (type == "http" || type == "srt") && !transcodedInput;
     const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
-    // 202.23: an SRT SPTS with inputServiceId=0 can remap SID/V-PID/A-PID
-    // directly in 188-byte TS packets.  Do not destroy the working source
-    // timeline with tsdemux/parsers/mpegtsmux merely to change identifiers.
-    const bool remapNeedsMux = outputConfig.remapEnabled && !remapAlreadyApplied && !networkPacketRemap;
-    const bool needsRemux = (remapNeedsMux || stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
+    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied) || stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
     if (remapAlreadyApplied && outputConfig.remapEnabled) {
         std::cerr << "DVB remap passthrough: packet-level PID/SID rewrite already applied"
                   << " service_id=" << outputConfig.serviceId
@@ -7131,15 +7106,9 @@ bool StreamManager::buildPassthroughPipeline(
     // reservoir for UDP; all source chains reaching this function expose TS,
     // and DVB/test chains are already packet-aligned upstream.
     const bool directStableUdpTs = usesStableUdpShaper(cfg);
-    const auto sourceProtocol = tvs::stream_protocols::inputKind(state->runtimeConfig);
-    const bool directNetworkPacketRemap = directStableUdpTs && cfg.remapEnabled &&
-        state->runtimeConfig.inputServiceId == 0 &&
-        (sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt ||
-         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Http);
-    GstElement* tsparse = (!directStableUdpTs || directNetworkPacketRemap)
-        ? gst_element_factory_make("tsparse", branchName(
-              directNetworkPacketRemap ? "network_packet_remap_tsparse" : "tsparse", branchIndex).c_str())
-        : nullptr;
+    GstElement* tsparse = directStableUdpTs
+        ? nullptr
+        : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
     GstElement* queue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     // A transcoded HTTP/SRT stream is already a CBR MPEG-TS. Pace it from the
     // embedded PCR timeline with tsparse + clocksync instead of identity/datarate.
@@ -7149,12 +7118,11 @@ bool StreamManager::buildPassthroughPipeline(
         : nullptr;
     GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
 
-    if (((!directStableUdpTs || directNetworkPacketRemap) && !tsparse) ||
-        !queue || !sink || (cbrPacingActive && !pacer)) {
+    if ((!directStableUdpTs && !tsparse) || !queue || !sink || (cbrPacingActive && !pacer)) {
         return false;
     }
 
-    if (((!directStableUdpTs || directNetworkPacketRemap) && !addElementOrFail(pipeline, tsparse)) ||
+    if ((!directStableUdpTs && !addElementOrFail(pipeline, tsparse)) ||
         !addElementOrFail(pipeline, queue) ||
         (pacer && !addElementOrFail(pipeline, pacer))) {
         return false;
@@ -7167,48 +7135,6 @@ bool StreamManager::buildPassthroughPipeline(
         std::cerr << "Network CBR pacing: type=" << outputType(cfg)
                   << " target_bitrate=" << cfg.targetBitrate
                   << " clock=pcr-tsparse+clocksync smoothing_us=100000" << std::endl;
-    }
-
-    if (directNetworkPacketRemap) {
-        if (cfg.serviceId == 0 || cfg.videoPid == 0 || cfg.audioPid == 0) {
-            std::cerr << "Network packet remap requires non-zero output SID, V-PID and A-PID"
-                      << std::endl;
-            return false;
-        }
-        // Packet alignment only: do not ask tsparse to create a new timing
-        // domain.  PCR/PTS/DTS remain byte-for-byte source values.
-        configureTsPacketAlignment(tsparse);
-        setBooleanPropertyIfPresent(tsparse, "set-timestamps", FALSE);
-        setUIntPropertyIfPresent(tsparse, "smoothing-latency", 0U);
-
-        GstPad* remapPad = gst_element_get_static_pad(tsparse, "src");
-        if (!remapPad) {
-            std::cerr << "Network packet remap: failed to get tsparse src pad" << std::endl;
-            return false;
-        }
-        auto* remapContext = new DvbSingleProgramPsiContext();
-        remapContext->serviceId = 0;
-        remapContext->autoSelectFirstService = true;
-        remapContext->serviceName = cfg.serviceName.empty() ? cfg.name : cfg.serviceName;
-        remapContext->serviceProvider = cfg.serviceProvider;
-        remapContext->remapEnabled = true;
-        remapContext->outputServiceId = static_cast<uint16_t>(cfg.serviceId & 0xFFFFU);
-        remapContext->requestedVideoPid = static_cast<uint16_t>(cfg.videoPid & 0x1FFFU);
-        remapContext->requestedAudioPid = static_cast<uint16_t>(cfg.audioPid & 0x1FFFU);
-        remapContext->filterPids = false;
-        gst_pad_add_probe(
-            remapPad, GST_PAD_PROBE_TYPE_BUFFER, dvbSingleProgramPsiProbe, remapContext,
-            [](gpointer data) { delete static_cast<DvbSingleProgramPsiContext*>(data); });
-        gst_object_unref(remapPad);
-        std::cerr << "Network packet remap 202.23: source="
-                  << (sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt ? "SRT" : "HTTP")
-                  << " mode=TS-header+PAT/PMT/SDT"
-                  << " demux=off parsers=off mpegtsmux=off"
-                  << " source_pcr_pts_dts=preserved"
-                  << " output_sid=" << cfg.serviceId
-                  << " video_pid=" << cfg.videoPid
-                  << " audio_pid=" << cfg.audioPid
-                  << std::endl;
     }
 
     const bool finalDvbRemapContinuity = directStableUdpTs &&
@@ -7258,12 +7184,10 @@ bool StreamManager::buildPassthroughPipeline(
         }
         std::cerr << "Stable UDP passthrough: direct MPEG-TS -> WISI reservoir"
                   << " timestamp_tsparse=off smoothing=off"
-                  << " packetization=" << (directNetworkPacketRemap ? "tsparse-aligned-remap" : "preserve-upstream")
+                  << " packetization=preserve-upstream"
                   << " ts_diagnostics=" << (dvbDiagnosticsEnabled() ? "on" : "off")
                   << std::endl;
-        return directNetworkPacketRemap
-            ? gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr)
-            : gst_element_link_many(sourceTail, queue, sink, nullptr);
+        return gst_element_link_many(sourceTail, queue, sink, nullptr);
     }
 
     configureTsPacketAlignment(tsparse);
@@ -7344,6 +7268,27 @@ bool StreamManager::buildRemapPipeline(
         setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(selectedInputServiceId));
     }
 
+    const auto remapInputKind = state
+        ? tvs::stream_protocols::inputKind(state->runtimeConfig)
+        : tvs::stream_protocols::inputKind(cfg);
+    const bool networkStableUdpRemap =
+        usesStableUdpShaper(cfg) && cfg.remapEnabled &&
+        (remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
+         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http);
+    if (networkStableUdpRemap) {
+        // SRT already has its own network jitter reservoir and progressive HTTP
+        // is buffered upstream. The tsdemux default adds another 700 ms smooth
+        // demux latency, which makes live remux stalls much more visible.
+        setIntPropertyIfPresent(demux, "latency", 100);
+        // GStreamer >=1.28: preserve the source media timeline rather than
+        // continuously skew-correcting it before mpegtsmux. Older builds simply
+        // ignore this optional property.
+        setBooleanPropertyIfPresent(demux, "skew-corrections", FALSE);
+        std::cerr << "Network remap 202.24: demux=tsdemux latency_ms=100"
+                  << " skew_corrections=off-if-supported"
+                  << " output_clock=post-mux-media-timestamps" << std::endl;
+    }
+
     if (usesStableUdpShaper(cfg)) {
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
@@ -7368,8 +7313,10 @@ bool StreamManager::buildRemapPipeline(
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
-                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1500 : 0)
-                  << " audio_reservoir_mode=" << (udpCbrOutputEnabled(cfg) ? "startup-only" : "off")
+                  << " audio_reservoir_ms="
+                  << ((udpCbrOutputEnabled(cfg) && !networkStableUdpRemap) ? 1500 : 0)
+                  << " audio_reservoir_mode="
+                  << ((udpCbrOutputEnabled(cfg) && !networkStableUdpRemap) ? "startup-only" : "off")
                   << " audio_pacer=off"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
@@ -7812,10 +7759,15 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
+    const auto remapSourceKind = tvs::stream_protocols::inputKind(ctx->config);
+    const bool networkStableUdpElementaryRemap =
+        remapSourceKind == tvs::stream_protocols::InputProtocolKind::Srt ||
+        remapSourceKind == tvs::stream_protocols::InputProtocolKind::Http;
     const bool stableUdpAudioReservoir =
         isAudio && !ctx->flvMux &&
         usesStableUdpShaper(ctx->config) &&
-        udpCbrOutputEnabled(ctx->config);
+        udpCbrOutputEnabled(ctx->config) &&
+        !networkStableUdpElementaryRemap;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
@@ -7878,13 +7830,18 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
+    const bool stableUdpSrtRemapParser =
+        srtVideoParser && usesStableUdpShaper(ctx->config) && ctx->config.remapEnabled;
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
-        // SRT packet loss can leave a decoder without the parameter sets needed
-        // to resume at the next keyframe. Repeat them with every IDR and force the
-        // parser to process the stream instead of negotiating passthrough.
-        g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
-        if (srtVideoParser) {
-            setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
+        if (stableUdpSrtRemapParser) {
+            // Remap must be identifier-only. Do not manufacture/repeat codec
+            // parameter sets or force parser rewriting on the Stable UDP path.
+            g_object_set(parser, "config-interval", 0, nullptr);
+        } else {
+            g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
+            if (srtVideoParser) {
+                setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
+            }
         }
     }
     gst_element_sync_state_with_parent(queue);
@@ -7969,9 +7926,11 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << (stableUdpAudioReservoir
                       ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=off"
                       : "")
-                  << (srtVideoParser
-                      ? " srt_parameter_sets=every-idr parser_passthrough=off"
-                      : "")
+                  << (stableUdpSrtRemapParser
+                      ? " srt_parameter_sets=preserve parser_rewrite=minimal"
+                      : (srtVideoParser
+                          ? " srt_parameter_sets=every-idr parser_passthrough=off"
+                          : ""))
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {
