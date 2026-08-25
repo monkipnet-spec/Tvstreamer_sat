@@ -2660,6 +2660,80 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
               << "steady_state=source-timestamps audio_clocksync=off" << std::endl;
 }
 
+constexpr GstClockTime kHlsAudioBackwardTimestampTolerance = 250 * GST_MSECOND;
+
+struct HlsAudioGuardContext {
+    std::string streamId;
+    GstClockTime lastTimestamp = GST_CLOCK_TIME_NONE;
+    uint64_t droppedCorrupted = 0;
+    uint64_t droppedBackward = 0;
+};
+
+GstPadProbeReturn hlsAudioGuardProbe(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<HlsAudioGuardContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED)) {
+        ++ctx->droppedCorrupted;
+        std::cerr << "HLS audio guard 202.35: stream=" << ctx->streamId
+                  << " drop=corrupted"
+                  << " corrupted_drops=" << ctx->droppedCorrupted
+                  << " backward_drops=" << ctx->droppedBackward
+                  << std::endl;
+        return GST_PAD_PROBE_DROP;
+    }
+
+    const GstClockTime timestamp = GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer))
+        ? GST_BUFFER_PTS(buffer)
+        : GST_BUFFER_DTS(buffer);
+    if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
+        return GST_PAD_PROBE_OK;
+    }
+
+    // DISCONT/RESYNC is expected at a legitimate HLS timeline transition. Do
+    // not drop that buffer; simply re-anchor the guard to the new timeline.
+    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT) ||
+        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_RESYNC)) {
+        ctx->lastTimestamp = timestamp;
+        return GST_PAD_PROBE_OK;
+    }
+
+    if (GST_CLOCK_TIME_IS_VALID(ctx->lastTimestamp) &&
+        timestamp < ctx->lastTimestamp &&
+        ctx->lastTimestamp - timestamp > kHlsAudioBackwardTimestampTolerance) {
+        const GstClockTime backward = ctx->lastTimestamp - timestamp;
+        ++ctx->droppedBackward;
+
+        // Re-anchor immediately. If this was a genuine segment timeline
+        // change that arrived without DISCONT, only the first suspicious audio
+        // frame is discarded instead of muting an entire segment.
+        ctx->lastTimestamp = timestamp;
+
+        std::cerr << "HLS audio guard 202.35: stream=" << ctx->streamId
+                  << " drop=backward-timestamp"
+                  << " backward_ms=" << (backward / GST_MSECOND)
+                  << " corrupted_drops=" << ctx->droppedCorrupted
+                  << " backward_drops=" << ctx->droppedBackward
+                  << std::endl;
+        return GST_PAD_PROBE_DROP;
+    }
+
+    ctx->lastTimestamp = timestamp;
+    return GST_PAD_PROBE_OK;
+}
+
+void freeHlsAudioGuardContext(gpointer data) {
+    delete static_cast<HlsAudioGuardContext*>(data);
+}
+
 void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
     (void)userData;
     if (!queue || g_object_get_data(G_OBJECT(queue), "tvs-hls-prebuffer-started")) {
@@ -7780,6 +7854,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http;
     const bool tvStreamer5AudioClock =
         stableUdpAudioReservoir && tvStreamer5NetworkRemap;
+    const bool hlsAudioGuard =
+        isAudio && !ctx->flvMux &&
+        remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
@@ -7854,6 +7931,12 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
+    if (hlsAudioGuard) {
+        // HLS segment boundaries occasionally expose bad compressed-audio
+        // side data. Force GstBaseParse to validate/re-frame incoming audio
+        // instead of accepting parser passthrough when caps already look framed.
+        setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
+    }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
             // TVStreamer5 remap: do not force every-IDR parameter-set injection
@@ -7877,6 +7960,28 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     if (audioClockSync) {
         gst_element_sync_state_with_parent(audioClockSync);
+    }
+
+    if (hlsAudioGuard) {
+        GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
+        if (parserSrcPad) {
+            auto* guardContext = new HlsAudioGuardContext;
+            guardContext->streamId = ctx->config.id;
+            gst_pad_add_probe(
+                parserSrcPad,
+                GST_PAD_PROBE_TYPE_BUFFER,
+                hlsAudioGuardProbe,
+                guardContext,
+                freeHlsAudioGuardContext);
+            gst_object_unref(parserSrcPad);
+
+            std::cerr << "HLS audio guard 202.35: stream=" << ctx->config.id
+                      << " parser=" << parserFactory
+                      << " force_parse=on corrupted_drop=on"
+                      << " backward_pts_guard_ms=250"
+                      << " discont_policy=reanchor-not-drop"
+                      << std::endl;
+        }
     }
 
     const bool parserLinked = capsfilter
