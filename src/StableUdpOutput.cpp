@@ -1013,20 +1013,6 @@ private:
     static constexpr uint64_t kTargetReservoirNanoseconds = 2500ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kLowReservoirNanoseconds = 800ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
-    // 202.26 SRT/HTTP smoothing: the TVStreamer5 reservoir controller's hard
-    // 85% low-water throttle is visible as a periodic slowdown. Keep a wide
-    // 1..4 s dead-band and move useful-packet pace only very slowly outside it.
-    static constexpr uint64_t kTv5IpPllUpdateNanoseconds =
-        2ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kTv5IpLowReservoirNanoseconds =
-        1ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kTv5IpHighReservoirNanoseconds =
-        4ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kTv5IpTargetReservoirNanoseconds =
-        2500ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kTv5IpMaximumCorrectionPermille = 10ULL; // +/-1.0%
-    static constexpr uint64_t kTv5IpMaximumStepPermille = 2ULL;       // 0.2% / 2 s
-    static constexpr uint64_t kTv5IpSourceFollowDivisor = 32ULL;
     // v202.7 HLS playout PLL: keep useful TS packet spacing almost fixed.
     // The HLS demuxer may deliver a VBR GOP with a slightly different byte/PTS
     // density every few seconds; following that estimate directly makes video
@@ -1549,12 +1535,6 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
-        // 202.26: SRT/HTTP IP profile may use the full configured CBR transport.
-        // The old hidden 100 kbit/s reserve can itself keep a near-target service
-        // permanently overfilled and force the reservoir controller to oscillate.
-        if (tvStreamer5IpProfile) {
-            return configuredTargetBitrate;
-        }
         if (configuredTargetBitrate <= 100000ULL) {
             return configuredTargetBitrate;
         }
@@ -1644,101 +1624,32 @@ private:
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
+        // 202.27: SRT/HTTP must not change media speed to control reservoir
+        // occupancy. The 202.25 TVStreamer5 leaky-bucket correction (and its
+        // 85% low-water clamp) was visible as periodic video slowdowns. Keep
+        // the useful TS pace tied only to the already-smoothed input bitrate;
+        // the 5 s startup reservoir absorbs delivery jitter, while NULL/PCR-only
+        // packets consume the configured CBR/VBR transport headroom.
         if (tvStreamer5IpProfile) {
-            const uint64_t paceCeiling = maxRealPaceBitrate();
-            if (tv5IpPllBaseBitrate == 0) {
-                const uint64_t startupPace = currentRealPaceBitrate > 0
-                    ? currentRealPaceBitrate : estimate;
-                tv5IpPllBaseBitrate = std::min<uint64_t>(startupPace, paceCeiling);
-                currentRealPaceBitrate = tv5IpPllBaseBitrate;
-                tv5IpPllLastUpdateNanoseconds = nowNanoseconds;
-            }
-
-            const uint64_t lowBytes = std::max<uint64_t>(
-                kUdpPayloadSize * 8ULL,
-                bytesForDuration(tv5IpPllBaseBitrate, kTv5IpLowReservoirNanoseconds));
-            const uint64_t highBytes = std::max<uint64_t>(
-                lowBytes + kUdpPayloadSize * 8ULL,
-                bytesForDuration(tv5IpPllBaseBitrate, kTv5IpHighReservoirNanoseconds));
-            const uint64_t targetBytes = std::max<uint64_t>(
-                kUdpPayloadSize * 32ULL,
-                bytesForDuration(tv5IpPllBaseBitrate, kTv5IpTargetReservoirNanoseconds));
-
-            if (nowNanoseconds >= tv5IpPllLastUpdateNanoseconds &&
-                nowNanoseconds - tv5IpPllLastUpdateNanoseconds >= kTv5IpPllUpdateNanoseconds) {
-                tv5IpPllLastUpdateNanoseconds = nowNanoseconds;
-
-                // Follow real long-term service-rate changes slowly. HTTP/SRT input
-                // callbacks can still be bursty, so never copy a 500-ms estimate
-                // directly into the sender pace.
-                const uint64_t sourceLimited = std::min<uint64_t>(estimate, paceCeiling);
-                tv5IpPllBaseBitrate =
-                    (tv5IpPllBaseBitrate * (kTv5IpSourceFollowDivisor - 1ULL) + sourceLimited) /
-                    kTv5IpSourceFollowDivisor;
-
-                // Wide dead-band: from 1 to 4 seconds no occupancy correction at all.
-                // Outside it, request at most +/-1%, then additionally slew-limit the
-                // actual sender pace to 0.2% per two-second update.
-                int64_t correction = 0;
-                const int64_t maximumCorrection = static_cast<int64_t>(
-                    tv5IpPllBaseBitrate * kTv5IpMaximumCorrectionPermille / 1000ULL);
-                if (bufferNow < lowBytes && lowBytes > 0) {
-                    const uint64_t deficit = std::min<uint64_t>(lowBytes - bufferNow, lowBytes);
-#if defined(__SIZEOF_INT128__)
-                    correction = -static_cast<int64_t>(
-                        (static_cast<__int128>(maximumCorrection) * deficit) / lowBytes);
-#else
-                    correction = -static_cast<int64_t>(
-                        (static_cast<long double>(maximumCorrection) * deficit) /
-                        static_cast<long double>(lowBytes));
-#endif
-                    ++lowWatermarkEvents;
-                } else if (bufferNow > highBytes && highBytes > 0) {
-                    const uint64_t surplus = std::min<uint64_t>(bufferNow - highBytes, highBytes);
-#if defined(__SIZEOF_INT128__)
-                    correction = static_cast<int64_t>(
-                        (static_cast<__int128>(maximumCorrection) * surplus) / highBytes);
-#else
-                    correction = static_cast<int64_t>(
-                        (static_cast<long double>(maximumCorrection) * surplus) /
-                        static_cast<long double>(highBytes));
-#endif
-                }
-
-                int64_t desired = static_cast<int64_t>(tv5IpPllBaseBitrate) + correction;
-                desired = std::clamp<int64_t>(
-                    desired, 0, static_cast<int64_t>(paceCeiling));
-
-                const uint64_t maximumStep = std::max<uint64_t>(1000ULL,
-                    tv5IpPllBaseBitrate * kTv5IpMaximumStepPermille / 1000ULL);
-                const int64_t current = static_cast<int64_t>(currentRealPaceBitrate);
-                const int64_t lower = current > static_cast<int64_t>(maximumStep)
-                    ? current - static_cast<int64_t>(maximumStep) : 0;
-                const int64_t upper = std::min<int64_t>(
-                    static_cast<int64_t>(paceCeiling),
-                    current + static_cast<int64_t>(maximumStep));
-                currentRealPaceBitrate = static_cast<uint64_t>(
-                    std::clamp<int64_t>(desired, lower, upper));
-                tv5IpPllCorrectionBitrate = correction;
-            }
-
+            currentRealPaceBitrate = std::min<uint64_t>(
+                estimate, maxRealPaceBitrate());
             realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
             updateTransportBitrate();
-            targetReservoirBytes.store(targetBytes, std::memory_order_relaxed);
-            const uint64_t bufferMs = tv5IpPllBaseBitrate > 0
-                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, tv5IpPllBaseBitrate)
+            targetReservoirBytes.store(targetBufferBytes, std::memory_order_relaxed);
+            const uint64_t bufferMs = estimate > 0
+                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, estimate)
                 : 0;
             reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
 
-            if (!tv5IpSmoothPllAnnounced) {
-                std::cerr << "TVStreamer5 IP pacing 202.26: mode=smooth-reservoir-pll"
-                          << " base_bitrate=" << tv5IpPllBaseBitrate
+            if (!tv5IpFixedPaceAnnounced) {
+                std::cerr << "TVStreamer5 IP pacing 202.27: mode=ewma-fixed-media-pace"
+                          << " input_estimate=" << estimate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
-                          << " deadband_ms=1000..4000"
-                          << " update_ms=2000 max_correction_pct=1.0 max_step_pct=0.2"
-                          << " cbr_hidden_reserve=off"
+                          << " reservoir_correction=off low_water_throttle=off"
+                          << " cbr_real_headroom_bps=100000"
+                          << " vbr_transport_headroom_bps=" << kVbrTransportHeadroomBitrate
                           << std::endl;
-                tv5IpSmoothPllAnnounced = true;
+                tv5IpFixedPaceAnnounced = true;
             }
             return;
         }
@@ -2238,9 +2149,7 @@ private:
 
         std::cerr << "UDP shaper stats: stream=" << streamId
                   << " output=" << outputEndpoint
-                  << " profile=" << (tvStreamer5IpProfile ? "tvstreamer5-ip-smooth" : "sat5")
-                  << " ip_pll_base=" << (tvStreamer5IpProfile ? tv5IpPllBaseBitrate : 0)
-                  << " ip_pll_correction=" << (tvStreamer5IpProfile ? tv5IpPllCorrectionBitrate : 0)
+                  << " profile=" << (tvStreamer5IpProfile ? "tvstreamer5-ip" : "sat5")
                   << " input="
                   << (srtInput ? "srt"
                                : (segmentedHlsInput ? "hls"
@@ -2340,10 +2249,7 @@ private:
     const bool forceSyntheticPcr = false;
     const uint64_t startupReservoirDurationNanoseconds = 0;
     const std::size_t bufferLimitBytes = kMaxBufferedBytes;
-    bool tv5IpSmoothPllAnnounced = false;
-    uint64_t tv5IpPllBaseBitrate = 0;
-    int64_t tv5IpPllCorrectionBitrate = 0;
-    uint64_t tv5IpPllLastUpdateNanoseconds = 0;
+    bool tv5IpFixedPaceAnnounced = false;
     bool hlsExactPacingAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
@@ -2536,18 +2442,17 @@ GstElement* createSink(
           tvs::protocols::inputs::isSrtInput(config) ||
           forceSyntheticCbrPcr()));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.26: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.27: source="
                   << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
-                  << " profile=tvstreamer5-compatible-smooth"
+                  << " profile=tvstreamer5-compatible-fixed-pace"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"
                   << " timing=reservoir-rate-controller"
                   << " pcr_mode=periodic-pcr-only-20ms"
                   << " source_pcr=stripped-after-lock"
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
-                  << " pace_deadband_ms=1000..4000 pace_update_ms=2000"
-                  << " max_pace_correction_pct=1.0 max_pace_step_pct=0.2"
-                  << " cbr_hidden_reserve=off"
+                  << " reservoir_correction=off low_water_throttle=off"
+                  << " cbr_headroom_bps=100000 vbr_headroom_bps=120000"
                   << std::endl;
     }
     std::cerr << "Unified UDP reservoir TS shaper: mode="
