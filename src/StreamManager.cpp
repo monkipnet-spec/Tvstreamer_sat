@@ -7237,7 +7237,13 @@ bool StreamManager::buildRemapPipeline(
     const std::string networkType = outputType(cfg);
     const bool strictTsNetworkOutput = networkType == "http" || networkType == "srt";
     const bool srtRemapPrePaddedCbr = srtRemapUdpCbrPrePadded(cfg);
-    const bool cbrActive = wallClockNetworkCbrEnabled(cfg) || srtRemapPrePaddedCbr;
+    // 202.32: do NOT add tsparse+clocksync for SRT+remap+UDP-CBR.
+    // mpegtsmux already builds a target-rate transport (PCR + NULL stuffing),
+    // while StableUdpOutput is the single wall-clock pacer at targetBitrate.
+    // Running clocksync here as well creates two independent 4 Mbit/s clocks;
+    // their tiny drift eventually moves the reservoir and shows up as periodic
+    // video slowdowns even though neither clock is individually wrong.
+    const bool cbrActive = wallClockNetworkCbrEnabled(cfg);
     GstElement* cbrTsparse = cbrActive
         ? gst_element_factory_make("tsparse", branchName("cbr_tsparse", branchIndex).c_str())
         : nullptr;
@@ -7269,11 +7275,11 @@ bool StreamManager::buildRemapPipeline(
         configureNetworkCbrClock(pacer);
     }
     if (srtRemapPrePaddedCbr) {
-        std::cerr << "SRT remap CBR mux 202.31: mux_bitrate=" << cfg.targetBitrate
+        std::cerr << "SRT remap CBR mux 202.32: mux_bitrate=" << cfg.targetBitrate
                   << " source_pcr=mpegtsmux"
                   << " null_stuffing=mpegtsmux"
-                  << " mux_pacer=tsparse+clocksync"
-                  << " stable_udp_mode=1to1-prepadded"
+                  << " upstream_wallclock_pacer=off"
+                  << " stable_udp_pacer=single-clock-1to1"
                   << std::endl;
     }
     if (strictTsNetworkOutput) {

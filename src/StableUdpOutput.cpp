@@ -1709,7 +1709,7 @@ private:
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
-        // 202.31: SRT + remap + CBR is already a complete target-rate CBR
+        // 202.32: SRT + remap + CBR is already a complete target-rate CBR
         // transport from mpegtsmux, including NULL stuffing and a matching PCR
         // timeline. Never run the reservoir rate controller on it: changing the
         // useful-packet entitlement while preserving mux PCR is exactly what
@@ -1731,12 +1731,13 @@ private:
                 std::memory_order_relaxed);
 
             if (!srtPrePaddedCbrAnnounced) {
-                std::cerr << "SRT remap CBR sender 202.31: mode=1to1-prepadded"
+                std::cerr << "SRT remap CBR sender 202.32: mode=1to1-prepadded-single-pacer"
                           << " bitrate=" << configuredTargetBitrate
                           << " reservoir_controller=off"
                           << " source_pcr=passthrough"
                           << " source_null=passthrough"
                           << " synthetic_pcr=off"
+                          << " upstream_wallclock_pacer=off"
                           << std::endl;
                 srtPrePaddedCbrAnnounced = true;
             }
@@ -2545,7 +2546,7 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.31: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.32: source="
                   << (isSegmentedHlsInput(config) ? "HLS" : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP"))
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
@@ -2559,9 +2560,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {
-        std::cerr << "SRT remap CBR timing 202.31: source_pcr=mpegtsmux-passthrough"
+        std::cerr << "SRT remap CBR timing 202.32: source_pcr=mpegtsmux-passthrough"
                   << " synthetic_pcr=off periodic_pcr_slots=off"
                   << " useful_rate_ceiling=full-target"
+                  << " wallclock_pacer=stableudp-only"
                   << " scope=srt+remap+cbr-only"
                   << std::endl;
     }
