@@ -255,6 +255,11 @@ struct HlsTimestampRatePoint {
     uint64_t cumulativeBytes = 0;
 };
 
+struct NetworkArrivalRatePoint {
+    uint64_t arrivalNanoseconds = 0;
+    uint64_t cumulativeBytes = 0;
+};
+
 bool parsePcr(const std::array<guint8, kTsPacketSize>& packet,
               uint64_t& pcrTicks,
               bool& discontinuity) {
@@ -673,14 +678,12 @@ public:
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
           continuousNetworkMpegTsInput(
               useTvStreamer5IpShaperProfile(cfg) ? false : isContinuousNetworkMpegTsInput(cfg)),
-          // SRT is remuxed before StableUdpOutput, then its useful packets are
-          // spread across a newly generated CBR transport. Preserve source PCR
-          // for VBR, but generate a continuous output PCR for CBR so receivers
-          // do not see the remux clock arrive at a different packet cadence.
+          // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
+          // Non-IP streams keep the proven 202.22 source-PCR behaviour.
           forceSyntheticPcr(
               useTvStreamer5IpShaperProfile(cfg)
                   ? true
-                  : (forceSyntheticCbrPcr() || tvs::protocols::inputs::isSrtInput(cfg))),
+                  : forceSyntheticCbrPcr()),
           startupReservoirDurationNanoseconds(
               useTvStreamer5IpShaperProfile(cfg)
                   ? kTvStreamer5StartupReservoirNanoseconds
@@ -1021,12 +1024,18 @@ private:
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
     static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
-    // TCP and SRT callback cadence is bursty and must not become the media
-    // clock. Track the source PCR and move the playout pace only very slowly.
-    static constexpr uint64_t kNetworkPcrPllUpdateNanoseconds =
+    // 202.22 continuous SRT/HTTP: delivery callbacks can be bursty, while
+    // short PCR byte-density varies with VBR GOP structure.  Neither is a good
+    // instantaneous playout-rate control signal.  Measure bytes over a long
+    // wall-clock arrival window and only then apply a very slow reservoir PLL.
+    static constexpr uint64_t kNetworkArrivalRateWindowNanoseconds =
+        15ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kNetworkArrivalRateMinimumNanoseconds =
+        5ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kNetworkArrivalPllUpdateNanoseconds =
         2ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kNetworkPcrPllMaximumCorrectionPermille = 10ULL;
-    static constexpr uint64_t kNetworkPcrPllMaximumStepPermille = 1ULL;
+    static constexpr uint64_t kNetworkArrivalPllMaximumCorrectionPermille = 10ULL;
+    static constexpr uint64_t kNetworkArrivalPllMaximumStepPermille = 1ULL;
 
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
@@ -1200,8 +1209,7 @@ private:
                 const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
                 estimatedInputBitrate = segmentedHlsInput && hlsPtsRate > 0
                     ? hlsPtsRate
-                    : ((segmentedHlsInput || continuousNetworkMpegTsInput) &&
-                       pcrDerivedInputBitrate > 0
+                    : (segmentedHlsInput && pcrDerivedInputBitrate > 0
                         ? pcrDerivedInputBitrate
                         : arrivalRate);
                 if (estimatedInputBitrate == 0) {
@@ -1397,6 +1405,49 @@ private:
         }
     }
 
+    void observeNetworkArrivalRate(uint64_t nowNanoseconds, uint64_t cumulativeBytes) {
+        if (!continuousNetworkMpegTsInput || nowNanoseconds == 0) return;
+
+        if (!networkArrivalRateWindow.empty() &&
+            nowNanoseconds <= networkArrivalRateWindow.back().arrivalNanoseconds) {
+            networkArrivalRateWindow.back().cumulativeBytes = cumulativeBytes;
+            return;
+        }
+
+        networkArrivalRateWindow.push_back({nowNanoseconds, cumulativeBytes});
+        while (networkArrivalRateWindow.size() > 2 &&
+               nowNanoseconds > networkArrivalRateWindow.front().arrivalNanoseconds &&
+               nowNanoseconds - networkArrivalRateWindow.front().arrivalNanoseconds >
+                   kNetworkArrivalRateWindowNanoseconds) {
+            networkArrivalRateWindow.pop_front();
+        }
+
+        if (networkArrivalRateWindow.size() < 2) return;
+        const auto& first = networkArrivalRateWindow.front();
+        const auto& last = networkArrivalRateWindow.back();
+        if (last.arrivalNanoseconds <= first.arrivalNanoseconds ||
+            last.cumulativeBytes <= first.cumulativeBytes) return;
+
+        const uint64_t deltaNs = last.arrivalNanoseconds - first.arrivalNanoseconds;
+        if (deltaNs < kNetworkArrivalRateMinimumNanoseconds) return;
+        const uint64_t deltaBytes = last.cumulativeBytes - first.cumulativeBytes;
+        const uint64_t sampleBitrate = multiplyDivide(
+            deltaBytes * 8ULL, 1000000000ULL, deltaNs);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstLock = networkLongTermArrivalBitrate == 0;
+        networkLongTermArrivalBitrate = firstLock
+            ? sampleBitrate
+            : (networkLongTermArrivalBitrate * 3ULL + sampleBitrate) / 4ULL;
+        ++networkArrivalBitrateSamples;
+        if (firstLock) {
+            std::cerr << "Network MPEG-TS rate lock 202.22: source_rate=arrival_15s"
+                      << " bitrate=" << networkLongTermArrivalBitrate
+                      << " PCR_density=diagnostic_only source_PCR=preserved"
+                      << std::endl;
+        }
+    }
+
     void observePcrRate(const TimedTsPacket& packet) {
         // Count transport bytes independently of delivery timing. HLS segments,
         // TCP reads and SRT recovery windows all arrive in bursts; PCR does not.
@@ -1535,6 +1586,13 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
+        // 202.22: SRT/HTTP preserve source PCR and do not need synthetic
+        // PCR-only slots, so the whole configured CBR rate is available to
+        // useful source packets. Keep the legacy reservation for synthetic-PCR
+        // paths such as segmented HLS.
+        if (continuousNetworkMpegTsInput && !forceSyntheticPcr) {
+            return configuredTargetBitrate;
+        }
         if (configuredTargetBitrate <= 100000ULL) {
             return configuredTargetBitrate;
         }
@@ -1580,6 +1638,10 @@ private:
                 ? multiplyDivide(deltaBytes * 8ULL, 1000000000ULL, deltaTime)
                 : 0;
 
+            if (continuousNetworkMpegTsInput) {
+                observeNetworkArrivalRate(nowNanoseconds, bytesNow);
+            }
+
             const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
             if (segmentedHlsInput && hlsPtsRate > 0) {
                 // v202.6: hlsdemux's PTS/DTS running-time is the playout clock.
@@ -1588,10 +1650,14 @@ private:
                 // the service itself is VBR between adjacent PCR packets.
                 estimatedInputBitrate = hlsPtsRate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
-            } else if ((segmentedHlsInput || continuousNetworkMpegTsInput) &&
-                       pcrDerivedInputBitrate > 0) {
-                // Startup/fallback only until enough timestamp history exists.
+            } else if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
+                // HLS startup fallback only until enough timestamp history exists.
                 estimatedInputBitrate = pcrDerivedInputBitrate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0) {
+                // 202.22 SRT/HTTP: long-term arrival rate drives useful-packet
+                // pacing. PCR byte-density remains diagnostic only.
+                estimatedInputBitrate = networkLongTermArrivalBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (instantBitrate > 0) {
                 if (estimatedInputBitrate == 0) {
@@ -1624,44 +1690,14 @@ private:
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
 
-        // 202.27: SRT/HTTP must not change media speed to control reservoir
-        // occupancy. The 202.25 TVStreamer5 leaky-bucket correction (and its
-        // 85% low-water clamp) was visible as periodic video slowdowns. Keep
-        // the useful TS pace tied only to the already-smoothed input bitrate;
-        // the 5 s startup reservoir absorbs delivery jitter, while NULL/PCR-only
-        // packets consume the configured CBR/VBR transport headroom.
-        if (tvStreamer5IpProfile) {
-            currentRealPaceBitrate = std::min<uint64_t>(
-                estimate, maxRealPaceBitrate());
-            realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
-            updateTransportBitrate();
-            targetReservoirBytes.store(targetBufferBytes, std::memory_order_relaxed);
-            const uint64_t bufferMs = estimate > 0
-                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, estimate)
-                : 0;
-            reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
-
-            if (!tv5IpFixedPaceAnnounced) {
-                std::cerr << "TVStreamer5 IP pacing 202.27: mode=ewma-fixed-media-pace"
-                          << " input_estimate=" << estimate
-                          << " real_pace_bitrate=" << currentRealPaceBitrate
-                          << " reservoir_correction=off low_water_throttle=off"
-                          << " cbr_real_headroom_bps=100000"
-                          << " vbr_transport_headroom_bps=" << kVbrTransportHeadroomBitrate
-                          << std::endl;
-                tv5IpFixedPaceAnnounced = true;
-            }
-            return;
-        }
-
         const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
-        const bool networkPcrLocked =
-            mode == UdpShapingMode::Vbr &&
-            continuousNetworkMpegTsInput && pcrDerivedInputBitrate > 0;
-        const uint64_t playoutSourceRate =
-            segmentedHlsInput ? hlsSourceRate : pcrDerivedInputBitrate;
-        if ((segmentedHlsInput || networkPcrLocked) && playoutSourceRate > 0) {
+        const bool networkArrivalLocked =
+            continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
+        const uint64_t playoutSourceRate = segmentedHlsInput
+            ? hlsSourceRate
+            : networkLongTermArrivalBitrate;
+        if ((segmentedHlsInput || networkArrivalLocked) && playoutSourceRate > 0) {
             // Do not chase HTTP/SRT delivery bursts or every HLS GOP estimate.
             // Lock a long-lived media-clock pace and let a slow reservoir PLL
             // correct only long-term drift. This keeps video PES packets from
@@ -1670,16 +1706,18 @@ private:
             const uint64_t pllTargetReservoirNanoseconds = segmentedHlsInput
                 ? kHlsTargetReservoirNanoseconds : kTargetReservoirNanoseconds;
             const uint64_t pllUpdateNanoseconds = segmentedHlsInput
-                ? kHlsPllUpdateNanoseconds : kNetworkPcrPllUpdateNanoseconds;
+                ? kHlsPllUpdateNanoseconds : kNetworkArrivalPllUpdateNanoseconds;
             const uint64_t pllCorrectionPermille = segmentedHlsInput
                 ? kHlsPllMaximumCorrectionPermille
-                : kNetworkPcrPllMaximumCorrectionPermille;
+                : kNetworkArrivalPllMaximumCorrectionPermille;
             const uint64_t pllStepPermille = segmentedHlsInput
-                ? kHlsPllMaximumStepPermille : kNetworkPcrPllMaximumStepPermille;
+                ? kHlsPllMaximumStepPermille : kNetworkArrivalPllMaximumStepPermille;
             const uint64_t pllFollowDivisor = segmentedHlsInput ? 32ULL : 64ULL;
             if (hlsPllBaseBitrate == 0) {
-                const uint64_t startupPace = currentRealPaceBitrate > 0
-                    ? currentRealPaceBitrate
+                const uint64_t startupPace = segmentedHlsInput
+                    ? (currentRealPaceBitrate > 0
+                          ? currentRealPaceBitrate
+                          : playoutSourceRate)
                     : playoutSourceRate;
                 hlsPllBaseBitrate = std::min<uint64_t>(startupPace, hlsPaceCeiling);
                 currentRealPaceBitrate = hlsPllBaseBitrate;
@@ -1765,9 +1803,9 @@ private:
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
                                   ? "HLS UDP pacing: mode=slow-playout-pll"
-                                  : "Network MPEG-TS UDP pacing: mode=pcr-playout-pll")
+                                  : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
-                          << " source_clock_bitrate=" << playoutSourceRate
+                          << " source_rate_bitrate=" << playoutSourceRate
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " target_reservoir_ms="
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
@@ -1776,7 +1814,7 @@ private:
                           << " PCR="
                           << (segmentedHlsInput
                                   ? "continuous-20ms-clock"
-                                  : "source-passthrough")
+                                  : "source-passthrough PCR_density=diagnostic_only")
                           << std::endl;
                 hlsExactPacingAnnounced = true;
             }
@@ -2183,8 +2221,8 @@ private:
                   << " timing="
                   << (segmentedHlsInput
                           ? "hls_slow_playout_pll_periodic_pcr"
-                          : (mode == UdpShapingMode::Vbr && continuousNetworkMpegTsInput
-                                ? "network_pcr_playout_pll_source_pcr"
+                          : (continuousNetworkMpegTsInput
+                                ? "network_arrival_playout_pll_source_pcr"
                                 : (sourcePcrPassthrough()
                                       ? "reservoir_rate_controller_source_pcr"
                                       : "reservoir_rate_controller_periodic_pcr")))
@@ -2207,13 +2245,18 @@ private:
                   << " hls_pts_resets=" << hlsTimestampRateResets.load(std::memory_order_relaxed)
                   << " hls_pll_base=" << (segmentedHlsInput ? hlsPllBaseBitrate : 0)
                   << " hls_pll_correction=" << (segmentedHlsInput ? hlsPllCorrectionBitrate : 0)
-                  << " network_pcr_pll_base="
+                  << " network_arrival_rate="
+                  << (continuousNetworkMpegTsInput ? networkLongTermArrivalBitrate : 0)
+                  << " network_arrival_samples="
+                  << networkArrivalBitrateSamples.load(std::memory_order_relaxed)
+                  << " network_arrival_pll_base="
                   << (continuousNetworkMpegTsInput ? hlsPllBaseBitrate : 0)
-                  << " network_pcr_pll_correction="
+                  << " network_arrival_pll_correction="
                   << (continuousNetworkMpegTsInput ? hlsPllCorrectionBitrate : 0)
                   << " pcr_rate=" << pcrDerivedInputBitrate
                   << " pcr_rate_samples="
                   << pcrDerivedBitrateSamples.load(std::memory_order_relaxed)
+                  << " pcr_rate_diagnostic=" << (continuousNetworkMpegTsInput ? 1 : 0)
                   << " timeline_shift_ms="
                   << (schedulerTimelineShiftNanoseconds.load(std::memory_order_relaxed) / 1000000ULL)
                   << " clock_resets=" << schedulerResets.load(std::memory_order_relaxed)
@@ -2249,7 +2292,6 @@ private:
     const bool forceSyntheticPcr = false;
     const uint64_t startupReservoirDurationNanoseconds = 0;
     const std::size_t bufferLimitBytes = kMaxBufferedBytes;
-    bool tv5IpFixedPaceAnnounced = false;
     bool hlsExactPacingAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
@@ -2309,12 +2351,14 @@ private:
 
     uint64_t estimatedInputBitrate = 0;
     uint64_t pcrDerivedInputBitrate = 0;
+    uint64_t networkLongTermArrivalBitrate = 0;
     uint64_t hlsTimestampDerivedInputBitrate = 0;
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
+    std::deque<NetworkArrivalRatePoint> networkArrivalRateWindow;
     uint64_t hlsPcrBytesSinceSample = 0;
     uint64_t hlsLastPcrTicks = 0;
     uint16_t hlsPcrSamplePid = 0x1FFF;
@@ -2339,6 +2383,7 @@ private:
     std::atomic<uint64_t> inputBytesReceived{0};
     std::atomic<uint64_t> inputBitrateEstimate{0};
     std::atomic<uint64_t> pcrDerivedBitrateSamples{0};
+    std::atomic<uint64_t> networkArrivalBitrateSamples{0};
     std::atomic<uint64_t> hlsTimestampBitrateSamples{0};
     std::atomic<uint64_t> hlsTimestampRateResets{0};
     std::atomic<uint64_t> realPaceBitrate{0};
@@ -2442,17 +2487,15 @@ GstElement* createSink(
           tvs::protocols::inputs::isSrtInput(config) ||
           forceSyntheticCbrPcr()));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.27: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.28: source="
                   << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
-                  << " profile=tvstreamer5-compatible-fixed-pace"
+                  << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"
                   << " timing=reservoir-rate-controller"
                   << " pcr_mode=periodic-pcr-only-20ms"
                   << " source_pcr=stripped-after-lock"
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
-                  << " reservoir_correction=off low_water_throttle=off"
-                  << " cbr_headroom_bps=100000 vbr_headroom_bps=120000"
                   << std::endl;
     }
     std::cerr << "Unified UDP reservoir TS shaper: mode="

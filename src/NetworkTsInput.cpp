@@ -199,7 +199,7 @@ GstElement* buildSrt(
     if (!hasElementFactory(factory)) {
         if (mode == "caller" && hasElementFactory("srtsrc")) {
             factory = "srtsrc";
-            std::cerr << "Network TS input 202.21: srtclientsrc unavailable; "
+            std::cerr << "Network TS input 202.28: srtclientsrc unavailable; "
                       << "falling back to srtsrc caller mode" << std::endl;
         } else {
             error = std::string("missing element: ") + preferredFactory;
@@ -238,7 +238,7 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.24: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.28: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
               << " queue_ms=3000 leaky=off prebuffer=off"
@@ -251,22 +251,16 @@ GstElement* buildHttp(
     GstElement* pipeline,
     GstElement*& terminalElement,
     std::string& error) {
-    if (!hasElementFactory("souphttpsrc") || !hasElementFactory("tsparse")) {
-        error = "HTTP MPEG-TS input: missing souphttpsrc/tsparse";
+    if (!hasElementFactory("souphttpsrc")) {
+        error = "missing element: souphttpsrc";
         return nullptr;
     }
 
     GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
-    GstElement* capsFilter = gst_element_factory_make("capsfilter", "input_http_ts_caps");
-    GstElement* tsparse = gst_element_factory_make("tsparse", "input_http_media_clock");
     GstElement* queue = addQueue(pipeline, "input_queue", kNetworkInputQueue);
-    if (!src || !capsFilter || !tsparse || !queue ||
-        !addElementOrFail(pipeline, src) || !addElementOrFail(pipeline, capsFilter) ||
-        !addElementOrFail(pipeline, tsparse)) {
+    if (!src || !queue || !addElementOrFail(pipeline, src)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
-        if (capsFilter && !GST_OBJECT_PARENT(capsFilter)) gst_object_unref(capsFilter);
-        if (tsparse && !GST_OBJECT_PARENT(tsparse)) gst_object_unref(tsparse);
-        error = "HTTP MPEG-TS input: failed to create souphttpsrc/capsfilter/tsparse/queue";
+        error = "HTTP MPEG-TS input: failed to create souphttpsrc/queue";
         return nullptr;
     }
 
@@ -280,39 +274,21 @@ GstElement* buildHttp(
     configureHttpCredentials(src, cfg);
     setBooleanPropertyIfPresent(src, "compress", FALSE);
 
-    GstCaps* tsCaps = gst_caps_from_string(
-        "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
-    if (!tsCaps) {
-        error = "HTTP MPEG-TS input: failed to create TS caps";
-        return nullptr;
-    }
-    g_object_set(capsFilter, "caps", tsCaps, nullptr);
-    gst_caps_unref(tsCaps);
-
-    // HTTP/TCP delivery can be very bursty. Ask tsparse to attach media-time
-    // timestamps derived from the embedded PCR, but do NOT clock/sleep here.
-    // StableUdpOutput consumes these timestamps only as a rate observation;
-    // it remains the single physical output scheduler.
-    setIntPropertyIfPresent(tsparse, "alignment", 7);
-    setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
-    setUIntPropertyIfPresent(tsparse, "smoothing-latency", 100000U);
-
     const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     if (!inputInterface.empty()) {
         std::cerr << "HTTP MPEG-TS input: input_iface=" << inputInterface
                   << " selected; souphttpsrc follows the kernel HTTP route" << std::endl;
     }
 
-    if (!gst_element_link_many(src, capsFilter, tsparse, queue, nullptr)) {
-        error = "HTTP MPEG-TS input: failed to link souphttpsrc -> caps -> tsparse -> queue";
+    if (!gst_element_link(src, queue)) {
+        error = "HTTP MPEG-TS input: failed to link souphttpsrc -> queue";
         return nullptr;
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.24: protocol=HTTP transport=souphttpsrc"
+    std::cerr << "Network TS input 202.28: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
               << " queue_ms=3000 leaky=off prebuffer=off"
-              << " do_timestamp=on libcurl_appsrc=off"
-              << " media_clock=PCR-tsparse-timestamps clocksync=off"
+              << " do_timestamp=on libcurl_appsrc=off input_pacing=off"
               << " access=" << (cfg.hlsAccessKeyMode.empty() ? "none" : cfg.hlsAccessKeyMode)
               << std::endl;
     return src;
@@ -419,7 +395,7 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.24: protocol=HLS source=souphttpsrc+hlsdemux"
+    std::cerr << "Network TS input 202.28: protocol=HLS source=souphttpsrc+hlsdemux"
               << " queue_ms=5000 leaky=off prebuffer=off do_timestamp=on"
               << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
               << std::endl;
