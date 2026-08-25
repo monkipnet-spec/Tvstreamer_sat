@@ -7020,9 +7020,17 @@ bool StreamManager::buildOutputBranch(
     const bool hlsTransportTs = state &&
         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
         state->runtimeConfig.inputServiceId == 0;
+    // 202.22: SRT commonly carries an already-finished SPTS.  If no explicit
+    // service selection was requested, keep that transport intact exactly like
+    // direct HTTP MPEG-TS and direct HLS MPEG-TS.  Re-demux/remux remains
+    // available when inputServiceId selects one program from an SRT MPTS or
+    // when explicit PID/SID remapping is enabled.
+    const bool srtTransportTs = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt &&
+        state->runtimeConfig.inputServiceId == 0;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
-        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs || srtTransportTs ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
@@ -7036,6 +7044,11 @@ bool StreamManager::buildOutputBranch(
     // Explicit PID/SID remap still takes the normal remux path below.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
+    if (srtTransportTs && usesStableUdpShaper(outputConfig) && !outputConfig.remapEnabled) {
+        std::cerr << "Unified UDP direct TS 202.22: source=SRT"
+                  << " input_service_id=0 demux=off remux=off source_pcr=preserved"
+                  << std::endl;
+    }
     // NETUP Stream Processor is less tolerant than VLC of a live TS that begins
     // in the middle of a GOP/PSI cycle.  HTTP Progressive and SRT therefore get
     // a clean single-program remux with frequent PAT/PMT/PCR even when explicit
