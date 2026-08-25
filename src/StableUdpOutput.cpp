@@ -155,11 +155,11 @@ bool isContinuousNetworkMpegTsInput(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
-// 202.30: all network MPEG-TS inputs use the TVStreamer5 UDP timing profile.
-// HLS is forced through hlsdemux -> elementary streams -> mpegtsmux first, so
-// the mux produces one continuous PCR/PTS/DTS domain across segment boundaries.
+// 202.36: restore the pre-202.30 HLS path. Plain SRT/HTTP MPEG-TS uses
+// the TVStreamer5 UDP timing profile; segmented HLS stays on the validated
+// SAT5 HLS PTS/slow-PLL path from 202.29 (v202.7 lineage).
 bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
-    if (isSegmentedHlsInput(cfg)) return true;
+    if (isSegmentedHlsInput(cfg)) return false;
     if (tvs::protocols::inputs::isSrtInput(cfg)) return true;
     std::string uri = cfg.inputUri;
     std::transform(uri.begin(), uri.end(), uri.begin(), [](unsigned char c) {
@@ -688,7 +688,7 @@ public:
           caCleanStartEnabled(!useTvStreamer5IpShaperProfile(cfg)),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           hlsInput(isSegmentedHlsInput(cfg)),
-          segmentedHlsInput(isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
+          segmentedHlsInput(isSegmentedHlsInput(cfg)),
           continuousNetworkMpegTsInput(
               useTvStreamer5IpShaperProfile(cfg) ? false : isContinuousNetworkMpegTsInput(cfg)),
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
@@ -2546,8 +2546,8 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.32: source="
-                  << (isSegmentedHlsInput(config) ? "HLS" : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP"))
+        std::cerr << "TVStreamer5 IP UDP shaper 202.36: source="
+                  << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"
@@ -2557,6 +2557,12 @@ GstElement* createSink(
                   << " source_pcr="
                   << (srtRemapCbrSourcePcr ? "preserved" : "stripped-after-lock")
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
+                  << std::endl;
+    }
+    if (isSegmentedHlsInput(config)) {
+        std::cerr << "HLS timing 202.36: profile=sat5-restored-202.29"
+                  << " direct_mpegts=preferred remux=fallback-only"
+                  << " pacing=slow-playout-pll periodic_pcr=20ms"
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {

@@ -2660,80 +2660,6 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
               << "steady_state=source-timestamps audio_clocksync=off" << std::endl;
 }
 
-constexpr GstClockTime kHlsAudioBackwardTimestampTolerance = 250 * GST_MSECOND;
-
-struct HlsAudioGuardContext {
-    std::string streamId;
-    GstClockTime lastTimestamp = GST_CLOCK_TIME_NONE;
-    uint64_t droppedCorrupted = 0;
-    uint64_t droppedBackward = 0;
-};
-
-GstPadProbeReturn hlsAudioGuardProbe(
-    GstPad*, GstPadProbeInfo* info, gpointer userData) {
-    auto* ctx = static_cast<HlsAudioGuardContext*>(userData);
-    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buffer) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED)) {
-        ++ctx->droppedCorrupted;
-        std::cerr << "HLS audio guard 202.35: stream=" << ctx->streamId
-                  << " drop=corrupted"
-                  << " corrupted_drops=" << ctx->droppedCorrupted
-                  << " backward_drops=" << ctx->droppedBackward
-                  << std::endl;
-        return GST_PAD_PROBE_DROP;
-    }
-
-    const GstClockTime timestamp = GST_CLOCK_TIME_IS_VALID(GST_BUFFER_PTS(buffer))
-        ? GST_BUFFER_PTS(buffer)
-        : GST_BUFFER_DTS(buffer);
-    if (!GST_CLOCK_TIME_IS_VALID(timestamp)) {
-        return GST_PAD_PROBE_OK;
-    }
-
-    // DISCONT/RESYNC is expected at a legitimate HLS timeline transition. Do
-    // not drop that buffer; simply re-anchor the guard to the new timeline.
-    if (GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DISCONT) ||
-        GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_RESYNC)) {
-        ctx->lastTimestamp = timestamp;
-        return GST_PAD_PROBE_OK;
-    }
-
-    if (GST_CLOCK_TIME_IS_VALID(ctx->lastTimestamp) &&
-        timestamp < ctx->lastTimestamp &&
-        ctx->lastTimestamp - timestamp > kHlsAudioBackwardTimestampTolerance) {
-        const GstClockTime backward = ctx->lastTimestamp - timestamp;
-        ++ctx->droppedBackward;
-
-        // Re-anchor immediately. If this was a genuine segment timeline
-        // change that arrived without DISCONT, only the first suspicious audio
-        // frame is discarded instead of muting an entire segment.
-        ctx->lastTimestamp = timestamp;
-
-        std::cerr << "HLS audio guard 202.35: stream=" << ctx->streamId
-                  << " drop=backward-timestamp"
-                  << " backward_ms=" << (backward / GST_MSECOND)
-                  << " corrupted_drops=" << ctx->droppedCorrupted
-                  << " backward_drops=" << ctx->droppedBackward
-                  << std::endl;
-        return GST_PAD_PROBE_DROP;
-    }
-
-    ctx->lastTimestamp = timestamp;
-    return GST_PAD_PROBE_OK;
-}
-
-void freeHlsAudioGuardContext(gpointer data) {
-    delete static_cast<HlsAudioGuardContext*>(data);
-}
-
 void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
     (void)userData;
     if (!queue || g_object_get_data(G_OBJECT(queue), "tvs-hls-prebuffer-started")) {
@@ -7788,21 +7714,44 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // 202.30: never pass segmented HLS MPEG-TS through byte-for-byte. Many
-        // providers restart PCR/PTS/DTS at every 2-3 second segment. Direct TS
-        // therefore freezes in VBR and becomes jerky when CBR replaces only PCR.
-        // Always demux the segment transport and rebuild one continuous program
-        // with mpegtsmux, matching the TVStreamer5 HLS architecture.
-        if (!ctx->hlsDirectTsActive) {
-            ctx->hlsDirectTsActive = true;
-            std::cerr << "HLS input 202.30: direct_passthrough=off remux=always"
-                      << " timeline=hlsdemux-running-time->mpegtsmux"
-                      << " segment_timestamp_restart=absorbed"
+        // v202.2 HLS fast path. Legacy hlsdemux commonly exposes complete MPEG-TS
+        // fragments. They already contain a coherent provider PAT/PMT/PCR/PTS
+        // timeline, so demuxing to elementary streams and rebuilding with
+        // mpegtsmux only adds timestamp jitter at every segment boundary.
+        // Select a direct transport path and keep every TS byte unchanged.
+        if (ctx->hlsInputSelector) {
+            if (!ctx->hlsDirectSelectorPad) {
+                ctx->hlsDirectSelectorPad =
+                    gst_element_request_pad_simple(ctx->hlsInputSelector, "sink_%u");
+            }
+            GstPad* directSinkPad = ctx->hlsDirectSelectorPad;
+            if (directSinkPad) {
+                GstPad* oldPeer = gst_pad_get_peer(directSinkPad);
+                if (oldPeer) {
+                    if (oldPeer != pad) {
+                        gst_pad_unlink(oldPeer, directSinkPad);
+                    }
+                    gst_object_unref(oldPeer);
+                }
+                if (gst_pad_is_linked(directSinkPad) ||
+                    gst_pad_link(pad, directSinkPad) == GST_PAD_LINK_OK) {
+                    g_object_set(ctx->hlsInputSelector, "active-pad", directSinkPad, nullptr);
+                    if (!ctx->hlsDirectTsActive) {
+                        ctx->hlsDirectTsActive = true;
+                        std::cerr << "HLS input 202.36: transport=mpegts direct_passthrough=on"
+                                  << " remux=off preserve_pcr_pts=on preserve_cc=on"
+                                  << std::endl;
+                    }
+                    if (caps) gst_caps_unref(caps);
+                    return;
+                }
+            }
+            std::cerr << "HLS input 202.36: direct MPEG-TS link failed, falling back to remux"
                       << std::endl;
         }
 
-        // hlsdemux may expose complete MPEG-TS fragments. Convert those back to
-        // elementary streams and feed the existing mpegtsmux fallback branch.
+        // Compatibility fallback for builds where the direct selector cannot be
+        // used: reproduce the old tsdemux -> parser -> mpegtsmux path.
         GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
         GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
         if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
@@ -7854,9 +7803,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http;
     const bool tvStreamer5AudioClock =
         stableUdpAudioReservoir && tvStreamer5NetworkRemap;
-    const bool hlsAudioGuard =
-        isAudio && !ctx->flvMux &&
-        remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
@@ -7931,12 +7877,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
-    if (hlsAudioGuard) {
-        // HLS segment boundaries occasionally expose bad compressed-audio
-        // side data. Force GstBaseParse to validate/re-frame incoming audio
-        // instead of accepting parser passthrough when caps already look framed.
-        setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
-    }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
             // TVStreamer5 remap: do not force every-IDR parameter-set injection
@@ -7960,28 +7900,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     if (audioClockSync) {
         gst_element_sync_state_with_parent(audioClockSync);
-    }
-
-    if (hlsAudioGuard) {
-        GstPad* parserSrcPad = gst_element_get_static_pad(parser, "src");
-        if (parserSrcPad) {
-            auto* guardContext = new HlsAudioGuardContext;
-            guardContext->streamId = ctx->config.id;
-            gst_pad_add_probe(
-                parserSrcPad,
-                GST_PAD_PROBE_TYPE_BUFFER,
-                hlsAudioGuardProbe,
-                guardContext,
-                freeHlsAudioGuardContext);
-            gst_object_unref(parserSrcPad);
-
-            std::cerr << "HLS audio guard 202.35: stream=" << ctx->config.id
-                      << " parser=" << parserFactory
-                      << " force_parse=on corrupted_drop=on"
-                      << " backward_pts_guard_ms=250"
-                      << " discont_policy=reanchor-not-drop"
-                      << std::endl;
-        }
     }
 
     const bool parserLinked = capsfilter
