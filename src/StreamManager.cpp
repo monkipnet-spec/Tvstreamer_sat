@@ -1800,6 +1800,167 @@ GstPadProbeReturn dvbSingleProgramPsiProbe(GstPad*, GstPadProbeInfo* info, gpoin
 }
 
 
+struct HlsPacketRemapContext {
+    DvbSingleProgramPsiContext psi;
+    std::string streamId;
+    size_t branchIndex = 0;
+    bool autoInputService = false;
+    bool autoServiceAnnounced = false;
+    bool remapReadyAnnounced = false;
+};
+
+bool discoverHlsAutoServiceFromPat(const uint8_t* packet, HlsPacketRemapContext* ctx) {
+    if (!packet || !ctx || packet[0] != 0x47) return false;
+    if (ctx->psi.serviceId != 0) return true;
+
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    if (pid != 0x0000) return false;
+
+    if (!appendPsiSectionFromPacket(
+            packet, 0x00, ctx->psi.patSectionBuffer, ctx->psi.patSectionExpected)) {
+        return false;
+    }
+
+    const uint8_t* section = ctx->psi.patSectionBuffer.data();
+    const size_t total = ctx->psi.patSectionExpected;
+    if (!section || total < 12 || section[0] != 0x00) {
+        ctx->psi.patSectionBuffer.clear();
+        ctx->psi.patSectionExpected = 0;
+        return false;
+    }
+
+    const size_t sectionLength = static_cast<size_t>(((section[1] & 0x0F) << 8) | section[2]);
+    if (sectionLength < 9 || 3 + sectionLength > total) {
+        ctx->psi.patSectionBuffer.clear();
+        ctx->psi.patSectionExpected = 0;
+        return false;
+    }
+
+    ctx->psi.transportStreamId = static_cast<uint16_t>((section[3] << 8) | section[4]);
+    ctx->psi.patVersion = static_cast<uint8_t>((section[5] >> 1) & 0x1F);
+    const size_t entriesEnd = 3 + sectionLength - 4;
+    for (size_t pos = 8; pos + 4 <= entriesEnd; pos += 4) {
+        const uint16_t program = static_cast<uint16_t>((section[pos] << 8) | section[pos + 1]);
+        const uint16_t pmtPid = static_cast<uint16_t>(((section[pos + 2] & 0x1F) << 8) | section[pos + 3]);
+        if (program == 0 || pmtPid == 0 || pmtPid >= 0x1FFF) continue;
+        ctx->psi.serviceId = program;
+        ctx->psi.pmtPid = pmtPid;
+        break;
+    }
+
+    ctx->psi.patSectionBuffer.clear();
+    ctx->psi.patSectionExpected = 0;
+
+    if (ctx->psi.serviceId != 0 && !ctx->autoServiceAnnounced) {
+        std::cerr << "HLS packet remap 202.37: auto_input_sid=" << ctx->psi.serviceId
+                  << " pmt_pid=" << ctx->psi.pmtPid
+                  << " source=PAT first-program"
+                  << std::endl;
+        ctx->autoServiceAnnounced = true;
+    }
+    return ctx->psi.serviceId != 0;
+}
+
+void rewriteHlsRemapPacketPid(uint8_t* packet, const DvbSingleProgramPsiContext& ctx) {
+    if (!packet || packet[0] != 0x47 || !ctx.remapEnabled || !ctx.remapPmtRewritten) return;
+    uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+    uint16_t mapped = pid;
+    if (ctx.inputVideoPid && ctx.requestedVideoPid && pid == ctx.inputVideoPid) {
+        mapped = ctx.requestedVideoPid;
+    } else if (ctx.inputAudioPid && ctx.requestedAudioPid && pid == ctx.inputAudioPid) {
+        mapped = ctx.requestedAudioPid;
+    }
+    if (mapped == pid) return;
+    packet[1] = static_cast<uint8_t>((packet[1] & 0xE0) | ((mapped >> 8) & 0x1F));
+    packet[2] = static_cast<uint8_t>(mapped & 0xFF);
+}
+
+GstPadProbeReturn hlsPacketRemapProbe(GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* ctx = static_cast<HlsPacketRemapContext*>(userData);
+    if (!ctx || !(info->type & GST_PAD_PROBE_TYPE_BUFFER)) return GST_PAD_PROBE_OK;
+
+    GstBuffer* original = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!original) return GST_PAD_PROBE_OK;
+    GstBuffer* buffer = gst_buffer_make_writable(original);
+    if (!buffer) return GST_PAD_PROBE_OK;
+    if (buffer != original) GST_PAD_PROBE_INFO_DATA(info) = buffer;
+
+    GstMapInfo map{};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
+
+    size_t packetStart = 0;
+    const size_t maxSyncOffset = std::min<size_t>(kTsPacketSize, map.size);
+    bool aligned = map.size >= kTsPacketSize && map.data[0] == 0x47;
+    if (aligned && map.size >= kTsPacketSize * 2 && map.data[kTsPacketSize] != 0x47) {
+        aligned = false;
+    }
+    if (!aligned) {
+        bool found = false;
+        for (size_t candidate = 0; candidate < maxSyncOffset; ++candidate) {
+            if (map.data[candidate] != 0x47) continue;
+            if (candidate + kTsPacketSize >= map.size ||
+                map.data[candidate + kTsPacketSize] == 0x47) {
+                packetStart = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            gst_buffer_unmap(buffer, &map);
+            return GST_PAD_PROBE_OK;
+        }
+    }
+
+    for (size_t offset = packetStart; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
+        uint8_t* packet = map.data + offset;
+        if (packet[0] != 0x47) continue;
+
+        if (ctx->psi.serviceId == 0) {
+            discoverHlsAutoServiceFromPat(packet, ctx);
+        }
+        if (ctx->psi.serviceId == 0) continue;
+
+        discoverSelectedPmtFromPacket(packet, &ctx->psi);
+        const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1F) << 8) | packet[2]);
+
+        if (ctx->psi.remapEnabled && pid == ctx->psi.pmtPid) {
+            const bool wasReady = ctx->psi.remapPmtRewritten;
+            rewriteDvbRemapPmt(packet, &ctx->psi);
+            if (!wasReady && ctx->psi.remapPmtRewritten && !ctx->remapReadyAnnounced) {
+                std::cerr << "HLS packet remap 202.37: stream=" << ctx->streamId
+                          << " branch=" << ctx->branchIndex
+                          << " input_sid=" << ctx->psi.serviceId
+                          << " output_sid=" << requestedDvbServiceId(ctx->psi)
+                          << " video=" << ctx->psi.inputVideoPid << "->"
+                          << (ctx->psi.requestedVideoPid ? ctx->psi.requestedVideoPid : ctx->psi.inputVideoPid)
+                          << " audio=" << ctx->psi.inputAudioPid << "->"
+                          << (ctx->psi.requestedAudioPid ? ctx->psi.requestedAudioPid : ctx->psi.inputAudioPid)
+                          << " mode=packet-level-no-demux-no-remux"
+                          << " timestamps=preserve pcr=preserve cc=preserve"
+                          << std::endl;
+                ctx->remapReadyAnnounced = true;
+            }
+        }
+
+        if (pid == 0x0000) {
+            if (ctx->psi.pmtPid > 0 && ctx->psi.pmtPid < 0x1FFF) {
+                writeSingleProgramPat(packet, ctx->psi);
+            }
+        } else if (pid == 0x0011) {
+            writeSingleProgramSdt(packet, ctx->psi);
+        } else if (pid != ctx->psi.pmtPid) {
+            rewriteHlsRemapPacketPid(packet, ctx->psi);
+        }
+        // Deliberately do not normalize continuity counters here. HLS direct TS
+        // is already smooth without remap, and changing only PID/SID must not
+        // introduce a new packet clock or continuity domain.
+    }
+
+    gst_buffer_unmap(buffer, &map);
+    return GST_PAD_PROBE_OK;
+}
+
+
 // v178 single-pass DVB service dispatcher.
 //
 // The v167-v177 relay topology delivered the complete transponder to a
@@ -7097,7 +7258,24 @@ bool StreamManager::buildOutputBranch(
     // PID/SID remapping is disabled.  This does not touch UDP/WISI output.
     const bool strictTsNetworkOutput = (type == "http" || type == "srt") && !transcodedInput;
     const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
-    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied) || stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
+    // 202.37: HLS SPTS is already smooth in direct transport mode. For UDP remap,
+    // do not destroy that timeline with tsdemux/parsers/mpegtsmux. Rewrite only
+    // PAT/PMT/SID and requested A/V PID headers packet-by-packet.
+    const bool hlsPacketRemap = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
+        state->runtimeConfig.inputServiceId == 0 &&
+        outputConfig.remapEnabled && usesStableUdpShaper(outputConfig);
+    const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied && !hlsPacketRemap) ||
+                             stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
+    if (hlsPacketRemap) {
+        std::cerr << "HLS remap 202.37: direct transport packet rewrite selected"
+                  << " input_sid=auto-SPTS"
+                  << " output_sid=" << outputConfig.serviceId
+                  << " video_pid=" << outputConfig.videoPid
+                  << " audio_pid=" << outputConfig.audioPid
+                  << " demux=off remux=off preserve_pcr_pts_cc=on"
+                  << std::endl;
+    }
     if (remapAlreadyApplied && outputConfig.remapEnabled) {
         std::cerr << "DVB remap passthrough: packet-level PID/SID rewrite already applied"
                   << " service_id=" << outputConfig.serviceId
@@ -7137,6 +7315,13 @@ bool StreamManager::buildPassthroughPipeline(
         return false;
     }
     const StreamConfig& cfg = outputConfig;
+    const auto sourceProtocol = state
+        ? tvs::stream_protocols::inputKind(state->runtimeConfig)
+        : tvs::stream_protocols::InputProtocolKind::Unknown;
+    const bool hlsPacketRemap = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
+        state->runtimeConfig.inputServiceId == 0 &&
+        cfg.remapEnabled && usesStableUdpShaper(cfg);
 
     // v122: StableUdpOutput already owns the output clock, five-second WISI
     // reservoir and PCR restamping.  A second tsparse with set-timestamps and
@@ -7147,7 +7332,7 @@ bool StreamManager::buildPassthroughPipeline(
     // Bitrate Out=0.  Feed the already-normalised MPEG-TS directly to the
     // reservoir for UDP; all source chains reaching this function expose TS,
     // and DVB/test chains are already packet-aligned upstream.
-    const bool directStableUdpTs = usesStableUdpShaper(cfg);
+    const bool directStableUdpTs = usesStableUdpShaper(cfg) && !hlsPacketRemap;
     GstElement* tsparse = directStableUdpTs
         ? nullptr
         : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
@@ -7233,6 +7418,45 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     configureTsPacketAlignment(tsparse);
+    if (hlsPacketRemap) {
+        // Alignment only: set-timestamps stays OFF. The provider PCR/PTS/DTS and
+        // buffer timing are preserved; tsparse only guarantees complete 7x188 TS
+        // buffers for the in-place packet rewriter.
+        setBooleanPropertyIfPresent(tsparse, "set-timestamps", FALSE);
+        GstPad* remapPad = gst_element_get_static_pad(tsparse, "src");
+        if (!remapPad) {
+            std::cerr << "HLS packet remap 202.37: failed to get tsparse src pad" << std::endl;
+            return false;
+        }
+        auto* remapContext = new HlsPacketRemapContext();
+        remapContext->streamId = state->config.id;
+        remapContext->branchIndex = branchIndex;
+        remapContext->autoInputService = state->runtimeConfig.inputServiceId == 0;
+        remapContext->psi.serviceId = static_cast<uint16_t>(state->runtimeConfig.inputServiceId & 0xFFFFU);
+        remapContext->psi.outputServiceId = cfg.serviceId > 0 && cfg.serviceId <= 0xFFFFU
+            ? static_cast<uint16_t>(cfg.serviceId) : 0;
+        remapContext->psi.requestedVideoPid = isValidDvbElementaryPid(cfg.videoPid)
+            ? static_cast<uint16_t>(cfg.videoPid) : 0;
+        remapContext->psi.requestedAudioPid = isValidDvbElementaryPid(cfg.audioPid)
+            ? static_cast<uint16_t>(cfg.audioPid) : 0;
+        remapContext->psi.serviceName = cfg.serviceName.empty() ? cfg.name : cfg.serviceName;
+        remapContext->psi.serviceProvider = cfg.serviceProvider;
+        remapContext->psi.remapEnabled = true;
+        // Suppress the DVB-specific helper log; this path emits its own HLS log.
+        remapContext->psi.remapAnnounced = true;
+        gst_pad_add_probe(
+            remapPad, GST_PAD_PROBE_TYPE_BUFFER, hlsPacketRemapProbe, remapContext,
+            [](gpointer data) { delete static_cast<HlsPacketRemapContext*>(data); });
+        gst_object_unref(remapPad);
+        std::cerr << "HLS packet remap 202.37: alignment=7x188 set_timestamps=off"
+                  << " input_sid=" << (state->runtimeConfig.inputServiceId > 0
+                        ? std::to_string(state->runtimeConfig.inputServiceId) : "auto")
+                  << " output_sid=" << cfg.serviceId
+                  << " video_pid=" << cfg.videoPid
+                  << " audio_pid=" << cfg.audioPid
+                  << " pcr_pts_dts=preserve cc=preserve"
+                  << std::endl;
+    }
     return pacer
         ? gst_element_link_many(sourceTail, tsparse, queue, pacer, sink, nullptr)
         : gst_element_link_many(sourceTail, tsparse, queue, sink, nullptr);
