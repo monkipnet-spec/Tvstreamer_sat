@@ -168,11 +168,10 @@ bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
-// 202.29: remapped SRT in UDP-CBR already has a fresh PCR timeline from
-// mpegtsmux. Replacing that PCR with a second sender clock costs one transport
-// slot every 20 ms and leaves less room for the remuxed payload. Preserve the
-// mux PCR only for this exact case; all other TVStreamer5-compatible IP modes
-// keep their proven 202.28 behaviour.
+// 202.31: remapped SRT in UDP-CBR is now pre-padded by mpegtsmux at the
+// configured target bitrate and paced from that mux PCR before StableUdpOutput.
+// Preserve the mux PCR and transmit every source TS packet 1:1; the reservoir
+// remains a jitter buffer only and must never re-space this pre-padded stream.
 bool useSrtRemapCbrSourcePcr(const StreamConfig& cfg) {
     return tvs::protocols::inputs::isSrtInput(cfg) &&
            cfg.remapEnabled &&
@@ -1223,11 +1222,13 @@ private:
                 // from PCR distance and byte distance so audio/video remain on the
                 // broadcaster's clock.
                 const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
-                estimatedInputBitrate = segmentedHlsInput && hlsPtsRate > 0
-                    ? hlsPtsRate
-                    : (segmentedHlsInput && pcrDerivedInputBitrate > 0
-                        ? pcrDerivedInputBitrate
-                        : arrivalRate);
+                estimatedInputBitrate = srtRemapCbrSourcePcr
+                    ? configuredTargetBitrate
+                    : (segmentedHlsInput && hlsPtsRate > 0
+                        ? hlsPtsRate
+                        : (segmentedHlsInput && pcrDerivedInputBitrate > 0
+                            ? pcrDerivedInputBitrate
+                            : arrivalRate));
                 if (estimatedInputBitrate == 0) {
                     estimatedInputBitrate = mode == UdpShapingMode::Cbr
                         ? std::min<uint64_t>(configuredTargetBitrate, 1000000ULL)
@@ -1707,6 +1708,40 @@ private:
         const uint64_t lowBufferBytes = std::max<uint64_t>(
             kUdpPayloadSize * 8ULL,
             bytesForDuration(estimate, kLowReservoirNanoseconds));
+
+        // 202.31: SRT + remap + CBR is already a complete target-rate CBR
+        // transport from mpegtsmux, including NULL stuffing and a matching PCR
+        // timeline. Never run the reservoir rate controller on it: changing the
+        // useful-packet entitlement while preserving mux PCR is exactly what
+        // caused the periodic late freezes after longer playback.
+        if (srtRemapCbrSourcePcr) {
+            estimatedInputBitrate = configuredTargetBitrate;
+            inputBitrateEstimate.store(configuredTargetBitrate, std::memory_order_relaxed);
+            currentRealPaceBitrate = configuredTargetBitrate;
+            realPaceBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
+            transportBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
+
+            const uint64_t targetBytes = std::max<uint64_t>(
+                kUdpPayloadSize * 32ULL,
+                bytesForDuration(configuredTargetBitrate, kTargetReservoirNanoseconds));
+            targetReservoirBytes.store(targetBytes, std::memory_order_relaxed);
+            reservoirMilliseconds.store(
+                multiplyDivide(bufferNow * 8ULL, 1000ULL,
+                               std::max<uint64_t>(1ULL, configuredTargetBitrate)),
+                std::memory_order_relaxed);
+
+            if (!srtPrePaddedCbrAnnounced) {
+                std::cerr << "SRT remap CBR sender 202.31: mode=1to1-prepadded"
+                          << " bitrate=" << configuredTargetBitrate
+                          << " reservoir_controller=off"
+                          << " source_pcr=passthrough"
+                          << " source_null=passthrough"
+                          << " synthetic_pcr=off"
+                          << std::endl;
+                srtPrePaddedCbrAnnounced = true;
+            }
+            return;
+        }
 
         const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
@@ -2313,6 +2348,7 @@ private:
     const uint64_t startupReservoirDurationNanoseconds = 0;
     const std::size_t bufferLimitBytes = kMaxBufferedBytes;
     bool hlsExactPacingAnnounced = false;
+    bool srtPrePaddedCbrAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
     bool caCleanStartVideoSeen = false;
@@ -2509,7 +2545,7 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.30: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.31: source="
                   << (isSegmentedHlsInput(config) ? "HLS" : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP"))
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
@@ -2523,7 +2559,7 @@ GstElement* createSink(
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {
-        std::cerr << "SRT remap CBR timing 202.29: source_pcr=mpegtsmux-passthrough"
+        std::cerr << "SRT remap CBR timing 202.31: source_pcr=mpegtsmux-passthrough"
                   << " synthetic_pcr=off periodic_pcr_slots=off"
                   << " useful_rate_ceiling=full-target"
                   << " scope=srt+remap+cbr-only"

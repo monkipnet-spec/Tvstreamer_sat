@@ -2712,6 +2712,19 @@ bool udpCbrOutputEnabled(const StreamConfig& cfg) {
     return type == "udp" && cfg.cbr && cfg.targetBitrate > 0;
 }
 
+// 202.31: SRT + remap + UDP-CBR is pre-padded by mpegtsmux itself.
+// Keeping PCR, NULL stuffing and packet pacing in one mux clock domain avoids
+// the late freezes seen when StableUdpOutput independently re-spaced the
+// remuxed real packets while preserving the mux PCR.
+bool srtRemapUdpCbrPrePadded(const StreamConfig& cfg) {
+    return tvs::stream_protocols::inputKind(cfg) ==
+               tvs::stream_protocols::InputProtocolKind::Srt &&
+           cfg.remapEnabled &&
+           usesStableUdpShaper(cfg) &&
+           udpCbrOutputEnabled(cfg) &&
+           cfg.targetBitrate > 0;
+}
+
 bool cbrMuxEnabled(const StreamConfig& cfg) {
     // v198: CBR is supported for UDP-CBR and for HTTP/HLS/SRT when the stream
     // CBR checkbox is enabled. RTSP/RTMP/YouTube/RTP/FIFO remain source-paced.
@@ -3686,10 +3699,16 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
     }
     const bool externalUdpShaper = usesStableUdpShaper(cfg);
     if (externalUdpShaper) {
-        // All UDP MPEG-TS outputs now use the same reservoir/shaper path. Keep
-        // mpegtsmux unpadded so the sender can build either strict CBR or
-        // source-rate-following VBR from one clean SPTS timeline.
-        setUInt64PropertyIfPresent(mux, "bitrate", 0);
+        if (srtRemapUdpCbrPrePadded(cfg)) {
+            // 202.31: this exact path must keep packet spacing and PCR in the
+            // same CBR domain. mpegtsmux emits the final target-rate transport
+            // including NULL packets; StableUdpOutput only preserves that rate.
+            setUInt64PropertyIfPresent(
+                mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
+        } else {
+            // Other Stable UDP modes remain externally shaped as before.
+            setUInt64PropertyIfPresent(mux, "bitrate", 0);
+        }
     } else if (cbrMuxEnabled(cfg)) {
         setUInt64PropertyIfPresent(mux, "bitrate", static_cast<guint64>(cfg.targetBitrate));
     }
@@ -7217,7 +7236,8 @@ bool StreamManager::buildRemapPipeline(
     GstElement* mux = gst_element_factory_make("mpegtsmux", branchName("mux", branchIndex).c_str());
     const std::string networkType = outputType(cfg);
     const bool strictTsNetworkOutput = networkType == "http" || networkType == "srt";
-    const bool cbrActive = wallClockNetworkCbrEnabled(cfg);
+    const bool srtRemapPrePaddedCbr = srtRemapUdpCbrPrePadded(cfg);
+    const bool cbrActive = wallClockNetworkCbrEnabled(cfg) || srtRemapPrePaddedCbr;
     GstElement* cbrTsparse = cbrActive
         ? gst_element_factory_make("tsparse", branchName("cbr_tsparse", branchIndex).c_str())
         : nullptr;
@@ -7247,6 +7267,14 @@ bool StreamManager::buildRemapPipeline(
     if (cbrActive) {
         configureNetworkCbrTimestamping(cbrTsparse);
         configureNetworkCbrClock(pacer);
+    }
+    if (srtRemapPrePaddedCbr) {
+        std::cerr << "SRT remap CBR mux 202.31: mux_bitrate=" << cfg.targetBitrate
+                  << " source_pcr=mpegtsmux"
+                  << " null_stuffing=mpegtsmux"
+                  << " mux_pacer=tsparse+clocksync"
+                  << " stable_udp_mode=1to1-prepadded"
+                  << std::endl;
     }
     if (strictTsNetworkOutput) {
         std::cerr << "NETUP TS compatibility mux: type=" << networkType
