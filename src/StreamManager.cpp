@@ -54,7 +54,25 @@ constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
 constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(3);
+// 202.33: SRT caller/listener startup can legitimately take longer than the
+// generic live-input watchdog, especially when remap has to discover the
+// program and build dynamic pads before media counters start moving.  Give a
+// fresh SRT primary enough time to deliver its first TS bytes; once media has
+// flowed, keep the existing fast 3-second failover for a real outage.
+constexpr auto kSrtStartupFailoverDelay = std::chrono::seconds(15);
+constexpr auto kSrtPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
+
+std::chrono::milliseconds inputProbeTimeoutForUri(
+    const StreamConfig& baseConfig, const std::string& inputUri) {
+    StreamConfig probeConfig = baseConfig;
+    probeConfig.inputUri = inputUri;
+    return tvs::stream_protocols::inputKind(probeConfig) ==
+            tvs::stream_protocols::InputProtocolKind::Srt
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(kSrtPrimaryProbeTimeout)
+        : std::chrono::duration_cast<std::chrono::milliseconds>(kInputFailoverDelay);
+}
+
 constexpr long kHttpConnectTimeoutMs = 3000;
 constexpr long kHttpLowSpeedTimeSeconds = 8;
 constexpr int kNetworkSourceTimeoutSeconds = 5;
@@ -3045,6 +3063,11 @@ bool telegramUsesEnglish(const ConfigManager& manager) {
 }
 
 std::string telegramText(const ConfigManager& manager, const char* ru, const char* en) {
+    return telegramUsesEnglish(manager) ? en : ru;
+}
+
+std::string telegramText(
+    const ConfigManager& manager, const std::string& ru, const std::string& en) {
     return telegramUsesEnglish(manager) ? en : ru;
 }
 
@@ -8408,7 +8431,9 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->lastPrimaryRetry = now;
                 const std::string primaryUri = state->primaryInputUri;
                 if (!primaryUri.empty() &&
-                    probeInputAvailable(state->config, primaryUri, kInputFailoverDelay)) {
+                    probeInputAvailable(
+                        state->config, primaryUri,
+                        inputProbeTimeoutForUri(state->config, primaryUri))) {
                     notifyStreamState(
                         state->config,
                         "🟢",
@@ -8451,6 +8476,13 @@ void StreamManager::monitorBus(const std::string& id) {
 
     if (!bus) {
         return;
+    }
+
+    if (tvs::stream_protocols::inputKind(state->config) ==
+        tvs::stream_protocols::InputProtocolKind::Srt) {
+        std::cerr << "SRT input watchdog 202.33: startup_wait_ms=15000"
+                  << " steady_loss_ms=3000 primary_probe_ms=15000"
+                  << " source_auto_reconnect=on" << std::endl;
     }
 
     while (state->running.load()) {
@@ -8621,13 +8653,28 @@ void StreamManager::monitorBus(const std::string& id) {
         maybeLogSrtInputStats(state, now);
 
         if (!state->config.testPattern) {
-            const bool inputTimedOut = now - state->lastInputActivity >= kInputFailoverDelay;
+            const bool waitingForFirstSrtMedia =
+                srtInput &&
+                state->lastInputBytesSeen == 0 &&
+                state->inputBytes.load(std::memory_order_relaxed) == 0;
+            const auto inputFailoverDelay = waitingForFirstSrtMedia
+                ? kSrtStartupFailoverDelay
+                : kInputFailoverDelay;
+            const bool inputTimedOut =
+                now - state->lastInputActivity >= inputFailoverDelay;
             if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
                 notifyStreamState(
                     state->config,
                     "🟡",
                     telegramText(configManager, "Основной поток пропал", "Primary stream lost"),
-                    telegramText(configManager, "Нет входных данных 5 секунд", "No input data for 5 seconds") +
+                    telegramText(
+                        configManager,
+                        "Нет входных данных " + std::to_string(
+                            std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()) +
+                            " секунд",
+                        "No input data for " + std::to_string(
+                            std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()) +
+                            " seconds") +
                         "\n" + telegramText(configManager, "Переключаюсь на резерв", "Switching to backup") +
                         "\nBackup: " + state->config.backupInputUri);
                 if (restartActiveInput(state, state->config.backupInputUri, true)) {
@@ -8665,7 +8712,9 @@ void StreamManager::monitorBus(const std::string& id) {
                         primaryProbeConfig.inputServiceId = 0;
                         primaryProbeUri = state->sharedDvbServiceRelayUri;
                     }
-                    if (probeInputAvailable(primaryProbeConfig, primaryProbeUri, kInputFailoverDelay)) {
+                    if (probeInputAvailable(
+                            primaryProbeConfig, primaryProbeUri,
+                            inputProbeTimeoutForUri(primaryProbeConfig, primaryProbeUri))) {
                         notifyStreamState(
                             state->config,
                             "🟢",
@@ -8719,7 +8768,14 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->config,
                         "🔴",
                         telegramText(configManager, "Нет входного сигнала", "No input signal"),
-                        telegramText(configManager, "Входных данных нет 5 секунд", "No input data for 5 seconds") +
+                        telegramText(
+                            configManager,
+                            "Входных данных нет " + std::to_string(
+                                std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()) +
+                                " секунд",
+                            "No input data for " + std::to_string(
+                                std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()) +
+                                " seconds") +
                             "\n" + telegramText(configManager, "Резервная ссылка не задана", "Backup URL is not configured") +
                             "\nURL: " + state->activeInputUri);
                 }
