@@ -395,9 +395,9 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.28: protocol=HLS source=souphttpsrc+hlsdemux"
+    std::cerr << "Network TS input 202.30: protocol=HLS source=souphttpsrc+hlsdemux"
               << " queue_ms=5000 leaky=off prebuffer=off do_timestamp=on"
-              << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
+              << " direct_mpegts=off remux=always input_pacing=tvstreamer5-output-shaper"
               << std::endl;
     return src;
 }

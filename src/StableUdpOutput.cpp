@@ -155,10 +155,11 @@ bool isContinuousNetworkMpegTsInput(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
-// 202.25: plain SRT/HTTP MPEG-TS uses the StableUdpOutput timing profile
-// from TVStreamer5. HLS remains on its already validated segmented PTS/PLL path.
+// 202.30: all network MPEG-TS inputs use the TVStreamer5 UDP timing profile.
+// HLS is forced through hlsdemux -> elementary streams -> mpegtsmux first, so
+// the mux produces one continuous PCR/PTS/DTS domain across segment boundaries.
 bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
-    if (isSegmentedHlsInput(cfg)) return false;
+    if (isSegmentedHlsInput(cfg)) return true;
     if (tvs::protocols::inputs::isSrtInput(cfg)) return true;
     std::string uri = cfg.inputUri;
     std::transform(uri.begin(), uri.end(), uri.begin(), [](unsigned char c) {
@@ -687,7 +688,8 @@ public:
           diagnosticsEnabled(tsDiagnosticsEnabled()),
           caCleanStartEnabled(!useTvStreamer5IpShaperProfile(cfg)),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
-          segmentedHlsInput(isSegmentedHlsInput(cfg)),
+          hlsInput(isSegmentedHlsInput(cfg)),
+          segmentedHlsInput(isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
           continuousNetworkMpegTsInput(
               useTvStreamer5IpShaperProfile(cfg) ? false : isContinuousNetworkMpegTsInput(cfg)),
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
@@ -2206,7 +2208,7 @@ private:
                   << " profile=" << (tvStreamer5IpProfile ? "tvstreamer5-ip" : "sat5")
                   << " input="
                   << (srtInput ? "srt"
-                               : (segmentedHlsInput ? "hls"
+                               : (hlsInput ? "hls"
                                                     : (continuousNetworkMpegTsInput
                                                           ? "http-mpegts" : "other")))
                   << " mode=" << shapingModeName(mode)
@@ -2304,6 +2306,7 @@ private:
     const bool diagnosticsEnabled = false;
     const bool caCleanStartEnabled = false;
     const bool conditionalAccessInput = false;
+    const bool hlsInput = false;
     const bool segmentedHlsInput = false;
     const bool continuousNetworkMpegTsInput = false;
     const bool forceSyntheticPcr = false;
@@ -2506,8 +2509,8 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.29: source="
-                  << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
+        std::cerr << "TVStreamer5 IP UDP shaper 202.30: source="
+                  << (isSegmentedHlsInput(config) ? "HLS" : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP"))
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"

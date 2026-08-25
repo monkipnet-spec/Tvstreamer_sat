@@ -7657,44 +7657,21 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // v202.2 HLS fast path. Legacy hlsdemux commonly exposes complete MPEG-TS
-        // fragments. They already contain a coherent provider PAT/PMT/PCR/PTS
-        // timeline, so demuxing to elementary streams and rebuilding with
-        // mpegtsmux only adds timestamp jitter at every segment boundary.
-        // Select a direct transport path and keep every TS byte unchanged.
-        if (ctx->hlsInputSelector) {
-            if (!ctx->hlsDirectSelectorPad) {
-                ctx->hlsDirectSelectorPad =
-                    gst_element_request_pad_simple(ctx->hlsInputSelector, "sink_%u");
-            }
-            GstPad* directSinkPad = ctx->hlsDirectSelectorPad;
-            if (directSinkPad) {
-                GstPad* oldPeer = gst_pad_get_peer(directSinkPad);
-                if (oldPeer) {
-                    if (oldPeer != pad) {
-                        gst_pad_unlink(oldPeer, directSinkPad);
-                    }
-                    gst_object_unref(oldPeer);
-                }
-                if (gst_pad_is_linked(directSinkPad) ||
-                    gst_pad_link(pad, directSinkPad) == GST_PAD_LINK_OK) {
-                    g_object_set(ctx->hlsInputSelector, "active-pad", directSinkPad, nullptr);
-                    if (!ctx->hlsDirectTsActive) {
-                        ctx->hlsDirectTsActive = true;
-                        std::cerr << "HLS input: transport=mpegts direct_passthrough=on"
-                                  << " remux=off preserve_pcr_pts=on preserve_cc=on"
-                                  << std::endl;
-                    }
-                    if (caps) gst_caps_unref(caps);
-                    return;
-                }
-            }
-            std::cerr << "HLS input: direct MPEG-TS link failed, falling back to remux"
+        // 202.30: never pass segmented HLS MPEG-TS through byte-for-byte. Many
+        // providers restart PCR/PTS/DTS at every 2-3 second segment. Direct TS
+        // therefore freezes in VBR and becomes jerky when CBR replaces only PCR.
+        // Always demux the segment transport and rebuild one continuous program
+        // with mpegtsmux, matching the TVStreamer5 HLS architecture.
+        if (!ctx->hlsDirectTsActive) {
+            ctx->hlsDirectTsActive = true;
+            std::cerr << "HLS input 202.30: direct_passthrough=off remux=always"
+                      << " timeline=hlsdemux-running-time->mpegtsmux"
+                      << " segment_timestamp_restart=absorbed"
                       << std::endl;
         }
 
-        // Compatibility fallback for builds where the direct selector cannot be
-        // used: reproduce the old tsdemux -> parser -> mpegtsmux path.
+        // hlsdemux may expose complete MPEG-TS fragments. Convert those back to
+        // elementary streams and feed the existing mpegtsmux fallback branch.
         GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
         GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
         if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
