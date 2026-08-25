@@ -700,11 +700,9 @@ public:
                         ? true
                         : forceSyntheticCbrPcr())),
           startupReservoirDurationNanoseconds(
-              useSrtRemapCbrSourcePcr(cfg)
-                  ? 0ULL
-                  : (useTvStreamer5IpShaperProfile(cfg)
-                        ? kTvStreamer5StartupReservoirNanoseconds
-                        : startupReservoirNanoseconds())),
+              useTvStreamer5IpShaperProfile(cfg)
+                  ? kTvStreamer5StartupReservoirNanoseconds
+                  : startupReservoirNanoseconds()),
           bufferLimitBytes(
               useTvStreamer5IpShaperProfile(cfg)
                   ? kTvStreamer5MaxBufferedBytes
@@ -808,13 +806,7 @@ public:
 
         ready = true;
         try {
-            senderThread = std::thread([this]() {
-                if (srtRemapCbrSourcePcr) {
-                    sendUpstreamPacedLoop();
-                } else {
-                    sendLoop();
-                }
-            });
+            senderThread = std::thread(&StableUdpSender::sendLoop, this);
         } catch (const std::exception& ex) {
             error = std::string("failed to create stable UDP sender thread: ") + ex.what();
             std::cerr << "Resource guard: " << error << std::endl;
@@ -1059,74 +1051,6 @@ private:
         2ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kNetworkArrivalPllMaximumCorrectionPermille = 10ULL;
     static constexpr uint64_t kNetworkArrivalPllMaximumStepPermille = 1ULL;
-
-    void sendUpstreamPacedLoop() {
-        // 202.34 SRT+remap+CBR: mpegtsmux generates the complete target-rate
-        // transport and tsparse+clocksync paces its 7x188 buffers from mux PCR.
-        // Do not create another clock here.  This thread only decouples the
-        // GStreamer streaming thread from sendto() and preserves packet order.
-        const uint64_t started = monotonicNanoseconds();
-        statsStartedNanoseconds = started;
-        lastStatsNanoseconds = started;
-        lastRateSampleNanoseconds = started;
-        lastRateSampleBytes = inputBytesReceived.load(std::memory_order_relaxed);
-        lastControllerUpdateNanoseconds = started;
-        estimatedInputBitrate = configuredTargetBitrate;
-        currentRealPaceBitrate = configuredTargetBitrate;
-        inputBitrateEstimate.store(configuredTargetBitrate, std::memory_order_relaxed);
-        realPaceBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
-        transportBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
-        startupReservoirBytes.store(0, std::memory_order_relaxed);
-        reservoirMilliseconds.store(0, std::memory_order_relaxed);
-
-        std::cerr << "SRT remap CBR sender 202.34: mode=upstream-paced-unclocked-1to1"
-                  << " bitrate=" << configuredTargetBitrate
-                  << " upstream_clock=pcr-tsparse+clocksync"
-                  << " internal_startup_reservoir=off"
-                  << " internal_rate_controller=off"
-                  << " internal_wallclock_pacer=off"
-                  << " source_pcr=passthrough"
-                  << " source_null=passthrough"
-                  << " synthetic_pcr=off"
-                  << std::endl;
-        srtPrePaddedCbrAnnounced = true;
-
-        while (!stopping.load(std::memory_order_relaxed)) {
-            {
-                std::unique_lock<std::mutex> lock(queueMutex);
-                queueReady.wait_for(lock, std::chrono::milliseconds(20), [&]() {
-                    return stopping.load(std::memory_order_relaxed) || !queuedChunks.empty();
-                });
-            }
-            if (stopping.load(std::memory_order_relaxed)) break;
-
-            moveAvailableChunks();
-
-            while (realPackets.size() >= kTsPacketsPerDatagram) {
-                std::array<guint8, kUdpPayloadSize> datagram {};
-                for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
-                    TimedTsPacket packet = std::move(realPackets.front());
-                    realPackets.pop_front();
-                    std::copy(packet.bytes.begin(), packet.bytes.end(),
-                              datagram.begin() + slot * kTsPacketSize);
-                    bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
-                }
-
-                sendDatagram(datagram.data(), datagram.size());
-                totalDatagrams.fetch_add(1, std::memory_order_relaxed);
-                totalRealPackets.fetch_add(kTsPacketsPerDatagram, std::memory_order_relaxed);
-                queueSpace.notify_all();
-            }
-
-            const uint64_t now = monotonicNanoseconds();
-            const uint64_t bufferedNow = bufferedBytes.load(std::memory_order_relaxed);
-            reservoirMilliseconds.store(
-                multiplyDivide(bufferedNow * 8ULL, 1000ULL,
-                               std::max<uint64_t>(1ULL, configuredTargetBitrate)),
-                std::memory_order_relaxed);
-            maybeLogStats(now);
-        }
-    }
 
     void sendLoop() {
         uint64_t nextSendNanoseconds = 0;
@@ -2622,16 +2546,12 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.34: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.32: source="
                   << (isSegmentedHlsInput(config) ? "HLS" : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP"))
                   << " profile=tvstreamer5-compatible"
-                  << " startup_reservoir_ms="
-                  << (srtRemapCbrSourcePcr ? 0ULL : 5000ULL)
-                  << " startup_pcr_min="
-                  << (srtRemapCbrSourcePcr ? 0ULL : 5ULL)
+                  << " startup_reservoir_ms=5000 startup_pcr_min=5"
                   << " buffer_limit_mb=32"
-                  << " timing="
-                  << (srtRemapCbrSourcePcr ? "upstream-pcr-clocksync" : "reservoir-rate-controller")
+                  << " timing=reservoir-rate-controller"
                   << " pcr_mode="
                   << (srtRemapCbrSourcePcr ? "mpegtsmux-source-pcr" : "periodic-pcr-only-20ms")
                   << " source_pcr="
@@ -2640,11 +2560,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {
-        std::cerr << "SRT remap CBR timing 202.34: source_pcr=mpegtsmux-passthrough"
+        std::cerr << "SRT remap CBR timing 202.32: source_pcr=mpegtsmux-passthrough"
                   << " synthetic_pcr=off periodic_pcr_slots=off"
                   << " useful_rate_ceiling=full-target"
-                  << " wallclock_pacer=upstream-pcr-clocksync-only"
-                  << " stableudp_timer=off startup_reservoir=off"
+                  << " wallclock_pacer=stableudp-only"
                   << " scope=srt+remap+cbr-only"
                   << std::endl;
     }
@@ -2653,25 +2572,16 @@ GstElement* createSink(
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)
               << " vbr_rate=auto"
               << " packetization=7x188 startup_reservoir_ms="
-              << (srtRemapCbrSourcePcr
-                    ? 0ULL
-                    : (tv5IpProfile
-                          ? (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
-                          : (startupReservoirNanoseconds() / 1000000ULL)))
+              << (tv5IpProfile
+                    ? (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
+                    : (startupReservoirNanoseconds() / 1000000ULL))
               << " startup_pcr_min="
               << (tv5IpProfile ? kTvStreamer5StartupMinimumPcrSamples : kStartupMinimumPcrSamples)
               << " startup_pcr_grace_ms="
               << (tv5IpProfile ? 0ULL : (kStartupPcrGraceNanoseconds / 1000000ULL))
-              << " target_reservoir_ms="
-              << (srtRemapCbrSourcePcr ? 0ULL : 2500ULL)
-              << " low_watermark_ms="
-              << (srtRemapCbrSourcePcr ? 0ULL : 800ULL)
+              << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
-              << (srtRemapCbrSourcePcr
-                    ? "upstream-pcr-clocksync"
-                    : (isSegmentedHlsInput(config)
-                          ? "hls-pts-window-controller"
-                          : "reservoir-rate-controller"))
+              << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
               << " pcr_mode="
               << (syntheticPcr
                     ? "synthetic-continuous-20ms"
@@ -2682,8 +2592,7 @@ GstElement* createSink(
                     : "preserved")
               << " pcr_restamp="
               << (syntheticPcr ? "continuous-transport-media" : "off")
-              << " sender_clock="
-              << (srtRemapCbrSourcePcr ? "upstream-clocksync" : "clock_nanosleep-abstime")
+              << " sender_clock=clock_nanosleep-abstime"
               << " pcr_scheduler_decoupled=1 busywait=off"
               << " clean_start=post-dual-media-video-random-access"
               << " conditional_access="
