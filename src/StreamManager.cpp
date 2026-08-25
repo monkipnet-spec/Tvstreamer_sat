@@ -1,7 +1,6 @@
 #include "StreamManager.h"
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
-#include "NetworkTsInput.h"
 #include "TsCcStageTrace.h"
 #include "UdpInput.h"
 #include "DvbSatellite.h"
@@ -6671,20 +6670,276 @@ GstElement* StreamManager::createSourceChain(StreamState* state, GstElement* pip
         return src;
     }
 
-    if (tvs::network_input::handles(cfg)) {
-        std::string networkInputError;
-        GstElement* src = tvs::network_input::build(
-            state,
-            pipeline,
-            terminalElement,
-            G_CALLBACK(StreamManager::onDemuxPadAdded),
-            configureTsMux,
-            networkInputError);
-        if (!src) {
-            std::cerr << "Network TS input build failed: uri=" << input
-                      << " mode=" << cfg.inputMode
-                      << " error=" << networkInputError << std::endl;
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Srt) {
+        std::string mode = toLower(cfg.inputMode);
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
+        const char* factory = "srtsrc";
+        if (!hasElementFactory(factory)) {
+            std::cerr << missingElementStatus(factory) << std::endl;
+            return nullptr;
         }
+
+        GstElement* src = gst_element_factory_make(factory, "input_src");
+        // SRT already releases packets through its latency/retransmission
+        // window. A downstream-leaky queue after srtsrc discards recovered TS
+        // packets during short CPU stalls and turns them into visible PES/CC
+        // damage. Keep a bounded non-leaky reserve and apply back-pressure.
+        GstElement* queue = addQueue("input_queue", kSrtInputQueueMax, false);
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+            return nullptr;
+        }
+
+        g_object_set(src, "uri", input.c_str(), nullptr);
+        // srtsrc derives each buffer timestamp from the SRT sender time and
+        // measured transport delay. Keep GstBaseSrc timestamping disabled so
+        // recovered packets retain that smooth source timeline instead of
+        // being retimed from bursty local delivery.
+        setBooleanPropertyIfPresent(src, "do-timestamp", FALSE);
+        setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
+        setIntPropertyIfPresent(src, "latency", kSrtInputLatencyMs);
+        setUIntPropertyIfPresent(src, "blocksize", kTsPacketsPerUdpBuffer * 188U);
+        setStringPropertyIfPresent(src, "localaddress", inputInterface);
+        if (mode == "listener") {
+            setIntPropertyIfPresent(src, "mode", 2);
+            setBooleanPropertyIfPresent(src, "wait-for-connection", TRUE);
+            setBooleanPropertyIfPresent(src, "keep-listening", TRUE);
+        } else {
+            setIntPropertyIfPresent(src, "mode", 1);
+            setBooleanPropertyIfPresent(src, "wait-for-connection", FALSE);
+            setUIntPropertyIfPresent(src, "localport", 0);
+            setUInt64PropertyIfPresent(queue, "min-threshold-time", kSrtInputStartupBuffer);
+            g_signal_connect(queue, "running", G_CALLBACK(onSrtInputPrebufferRunning), nullptr);
+        }
+
+        std::cerr << "SRT input: mode=" << (mode == "listener" ? "listener" : "caller")
+                  << " latency_ms=" << kSrtInputLatencyMs
+                  << " queue_ms=8000 startup_buffer_ms="
+                  << (mode == "listener" ? 0 : 2000)
+                  << " leaky=off backpressure=on"
+                  << " blocksize=" << (kTsPacketsPerUdpBuffer * 188U)
+                  << " input_pacing=off"
+                  << " source_timestamping=srt-sender-clock" << std::endl;
+
+        if (!gst_element_link(src, queue)) {
+            return nullptr;
+        }
+
+        terminalElement = queue;
+        return src;
+    }
+
+    const std::string normalizedInputMode = toLower(cfg.inputMode);
+    const bool directHttpMpegTs = isDirectHttpMpegTsConfig(cfg);
+
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http && directHttpMpegTs) {
+        // v187: tokenized IPTV HTTP MPEG-TS is fetched by libcurl and fed to
+        // appsrc.  This creates exactly one provider request and avoids a
+        // build-time dependency on souphttpsrc/caps negotiation for opaque URLs.
+        GstElement* src = gst_element_factory_make("appsrc", "input_src");
+        GstElement* queue = addQueue("input_queue", 8000000000ULL, false);
+        setUIntPropertyIfPresent(queue, "max-size-bytes", 8U * 1024U * 1024U);
+        if (!src || !queue || !addElementOrFail(pipeline, src)) {
+            if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
+            std::cerr << "HTTP MPEG-TS input: failed to create appsrc/queue" << std::endl;
+            return nullptr;
+        }
+
+        GstCaps* caps = gst_caps_from_string(
+            "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+        if (!caps) {
+            std::cerr << "HTTP MPEG-TS input: failed to create MPEG-TS caps" << std::endl;
+            return nullptr;
+        }
+        gst_app_src_set_caps(GST_APP_SRC(src), caps);
+        gst_caps_unref(caps);
+        gst_app_src_set_stream_type(GST_APP_SRC(src), GST_APP_STREAM_TYPE_STREAM);
+        gst_app_src_set_max_bytes(GST_APP_SRC(src), 4ULL * 1024ULL * 1024ULL);
+        g_object_set(src,
+            "is-live", TRUE,
+            "format", GST_FORMAT_BYTES,
+            "block", TRUE,
+            "do-timestamp", FALSE,
+            nullptr);
+
+        if (!gst_element_link(src, queue)) {
+            std::cerr << "HTTP MPEG-TS input: failed to link appsrc -> input_queue" << std::endl;
+            return nullptr;
+        }
+
+        const std::string location = appendHlsAccessQuery(input, cfg);
+        auto httpState = std::make_shared<HttpMpegTsCurlInputState>(src, cfg, location);
+        state->httpMpegTsInputState = httpState;
+
+        std::cerr << "HTTP MPEG-TS input: mode=single-request"
+                  << " uri=" << input
+                  << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
+                  << " input_mode=" << (normalizedInputMode.empty() ? "auto" : normalizedInputMode)
+                  << " hls_probe=bypassed transport=libcurl-appsrc start=after-pipeline-playing"
+                  << std::endl;
+        terminalElement = queue;
+        return src;
+    }
+
+    // Opaque IPTV HTTP URLs often contain a per-session access token in the
+    // path.  Do not pre-open such URLs when the user explicitly selects
+    // HTTP MPEG-TS: some providers permit only one active request per token
+    // and the old HLS sniff request could consume/lock that session before
+    // souphttpsrc opened the real stream.
+    // v187: do not pre-open opaque HTTP URLs. .m3u8 and explicit HLS mode are
+    // classified as HLS by inputKind(); every other HTTP URL in Auto is treated
+    // as a continuous MPEG-TS stream and opened exactly once through libcurl.
+    const bool useHlsInput = inputProtocol == tvs::stream_protocols::InputProtocolKind::Hls;
+
+    if (useHlsInput) {
+        if (!hasElementFactory("souphttpsrc")) {
+            std::cerr << missingElementStatus("souphttpsrc") << std::endl;
+            return nullptr;
+        }
+        if (!hasElementFactory("hlsdemux")) {
+            std::cerr << missingElementStatus("hlsdemux") << std::endl;
+            return nullptr;
+        }
+        if (!hasElementFactory("mpegtsmux")) {
+            std::cerr << missingElementStatus("mpegtsmux") << std::endl;
+            return nullptr;
+        }
+
+        std::string location = input;
+        if (inputLower.rfind("hls://", 0) == 0) {
+            location = "http://" + input.substr(6);
+        }
+        location = appendHlsAccessQuery(location, cfg);
+
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
+        GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
+        GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
+        GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
+        // v202.2: keep two HLS paths behind one selector.  Complete MPEG-TS
+        // fragments go directly to the source tail and preserve the provider's
+        // original PAT/PMT/PCR/PTS/CC.  The mpegtsmux path is retained only for
+        // hlsdemux implementations that expose elementary audio/video pads.
+        GstElement* selector = gst_element_factory_make("input-selector", "input_hls_transport_selector");
+        // v202.1: HLS is burst-delivered segment media, not a datagram live source.
+        // A short leaky queue drops valid TS whenever a segment is downloaded faster
+        // than downstream consumes it, producing CC/PES damage (audible scratching)
+        // and apparent input-bitrate collapses. Preserve up to 12 seconds and use
+        // normal back-pressure into hlsdemux instead of discarding segment data.
+        GstElement* queue = addQueue("input_queue", kHlsInputQueueMax, false);
+        if (!src || !demux || !mux || !selector || !queue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, demux) ||
+            !addElementOrFail(pipeline, mux) ||
+            !addElementOrFail(pipeline, selector)) {
+            return nullptr;
+        }
+
+        g_object_set(src, "location", location.c_str(), "is-live", FALSE, "do-timestamp", FALSE, nullptr);
+        setIntPropertyIfPresent(src, "timeout", kNetworkSourceTimeoutSeconds);
+        if (!inputInterface.empty()) {
+            std::cerr << "HLS input: input_iface=" << inputInterface
+                      << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
+                      << std::endl;
+        }
+        // connection-speed describes measured download capacity, not the
+        // configured output mux rate. Keep zero so hlsdemux measures bandwidth
+        // and does not oscillate between variants around the output bitrate.
+        setUIntPropertyIfPresent(demux, "connection-speed", 0);
+        configureTsMux(mux, cfg);
+        setBooleanPropertyIfPresent(selector, "sync-streams", FALSE);
+        setBooleanPropertyIfPresent(selector, "cache-buffers", FALSE);
+        setUInt64PropertyIfPresent(queue, "min-threshold-time", kHlsInputStartupBuffer);
+        g_signal_connect(queue, "running", G_CALLBACK(onHlsInputPrebufferRunning), nullptr);
+        std::cerr << "HLS input: queue_ms=12000 startup_buffer_ms=1000 "
+                  << "leaky=off backpressure=on source_timestamping=off "
+                  << "adaptive_bandwidth=auto" << std::endl;
+
+        if (!gst_element_link(src, demux) || !gst_element_link(selector, queue)) {
+            return nullptr;
+        }
+
+        if (!state->sourceContext) {
+            state->sourceContext = std::make_unique<RemapContext>();
+        }
+        state->sourceContext->mux = mux;
+        state->sourceContext->hlsInputSelector = selector;
+
+        // Pre-connect the fallback remux branch.  input-selector starts on this
+        // pad; onDemuxPadAdded switches to hlsDirectSelectorPad as soon as a
+        // complete video/mpegts pad is seen.
+        GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src");
+        GstPad* muxSelectorPad = gst_element_request_pad_simple(selector, "sink_%u");
+        if (!muxSrcPad || !muxSelectorPad || gst_pad_link(muxSrcPad, muxSelectorPad) != GST_PAD_LINK_OK) {
+            if (muxSrcPad) gst_object_unref(muxSrcPad);
+            if (muxSelectorPad) gst_object_unref(muxSelectorPad);
+            return nullptr;
+        }
+        gst_object_unref(muxSrcPad);
+        state->sourceContext->hlsMuxSelectorPad = muxSelectorPad;
+        g_object_set(selector, "active-pad", muxSelectorPad, nullptr);
+        state->sourceContext->config = cfg;
+        state->sourceContext->flvMux = false;
+        configureHlsHttpSource(src, state->sourceContext->config);
+        // Legacy hlsdemux creates HTTP child sources for variant playlists,
+        // segments and AES key URIs. Apply this stream's access credential to
+        // every such child, not just to the first manifest request.
+        g_signal_connect(demux, "deep-element-added", G_CALLBACK(onHlsDeepElementAdded), state->sourceContext.get());
+        g_signal_connect(demux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), state->sourceContext.get());
+        terminalElement = queue;
+        return src;
+    }
+
+    if (inputProtocol == tvs::stream_protocols::InputProtocolKind::Http) {
+        if (!hasElementFactory("souphttpsrc")) {
+            std::cerr << missingElementStatus("souphttpsrc") << std::endl;
+            return nullptr;
+        }
+
+        GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
+        GstElement* capsFilter = gst_element_factory_make("capsfilter", "input_http_ts_caps");
+        GstElement* queue = addQueue("input_queue", 8000000000ULL, false);
+        setUIntPropertyIfPresent(queue, "max-size-bytes", 8U * 1024U * 1024U);
+        if (!src || !capsFilter || !queue ||
+            !addElementOrFail(pipeline, src) ||
+            !addElementOrFail(pipeline, capsFilter)) {
+            return nullptr;
+        }
+
+        const std::string inputInterface = configuredInputInterfaceAddress(cfg);
+        // hls_access_* fields are deliberately retained for config backward
+        // compatibility, but they are generic HTTP/HLS credentials since v185.
+        // A token already embedded in the URL path is left byte-for-byte intact.
+        const std::string httpLocation = appendHlsAccessQuery(input, cfg);
+        g_object_set(src, "location", httpLocation.c_str(), "is-live", TRUE, "do-timestamp", FALSE, nullptr);
+        configureHlsHttpSource(src, cfg);
+        // Never request gzip/deflate for a continuous MPEG-TS byte stream.
+        setBooleanPropertyIfPresent(src, "compress", FALSE);
+        setIntPropertyIfPresent(src, "timeout", kNetworkSourceTimeoutSeconds);
+        setUIntPropertyIfPresent(src, "blocksize", kTsPacketsPerUdpBuffer * kTsPacketSize);
+
+        GstCaps* tsCaps = gst_caps_from_string(
+            "video/mpegts,systemstream=(boolean)true,packetsize=(int)188");
+        if (!tsCaps) return nullptr;
+        g_object_set(capsFilter, "caps", tsCaps, nullptr);
+        gst_caps_unref(tsCaps);
+
+        if (!inputInterface.empty()) {
+            std::cerr << "HTTP MPEG-TS input: input_iface=" << inputInterface
+                      << " is selected, but souphttpsrc uses the kernel route for HTTP sockets"
+                      << std::endl;
+        }
+
+        std::cerr << "HTTP MPEG-TS input: mode="
+                  << "legacy-http"
+                  << " uri=" << input
+                  << " access=" << (cfg.hlsAccessKeyMode == "none" ? "url-only" : cfg.hlsAccessKeyMode)
+                  << " hls_probe=disabled"
+                  << std::endl;
+
+        if (!gst_element_link_many(src, capsFilter, queue, nullptr)) {
+            return nullptr;
+        }
+
+        terminalElement = queue;
         return src;
     }
 
@@ -7020,17 +7275,9 @@ bool StreamManager::buildOutputBranch(
     const bool hlsTransportTs = state &&
         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
         state->runtimeConfig.inputServiceId == 0;
-    // 202.22: SRT commonly carries an already-finished SPTS.  If no explicit
-    // service selection was requested, keep that transport intact exactly like
-    // direct HTTP MPEG-TS and direct HLS MPEG-TS.  Re-demux/remux remains
-    // available when inputServiceId selects one program from an SRT MPTS or
-    // when explicit PID/SID remapping is enabled.
-    const bool srtTransportTs = state &&
-        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt &&
-        state->runtimeConfig.inputServiceId == 0;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
-        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs || srtTransportTs ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
@@ -7044,11 +7291,6 @@ bool StreamManager::buildOutputBranch(
     // Explicit PID/SID remap still takes the normal remux path below.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
-    if (srtTransportTs && usesStableUdpShaper(outputConfig) && !outputConfig.remapEnabled) {
-        std::cerr << "Unified UDP direct TS 202.22: source=SRT"
-                  << " input_service_id=0 demux=off remux=off source_pcr=preserved"
-                  << std::endl;
-    }
     // NETUP Stream Processor is less tolerant than VLC of a live TS that begins
     // in the middle of a GOP/PSI cycle.  HTTP Progressive and SRT therefore get
     // a clean single-program remux with frequent PAT/PMT/PCR even when explicit
@@ -7268,27 +7510,6 @@ bool StreamManager::buildRemapPipeline(
         setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(selectedInputServiceId));
     }
 
-    const auto remapInputKind = state
-        ? tvs::stream_protocols::inputKind(state->runtimeConfig)
-        : tvs::stream_protocols::inputKind(cfg);
-    const bool networkStableUdpRemap =
-        usesStableUdpShaper(cfg) && cfg.remapEnabled &&
-        (remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
-         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http);
-    if (networkStableUdpRemap) {
-        // SRT already has its own network jitter reservoir and progressive HTTP
-        // is buffered upstream. The tsdemux default adds another 700 ms smooth
-        // demux latency, which makes live remux stalls much more visible.
-        setIntPropertyIfPresent(demux, "latency", 100);
-        // GStreamer >=1.28: preserve the source media timeline rather than
-        // continuously skew-correcting it before mpegtsmux. Older builds simply
-        // ignore this optional property.
-        setBooleanPropertyIfPresent(demux, "skew-corrections", FALSE);
-        std::cerr << "Network remap 202.24: demux=tsdemux latency_ms=100"
-                  << " skew_corrections=off-if-supported"
-                  << " output_clock=post-mux-media-timestamps" << std::endl;
-    }
-
     if (usesStableUdpShaper(cfg)) {
         if (udpCbrOutputEnabled(cfg) && cfg.targetBitrate == 0) {
             std::cerr << "UDP CBR requires Target bitrate greater than zero" << std::endl;
@@ -7313,10 +7534,8 @@ bool StreamManager::buildRemapPipeline(
                   << " external_shaper=" << (udpCbrOutputEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " input_sid=" << inputServiceId
                   << " output_sid=" << cfg.serviceId
-                  << " audio_reservoir_ms="
-                  << ((udpCbrOutputEnabled(cfg) && !networkStableUdpRemap) ? 1500 : 0)
-                  << " audio_reservoir_mode="
-                  << ((udpCbrOutputEnabled(cfg) && !networkStableUdpRemap) ? "startup-only" : "off")
+                  << " audio_reservoir_ms=" << (udpCbrOutputEnabled(cfg) ? 1500 : 0)
+                  << " audio_reservoir_mode=" << (udpCbrOutputEnabled(cfg) ? "startup-only" : "off")
                   << " audio_pacer=off"
                   << " alignment=" << kTsPacketsPerUdpBuffer
                   << " pcr_interval=1800 pat_pmt_interval=9000" << std::endl;
@@ -7759,15 +7978,10 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
-    const auto remapSourceKind = tvs::stream_protocols::inputKind(ctx->config);
-    const bool networkStableUdpElementaryRemap =
-        remapSourceKind == tvs::stream_protocols::InputProtocolKind::Srt ||
-        remapSourceKind == tvs::stream_protocols::InputProtocolKind::Http;
     const bool stableUdpAudioReservoir =
         isAudio && !ctx->flvMux &&
         usesStableUdpShaper(ctx->config) &&
-        udpCbrOutputEnabled(ctx->config) &&
-        !networkStableUdpElementaryRemap;
+        udpCbrOutputEnabled(ctx->config);
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
@@ -7830,18 +8044,13 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
-    const bool stableUdpSrtRemapParser =
-        srtVideoParser && usesStableUdpShaper(ctx->config) && ctx->config.remapEnabled;
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
-        if (stableUdpSrtRemapParser) {
-            // Remap must be identifier-only. Do not manufacture/repeat codec
-            // parameter sets or force parser rewriting on the Stable UDP path.
-            g_object_set(parser, "config-interval", 0, nullptr);
-        } else {
-            g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
-            if (srtVideoParser) {
-                setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
-            }
+        // SRT packet loss can leave a decoder without the parameter sets needed
+        // to resume at the next keyframe. Repeat them with every IDR and force the
+        // parser to process the stream instead of negotiating passthrough.
+        g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
+        if (srtVideoParser) {
+            setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
         }
     }
     gst_element_sync_state_with_parent(queue);
@@ -7926,11 +8135,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << (stableUdpAudioReservoir
                       ? " audio_reservoir_ms=1500 audio_reservoir_mode=startup-only audio_pacer=off"
                       : "")
-                  << (stableUdpSrtRemapParser
-                      ? " srt_parameter_sets=preserve parser_rewrite=minimal"
-                      : (srtVideoParser
-                          ? " srt_parameter_sets=every-idr parser_passthrough=off"
-                          : ""))
+                  << (srtVideoParser
+                      ? " srt_parameter_sets=every-idr parser_passthrough=off"
+                      : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
         if (isVideo) {

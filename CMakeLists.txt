@@ -52,7 +52,6 @@ add_executable(TVStreammerSAT5
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
-    src/NetworkTsInput.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp
