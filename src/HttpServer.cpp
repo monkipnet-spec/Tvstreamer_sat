@@ -2233,15 +2233,13 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .header-left .title{font-size:1.05rem;font-weight:700;letter-spacing:.02em;color:#fff;white-space:nowrap}
 .header-left .title .server-name{color:#7dd1ff}
 .header-left .subtitle{font-size:.78rem;color:#9aa3b1;margin-top:2px}
-.header-monitor{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
-.header-monitor .metric,.header-monitor .status{display:inline-flex;align-items:center;gap:5px;padding:5px 7px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:9px;color:#d1d9ed;font-size:.75rem;line-height:1;white-space:nowrap}
-.header-monitor strong{color:#fff;font-size:.75rem}
+.header-monitor{display:flex;align-items:center;gap:8px;min-width:0}
+.header-monitor-group{display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:3px;min-width:94px}
+.header-monitor .metric,.header-monitor .status{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 7px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#d1d9ed;font-size:.74rem;line-height:1.05;white-space:nowrap}
+.header-monitor strong{color:#fff;font-size:.74rem}
 .header-monitor .metric span{color:#7dd1ff;font-weight:700}
 .header-monitor .status span{color:#fff;font-weight:700}
 .header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.header-center{display:flex;align-items:center;justify-content:center;gap:12px}
-.network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
-.network-button:hover{background:rgba(57,189,248,.24)}
 .restart-button{border-color:rgba(255,184,77,.28);color:#ffe0a3;background:rgba(255,184,77,.1)}
 .restart-button:hover{background:rgba(255,184,77,.2);border-color:rgba(255,184,77,.38)}
 .restart-button:disabled{opacity:.65;cursor:wait}
@@ -2250,7 +2248,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .system-menu summary::-webkit-details-marker{display:none}
 .system-menu summary:after{content:'';width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid currentColor;opacity:.8}
 .system-menu[open] summary{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
-.system-menu-list{position:absolute;right:0;top:calc(100% + 6px);z-index:100001;min-width:178px;padding:6px;background:#121825;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 42px rgba(0,0,0,.28)}
+.system-menu-list{position:absolute;left:50%;right:auto;transform:translateX(-50%);top:calc(100% + 6px);z-index:100001;min-width:178px;padding:6px;background:#121825;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 18px 42px rgba(0,0,0,.28)}
 .system-menu-item{display:block;width:100%;padding:8px 10px;border:0;border-radius:7px;background:transparent;color:#e7edf8;text-align:left;font-size:.82rem;cursor:pointer}
 .system-menu-item:hover{background:rgba(255,255,255,.08)}
 .system-menu-item.restart-button{color:#ffe0a3;background:transparent;border:0}
@@ -2469,20 +2467,22 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <div class="subtitle" data-i18n="subtitle">Broadcast monitoring and stream control</div>
 </div>
 <div class="header-monitor">
+<div class="header-monitor-group">
 <span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
 <span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
+</div>
+<div class="header-monitor-group">
 <span class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></span>
 <span class="status"><strong data-i18n="active">Active:</strong> <span id="activeCount">0</span></span>
 </div>
 </div>
-<div class="header-center">
-<button class="network-button" onclick="openNetworkModal()" data-i18n="network">Network</button>
 </div>
 <div class="header-right">
 <button class="button-secondary" onclick="toggleLanguage()" id="languageButton">RU</button>
 <details class="system-menu" id="systemMenu">
 <summary class="button-secondary" data-i18n="system">System</summary>
 <div class="system-menu-list">
+<button class="system-menu-item" onclick="openNetworkModal();closeSystemMenu()" data-i18n="network">Network</button>
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
 <button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
@@ -2491,7 +2491,6 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <button class="system-menu-item restart-button" onclick="closeSystemMenu();restartProgram()" data-i18n="restartProgram">Restart</button>
 </div>
 </details>
-<button class="button-secondary" onclick="downloadVlcPlaylist()" data-i18n="playlist">VLC playlist</button>
 <button class="button-secondary" onclick="openSubscribersModal()" data-i18n="subscribers">Subscribers</button>
 <button class="button-secondary" onclick="openAddChannelModal()" data-i18n="addChannel">+ Add channel</button>
 <button class="button-primary" onclick="openStreamModal()" data-i18n="addStream">+ Add stream</button>
@@ -3484,7 +3483,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.39'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.40'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
