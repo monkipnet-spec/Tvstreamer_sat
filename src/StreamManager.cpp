@@ -54,6 +54,13 @@ constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
 constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(3);
+// 202.38: HLS is segmented delivery, so a several-second gap in emitted TS
+// buffers can be normal while hlsdemux waits for/reloads the next media
+// segment.  Do not treat the generic 3-second live-input watchdog as signal
+// loss for HLS.  Fifteen seconds matches the existing HLS session TTL and is
+// long enough to span normal segment boundaries without hiding a real outage.
+constexpr auto kHlsInputFailoverDelay = std::chrono::seconds(15);
+constexpr auto kHlsPrimaryProbeTimeout = std::chrono::seconds(15);
 // 202.33: SRT caller/listener startup can legitimately take longer than the
 // generic live-input watchdog, especially when remap has to discover the
 // program and build dynamic pads before media counters start moving.  Give a
@@ -67,10 +74,14 @@ std::chrono::milliseconds inputProbeTimeoutForUri(
     const StreamConfig& baseConfig, const std::string& inputUri) {
     StreamConfig probeConfig = baseConfig;
     probeConfig.inputUri = inputUri;
-    return tvs::stream_protocols::inputKind(probeConfig) ==
-            tvs::stream_protocols::InputProtocolKind::Srt
-        ? std::chrono::duration_cast<std::chrono::milliseconds>(kSrtPrimaryProbeTimeout)
-        : std::chrono::duration_cast<std::chrono::milliseconds>(kInputFailoverDelay);
+    const auto kind = tvs::stream_protocols::inputKind(probeConfig);
+    if (kind == tvs::stream_protocols::InputProtocolKind::Srt) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(kSrtPrimaryProbeTimeout);
+    }
+    if (kind == tvs::stream_protocols::InputProtocolKind::Hls) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(kHlsPrimaryProbeTimeout);
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(kInputFailoverDelay);
 }
 
 constexpr long kHttpConnectTimeoutMs = 3000;
@@ -8725,18 +8736,24 @@ void StreamManager::monitorBus(const std::string& id) {
         return;
     }
 
-    if (tvs::stream_protocols::inputKind(state->config) ==
-        tvs::stream_protocols::InputProtocolKind::Srt) {
+    const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
+    if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
         std::cerr << "SRT input watchdog 202.33: startup_wait_ms=15000"
                   << " steady_loss_ms=3000 primary_probe_ms=15000"
                   << " source_auto_reconnect=on" << std::endl;
+    } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
+        std::cerr << "HLS input watchdog 202.38: loss_wait_ms=15000"
+                  << " primary_probe_ms=15000 generic_live_watchdog_ms=3000"
+                  << " segmented_input=on" << std::endl;
     }
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
+        const auto activeConfiguredInputKind = tvs::stream_protocols::inputKind(state->config);
         const bool srtInput =
-            tvs::stream_protocols::inputKind(state->config) ==
-            tvs::stream_protocols::InputProtocolKind::Srt;
+            activeConfiguredInputKind == tvs::stream_protocols::InputProtocolKind::Srt;
+        const bool hlsInput =
+            activeConfiguredInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
 
         // v200 overload self-healing.  Do not restart while the machine is
         // still overloaded: continuity damage keeps refreshing
@@ -8904,9 +8921,9 @@ void StreamManager::monitorBus(const std::string& id) {
                 srtInput &&
                 state->lastInputBytesSeen == 0 &&
                 state->inputBytes.load(std::memory_order_relaxed) == 0;
-            const auto inputFailoverDelay = waitingForFirstSrtMedia
-                ? kSrtStartupFailoverDelay
-                : kInputFailoverDelay;
+            const auto inputFailoverDelay = hlsInput
+                ? kHlsInputFailoverDelay
+                : (waitingForFirstSrtMedia ? kSrtStartupFailoverDelay : kInputFailoverDelay);
             const bool inputTimedOut =
                 now - state->lastInputActivity >= inputFailoverDelay;
             if (inputTimedOut && !state->usingBackup && !state->config.backupInputUri.empty()) {
