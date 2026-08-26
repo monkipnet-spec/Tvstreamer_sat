@@ -2228,15 +2228,18 @@ html{font-size:14px}
 body{font-family:Arial,Helvetica,sans-serif;background:#0f1218;color:#EEE;margin:0;padding:0;min-height:100vh}
 body:before{content:'';position:fixed;inset:0;background:radial-gradient(circle at top left,rgba(40,160,255,.18),transparent 28%),radial-gradient(circle at top right,rgba(120,90,255,.15),transparent 22%),linear-gradient(180deg,#10131a 0%,#090c12 100%);pointer-events:none;z-index:-1}
 header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:rgba(19,23,31,.98);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.06);gap:12px;flex-wrap:wrap;box-sizing:border-box;box-shadow:0 8px 24px rgba(0,0,0,.22)}
-.header-left{display:flex;align-items:flex-start;gap:10px}
-.header-left .title{font-size:1.05rem;font-weight:700;letter-spacing:.02em;color:#fff}
+.header-left{display:flex;align-items:center;gap:14px;min-width:0;flex:1 1 auto}
+.header-title-block{flex:0 0 auto;min-width:0}
+.header-left .title{font-size:1.05rem;font-weight:700;letter-spacing:.02em;color:#fff;white-space:nowrap}
+.header-left .title .server-name{color:#7dd1ff}
 .header-left .subtitle{font-size:.78rem;color:#9aa3b1;margin-top:2px}
+.header-monitor{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-width:0}
+.header-monitor .metric,.header-monitor .status{display:inline-flex;align-items:center;gap:5px;padding:5px 7px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:9px;color:#d1d9ed;font-size:.75rem;line-height:1;white-space:nowrap}
+.header-monitor strong{color:#fff;font-size:.75rem}
+.header-monitor .metric span{color:#7dd1ff;font-weight:700}
+.header-monitor .status span{color:#fff;font-weight:700}
 .header-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .header-center{display:flex;align-items:center;justify-content:center;gap:12px}
-.system-load{display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:2px;min-width:86px;padding:6px 10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;color:#d1d9ed;font-size:.76rem;white-space:nowrap}
-.system-load strong{color:#fff;font-size:.76rem}
-.system-load .metric{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;line-height:1.2}
-.system-load .metric span{color:#7dd1ff;font-weight:700;min-width:38px;text-align:right}
 .network-button{padding:7px 10px;border:1px solid rgba(57,189,248,.28);border-radius:10px;color:#bdefff;background:rgba(57,189,248,.12);cursor:pointer;font-size:.78rem;white-space:nowrap}
 .network-button:hover{background:rgba(57,189,248,.24)}
 .restart-button{border-color:rgba(255,184,77,.28);color:#ffe0a3;background:rgba(255,184,77,.1)}
@@ -2261,10 +2264,6 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .button-primary.save-dirty:hover{background:#ffc968}
 .button-secondary:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
 .container{padding:calc(var(--header-height,58px) + 10px) 12px 12px;max-width:1180px;margin:0 auto;box-sizing:border-box}
-.stats-panel{display:grid;grid-template-columns:repeat(2,minmax(100px,1fr));gap:10px;padding:8px 12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px}
-.stats-panel .status{display:flex;flex-direction:column;gap:3px;font-size:.78rem;color:#d1d9ed}
-.stats-panel .status strong{color:#fff;font-size:.78rem}
-.stats-panel .status span{font-size:1rem;font-weight:700;color:#fff}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
 .tile{position:relative;background:rgba(22,27,37,.94);padding:8px 10px 8px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:4px;height:252px;min-height:252px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
 .tile:before{content:'';position:absolute;left:0;top:12px;bottom:12px;width:4px;border-radius:999px;background:linear-gradient(180deg,#3fc8ff,#1d69ff)}
@@ -2465,21 +2464,18 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <body>
 <header>
 <div class="header-left">
-<div>
-<div class="title">Control Panel</div>
+<div class="header-title-block">
+<div class="title">Control Panel — <span class="server-name" id="headerServerName">TVStreammerSAT5</span></div>
 <div class="subtitle" data-i18n="subtitle">Broadcast monitoring and stream control</div>
+</div>
+<div class="header-monitor">
+<span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
+<span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
+<span class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></span>
+<span class="status"><strong data-i18n="active">Active:</strong> <span id="activeCount">0</span></span>
 </div>
 </div>
 <div class="header-center">
-<div class="system-load">
-<span class="metric"><strong>CPU</strong> <span id="cpuLoad">—%</span></span>
-<span class="metric"><strong>RAM</strong> <span id="ramLoad">—%</span></span>
-<span class="metric"><strong>PROC</strong> <span id="procLoad">—</span></span>
-</div>
-<div class="stats-panel">
-<div class="status"><strong data-i18n="total">Total:</strong> <span id="totalCount">0</span></div>
-<div class="status"><strong data-i18n="active">Active:</strong> <span id="activeCount">0</span></div>
-</div>
 <button class="network-button" onclick="openNetworkModal()" data-i18n="network">Network</button>
 </div>
 <div class="header-right">
@@ -2769,12 +2765,6 @@ async function statePollLoop() {
 function updateSystemLoad(metrics) {
   document.getElementById('cpuLoad').textContent = `${Number(metrics.cpu_percent || 0).toFixed(1)}%`;
   document.getElementById('ramLoad').textContent = `${Number(metrics.ram_percent || 0).toFixed(1)}%`;
-  const procEl = document.getElementById('procLoad');
-  if (procEl) {
-    const pidsMax = String(metrics.cgroup_pids_max || '');
-    const pidsText = metrics.cgroup_pids_current ? ` P:${metrics.cgroup_pids_current}/${pidsMax || '?'}` : '';
-    procEl.textContent = `T:${Number(metrics.process_threads || 0)} FD:${Number(metrics.process_fds || 0)} RSS:${Number(metrics.process_rss_mb || 0).toFixed(0)}M${pidsText}`;
-  }
   const table = document.getElementById('networkTableBody');
   if (!table) return;
   const interfaces = metrics.interfaces || [];
@@ -3005,8 +2995,10 @@ function updateStreamTile(tile, stream) {
   }
 }
 function updateLiveTiles() {
+  const headerServerName = document.getElementById('headerServerName');
   const totalCount = document.getElementById('totalCount');
   const activeCount = document.getElementById('activeCount');
+  if (headerServerName) headerServerName.textContent = state.server_name || 'TVStreammerSAT5';
   if (totalCount) totalCount.textContent = state.stream_count ?? (state.streams || []).length;
   if (activeCount) activeCount.textContent = state.active_count ?? (state.streams || []).filter(stream => stream.active).length;
   const tiles = document.getElementById('tiles');
@@ -3492,7 +3484,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.38'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.39'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
