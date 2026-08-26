@@ -2231,8 +2231,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .header-left{display:flex;align-items:center;gap:14px;min-width:0;flex:1 1 auto}
 .header-title-block{flex:0 0 auto;min-width:0}
 .header-left .title{font-size:1.05rem;font-weight:700;letter-spacing:.02em;color:#fff;white-space:nowrap}
-.header-left .title .server-name{color:#7dd1ff}
-.header-left .subtitle{font-size:.78rem;color:#9aa3b1;margin-top:2px}
+.header-title-block .server-name{display:block;margin-top:3px;color:#7dd1ff;font-size:.78rem;font-weight:600;line-height:1.15;white-space:nowrap}
 .header-monitor{display:flex;align-items:center;gap:8px;min-width:0}
 .header-monitor-group{display:flex;flex-direction:column;align-items:stretch;justify-content:center;gap:3px;min-width:94px}
 .header-monitor .metric,.header-monitor .status{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 7px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:8px;color:#d1d9ed;font-size:.74rem;line-height:1.05;white-space:nowrap}
@@ -2463,8 +2462,8 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <header>
 <div class="header-left">
 <div class="header-title-block">
-<div class="title">Control Panel — <span class="server-name" id="headerServerName">TVStreammerSAT5</span></div>
-<div class="subtitle" data-i18n="subtitle">Broadcast monitoring and stream control</div>
+<div class="title">Control Panel</div>
+<div class="server-name" id="headerServerName">TVStreammerSAT5</div>
 </div>
 <div class="header-monitor">
 <div class="header-monitor-group">
@@ -3483,7 +3482,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.40'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.41'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
