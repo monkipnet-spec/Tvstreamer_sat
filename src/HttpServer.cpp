@@ -38,6 +38,16 @@ namespace {
 
 constexpr const char* kProgramVersion = tvs::app::kProgramVersion;
 
+// 202.43: /api/state is normally polled every 2 seconds. Keeping every sample
+// for 30 days would retain ~1.3 million string-heavy objects per stream and a
+// month chart would create another very large transient JSON tree. Keep full
+// resolution for the recent hour, then compact old samples into time buckets.
+constexpr int64_t kQualityRetentionSeconds = 30LL * 24LL * 60LL * 60LL;
+constexpr int64_t kQualityFullResolutionSeconds = 60LL * 60LL;
+constexpr int64_t kQualityDayResolutionSeconds = 30LL;
+constexpr int64_t kQualityMonthResolutionSeconds = 5LL * 60LL;
+constexpr int64_t kQualityCompactionIntervalSeconds = 60LL;
+
 struct CaDecodeUiMemory {
     std::string state;
     std::chrono::steady_clock::time_point holdUntil{};
@@ -1097,10 +1107,37 @@ std::string HttpServer::currentState() {
     const auto activeStreamSessions = streamManager.activeStreamSessions();
     std::map<std::string, size_t> streamNumbers;
     std::map<std::string, std::string> streamNames;
+    std::set<std::string> configuredStreamIds;
     for (size_t index = 0; index < configManager.config.streams.size(); ++index) {
       const auto& stream = configManager.config.streams[index];
       streamNumbers[stream.id] = index + 1;
       streamNames[stream.id] = stream.name.empty() ? stream.id : stream.name;
+      configuredStreamIds.insert(stream.id);
+    }
+    // Also purge history/UI state for IDs removed by a full config update or
+    // rename, not only by the dedicated delete endpoint.
+    {
+      std::lock_guard<std::mutex> lock(qualityMutex);
+      for (auto it = qualitySamples.begin(); it != qualitySamples.end();) {
+        if (!configuredStreamIds.count(it->first)) {
+          qualityLastCompaction.erase(it->first);
+          it = qualitySamples.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      for (auto it = qualityLastCompaction.begin(); it != qualityLastCompaction.end();) {
+        if (!configuredStreamIds.count(it->first)) it = qualityLastCompaction.erase(it);
+        else ++it;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(caDecodeUiMutex());
+      auto& memory = caDecodeUiMemory();
+      for (auto it = memory.begin(); it != memory.end();) {
+        if (!configuredStreamIds.count(it->first)) it = memory.erase(it);
+        else ++it;
+      }
     }
     auto sessionToJson = [&](const ActiveStreamSession& session) {
       Json::Value item;
@@ -1782,9 +1819,36 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
         samples.push_back(sample);
     }
 
-    const int64_t cutoff = now - 30LL * 24LL * 60LL * 60LL;
+    const int64_t cutoff = now - kQualityRetentionSeconds;
     while (!samples.empty() && samples.front().timestamp < cutoff) {
         samples.pop_front();
+    }
+
+    auto& lastCompaction = qualityLastCompaction[cfg.id];
+    if (lastCompaction == 0 || now - lastCompaction >= kQualityCompactionIntervalSeconds) {
+        std::deque<QualitySample> compacted;
+        int64_t previousBucket = -1;
+        int64_t previousStep = -1;
+        for (const auto& existing : samples) {
+            const int64_t age = std::max<int64_t>(0, now - existing.timestamp);
+            const int64_t step = age <= kQualityFullResolutionSeconds
+                ? 1LL
+                : (age <= 24LL * 60LL * 60LL
+                    ? kQualityDayResolutionSeconds
+                    : kQualityMonthResolutionSeconds);
+            const int64_t bucket = existing.timestamp / step;
+            if (!compacted.empty() && step == previousStep && bucket == previousBucket) {
+                // Preserve the newest state in each old-data bucket. This also
+                // keeps the latest CC/status transition visible on the chart.
+                compacted.back() = existing;
+            } else {
+                compacted.push_back(existing);
+                previousStep = step;
+                previousBucket = bucket;
+            }
+        }
+        samples.swap(compacted);
+        lastCompaction = now;
     }
 }
 
@@ -2227,6 +2291,15 @@ void HttpServer::handleRestartProgram() {
     const std::string id = root.get("id", "").asString();
     if (id.empty()) return;
     streamManager.stopStream(id);
+    {
+      std::lock_guard<std::mutex> lock(qualityMutex);
+      qualitySamples.erase(id);
+      qualityLastCompaction.erase(id);
+    }
+    {
+      std::lock_guard<std::mutex> lock(caDecodeUiMutex());
+      caDecodeUiMemory().erase(id);
+    }
     auto& streams = configManager.config.streams;
     streams.erase(std::remove_if(streams.begin(), streams.end(), [&id](const StreamConfig& stream) {
       return stream.id == id;
@@ -3805,7 +3878,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.42'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.43'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

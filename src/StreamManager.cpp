@@ -54,10 +54,10 @@ constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
 constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
-constexpr auto kInputFailoverDelay = std::chrono::seconds(3);
+constexpr auto kInputFailoverDelay = std::chrono::seconds(6);
 // 202.38: HLS is segmented delivery, so a several-second gap in emitted TS
 // buffers can be normal while hlsdemux waits for/reloads the next media
-// segment.  Do not treat the generic 3-second live-input watchdog as signal
+// segment.  Do not treat the generic 6-second live-input watchdog as signal
 // loss for HLS.  Fifteen seconds matches the existing HLS session TTL and is
 // long enough to span normal segment boundaries without hiding a real outage.
 constexpr auto kHlsInputFailoverDelay = std::chrono::seconds(15);
@@ -66,7 +66,7 @@ constexpr auto kHlsPrimaryProbeTimeout = std::chrono::seconds(15);
 // generic live-input watchdog, especially when remap has to discover the
 // program and build dynamic pads before media counters start moving.  Give a
 // fresh SRT primary enough time to deliver its first TS bytes; once media has
-// flowed, keep the existing fast 3-second failover for a real outage.
+// flowed, use the 6-second failover for a real outage.
 constexpr auto kSrtStartupFailoverDelay = std::chrono::seconds(15);
 constexpr auto kSrtPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
@@ -7187,13 +7187,17 @@ bool StreamManager::buildOutputBranches(StreamState* state, GstElement* pipeline
         GstPad* teeSrcPad = gst_element_request_pad_simple(tee, "src_%u");
         GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
         if (!teeSrcPad || !queueSinkPad) {
-            if (teeSrcPad) gst_object_unref(teeSrcPad);
+            if (teeSrcPad) {
+                gst_element_release_request_pad(tee, teeSrcPad);
+                gst_object_unref(teeSrcPad);
+            }
             if (queueSinkPad) gst_object_unref(queueSinkPad);
             std::cerr << "Multi-output branch failed: index=" << i
                       << " type=" << type << " stage=tee-pad-request" << std::endl;
             return false;
         }
         const bool linked = gst_pad_link(teeSrcPad, queueSinkPad) == GST_PAD_LINK_OK;
+        if (!linked) gst_element_release_request_pad(tee, teeSrcPad);
         gst_object_unref(teeSrcPad);
         gst_object_unref(queueSinkPad);
         if (!linked) {
@@ -7650,8 +7654,14 @@ bool StreamManager::buildRemapPipeline(
         GstPad* videoPad = gst_element_request_pad_simple(mux, videoPadName.c_str());
         GstPad* audioPad = gst_element_request_pad_simple(mux, audioPadName.c_str());
         if (!videoPad || !audioPad) {
-            if (videoPad) gst_object_unref(videoPad);
-            if (audioPad) gst_object_unref(audioPad);
+            if (videoPad) {
+                gst_element_release_request_pad(mux, videoPad);
+                gst_object_unref(videoPad);
+            }
+            if (audioPad) {
+                gst_element_release_request_pad(mux, audioPad);
+                gst_object_unref(audioPad);
+            }
             std::cerr << "UDP remap failed to reserve output PID pads: video="
                       << cfg.videoPid << " audio=" << cfg.audioPid << std::endl;
             return false;
@@ -7971,7 +7981,14 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     if (!caps) {
         caps = gst_pad_query_caps(pad, nullptr);
     }
-    std::string capsString = caps ? gst_caps_to_string(caps) : "unknown";
+    std::string capsString = "unknown";
+    if (caps) {
+        gchar* capsText = gst_caps_to_string(caps);
+        if (capsText) {
+            capsString = capsText;
+            g_free(capsText);
+        }
+    }
     const bool isMpegTs = capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
@@ -8228,12 +8245,16 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     }
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
-        if (muxSinkPad) gst_object_unref(muxSinkPad);
+        if (muxSinkPad) {
+            if (!stableUdpPreMapped) gst_element_release_request_pad(ctx->mux, muxSinkPad);
+            gst_object_unref(muxSinkPad);
+        }
         gst_object_unref(pipeline);
         return;
     }
 
-    if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+    const bool muxPadLinked = gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK;
+    if (muxPadLinked) {
         std::cerr << (ctx->hlsSink2 ? "HLS linked " : (ctx->rtspPush ? "RTSP push linked " : "remap linked ")) << (isAudio ? "audio" : "video")
                   << " caps=" << capsString << " parser=" << parserFactory
                   << " pid=" << requestedPid
@@ -8260,6 +8281,12 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             ctx->audioPadName = padName ? padName : "";
         }
         if (!ctx->rtspPush && !ctx->hlsSink2) updateMuxProgramMap(ctx);
+    } else if (!stableUdpPreMapped) {
+        // Request pads are owned by the mux until explicitly released. Merely
+        // dropping our GstPad reference leaves a failed dynamic pad attached
+        // to a long-lived pipeline and accumulates resources on repeated pad
+        // add/link failures.
+        gst_element_release_request_pad(ctx->mux, muxSinkPad);
     }
 
     gst_object_unref(parserSrcPad);
@@ -8282,8 +8309,13 @@ void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_d
     if (!caps) {
         caps = gst_pad_query_caps(pad, nullptr);
     }
-    std::string capsString = caps ? gst_caps_to_string(caps) : "unknown";
+    std::string capsString = "unknown";
     if (caps) {
+        gchar* capsText = gst_caps_to_string(caps);
+        if (capsText) {
+            capsString = capsText;
+            g_free(capsText);
+        }
         gst_caps_unref(caps);
     }
 
@@ -8369,12 +8401,16 @@ void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_d
     GstPad* muxSinkPad = requestMuxSinkPad(ctx->mux, requestedPid);
     if (!parserSrcPad || !muxSinkPad) {
         if (parserSrcPad) gst_object_unref(parserSrcPad);
-        if (muxSinkPad) gst_object_unref(muxSinkPad);
+        if (muxSinkPad) {
+            gst_element_release_request_pad(ctx->mux, muxSinkPad);
+            gst_object_unref(muxSinkPad);
+        }
         gst_object_unref(pipeline);
         return;
     }
 
-    if (gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK) {
+    const bool muxPadLinked = gst_pad_link(parserSrcPad, muxSinkPad) == GST_PAD_LINK_OK;
+    if (muxPadLinked) {
         std::cerr << "RTSP remap linked " << (factories.isAudio ? "audio" : "video")
                   << " pid=" << requestedPid << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
@@ -8387,6 +8423,8 @@ void StreamManager::onRtspPadAdded(GstElement* src, GstPad* pad, gpointer user_d
             ctx->audioPadName = padName ? padName : "";
         }
         updateMuxProgramMap(ctx);
+    } else {
+        gst_element_release_request_pad(ctx->mux, muxSinkPad);
     }
 
     gst_object_unref(parserSrcPad);
@@ -8777,11 +8815,11 @@ void StreamManager::monitorBus(const std::string& id) {
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
         std::cerr << "SRT input watchdog 202.33: startup_wait_ms=15000"
-                  << " steady_loss_ms=3000 primary_probe_ms=15000"
+                  << " steady_loss_ms=6000 primary_probe_ms=15000"
                   << " source_auto_reconnect=on" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
         std::cerr << "HLS input watchdog 202.38: loss_wait_ms=15000"
-                  << " primary_probe_ms=15000 generic_live_watchdog_ms=3000"
+                  << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
                   << " segmented_input=on" << std::endl;
     }
 

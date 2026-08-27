@@ -373,7 +373,10 @@ GstElement* buildHls(
     if (!muxSrcPad || !muxSelectorPad ||
         gst_pad_link(muxSrcPad, muxSelectorPad) != GST_PAD_LINK_OK) {
         if (muxSrcPad) gst_object_unref(muxSrcPad);
-        if (muxSelectorPad) gst_object_unref(muxSelectorPad);
+        if (muxSelectorPad) {
+            gst_element_release_request_pad(selector, muxSelectorPad);
+            gst_object_unref(muxSelectorPad);
+        }
         error = "HLS input: failed to connect fallback remux selector pad";
         return nullptr;
     }

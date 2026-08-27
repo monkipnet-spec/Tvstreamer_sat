@@ -203,10 +203,14 @@ bool linkElementToMux(GstElement* source, GstElement* mux) {
     GstPad* sinkPad = gst_element_request_pad_simple(mux, "sink_%d");
     if (!srcPad || !sinkPad) {
         if (srcPad) gst_object_unref(srcPad);
-        if (sinkPad) gst_object_unref(sinkPad);
+        if (sinkPad) {
+            gst_element_release_request_pad(mux, sinkPad);
+            gst_object_unref(sinkPad);
+        }
         return false;
     }
     const bool ok = gst_pad_link(srcPad, sinkPad) == GST_PAD_LINK_OK;
+    if (!ok) gst_element_release_request_pad(mux, sinkPad);
     gst_object_unref(srcPad);
     gst_object_unref(sinkPad);
     return ok;
@@ -498,8 +502,15 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 
     GstCaps* caps = gst_pad_get_current_caps(pad);
     if (!caps) caps = gst_pad_query_caps(pad, nullptr);
-    std::string capsText = caps ? gst_caps_to_string(caps) : "";
-    if (caps) gst_caps_unref(caps);
+    std::string capsText;
+    if (caps) {
+        gchar* serializedCaps = gst_caps_to_string(caps);
+        if (serializedCaps) {
+            capsText = serializedCaps;
+            g_free(serializedCaps);
+        }
+        gst_caps_unref(caps);
+    }
     const bool mediaPad = capsText.find("video/") != std::string::npos ||
                           capsText.find("audio/") != std::string::npos;
     if (!mediaPad) {

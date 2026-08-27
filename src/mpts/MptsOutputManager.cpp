@@ -291,7 +291,7 @@ std::string interfaceNameForAddress(const std::string& address) {
 
 } // namespace
 
-struct MptsOutputManager::Runtime : public std::enable_shared_from_this<MptsOutputManager::Runtime> {
+struct MptsOutputManager::Runtime {
     struct InputChunk {
         std::string streamId;
         std::vector<uint8_t> data;
@@ -453,6 +453,15 @@ struct MptsOutputManager::Runtime : public std::enable_shared_from_this<MptsOutp
         {
             std::lock_guard<std::mutex> stateLock(serviceMutex);
             for (auto& service : services) {
+                service.sourcePmtPid = kNullPid;
+                service.sourceServiceId = 0;
+                service.program = ProgramInfo{};
+                service.pidMap.fill(kInvalidPid);
+                service.allowedSourcePids.fill(false);
+                service.allocatedOutputPids.clear();
+                service.ready = false;
+                service.pmtCc = 0;
+                service.inputPackets = 0;
                 service.tsRemainder.clear();
                 service.patAssembler.reset();
                 service.pmtAssembler.reset();
@@ -462,7 +471,11 @@ struct MptsOutputManager::Runtime : public std::enable_shared_from_this<MptsOutp
         lastPatPmt = std::chrono::steady_clock::time_point{};
         lastSdt = std::chrono::steady_clock::time_point{};
         try {
-            worker = std::thread([self = shared_from_this()] { self->run(); });
+            // Runtime is owned by MptsOutputManager. The worker must not own a
+            // shared_ptr back to Runtime: that creates a self-retaining lifetime
+            // where destruction alone cannot stop the thread. Runtime::~Runtime
+            // calls stop(), which joins this raw-this worker before memory is freed.
+            worker = std::thread([this] { run(); });
         } catch (const std::exception& ex) {
             running = false;
             stopRequested = true;
@@ -501,9 +514,24 @@ struct MptsOutputManager::Runtime : public std::enable_shared_from_this<MptsOutp
             ::close(socketFd);
             socketFd = -1;
         }
-        incoming.clear();
+        std::deque<InputChunk>().swap(incoming);
         incomingBytes = 0;
-        sendAccumulator.clear();
+        std::vector<uint8_t>().swap(sendAccumulator);
+        {
+            std::lock_guard<std::mutex> stateLock(serviceMutex);
+            for (auto& service : services) {
+                service.program = ProgramInfo{};
+                service.allocatedOutputPids.clear();
+                service.pidMap.fill(kInvalidPid);
+                service.allowedSourcePids.fill(false);
+                service.ready = false;
+                service.sourcePmtPid = kNullPid;
+                service.sourceServiceId = 0;
+                std::vector<uint8_t>().swap(service.tsRemainder);
+                service.patAssembler.reset();
+                service.pmtAssembler.reset();
+            }
+        }
         std::cerr << "MPTS output stopped: id=" << config.id << std::endl;
     }
 

@@ -1,0 +1,10 @@
+TVStreammerSAT5 202.43
+
+Memory/resource fixes based on 202.42:
+- Bound 30-day quality history with multi-resolution compaction: full recent hour, 30-second buckets up to 24h, 5-minute buckets for older data.
+- Remove quality-history and CA UI state immediately when a stream is deleted.
+- Free gchar buffers returned by gst_caps_to_string() in dynamic remap/transcoder callbacks.
+- Release failed GStreamer request pads instead of leaving them attached to long-lived mux/tee elements.
+- MPTS worker no longer self-retains Runtime with shared_from_this(); destructor stop/join owns lifecycle.
+- MPTS stop/start now clears queued storage and stale per-service PSI/PID/program state.
+- Generic no-input/failover watchdog increased from 3 seconds to 6 seconds as requested. SRT initial startup and HLS segmented-input watchdogs remain 15 seconds.

@@ -5,6 +5,7 @@
 #include <jsoncpp/json/json.h>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -91,5 +92,6 @@ private:
     std::chrono::steady_clock::time_point previousMetricsSample;
     std::map<std::string, std::pair<uint64_t, uint64_t>> previousNetworkBytes;
     std::unordered_map<std::string, std::deque<QualitySample>> qualitySamples;
+    std::unordered_map<std::string, int64_t> qualityLastCompaction;
     std::unordered_map<std::string, std::function<void(const boost::asio::ip::tcp::socket&)>> endpointHandlers;
 };
