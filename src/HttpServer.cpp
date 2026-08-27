@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 namespace {
 
@@ -587,6 +588,10 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
               res.body() = systemMetrics();
+            } else if (target == "/api/mpts/status") {
+                res.set(http::field::content_type, "application/json");
+                Json::StreamWriterBuilder writer;
+                res.body() = Json::writeString(writer, streamManager.mptsSnapshot());
             } else if (target == "/api/backup-files") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = listBackupFiles();
@@ -619,6 +624,12 @@ void HttpServer::handleSession(tcp::socket socket) {
             } else if (target == "/api/save-config") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleSaveConfig(req.body());
+            } else if (target == "/api/mpts/save") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleMptsSave(req.body());
+            } else if (target == "/api/mpts/action") {
+                res.set(http::field::content_type, "application/json");
+                res.body() = handleMptsAction(req.body());
             } else if (target == "/api/start-stream") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = handleStartStream(req.body());
@@ -1810,6 +1821,9 @@ std::string HttpServer::handleSaveConfig(const std::string& body) {
     if (!root.isMember("cam_clients")) {
         nextConfig.camClients = configManager.config.camClients;
     }
+    if (!root.isMember("mpts_outputs")) {
+        nextConfig.mptsOutputs = configManager.config.mptsOutputs;
+    }
     const bool hasStreamArray = root.isMember("streams") && root["streams"].isArray();
     const bool explicitlyAllowEmptyStreams = root.get("allow_empty_streams", false).asBool();
     if ((!hasStreamArray || nextConfig.streams.empty()) &&
@@ -1818,6 +1832,19 @@ std::string HttpServer::handleSaveConfig(const std::string& body) {
         std::cerr << "Config save preserved " << previousConfig.streams.size()
                   << " existing stream(s): request contained no streams or an empty stream list"
                   << std::endl;
+    }
+    {
+        std::set<std::string> validStreamIds;
+        for (const auto& stream : nextConfig.streams) validStreamIds.insert(stream.id);
+        for (auto& output : nextConfig.mptsOutputs) {
+            output.services.erase(std::remove_if(output.services.begin(), output.services.end(),
+                [&](const MptsServiceConfig& service) {
+                    return !validStreamIds.count(service.streamId);
+                }), output.services.end());
+        }
+        nextConfig.mptsOutputs.erase(std::remove_if(nextConfig.mptsOutputs.begin(), nextConfig.mptsOutputs.end(),
+            [](const MptsOutputConfig& output) { return output.services.empty(); }),
+            nextConfig.mptsOutputs.end());
     }
     std::string listenerError;
     if (!validateHttpPortsForConfig(nextConfig, listenerError)) {
@@ -1856,8 +1883,113 @@ std::string HttpServer::handleSaveConfig(const std::string& body) {
             std::cerr << "Hard restart failed for stream: " << stream.id << std::endl;
         }
     }
+    streamManager.configureMptsOutputs();
     Json::Value response; response["result"] = "ok";
     Json::StreamWriterBuilder writer; return Json::writeString(writer, response);
+}
+
+std::string HttpServer::handleMptsSave(const std::string& body) {
+    Json::Value response;
+    Json::Value request;
+    Json::CharReaderBuilder readerBuilder;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors) ||
+        !request.isMember("outputs") || !request["outputs"].isArray()) {
+        response["result"] = "error";
+        response["error"] = errors.empty() ? "MPTS request must contain outputs[]" : errors;
+        Json::StreamWriterBuilder writer;
+        return Json::writeString(writer, response);
+    }
+
+    std::set<std::string> availableStreams;
+    for (const auto& stream : configManager.config.streams) availableStreams.insert(stream.id);
+    std::set<std::string> ids;
+    std::vector<MptsOutputConfig> outputs;
+    for (const auto& item : request["outputs"]) {
+        auto output = MptsOutputConfig::fromJson(item);
+        if (output.id.empty() || cleanPathToken(output.id) != output.id) {
+            response["result"] = "error";
+            response["error"] = "MPTS output id must contain only letters, digits, '-' or '_'";
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        if (!ids.insert(output.id).second) {
+            response["result"] = "error";
+            response["error"] = "Duplicate MPTS output id: " + output.id;
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        if (output.services.empty()) {
+            response["result"] = "error";
+            response["error"] = "MPTS output has no services: " + output.id;
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        for (const auto& service : output.services) {
+            if (!availableStreams.count(service.streamId)) {
+                response["result"] = "error";
+                response["error"] = "MPTS references unknown stream: " + service.streamId;
+                Json::StreamWriterBuilder writer;
+                return Json::writeString(writer, response);
+            }
+        }
+        in_addr address{};
+        if (::inet_pton(AF_INET, output.outputHost.c_str(), &address) != 1) {
+            response["result"] = "error";
+            response["error"] = "Invalid MPTS IPv4 output address: " + output.outputHost;
+            Json::StreamWriterBuilder writer;
+            return Json::writeString(writer, response);
+        }
+        outputs.push_back(std::move(output));
+    }
+
+    const auto previous = configManager.config.mptsOutputs;
+    configManager.config.mptsOutputs = std::move(outputs);
+    if (!configManager.save()) {
+        configManager.config.mptsOutputs = previous;
+        response["result"] = "error";
+        response["error"] = "Failed to save MPTS configuration";
+    } else {
+        streamManager.configureMptsOutputs();
+        response = streamManager.mptsSnapshot();
+        response["result"] = "ok";
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
+}
+
+std::string HttpServer::handleMptsAction(const std::string& body) {
+    Json::Value response;
+    Json::Value request;
+    Json::CharReaderBuilder readerBuilder;
+    std::string errors;
+    std::istringstream input(body);
+    if (!Json::parseFromStream(readerBuilder, input, &request, &errors)) {
+        response["result"] = "error";
+        response["error"] = "Invalid MPTS action: " + errors;
+    } else {
+        const std::string id = request.get("id", "").asString();
+        const std::string action = toLower(request.get("action", "").asString());
+        std::string error;
+        bool ok = false;
+        if (action == "start") {
+            ok = streamManager.startMptsOutput(id, &error);
+        } else if (action == "stop") {
+            ok = streamManager.stopMptsOutput(id);
+            if (!ok) error = "MPTS output not found: " + id;
+        } else if (action == "restart") {
+            streamManager.stopMptsOutput(id);
+            ok = streamManager.startMptsOutput(id, &error);
+        } else {
+            error = "Unknown MPTS action: " + action;
+        }
+        response = streamManager.mptsSnapshot();
+        response["result"] = ok ? "ok" : "error";
+        if (!ok) response["error"] = error;
+    }
+    Json::StreamWriterBuilder writer;
+    return Json::writeString(writer, response);
 }
 
 std::string HttpServer::listBackupFiles() {
@@ -2099,7 +2231,16 @@ void HttpServer::handleRestartProgram() {
     streams.erase(std::remove_if(streams.begin(), streams.end(), [&id](const StreamConfig& stream) {
       return stream.id == id;
     }), streams.end());
+    auto& mptsOutputs = configManager.config.mptsOutputs;
+    for (auto& output : mptsOutputs) {
+      output.services.erase(std::remove_if(output.services.begin(), output.services.end(),
+        [&id](const MptsServiceConfig& service) { return service.streamId == id; }),
+        output.services.end());
+    }
+    mptsOutputs.erase(std::remove_if(mptsOutputs.begin(), mptsOutputs.end(),
+      [](const MptsOutputConfig& output) { return output.services.empty(); }), mptsOutputs.end());
     configManager.save();
+    streamManager.configureMptsOutputs();
   }
 
   void HttpServer::handleSaveSubscribers(const std::string& body) {
@@ -2260,6 +2401,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .button-primary.save-dirty{background:#ffbd4a;color:#161b25;box-shadow:0 0 0 2px rgba(255,189,74,.18)}
 .button-primary.save-dirty:hover{background:#ffc968}
 .button-secondary:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.24)}
+.button-danger{padding:7px 10px;border:1px solid rgba(239,68,68,.35);border-radius:999px;color:#ffc4c7;background:rgba(239,68,68,.10);cursor:pointer;font-size:.78rem}.button-danger:hover{background:rgba(239,68,68,.20)}
 .container{padding:calc(var(--header-height,58px) + 10px) 12px 12px;max-width:1180px;margin:0 auto;box-sizing:border-box}
 .tile-grid{display:grid;grid-template-columns:repeat(auto-fill, minmax(calc(180px * 1.15), 1fr));gap:12px 1ch;justify-content:start}
 .tile{position:relative;background:rgba(22,27,37,.94);padding:8px 10px 8px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:4px;height:252px;min-height:252px;width:100%;max-width:none;box-sizing:border-box;box-shadow:0 18px 42px rgba(0,0,0,.14);transition:transform .2s ease,border-color .2s ease;font-size:11px}
@@ -2449,7 +2591,13 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .cam-panel{margin:10px 0 4px;padding:10px 12px;border:1px solid rgba(168,85,247,.24);border-radius:12px;background:rgba(126,34,206,.07)}
 .cam-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.cam-head strong{color:#e9ddff}.cam-list{display:grid;gap:6px}.cam-row{display:grid;grid-template-columns:86px minmax(160px,1fr) auto;gap:8px;align-items:center;padding:7px 8px;border-radius:9px;background:rgba(255,255,255,.035);font-size:.75rem}.cam-row .cam-name{font-weight:800;color:#fff}.cam-device{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb8ca}.cam-state{display:inline-flex;align-items:center;justify-content:center;padding:3px 7px;border-radius:999px;font-size:.66rem;font-weight:800;white-space:nowrap}.cam-state.card{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4)}.cam-state.no-card{color:#ffb3b8;background:rgba(239,68,68,.13);border:1px solid rgba(239,68,68,.36)}.cam-state.busy{color:#a8dcff;background:rgba(56,189,248,.12);border:1px solid rgba(56,189,248,.32)}.cam-state.detected{color:#d7c9ff;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.32)}.cam-state.warn{color:#ffd88c;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.32)}.cam-controls{grid-column:1/-1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid rgba(255,255,255,.06);font-size:.68rem;color:#aeb8ca}.cam-controls label{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}.cam-controls input[type=number]{width:58px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls select{max-width:210px;padding:3px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.14);background:#111723;color:#fff}.cam-controls input[type=checkbox]{margin:0}.cam-controls button{padding:4px 8px;font-size:.68rem}.cam-activation-detail{min-width:160px;flex:1;color:#8f99aa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cam-empty{color:#8f99aa;font-size:.75rem;padding:5px 0}.cam-select{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(230px,1.8fr);gap:8px;align-items:end;margin-top:8px}
 @media (max-width:760px){.sat-signal-panel{grid-template-columns:1fr}.sat-form,.sat-output{grid-template-columns:repeat(2,minmax(0,1fr))}.cam-row{grid-template-columns:78px minmax(120px,1fr)}.cam-row .cam-state{grid-column:1/-1;justify-self:start}.cam-controls{gap:7px}.cam-activation-detail{flex-basis:100%}.cam-select{grid-template-columns:1fr}.sat-service-head,.sat-service-row{grid-template-columns:30px minmax(150px,1fr) 82px 62px}.sat-service-head>*:nth-child(3),.sat-service-head>*:nth-child(6),.sat-service-row>*:nth-child(3),.sat-service-row>*:nth-child(6){display:none}}
-@media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}.ui-toast-stack{position:fixed;right:18px;bottom:18px;z-index:30000;display:grid;gap:8px;width:min(520px,calc(100vw - 36px));pointer-events:none}
+@media (max-width:480px){.sat-form,.sat-output{grid-template-columns:1fr}.sat-field.wide{grid-column:span 1}}.mpts-modal{width:min(980px,94vw);max-width:980px}
+.mpts-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0 14px;flex-wrap:wrap}
+.mpts-list{display:grid;gap:9px}.mpts-row{display:grid;grid-template-columns:minmax(150px,1.2fr) minmax(160px,1fr) 90px 110px auto;gap:8px;align-items:center;padding:10px 12px;border:1px solid rgba(255,255,255,.08);border-radius:11px;background:rgba(255,255,255,.035)}
+.mpts-name{font-weight:800;color:#fff;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mpts-endpoint{color:#aeb8ca;font-family:monospace;font-size:.75rem}.mpts-services{font-size:.73rem;color:#b9c4d6}.mpts-state{display:inline-flex;align-items:center;justify-content:center;padding:4px 8px;border-radius:999px;font-size:.69rem;font-weight:800;white-space:nowrap}.mpts-state.on{color:#9ef3bd;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.38)}.mpts-state.off{color:#aeb8ca;background:rgba(148,163,184,.09);border:1px solid rgba(148,163,184,.24)}.mpts-actions{display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap}.mpts-actions button{padding:5px 8px;font-size:.7rem}
+.mpts-service-picker{max-height:330px;overflow:auto;display:grid;gap:5px;padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:10px;background:rgba(0,0,0,.12)}.mpts-service-row{display:grid;grid-template-columns:30px minmax(160px,1fr) 120px 90px;gap:8px;align-items:center;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,.025);font-size:.75rem}.mpts-service-row input[type=number]{width:84px;padding:5px 6px}.mpts-runtime{color:#8f99aa;font-size:.68rem;white-space:nowrap}.mpts-runtime.ready{color:#8ee8b0}.mpts-empty{padding:18px;text-align:center;color:#8f99aa;border:1px dashed rgba(255,255,255,.12);border-radius:10px}.mpts-hint{font-size:.72rem;color:#8f99aa;line-height:1.45;margin:6px 0 12px}.mpts-advanced{margin-top:10px;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px 10px}.mpts-advanced summary{cursor:pointer;color:#b9c4d6;font-size:.75rem;font-weight:700}.mpts-advanced .form-grid{margin-top:9px}
+@media(max-width:780px){.mpts-row{grid-template-columns:1fr 1fr}.mpts-actions{grid-column:1/-1;justify-content:flex-start}.mpts-service-row{grid-template-columns:28px minmax(130px,1fr) 94px}.mpts-service-row .mpts-runtime{grid-column:2/-1}.mpts-modal{width:96vw}}
+.ui-toast-stack{position:fixed;right:18px;bottom:18px;z-index:30000;display:grid;gap:8px;width:min(520px,calc(100vw - 36px));pointer-events:none}
 .ui-toast{position:relative;padding:11px 38px 11px 14px;border:1px solid rgba(255,95,95,.42);border-radius:9px;background:#2a1820;color:#ffd9dd;box-shadow:0 12px 30px rgba(0,0,0,.32);font-size:.82rem;line-height:1.4;pointer-events:auto;animation:ui-toast-in .16s ease-out}
 .ui-toast.ok{border-color:rgba(23,194,97,.42);background:#14251d;color:#c8f7d7}
 .ui-toast-close{display:inline-flex;align-items:center;justify-content:center;position:absolute;top:6px;right:6px;width:18px;height:18px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;line-height:1;cursor:pointer}
@@ -2482,6 +2630,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 <summary class="button-secondary" data-i18n="system">System</summary>
 <div class="system-menu-list">
 <button class="system-menu-item" onclick="openNetworkModal();closeSystemMenu()" data-i18n="network">Network</button>
+<button class="system-menu-item" onclick="openMptsModal();closeSystemMenu()">MPTS</button>
 <button class="system-menu-item" onclick="openLoginModal();closeSystemMenu()" data-i18n="user">User</button>
 <button class="system-menu-item" onclick="openTelegramModal();closeSystemMenu()" data-i18n="telegram">Telegram API</button>
 <button class="system-menu-item" onclick="openNewcamdModal();closeSystemMenu()">Newcamd</button>
@@ -2623,6 +2772,7 @@ let dvbAdapters = [];
 let camClientsLoaded = false;
 let caManagerState = {clients:[]};
 let streamActionBusy = new Set();
+let mptsState = {outputs:[]};
 function uiError(message) {
   console.error(message);
   const text = String(message || 'UI error');
@@ -3140,6 +3290,179 @@ function restartProgram() {
       setTimeout(()=>window.location.reload(), 3500);
     });
 }
+function mptsConfigOnly(output) {
+  return {
+    id:String(output?.id || ''),
+    name:String(output?.name || output?.id || ''),
+    output_host:String(output?.output_host || '239.255.20.1'),
+    output_port:Number(output?.output_port || 5000),
+    interface_address:String(output?.interface_address || ''),
+    auto_start:!!output?.auto_start,
+    transport_stream_id:Number(output?.transport_stream_id || 1),
+    original_network_id:Number(output?.original_network_id || 1),
+    service_id_base:Number(output?.service_id_base || 1),
+    pmt_pid_base:Number(output?.pmt_pid_base || 4096),
+    services:Array.isArray(output?.services) ? output.services.map(service => ({
+      stream_id:String(service?.stream_id || ''),
+      service_id:Number(service?.service_id || 0)
+    })).filter(service => service.stream_id) : []
+  };
+}
+async function fetchMptsStatus() {
+  const data = await fetchJson('/api/mpts/status', {cache:'no-store'}, 10000);
+  mptsState = data && Array.isArray(data.outputs) ? data : {outputs:[]};
+  return mptsState;
+}
+function renderMptsList() {
+  const outputs = mptsState.outputs || [];
+  const rows = outputs.length ? outputs.map((output,index) => {
+    const runtimeServices = Array.isArray(output.runtime_services) ? output.runtime_services : [];
+    const ready = runtimeServices.filter(service => service.ready).length;
+    const configured = Array.isArray(output.services) ? output.services.length : runtimeServices.length;
+    const active = !!output.active;
+    return `<div class="mpts-row">
+      <div class="mpts-name" title="${escapeHtmlValue(output.name || output.id)}">${escapeHtmlValue(output.name || output.id)}</div>
+      <div class="mpts-endpoint">${escapeHtmlValue(output.output_host || '')}:${Number(output.output_port || 0)}</div>
+      <div class="mpts-services">${ready}/${configured} сервисов</div>
+      <span class="mpts-state ${active?'on':'off'}">${active?'Работает':'Остановлен'}</span>
+      <div class="mpts-actions">
+        <button class="button-secondary" onclick="mptsActionByIndex(${index},'${active?'stop':'start'}')">${active?'Стоп':'Старт'}</button>
+        <button class="button-secondary" onclick="openMptsEditor(${index})">Ред.</button>
+        <button class="button-danger" onclick="deleteMptsOutput(${index})">Удалить</button>
+      </div>
+    </div>`;
+  }).join('') : `<div class="mpts-empty">MPTS-выходы ещё не созданы</div>`;
+  openModal(`
+    <h2>MPTS</h2>
+    <div class="mpts-hint">Отдельный пакетный мультиплексор объединяет выбранные выходные SPTS в один MPEG-TS. PCR/PTS/DTS медиапакетов не переписываются; исходные PAT/PMT/SDT заменяются общей таблицей MPTS, null-пакеты отдельных каналов отбрасываются.</div>
+    <div class="mpts-toolbar"><strong>MPTS-выходы</strong><button class="button-primary" onclick="openMptsEditor(-1)">+ Добавить MPTS</button></div>
+    <div class="mpts-list">${rows}</div>
+    <div class="modal-actions"><button class="button-secondary" onclick="closeModal()">${t('close')}</button></div>
+  `);
+  document.getElementById('modalContent').className = 'modal-content mpts-modal';
+}
+async function openMptsModal() {
+  try {
+    await fetchMptsStatus();
+    renderMptsList();
+  } catch (error) {
+    uiError(error?.message || error);
+  }
+}
+function openMptsEditor(index) {
+  const existing = index >= 0 ? mptsState.outputs[index] : null;
+  const output = mptsConfigOnly(existing || {
+    id:`mpts-${Date.now()}`, name:'MPTS', output_host:'239.255.20.1', output_port:5000,
+    interface_address:'', auto_start:false, transport_stream_id:1,
+    original_network_id:1, service_id_base:1, pmt_pid_base:4096, services:[]
+  });
+  const selected = new Map(output.services.map(service => [String(service.stream_id), Number(service.service_id || 0)]));
+  const runtimeById = new Map((existing?.runtime_services || []).map(service => [String(service.stream_id), service]));
+  const interfaceOptions = [`<option value="">Auto</option>`].concat((state.interfaces || []).map(iface =>
+    `<option value="${escapeHtmlValue(iface.address || '')}" ${(iface.address||'')===output.interface_address?'selected':''}>${escapeHtmlValue(iface.name || '')}${iface.address?` (${escapeHtmlValue(iface.address)})`:''}</option>`
+  )).join('');
+  const serviceRows = (state.streams || []).map(stream => {
+    const id = String(stream.id || '');
+    const checked = selected.has(id);
+    const runtime = runtimeById.get(id);
+    const runtimeText = runtime ? (runtime.ready ? `готов · SID ${runtime.service_id} · PMT ${runtime.pmt_pid}` : 'ожидание PSI') : '';
+    return `<label class="mpts-service-row">
+      <input class="mpts-service-check" type="checkbox" data-stream-id="${escapeHtmlValue(id)}" ${checked?'checked':''}/>
+      <span>${escapeHtmlValue(stream.name || id)}</span>
+      <input class="mpts-service-sid" data-stream-id="${escapeHtmlValue(id)}" type="number" min="0" max="65535" value="${checked ? selected.get(id) : 0}" title="SID MPTS, 0 = автоматически"/>
+      <span class="mpts-runtime ${runtime?.ready?'ready':''}">${escapeHtmlValue(runtimeText)}</span>
+    </label>`;
+  }).join('') || `<div class="mpts-empty">Сначала создайте каналы</div>`;
+  openModal(`
+    <h2>${existing?'Редактирование MPTS':'Новый MPTS'}</h2>
+    <input id="mptsEditId" type="hidden" value="${escapeHtmlValue(output.id)}" />
+    <input id="mptsEditIndex" type="hidden" value="${index}" />
+    <div class="form-grid">
+      <div class="form-row"><label>Имя</label><input id="mptsName" value="${escapeHtmlValue(output.name)}" /></div>
+      <div class="form-row"><label>IP назначения</label><input id="mptsHost" value="${escapeHtmlValue(output.output_host)}" placeholder="239.255.20.1" /></div>
+      <div class="form-row"><label>Порт</label><input id="mptsPort" type="number" min="1" max="65535" value="${output.output_port}" /></div>
+      <div class="form-row"><label>Интерфейс выхода</label><select id="mptsInterface">${interfaceOptions}</select></div>
+      <label class="checkbox-inline"><input id="mptsAutoStart" type="checkbox" ${output.auto_start?'checked':''}/><span>Автозапуск MPTS</span></label>
+    </div>
+    <h3>Каналы MPTS</h3>
+    <div class="mpts-hint">SID = 0 означает автоматическую нумерацию от базового SID. Порядок сервисов соответствует порядку каналов в конфигурации.</div>
+    <div class="mpts-service-picker">${serviceRows}</div>
+    <details class="mpts-advanced"><summary>Расширенные параметры PSI</summary>
+      <div class="form-grid">
+        <div class="form-row"><label>TSID</label><input id="mptsTsid" type="number" min="1" max="65535" value="${output.transport_stream_id}" /></div>
+        <div class="form-row"><label>ONID</label><input id="mptsOnid" type="number" min="1" max="65535" value="${output.original_network_id}" /></div>
+        <div class="form-row"><label>Базовый SID</label><input id="mptsSidBase" type="number" min="1" max="65535" value="${output.service_id_base}" /></div>
+        <div class="form-row"><label>Базовый PMT PID</label><input id="mptsPmtBase" type="number" min="32" max="8190" value="${output.pmt_pid_base}" /></div>
+      </div>
+    </details>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="renderMptsList()">Назад</button>
+      <button class="button-primary" onclick="saveMptsEditor()">${t('save')}</button>
+    </div>
+  `);
+  document.getElementById('modalContent').className = 'modal-content mpts-modal';
+}
+async function saveMptsEditor() {
+  const index = Number(document.getElementById('mptsEditIndex')?.value ?? -1);
+  const services = [...document.querySelectorAll('.mpts-service-check:checked')].map(check => {
+    const id = String(check.dataset.streamId || '');
+    const sid = Number(document.querySelector(`.mpts-service-sid[data-stream-id="${CSS.escape(id)}"]`)?.value || 0);
+    return {stream_id:id, service_id:Number.isFinite(sid) ? Math.max(0, Math.min(65535, sid)) : 0};
+  }).filter(service => service.stream_id);
+  if (!services.length) { uiError('Выберите хотя бы один канал для MPTS'); return; }
+  const output = {
+    id:String(document.getElementById('mptsEditId')?.value || `mpts-${Date.now()}`),
+    name:String(document.getElementById('mptsName')?.value || 'MPTS').trim() || 'MPTS',
+    output_host:String(document.getElementById('mptsHost')?.value || '').trim(),
+    output_port:Number(document.getElementById('mptsPort')?.value || 5000),
+    interface_address:String(document.getElementById('mptsInterface')?.value || ''),
+    auto_start:!!document.getElementById('mptsAutoStart')?.checked,
+    transport_stream_id:Number(document.getElementById('mptsTsid')?.value || 1),
+    original_network_id:Number(document.getElementById('mptsOnid')?.value || 1),
+    service_id_base:Number(document.getElementById('mptsSidBase')?.value || 1),
+    pmt_pid_base:Number(document.getElementById('mptsPmtBase')?.value || 4096),
+    services
+  };
+  if (!output.output_host || output.output_port < 1 || output.output_port > 65535) {
+    uiError('Укажите корректный IP и порт MPTS'); return;
+  }
+  const outputs = (mptsState.outputs || []).map(mptsConfigOnly);
+  if (index >= 0 && index < outputs.length) outputs[index] = output; else outputs.push(output);
+  try {
+    const result = await fetchJson('/api/mpts/save', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({outputs})
+    }, 15000);
+    if (result.result !== 'ok') throw new Error(result.error || 'Не удалось сохранить MPTS');
+    mptsState = result;
+    renderMptsList();
+  } catch (error) { uiError(error?.message || error); }
+}
+async function deleteMptsOutput(index) {
+  const output = mptsState.outputs?.[index];
+  if (!output) return;
+  if (!confirm(`Удалить MPTS «${output.name || output.id}»?`)) return;
+  const outputs = (mptsState.outputs || []).map(mptsConfigOnly).filter((_,i) => i !== index);
+  try {
+    const result = await fetchJson('/api/mpts/save', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({outputs})
+    }, 15000);
+    if (result.result !== 'ok') throw new Error(result.error || 'Не удалось удалить MPTS');
+    mptsState = result;
+    renderMptsList();
+  } catch (error) { uiError(error?.message || error); }
+}
+async function mptsActionByIndex(index, action) {
+  const id = String(mptsState.outputs?.[index]?.id || '');
+  if (!id) { uiError('MPTS output not found'); return; }
+  try {
+    const result = await fetchJson('/api/mpts/action', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id,action})
+    }, 15000);
+    if (result.result !== 'ok') throw new Error(result.error || `MPTS ${action} failed`);
+    mptsState = result;
+    renderMptsList();
+  } catch (error) { uiError(error?.message || error); }
+}
 function openNetworkModal() {
   document.getElementById('modalContent').className = 'modal-content network-modal';
   document.getElementById('modalContent').innerHTML = modalCloseButton() + `
@@ -3482,7 +3805,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.41'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.42'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

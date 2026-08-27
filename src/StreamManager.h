@@ -21,6 +21,8 @@
 #include "TelegramNotifier.h"
 #include "utils.h"
 
+class MptsOutputManager;
+
 struct RemapContext {
     GstElement* mux = nullptr;
     GstElement* sink = nullptr;
@@ -178,6 +180,9 @@ struct StreamState {
     // v186: custom single-request libcurl -> appsrc HTTP MPEG-TS source.
     // Kept opaque here so curl/GStreamer implementation stays in StreamManager.cpp.
     std::shared_ptr<void> httpMpegTsInputState;
+    // Non-owning tap target. The manager lives for the whole StreamManager
+    // lifetime and receives only copies of the normalized outgoing SPTS.
+    MptsOutputManager* mptsOutputManager = nullptr;
     std::unique_ptr<RemapContext> sourceContext;
     std::unique_ptr<GstTranscoderProcess> gstTranscoder;
     std::vector<std::unique_ptr<ExternalSrtOutputState>> externalSrtOutputs;
@@ -207,6 +212,13 @@ public:
     size_t enforceSubscriberAccess();
     size_t restartSrtOutputsForStreams(const std::vector<std::string>& streamIds);
     size_t restartAllSrtOutputs();
+
+    // Separate packet-level MPTS aggregator. These calls do not rebuild or
+    // alter the normal per-channel pipelines.
+    void configureMptsOutputs();
+    bool startMptsOutput(const std::string& id, std::string* error = nullptr);
+    bool stopMptsOutput(const std::string& id);
+    Json::Value mptsSnapshot() const;
 
 private:
     bool gstreamerInitialized;
@@ -261,6 +273,7 @@ private:
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
     std::map<std::string, std::unique_ptr<SharedDvbFrontendState>> sharedDvbFrontends;
+    std::unique_ptr<MptsOutputManager> mptsOutputManager;
     // When the last consumer stops, frontend shutdown happens on the stop
     // thread. Keep a short release barrier so a new transponder cannot race
     // the old GstDvbSrc while the kernel device is still closing.

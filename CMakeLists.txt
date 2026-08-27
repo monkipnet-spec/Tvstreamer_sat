@@ -53,6 +53,7 @@ add_executable(TVStreammerSAT5
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
     src/NetworkTsInput.cpp
+    src/mpts/MptsOutputManager.cpp
     src/StreamManager.cpp
     src/TranscoderModule.cpp
     src/GstTranscoderProcess.cpp

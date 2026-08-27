@@ -16,6 +16,32 @@ struct StreamOutputConfig {
     static StreamOutputConfig fromJson(const Json::Value& root);
 };
 
+struct MptsServiceConfig {
+    std::string streamId;
+    // 0 = allocate from the MPTS output service_id_base.
+    uint32_t serviceId = 0;
+
+    Json::Value toJson() const;
+    static MptsServiceConfig fromJson(const Json::Value& root);
+};
+
+struct MptsOutputConfig {
+    std::string id;
+    std::string name;
+    std::string outputHost = "239.255.20.1";
+    int outputPort = 5000;
+    std::string interfaceAddress;
+    bool autoStart = false;
+    uint32_t transportStreamId = 1;
+    uint32_t originalNetworkId = 1;
+    uint32_t serviceIdBase = 1;
+    uint32_t pmtPidBase = 0x1000;
+    std::vector<MptsServiceConfig> services;
+
+    Json::Value toJson() const;
+    static MptsOutputConfig fromJson(const Json::Value& root);
+};
+
 struct StreamConfig {
     std::string id;
     std::string name;
@@ -81,6 +107,7 @@ struct AppConfig {
     std::string telegramToken;
     std::string telegramChatId;
     std::vector<StreamConfig> streams;
+    std::vector<MptsOutputConfig> mptsOutputs;
     std::vector<CamClientConfig> camClients;
 
     Json::Value toJson() const;

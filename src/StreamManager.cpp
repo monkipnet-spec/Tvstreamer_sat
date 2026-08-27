@@ -2,6 +2,7 @@
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "NetworkTsInput.h"
+#include "mpts/MptsOutputManager.h"
 #include "TsCcStageTrace.h"
 #include "UdpInput.h"
 #include "DvbSatellite.h"
@@ -4174,7 +4175,9 @@ void maybeLogSrtInputStats(
 } // namespace
 
 StreamManager::StreamManager(ConfigManager& cfg, TelegramNotifier& notifier)
-    : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(gst_is_initialized()) {
+    : configManager(cfg), telegramNotifier(notifier), gstreamerInitialized(gst_is_initialized()),
+      mptsOutputManager(std::make_unique<MptsOutputManager>()) {
+    mptsOutputManager->configure(configManager.config.mptsOutputs, configManager.config.streams);
     std::cerr << "StreamManager constructed" << std::endl;
 }
 
@@ -5180,6 +5183,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
               << std::endl;
 
     auto state = std::make_unique<StreamState>();
+    state->mptsOutputManager = mptsOutputManager.get();
 
     StreamConfig effectiveConfig = streamConfig;
     const std::string primaryInputUri = normalizeInputUri(effectiveConfig.inputUri);
@@ -5688,6 +5692,7 @@ bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string*
 }
 
 void StreamManager::stopAll() {
+    if (mptsOutputManager) mptsOutputManager->stopAll();
     std::vector<std::unique_ptr<StreamState>> stoppedStreams;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
@@ -5727,6 +5732,28 @@ void StreamManager::stopAll() {
         state.sourceContext.reset();
         tvs::protocols::removeFifoRelay(state.config);
     }
+}
+
+void StreamManager::configureMptsOutputs() {
+    if (mptsOutputManager) {
+        mptsOutputManager->configure(configManager.config.mptsOutputs, configManager.config.streams);
+    }
+}
+
+bool StreamManager::startMptsOutput(const std::string& id, std::string* error) {
+    if (!mptsOutputManager) {
+        if (error) *error = "MPTS module is not initialized";
+        return false;
+    }
+    return mptsOutputManager->start(id, error);
+}
+
+bool StreamManager::stopMptsOutput(const std::string& id) {
+    return mptsOutputManager && mptsOutputManager->stop(id);
+}
+
+Json::Value StreamManager::mptsSnapshot() const {
+    return mptsOutputManager ? mptsOutputManager->snapshot() : Json::Value(Json::objectValue);
 }
 
 bool StreamManager::isStreamActive(const std::string& id) {
@@ -8595,12 +8622,23 @@ GstPadProbeReturn StreamManager::outputPadProbe(GstPad* pad, GstPadProbeInfo* in
             state->outputBytes.fetch_add(gst_buffer_get_size(buffer), std::memory_order_relaxed);
             updateOutputContinuityErrors(state, buffer);
             updateOutputScramblingStats(state, buffer);
+            if (state->mptsOutputManager) {
+                state->mptsOutputManager->pushBuffer(state->config.id, buffer);
+            }
         }
     } else if (info->type & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
         GstBufferList* list = gst_pad_probe_info_get_buffer_list(info);
         state->outputBytes.fetch_add(bufferListSize(list), std::memory_order_relaxed);
         updateOutputContinuityErrors(state, list);
         updateOutputScramblingStats(state, list);
+        if (state->mptsOutputManager && list) {
+            const guint count = gst_buffer_list_length(list);
+            for (guint i = 0; i < count; ++i) {
+                if (GstBuffer* buffer = gst_buffer_list_get(list, i)) {
+                    state->mptsOutputManager->pushBuffer(state->config.id, buffer);
+                }
+            }
+        }
     }
 
     return GST_PAD_PROBE_OK;

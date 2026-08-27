@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <array>
 #include <vector>
+#include <set>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -260,6 +261,89 @@ Json::Value StreamOutputConfig::toJson() const {
     return root;
 }
 
+MptsServiceConfig MptsServiceConfig::fromJson(const Json::Value& root) {
+    MptsServiceConfig service;
+    service.streamId = root.get("stream_id", "").asString();
+    service.serviceId = root.get("service_id", 0).asUInt();
+    if (service.serviceId > 0xFFFFU) service.serviceId = 0;
+    return service;
+}
+
+Json::Value MptsServiceConfig::toJson() const {
+    Json::Value root;
+    root["stream_id"] = streamId;
+    root["service_id"] = serviceId;
+    return root;
+}
+
+MptsOutputConfig MptsOutputConfig::fromJson(const Json::Value& root) {
+    MptsOutputConfig output;
+    output.id = root.get("id", "").asString();
+    output.name = root.get("name", output.id).asString();
+    output.outputHost = root.get("output_host", "239.255.20.1").asString();
+    output.outputPort = root.get("output_port", 5000).asInt();
+    // Accept the same convenient host syntax as normal UDP outputs.
+    std::string normalizedHost;
+    int normalizedPort = output.outputPort;
+    if (normalizeUdpEndpoint(output.outputHost, output.outputPort, normalizedHost, normalizedPort)) {
+        output.outputHost = normalizedHost;
+        output.outputPort = normalizedPort;
+    }
+    if (output.outputPort <= 0 || output.outputPort > 65535) output.outputPort = 5000;
+    output.interfaceAddress = root.get("interface_address", "").asString();
+    output.autoStart = root.get("auto_start", false).asBool();
+    output.transportStreamId = std::clamp(root.get("transport_stream_id", 1).asUInt(), 1U, 0xFFFFU);
+    output.originalNetworkId = std::clamp(root.get("original_network_id", 1).asUInt(), 1U, 0xFFFFU);
+    output.serviceIdBase = std::clamp(root.get("service_id_base", 1).asUInt(), 1U, 0xFFFFU);
+    output.pmtPidBase = std::clamp(root.get("pmt_pid_base", 0x1000).asUInt(), 0x20U, 0x1FFEU);
+    if (root.isMember("services") && root["services"].isArray()) {
+        std::set<std::string> seen;
+        for (const auto& item : root["services"]) {
+            auto service = MptsServiceConfig::fromJson(item);
+            if (!service.streamId.empty() && seen.insert(service.streamId).second) {
+                output.services.push_back(std::move(service));
+            }
+        }
+    } else if (root.isMember("stream_ids") && root["stream_ids"].isArray()) {
+        std::set<std::string> seen;
+        for (const auto& item : root["stream_ids"]) {
+            MptsServiceConfig service;
+            service.streamId = item.asString();
+            if (!service.streamId.empty() && seen.insert(service.streamId).second) {
+                output.services.push_back(std::move(service));
+            }
+        }
+    }
+    // The packet-level mapper reserves 32 PID slots per service below the PMT
+    // range. Keep v202.42 bounded and deterministic rather than silently
+    // creating overlapping PID blocks.
+    if (output.services.size() > 120) output.services.resize(120);
+    if (!output.services.empty()) {
+        const uint32_t countMinusOne = static_cast<uint32_t>(output.services.size() - 1);
+        output.pmtPidBase = std::min<uint32_t>(output.pmtPidBase, 0x1FFEU - countMinusOne);
+        output.serviceIdBase = std::min<uint32_t>(output.serviceIdBase, 0xFFFFU - countMinusOne);
+    }
+    return output;
+}
+
+Json::Value MptsOutputConfig::toJson() const {
+    Json::Value root;
+    root["id"] = id;
+    root["name"] = name;
+    root["output_host"] = outputHost;
+    root["output_port"] = outputPort;
+    root["interface_address"] = interfaceAddress;
+    root["auto_start"] = autoStart;
+    root["transport_stream_id"] = transportStreamId;
+    root["original_network_id"] = originalNetworkId;
+    root["service_id_base"] = serviceIdBase;
+    root["pmt_pid_base"] = pmtPidBase;
+    Json::Value list(Json::arrayValue);
+    for (const auto& service : services) list.append(service.toJson());
+    root["services"] = list;
+    return root;
+}
+
 StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     StreamConfig config;
     config.id = root.get("id", "").asString();
@@ -425,6 +509,9 @@ Json::Value AppConfig::toJson() const {
         list.append(stream.toJson());
     }
     root["streams"] = list;
+    Json::Value mptsList(Json::arrayValue);
+    for (const auto& output : mptsOutputs) mptsList.append(output.toJson());
+    root["mpts_outputs"] = mptsList;
     return root;
 }
 
@@ -446,6 +533,15 @@ AppConfig AppConfig::fromJson(const Json::Value& root) {
     if (root.isMember("streams") && root["streams"].isArray()) {
         for (const auto& item : root["streams"]) {
             config.streams.push_back(StreamConfig::fromJson(item));
+        }
+    }
+    if (root.isMember("mpts_outputs") && root["mpts_outputs"].isArray()) {
+        std::set<std::string> seen;
+        for (const auto& item : root["mpts_outputs"]) {
+            auto output = MptsOutputConfig::fromJson(item);
+            if (!output.id.empty() && !output.services.empty() && seen.insert(output.id).second) {
+                config.mptsOutputs.push_back(std::move(output));
+            }
         }
     }
     return config;
