@@ -1,0 +1,13 @@
+TVStreammerSAT5 202.48
+
+Memory / recovery teardown follow-up:
+- wait for old GStreamer pipeline to reach NULL before allocating a replacement during SRT/HTTP/HLS recovery
+- flush and release the retired GstBus only after the replacement pipeline is running
+- temporary input probes now wait for deterministic NULL teardown and trim released allocator pages
+- stopAll also stops custom HTTP input workers and waits for pipeline NULL teardown
+- fix confirmed TelegramNotifier leak: every curl_easy_escape() result is now released with curl_free()
+- add once-per-minute allocator diagnostics (mallinfo2 on glibc): RSS/Anon/VmData, malloc in-use/free/arena/mmap, quality sample count, MPTS queue bytes, threads and FDs
+
+The diagnostic line is:
+MEMORY DIAG 202.48: ...
+It distinguishes live heap growth from allocator fragmentation and bounded media queues.

@@ -92,6 +92,7 @@ private:
     uint64_t previousCpuTotal = 0;
     uint64_t previousCpuIdle = 0;
     std::chrono::steady_clock::time_point previousMetricsSample;
+    std::chrono::steady_clock::time_point lastMemoryDiagLog;
     std::map<std::string, std::pair<uint64_t, uint64_t>> previousNetworkBytes;
     std::unordered_map<std::string, std::deque<QualitySample>> qualitySamples;
     std::unordered_map<std::string, int64_t> qualityLastCompaction;

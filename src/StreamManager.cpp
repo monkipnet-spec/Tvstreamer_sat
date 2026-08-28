@@ -5547,7 +5547,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     if (duplicateStart) {
         state->running = false;
         if (state->pipeline) {
-            gst_element_set_state(state->pipeline, GST_STATE_NULL);
+            stopPipelineAndWait(state->pipeline, 2 * GST_SECOND);
         }
         stopHttpMpegTsInput(state.get());
         if (state->bus) {
@@ -5753,8 +5753,9 @@ void StreamManager::stopAll() {
     for (auto& statePtr : stoppedStreams) {
         auto& state = *statePtr;
         if (state.pipeline) {
-            gst_element_set_state(state.pipeline, GST_STATE_NULL);
+            stopPipelineAndWait(state.pipeline, 2 * GST_SECOND);
         }
+        stopHttpMpegTsInput(&state);
         releaseSharedDvbInput(&state);
         stopExternalSrtOutputs(&state);
         if (state.busThread.joinable()) {
@@ -6411,11 +6412,13 @@ bool StreamManager::probeInputAvailable(
     }
 
     available = available && receivedData.load(std::memory_order_relaxed);
-    gst_element_set_state(pipeline, GST_STATE_NULL);
+    stopPipelineAndWait(pipeline, 2 * GST_SECOND);
     if (bus) {
+        gst_bus_set_flushing(bus, TRUE);
         gst_object_unref(bus);
     }
     gst_object_unref(pipeline);
+    trimReleasedPipelineMemory();
     return available;
 }
 
@@ -6429,7 +6432,12 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     stopHttpMpegTsInput(state);
     if (oldPipeline) {
-        gst_element_set_state(oldPipeline, GST_STATE_NULL);
+        // 202.48: network/HLS recovery used to start the replacement pipeline
+        // immediately after requesting NULL on the old one.  Network sources and
+        // demuxers can complete NULL asynchronously, leaving old buffer pools and
+        // allocator pages alive while the next pipeline is already filling. Wait
+        // for deterministic teardown before allocating the replacement.
+        stopPipelineAndWait(oldPipeline, 2 * GST_SECOND);
     }
 
     state->runtimeConfig = state->config;
@@ -6541,6 +6549,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     startHttpMpegTsInput(state);
 
     if (oldBus) {
+        gst_bus_set_flushing(oldBus, TRUE);
         gst_object_unref(oldBus);
     }
     if (oldPipeline) {

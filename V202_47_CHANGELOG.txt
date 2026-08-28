@@ -1,8 +1,0 @@
-TVStreammerSAT5 202.47
-
-Memory/RSS stabilization:
-- replace detached pthread-per-HTTP-request with a fixed 24-worker Boost.Asio pool
-- cap queued HTTP sessions at 256 to prevent an unbounded request backlog
-- reuse worker stacks/allocator arenas for /api/state, metrics, HLS file and control requests
-- keep all 202.46 GStreamer queue byte caps and allocator trimming
-- no streaming/recovery timing changes

@@ -19,16 +19,34 @@ void TelegramNotifier::sendMessage(const std::string& text) {
         return;
     }
 
+    // 202.48: curl_easy_escape() returns curl-allocated strings. The old
+    // notifier streamed those pointers directly into ostringstream and never
+    // released them, leaking memory on every Telegram status notification.
+    char* escapedToken = curl_easy_escape(curl, config.telegramToken.c_str(), 0);
+    char* escapedChatId = curl_easy_escape(curl, config.telegramChatId.c_str(), 0);
+    char* escapedText = curl_easy_escape(curl, text.c_str(), 0);
+    if (!escapedToken || !escapedChatId || !escapedText) {
+        if (escapedToken) curl_free(escapedToken);
+        if (escapedChatId) curl_free(escapedChatId);
+        if (escapedText) curl_free(escapedText);
+        curl_easy_cleanup(curl);
+        return;
+    }
+
     std::ostringstream url;
     url << "https://api.telegram.org/bot"
-        << curl_easy_escape(curl, config.telegramToken.c_str(), 0)
+        << escapedToken
         << "/sendMessage?chat_id="
-        << curl_easy_escape(curl, config.telegramChatId.c_str(), 0)
+        << escapedChatId
         << "&parse_mode=HTML"
         << "&disable_web_page_preview=true"
-        << "&text=" << curl_easy_escape(curl, text.c_str(), 0);
+        << "&text=" << escapedText;
+    curl_free(escapedToken);
+    curl_free(escapedChatId);
+    curl_free(escapedText);
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());
+    const std::string requestUrl = url.str();
+    curl_easy_setopt(curl, CURLOPT_URL, requestUrl.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);

@@ -33,6 +33,9 @@
 #include <vector>
 #include <unistd.h>
 #include <arpa/inet.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 
@@ -986,6 +989,8 @@ std::string HttpServer::listInterfaces() {
     // scripts on a production headend.
     uint64_t processThreads = 0;
     uint64_t processRssKb = 0;
+    uint64_t processAnonKb = 0;
+    uint64_t processDataKb = 0;
     {
       std::ifstream status("/proc/self/status");
       std::string line;
@@ -996,8 +1001,40 @@ std::string HttpServer::listInterfaces() {
         } else if (line.rfind("VmRSS:", 0) == 0) {
           std::istringstream value(line.substr(6));
           value >> processRssKb;
+        } else if (line.rfind("RssAnon:", 0) == 0) {
+          std::istringstream value(line.substr(8));
+          value >> processAnonKb;
+        } else if (line.rfind("VmData:", 0) == 0) {
+          std::istringstream value(line.substr(7));
+          value >> processDataKb;
         }
       }
+    }
+
+    uint64_t mallocArenaBytes = 0;
+    uint64_t mallocInUseBytes = 0;
+    uint64_t mallocFreeBytes = 0;
+    uint64_t mallocMmapBytes = 0;
+#if defined(__GLIBC__)
+    {
+      const struct mallinfo2 info = mallinfo2();
+      mallocArenaBytes = static_cast<uint64_t>(info.arena);
+      mallocInUseBytes = static_cast<uint64_t>(info.uordblks);
+      mallocFreeBytes = static_cast<uint64_t>(info.fordblks);
+      mallocMmapBytes = static_cast<uint64_t>(info.hblkhd);
+    }
+#endif
+
+    uint64_t qualitySampleCount = 0;
+    {
+      std::lock_guard<std::mutex> qualityLock(qualityMutex);
+      for (const auto& entry : qualitySamples) qualitySampleCount += entry.second.size();
+    }
+
+    uint64_t mptsQueueBytes = 0;
+    const Json::Value mptsMemory = streamManager.mptsSnapshot();
+    for (const auto& output : mptsMemory["outputs"]) {
+      mptsQueueBytes += output.get("queue_bytes", Json::UInt64(0)).asUInt64();
     }
     uint64_t processFds = 0;
     {
@@ -1038,8 +1075,34 @@ std::string HttpServer::listInterfaces() {
     root["process_threads"] = Json::UInt64(processThreads);
     root["process_fds"] = Json::UInt64(processFds);
     root["process_rss_mb"] = static_cast<double>(processRssKb) / 1024.0;
+    root["process_anon_mb"] = static_cast<double>(processAnonKb) / 1024.0;
+    root["process_data_mb"] = static_cast<double>(processDataKb) / 1024.0;
+    root["malloc_arena_mb"] = static_cast<double>(mallocArenaBytes) / (1024.0 * 1024.0);
+    root["malloc_inuse_mb"] = static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0);
+    root["malloc_free_mb"] = static_cast<double>(mallocFreeBytes) / (1024.0 * 1024.0);
+    root["malloc_mmap_mb"] = static_cast<double>(mallocMmapBytes) / (1024.0 * 1024.0);
+    root["quality_samples"] = Json::UInt64(qualitySampleCount);
+    root["mpts_queue_mb"] = static_cast<double>(mptsQueueBytes) / (1024.0 * 1024.0);
     root["cgroup_pids_current"] = Json::UInt64(cgroupPidsCurrent);
     root["cgroup_pids_max"] = cgroupPidsMax;
+
+    if (lastMemoryDiagLog.time_since_epoch().count() == 0 ||
+        now - lastMemoryDiagLog >= std::chrono::seconds(60)) {
+      lastMemoryDiagLog = now;
+      std::cerr << "MEMORY DIAG 202.48: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+                << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
+                << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
+                << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
+                << " malloc_free_mb=" << (static_cast<double>(mallocFreeBytes) / (1024.0 * 1024.0))
+                << " malloc_arena_mb=" << (static_cast<double>(mallocArenaBytes) / (1024.0 * 1024.0))
+                << " malloc_mmap_mb=" << (static_cast<double>(mallocMmapBytes) / (1024.0 * 1024.0))
+                << " quality_samples=" << qualitySampleCount
+                << " mpts_queue_mb=" << (static_cast<double>(mptsQueueBytes) / (1024.0 * 1024.0))
+                << " threads=" << processThreads
+                << " fds=" << processFds
+                << std::endl;
+    }
+
     Json::Value interfaces(Json::arrayValue);
     const auto interfaceAddresses = enumerateNetworkInterfaces();
     std::ifstream netdev("/proc/net/dev");
