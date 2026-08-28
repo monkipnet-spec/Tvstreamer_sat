@@ -4185,6 +4185,18 @@ bool isExternalSrtListenerOutput(const StreamConfig& outputConfig) {
            tvs::protocols::srtOutputMode(outputConfig) != "caller";
 }
 
+void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SECOND) {
+    if (!pipeline) {
+        return;
+    }
+
+    const GstStateChangeReturn result =
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+    if (result == GST_STATE_CHANGE_ASYNC) {
+        gst_element_get_state(pipeline, nullptr, nullptr, timeout);
+    }
+}
+
 void maybeLogSrtInputStats(
     StreamState* state,
     std::chrono::steady_clock::time_point now) {
