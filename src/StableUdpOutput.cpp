@@ -82,6 +82,18 @@ bool tsDiagnosticsEnabled() {
     return enabled;
 }
 
+// 202.51: periodic shaper statistics used to be emitted synchronously from
+// the real-time UDP sender loop every five seconds. With dozens of streams the
+// large journal writes line up and can stall sender threads long enough to be
+// visible as short freezes. Keep detailed statistics opt-in for diagnostics.
+bool udpShaperStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_UDP_SHAPER_STATS");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 bool forceSyntheticCbrPcr() {
     static const bool enabled = [] {
         const char* value = std::getenv("TVS_UDP_FORCE_SYNTHETIC_PCR");
@@ -1141,7 +1153,11 @@ private:
                 queueSpace.notify_all();
             }
 
-            maybeLogStats(now);
+            // Never perform synchronous journal I/O in the production sender
+            // hot path. Detailed stats are available on explicit request only.
+            if (udpShaperStatsEnabled()) {
+                maybeLogStats(now);
+            }
 
             nextSendNanoseconds += intervalNanoseconds;
             mediaTimelineNanoseconds += intervalNanoseconds;

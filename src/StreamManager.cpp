@@ -102,6 +102,8 @@ constexpr int kSrtInputLatencyMs = 1000;
 constexpr guint64 kSrtInputStartupBuffer = 2 * GST_SECOND;
 constexpr guint64 kSrtInputQueueMax = 8 * GST_SECOND;
 constexpr auto kSrtStatsLogInterval = std::chrono::seconds(10);
+// 202.51: reading and serializing SRT statistics acquires internal source/SRT
+// locks. Do not do it periodically in production; enable only for diagnostics.
 constexpr int kSrtOutputLatencyMs = 150;
 constexpr int kSrtTranscodedOutputLatencyMs = 700;
 constexpr auto kHlsSessionTtl = std::chrono::seconds(15);
@@ -4197,10 +4199,18 @@ void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SE
     }
 }
 
+bool srtInputStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TVS_SRT_INPUT_STATS");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 void maybeLogSrtInputStats(
     StreamState* state,
     std::chrono::steady_clock::time_point now) {
-    if (!state || !state->pipeline ||
+    if (!srtInputStatsEnabled() || !state || !state->pipeline ||
         tvs::stream_protocols::inputKind(state->runtimeConfig) !=
             tvs::stream_protocols::InputProtocolKind::Srt ||
         now - state->lastSrtStatsLog < kSrtStatsLogInterval) {
