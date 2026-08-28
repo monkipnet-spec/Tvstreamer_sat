@@ -1092,7 +1092,7 @@ std::string HttpServer::listInterfaces() {
     if (lastMemoryDiagLog.time_since_epoch().count() == 0 ||
         now - lastMemoryDiagLog >= std::chrono::seconds(60)) {
       lastMemoryDiagLog = now;
-      // 202.52: enumerate live GStreamer queue occupancy only once per minute.
+      // 202.53: enumerate live GStreamer queue occupancy only once per minute.
       // Doing this on every /api/system-metrics request would add avoidable
       // pipeline locking to the media server hot path.
       const Json::Value gstQueueMemory = streamManager.queueMemorySnapshot();
@@ -1101,7 +1101,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t gstQueueMaxBytes = gstQueueMemory.get("max_queue_bytes", Json::UInt64(0)).asUInt64();
       const std::string gstQueueMaxName = gstQueueMemory.get("max_queue_name", "").asString();
       const std::string gstQueueMaxStream = gstQueueMemory.get("max_stream_id", "").asString();
-      std::cerr << "MEMORY DIAG 202.52: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.53: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -4007,7 +4007,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.52'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.53'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

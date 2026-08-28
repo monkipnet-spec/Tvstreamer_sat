@@ -172,12 +172,18 @@ struct StreamState {
     std::array<uint8_t, 8192> inputContinuity {};
     std::array<bool, 8192> inputContinuityValid {};
     std::vector<uint8_t> inputTsRemainder;
+    // 202.53: reuse one scratch buffer per telemetry path instead of allocating
+    // a temporary vector for every GstBuffer callback. This keeps glibc tcache
+    // and per-thread malloc arenas from retaining thousands of hot-path chunks.
+    std::vector<uint8_t> inputTsScratch;
     std::mutex inputContinuityMutex;
     std::array<uint8_t, 8192> outputContinuity {};
     std::array<bool, 8192> outputContinuityValid {};
     std::vector<uint8_t> outputTsRemainder;
+    std::vector<uint8_t> outputTsScratch;
     std::mutex outputContinuityMutex;
     std::vector<uint8_t> outputScramblingRemainder;
+    std::vector<uint8_t> outputScramblingScratch;
     std::mutex outputScramblingMutex;
     // Media PID discovery for the decode indicator. Clear PSI/ECM/teletext
     // packets must never be enough to report a channel as decoded.

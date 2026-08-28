@@ -3351,6 +3351,7 @@ uint64_t countContinuityErrors(
     std::array<uint8_t, 8192>& continuity,
     std::array<bool, 8192>& continuityValid,
     std::vector<uint8_t>& remainder,
+    std::vector<uint8_t>& scratch,
     std::mutex& continuityMutex) {
     if (!data || size == 0) {
         return 0;
@@ -3361,11 +3362,17 @@ uint64_t countContinuityErrors(
     // HTTP and HLS buffers are not guaranteed to begin or end on a 188-byte
     // MPEG-TS boundary. Preserve the incomplete tail and prepend it to the
     // next buffer instead of treating skipped fragments as packet loss.
-    std::vector<uint8_t> bytes;
-    bytes.reserve(remainder.size() + size);
-    bytes.insert(bytes.end(), remainder.begin(), remainder.end());
-    bytes.insert(bytes.end(), data, data + size);
+    // 202.53: this is a packet-hot path. A fresh std::vector on every callback
+    // caused malloc/tcache growth across hundreds of GStreamer worker threads.
+    // Reuse a buffer owned by StreamState; the owning continuity mutex already
+    // serializes access to it.
+    scratch.clear();
+    const std::size_t required = remainder.size() + size;
+    if (scratch.capacity() < required) scratch.reserve(required);
+    scratch.insert(scratch.end(), remainder.begin(), remainder.end());
+    scratch.insert(scratch.end(), data, data + size);
     remainder.clear();
+    auto& bytes = scratch;
 
     const std::size_t start = findTsAlignment(bytes.data(), bytes.size());
     if (start == std::string::npos) {
@@ -3540,8 +3547,12 @@ TransportScramblingCount countTransportScrambling(const guint8* data, std::size_
     std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
     seedConfiguredMediaPids(state);
 
-    std::vector<uint8_t> bytes;
-    bytes.reserve(state->outputScramblingRemainder.size() + size);
+    // 202.53: reuse the per-stream scratch vector. outputScramblingMutex owns
+    // both remainder and scratch, so this adds no new synchronization.
+    auto& bytes = state->outputScramblingScratch;
+    bytes.clear();
+    const std::size_t required = state->outputScramblingRemainder.size() + size;
+    if (bytes.capacity() < required) bytes.reserve(required);
     bytes.insert(bytes.end(), state->outputScramblingRemainder.begin(), state->outputScramblingRemainder.end());
     bytes.insert(bytes.end(), data, data + size);
     state->outputScramblingRemainder.clear();
@@ -3611,7 +3622,7 @@ void updateInputContinuityErrors(StreamState* state, GstBuffer* buffer) {
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
     const uint64_t errors = countContinuityErrors(
         map.data, map.size, state->inputContinuity, state->inputContinuityValid,
-        state->inputTsRemainder, state->inputContinuityMutex);
+        state->inputTsRemainder, state->inputTsScratch, state->inputContinuityMutex);
     gst_buffer_unmap(buffer, &map);
     if (errors > 0) state->inputCcErrors.fetch_add(errors, std::memory_order_relaxed);
 }
@@ -3622,7 +3633,7 @@ void updateOutputContinuityErrors(StreamState* state, GstBuffer* buffer) {
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return;
     const uint64_t errors = countContinuityErrors(
         map.data, map.size, state->outputContinuity, state->outputContinuityValid,
-        state->outputTsRemainder, state->outputContinuityMutex);
+        state->outputTsRemainder, state->outputTsScratch, state->outputContinuityMutex);
     gst_buffer_unmap(buffer, &map);
     if (errors > 0) state->outputCcErrors.fetch_add(errors, std::memory_order_relaxed);
 }
