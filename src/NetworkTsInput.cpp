@@ -17,6 +17,7 @@ constexpr guint64 kNetworkInputQueue = 5 * GST_SECOND;
 constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 constexpr gint kSrtLatencyMs = 1000;
+constexpr guint kNetworkQueueHardMaxBytes = 20U * 1024U * 1024U;
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -65,7 +66,11 @@ GstElement* addQueue(GstElement* pipeline, const char* name, guint64 maxSizeTime
     }
     g_object_set(queue,
         "max-size-buffers", 0,
-        "max-size-bytes", 0,
+        // 202.46: never rely on buffer timestamps as the only queue bound.
+        // MPEG-TS buffers can temporarily have missing/irregular duration during
+        // reconnect/remap; a time-only queue can then retain far more memory than
+        // the configured five-second window.
+        "max-size-bytes", kNetworkQueueHardMaxBytes,
         "max-size-time", maxSizeTime,
         "leaky", 0,
         nullptr);

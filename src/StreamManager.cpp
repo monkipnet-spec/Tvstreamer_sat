@@ -40,6 +40,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <curl/curl.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #define GST_USE_UNSTABLE_API
 #include <gst/mpegts/mpegts.h>
 #include <gst/app/gstappsrc.h>
@@ -106,6 +109,38 @@ constexpr int kSrtRestartAttempts = 4;
 constexpr auto kSrtRestartRetryDelay = std::chrono::milliseconds(250);
 constexpr GstClockTime kFastDvbReleaseWait = 250 * GST_MSECOND;
 constexpr const char* kTestPatternUri = "test://bars";
+
+constexpr guint kQueueMinHardBytes = 8U * 1024U * 1024U;
+constexpr guint kQueueMaxHardBytes = 32U * 1024U * 1024U;
+constexpr uint64_t kQueueSizingBitrate = 32ULL * 1000ULL * 1000ULL;
+
+guint queueHardByteLimit(guint64 maxSizeTime) {
+    // Size the byte cap for roughly 32 Mbit/s while also keeping sane floors
+    // and ceilings. This is deliberately independent of timestamps so every
+    // long-lived queue has a real memory bound.
+    const uint64_t bytes = (kQueueSizingBitrate * maxSizeTime) /
+        (8ULL * static_cast<uint64_t>(GST_SECOND));
+    return static_cast<guint>(std::clamp<uint64_t>(
+        bytes, kQueueMinHardBytes, kQueueMaxHardBytes));
+}
+
+void trimReleasedPipelineMemory() {
+#if defined(__GLIBC__)
+    // Pipeline rebuilds can free several MB from many allocator arenas at once.
+    // Throttle malloc_trim: it is process-wide and should not run for every
+    // individual element/pad teardown.
+    static std::mutex trimMutex;
+    static auto lastTrim = std::chrono::steady_clock::time_point::min();
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(trimMutex);
+    if (lastTrim != std::chrono::steady_clock::time_point::min() &&
+        now - lastTrim < std::chrono::seconds(30)) {
+        return;
+    }
+    lastTrim = now;
+    malloc_trim(0);
+#endif
+}
 
 void resetOverloadRecoveryWatch(StreamState* state, bool startCooldown);
 
@@ -3811,7 +3846,10 @@ void configureQueue(GstElement* queue, guint64 maxSizeTime = 3000000000ULL) {
 
     g_object_set(queue,
         "max-size-buffers", 0,
-        "max-size-bytes", 0,
+        // 202.46: time remains the preferred latency limit, but it must not be
+        // the only memory limit. During TS timestamp discontinuities a queue's
+        // time level may stop advancing while bytes continue to arrive.
+        "max-size-bytes", queueHardByteLimit(maxSizeTime),
         "max-size-time", maxSizeTime,
         nullptr);
 }
@@ -4976,21 +5014,13 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
         gst_caps_unref(caps);
     }
 
-    g_object_set(inputQueue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(5000000000ULL),
-        nullptr);
+    configureQueue(inputQueue, 5 * GST_SECOND);
     // The external path already performs PCR smoothing and CBR pacing. A
     // second set-timestamps/smoothing stage here periodically corrects the
     // clock against loopback arrival time and can produce regular SRT pauses.
     setBooleanPropertyIfPresent(tsparse, "set-timestamps", FALSE);
     setIntPropertyIfPresent(tsparse, "alignment", 7);
-    g_object_set(outputQueue,
-        "max-size-buffers", 0,
-        "max-size-bytes", 0,
-        "max-size-time", static_cast<guint64>(5000000000ULL),
-        nullptr);
+    configureQueue(outputQueue, 5 * GST_SECOND);
 
     if (!gst_element_link_many(src, inputQueue, tsparse, outputQueue, sink, nullptr)) {
         error = "failed to link transcoded SRT relay pipeline";
@@ -5601,6 +5631,7 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
     }
     state.outputContexts.clear();
     state.sourceContext.reset();
+    trimReleasedPipelineMemory();
     tvs::protocols::removeFifoRelay(stoppedConfig);
     CardManager::instance().releaseService(id);
 
@@ -5680,6 +5711,7 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
         }
         state.outputContexts.clear();
         state.sourceContext.reset();
+        trimReleasedPipelineMemory();
         tvs::protocols::removeFifoRelay(stoppedConfig);
         CardManager::instance().releaseService(id);
         notifyStreamState(
@@ -5740,6 +5772,7 @@ void StreamManager::stopAll() {
         }
         state.outputContexts.clear();
         state.sourceContext.reset();
+        trimReleasedPipelineMemory();
         tvs::protocols::removeFifoRelay(state.config);
     }
 }
@@ -6513,6 +6546,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     if (oldPipeline) {
         gst_object_unref(oldPipeline);
     }
+    trimReleasedPipelineMemory();
     resetOverloadRecoveryWatch(state, true);
     return true;
 }

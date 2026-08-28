@@ -1,6 +1,9 @@
 #include <iostream>
 #include <boost/asio.hpp>
 #include <gst/gst.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "ConfigManager.h"
 #include "CardManager.h"
@@ -10,6 +13,15 @@
 #include "AppVersion.h"
 
 int main() {
+#if defined(__GLIBC__)
+    // 202.46: this process owns hundreds of GStreamer/SRT worker threads.
+    // glibc otherwise creates many independent malloc arenas and keeps freed
+    // pages cached in those arenas, which makes RSS look like a leak after
+    // queue warm-up/reconnects.  A modest arena cap still gives enough allocator
+    // concurrency for the actual CPU parallelism while reducing fragmentation.
+    mallopt(M_ARENA_MAX, 16);
+    mallopt(M_TRIM_THRESHOLD, 512 * 1024);
+#endif
     std::cerr << tvs::app::kProductName
               << " " << tvs::app::kProgramVersion
               << " | support=" << tvs::app::kSupportEmail << std::endl;

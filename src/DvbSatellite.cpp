@@ -779,7 +779,7 @@ Json::Value runTune(const DvbSatelliteParams& params, bool collectServices, int 
         nullptr);
     g_object_set(queue,
         "max-size-buffers", 0U,
-        "max-size-bytes", 0U,
+        "max-size-bytes", 8U * 1024U * 1024U,
         "max-size-time", static_cast<guint64>(2 * GST_SECOND),
         nullptr);
 

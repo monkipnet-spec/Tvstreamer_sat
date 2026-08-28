@@ -397,7 +397,7 @@ void configureQueue(GstElement* queue, bool preserveLoopbackTransport) {
         // can absorb the recovery burst without continuity loss.
         g_object_set(queue,
             "max-size-buffers", 0,
-            "max-size-bytes", 0,
+            "max-size-bytes", 12U * 1024U * 1024U,
             "max-size-time", static_cast<guint64>(2 * GST_SECOND),
             "leaky", 0,
             nullptr);
@@ -410,7 +410,7 @@ void configureQueue(GstElement* queue, bool preserveLoopbackTransport) {
     // discard the oldest buffers for real network inputs.
     g_object_set(queue,
         "max-size-buffers", 0,
-        "max-size-bytes", 0,
+        "max-size-bytes", 8U * 1024U * 1024U,
         "max-size-time", static_cast<guint64>(750 * GST_MSECOND),
         "leaky", 2,
         nullptr);

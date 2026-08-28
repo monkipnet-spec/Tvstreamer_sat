@@ -1,0 +1,22 @@
+TVStreammerSAT5 202.46
+
+Memory containment / RSS stabilization:
+- Added hard byte limits to all long-lived GStreamer queues in addition to their time limits.
+  This prevents MPEG-TS queues from retaining unbounded data when timestamps/durations are
+  missing or discontinuous during network reconnect/remap.
+- Network HLS/SRT/HTTP MPEG-TS input queues are capped at 20 MiB while retaining the 5 s
+  latency window introduced in 202.45.
+- Generic stream queues now receive a dynamic 8..32 MiB hard cap sized for approximately
+  32 Mbit/s and their configured time window.
+- UDP input queues are capped at 12 MiB for internal DVB loopback and 8 MiB for external live UDP.
+- Transcoded SRT relay queues now use the same bounded generic queue helper.
+- DVB scan queue receives an 8 MiB hard cap.
+- On glibc systems malloc arenas are capped at 16 and the trim threshold is reduced to 512 KiB.
+  This reduces RSS fragmentation in a process with hundreds of GStreamer/SRT worker threads.
+- Pipeline teardown/rebuild paths perform a throttled malloc_trim(0) so freed queue/buffer pages
+  are returned to the OS after reconnects and channel stops instead of remaining cached in arenas.
+
+No protocol watchdog timing changes versus 202.45:
+- generic no-input watchdog: 6 s
+- HLS no-input watchdog: 15 s
+- initial SRT startup allowance: 15 s
