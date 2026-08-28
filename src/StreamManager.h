@@ -149,6 +149,13 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSrtStatsLog = std::chrono::steady_clock::now();
+    // 202.44: live HLS transport errors/EOS are recoverable. Keep the monitor
+    // thread alive and schedule a controlled pipeline rebuild instead of
+    // marking the whole channel stopped on a transient segment/HTTP failure.
+    bool hlsRecoveryPending = false;
+    unsigned hlsRecoveryAttempts = 0;
+    std::chrono::steady_clock::time_point hlsRecoveryDue =
+        std::chrono::steady_clock::time_point::min();
     // v200: overload recovery watchdog.  It uses raw TS byte/continuity counters
     // rather than CPU percentage, so it detects the actual damage caused by a
     // scheduling stall.  Recovery is armed while errors are occurring and is

@@ -62,6 +62,8 @@ constexpr auto kInputFailoverDelay = std::chrono::seconds(6);
 // long enough to span normal segment boundaries without hiding a real outage.
 constexpr auto kHlsInputFailoverDelay = std::chrono::seconds(15);
 constexpr auto kHlsPrimaryProbeTimeout = std::chrono::seconds(15);
+constexpr auto kHlsErrorRecoveryDelay = std::chrono::seconds(1);
+constexpr auto kHlsRecoveryRetryDelay = std::chrono::seconds(5);
 // 202.33: SRT caller/listener startup can legitimately take longer than the
 // generic live-input watchdog, especially when remap has to discover the
 // program and build dynamic pads before media counters start moving.  Give a
@@ -5432,6 +5434,9 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->outputBitrate = initialConfiguredOutputBitrate(effectiveConfig);
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
+    state->hlsRecoveryPending = false;
+    state->hlsRecoveryAttempts = 0;
+    state->hlsRecoveryDue = std::chrono::steady_clock::time_point::min();
     state->lastBitrateSample = state->lastInputActivity;
     attachBitrateProbes(state.get());
 
@@ -6471,6 +6476,8 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     }
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
+    state->hlsRecoveryPending = false;
+    state->hlsRecoveryDue = std::chrono::steady_clock::time_point::min();
     state->lastBitrateSample = state->lastInputActivity;
     attachBitrateProbes(state);
 
@@ -6630,6 +6637,8 @@ bool StreamManager::restartTranscodedInput(
     state->lastInputBytesSeen = 0;
     state->lastInputActivity = std::chrono::steady_clock::now();
     state->lastPrimaryRetry = state->lastInputActivity;
+    state->hlsRecoveryPending = false;
+    state->hlsRecoveryDue = std::chrono::steady_clock::time_point::min();
     state->lastBitrateSample = state->lastInputActivity;
     {
         std::lock_guard<std::mutex> lock(state->outputScramblingMutex);
@@ -8818,9 +8827,10 @@ void StreamManager::monitorBus(const std::string& id) {
                   << " steady_loss_ms=6000 primary_probe_ms=15000"
                   << " source_auto_reconnect=on" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
-        std::cerr << "HLS input watchdog 202.38: loss_wait_ms=15000"
+        std::cerr << "HLS input watchdog 202.44: loss_wait_ms=15000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
-                  << " segmented_input=on" << std::endl;
+                  << " http_retries=infinite error_recovery=on eos_recovery=on"
+                  << std::endl;
     }
 
     while (state->running.load()) {
@@ -8829,7 +8839,48 @@ void StreamManager::monitorBus(const std::string& id) {
         const bool srtInput =
             activeConfiguredInputKind == tvs::stream_protocols::InputProtocolKind::Srt;
         const bool hlsInput =
+            !state->usingBackup &&
             activeConfiguredInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
+
+        // 202.44: a live HLS source must self-heal. hlsdemux/souphttpsrc can
+        // emit ERROR/EOS for a transient playlist or segment failure. Those
+        // messages schedule a rebuild here instead of terminating monitorBus().
+        // Failed rebuilds are retried at a bounded interval without busy-looping.
+        if (hlsInput && state->hlsRecoveryPending && now >= state->hlsRecoveryDue) {
+            const std::string recoveryUri = !state->primaryInputUri.empty()
+                ? state->primaryInputUri : state->activeInputUri;
+            if (!recoveryUri.empty()) {
+                ++state->hlsRecoveryAttempts;
+                std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                          << " attempt=" << state->hlsRecoveryAttempts
+                          << " action=pipeline-rebuild"
+                          << std::endl;
+                if (restartActiveInput(state, recoveryUri, false)) {
+                    bus = state->bus;
+                    state->hlsRecoveryPending = false;
+                    state->statusMessage = "HLS reconnecting";
+                    state->active = true;
+                    continue;
+                }
+                bus = state->bus;
+                state->statusMessage = "HLS reconnect retry pending";
+                state->active = true;
+                if (!state->config.backupInputUri.empty()) {
+                    state->hlsRecoveryPending = false;
+                    state->lastInputActivity = now - kHlsInputFailoverDelay;
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " result=primary-rebuild-failed action=allow-backup-failover"
+                              << std::endl;
+                } else {
+                    state->hlsRecoveryDue = now + kHlsRecoveryRetryDelay;
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " result=retry-pending retry_ms="
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     kHlsRecoveryRetryDelay).count()
+                              << std::endl;
+                }
+            }
+        }
 
         // v200 overload self-healing.  Do not restart while the machine is
         // still overloaded: continuity damage keeps refreshing
@@ -8843,7 +8894,7 @@ void StreamManager::monitorBus(const std::string& id) {
         // a healthy SRT session and creates a much longer visible freeze.
         // srtsrc auto-reconnect and the no-input watchdog remain responsible
         // for actual connection failures.
-        if (!srtInput &&
+        if (!srtInput && !hlsInput &&
             now - state->overloadWatchSample >= std::chrono::seconds(1)) {
             const uint64_t inputNow = state->inputBytes.load(std::memory_order_relaxed);
             const uint64_t outputNow = state->outputBytes.load(std::memory_order_relaxed);
@@ -8979,6 +9030,16 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
             }
             state->inputLossNotified = false;
+            if (hlsInput) {
+                if (state->hlsRecoveryAttempts > 0) {
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " result=media-restored attempts="
+                              << state->hlsRecoveryAttempts << std::endl;
+                }
+                state->hlsRecoveryPending = false;
+                state->hlsRecoveryAttempts = 0;
+                state->hlsRecoveryDue = std::chrono::steady_clock::time_point::min();
+            }
             if (state->primaryRetryPending && !state->usingBackup) {
                 state->primaryRetryPending = false;
                 state->backupAttempted = false;
@@ -9078,6 +9139,28 @@ void StreamManager::monitorBus(const std::string& id) {
                     bus = state->bus;
                     state->inputLossNotified = false;
                 }
+            } else if (inputTimedOut && hlsInput && state->config.backupInputUri.empty()) {
+                // 202.44: a stalled HLS demux without a backup used to remain
+                // stuck forever after the notification. Schedule a controlled
+                // rebuild of the same primary URL. Keep 15 s as the HLS-specific
+                // no-data threshold so normal segment boundaries are tolerated.
+                if (!state->hlsRecoveryPending) {
+                    state->hlsRecoveryPending = true;
+                    state->hlsRecoveryDue = now;
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " reason=no-input-15s action=schedule-rebuild"
+                              << std::endl;
+                }
+                if (!state->inputLossNotified) {
+                    state->inputLossNotified = true;
+                    state->statusMessage = "HLS input stalled - reconnecting";
+                    notifyStreamState(
+                        state->config,
+                        "🟡",
+                        telegramText(configManager, "HLS поток временно пропал", "HLS stream temporarily lost"),
+                        telegramText(configManager, "Нет HLS данных 15 секунд, переподключаю источник", "No HLS data for 15 seconds, reconnecting source") +
+                            "\nURL: " + state->activeInputUri);
+                }
             } else if (inputTimedOut && !state->usingBackup && state->config.backupInputUri.empty() && !state->inputLossNotified) {
                 state->inputLossNotified = true;
                 const bool dvbStartupTimedOut =
@@ -9140,6 +9223,10 @@ void StreamManager::monitorBus(const std::string& id) {
             }
         }
 
+        if (!bus) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         GstMessage* msg = gst_bus_timed_pop(bus, 500000000LL);
         if (!msg) {
             continue;
@@ -9156,6 +9243,32 @@ void StreamManager::monitorBus(const std::string& id) {
                 }
                 g_free(dbg);
 
+                if (hlsInput) {
+                    gchar* sourcePath = GST_MESSAGE_SRC(msg)
+                        ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " reason=gstreamer-error source="
+                              << (sourcePath ? sourcePath : "unknown")
+                              << " message=" << message
+                              << std::endl;
+                    if (sourcePath) g_free(sourcePath);
+                    state->statusMessage = "HLS transport error - reconnecting: " + message;
+                    state->active = true;
+                    if (!state->config.backupInputUri.empty() && state->hlsRecoveryAttempts > 0) {
+                        state->hlsRecoveryPending = false;
+                        state->lastInputActivity = now - kHlsInputFailoverDelay;
+                        std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                                  << " action=allow-backup-after-fast-retry" << std::endl;
+                    } else if (!state->hlsRecoveryPending) {
+                        state->hlsRecoveryPending = true;
+                        state->hlsRecoveryDue = now +
+                            (state->hlsRecoveryAttempts == 0
+                                ? kHlsErrorRecoveryDelay : kHlsRecoveryRetryDelay);
+                    }
+                    gst_message_unref(msg);
+                    continue;
+                }
+
                 state->statusMessage = "error: " + message;
                 state->active = false;
                 state->running = false;
@@ -9168,6 +9281,23 @@ void StreamManager::monitorBus(const std::string& id) {
                 return;
             }
             case GST_MESSAGE_EOS:
+                if (hlsInput) {
+                    std::cerr << "HLS RECOVERY 202.44: stream=" << id
+                              << " reason=EOS action=schedule-rebuild" << std::endl;
+                    state->statusMessage = "HLS EOS - reconnecting";
+                    state->active = true;
+                    if (!state->config.backupInputUri.empty() && state->hlsRecoveryAttempts > 0) {
+                        state->hlsRecoveryPending = false;
+                        state->lastInputActivity = now - kHlsInputFailoverDelay;
+                    } else if (!state->hlsRecoveryPending) {
+                        state->hlsRecoveryPending = true;
+                        state->hlsRecoveryDue = now +
+                            (state->hlsRecoveryAttempts == 0
+                                ? kHlsErrorRecoveryDelay : kHlsRecoveryRetryDelay);
+                    }
+                    gst_message_unref(msg);
+                    continue;
+                }
                 if (state->usingBackup &&
                     state->config.backupFileLoop &&
                     isBackupFileInput(state->config, state->activeInputUri) &&

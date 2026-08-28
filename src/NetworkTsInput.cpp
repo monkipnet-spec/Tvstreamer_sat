@@ -38,6 +38,10 @@ void setIntPropertyIfPresent(GstElement* element, const char* propertyName, gint
     if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
 }
 
+void setDoublePropertyIfPresent(GstElement* element, const char* propertyName, gdouble value) {
+    if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
+}
+
 void setUIntPropertyIfPresent(GstElement* element, const char* propertyName, guint value) {
     if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
 }
@@ -168,6 +172,14 @@ void configureHlsChildSource(GstElement* element, StreamConfig& cfg) {
     }
 
     configureHttpCredentials(element, cfg);
+    // 202.44: HLS segment/playlist fetches are allowed to survive transient
+    // HTTP failures instead of exhausting souphttpsrc's default three retries
+    // and tearing down the complete channel. The stream-level watchdog still
+    // rebuilds the HLS pipeline if no TS data arrives for 15 seconds, so an
+    // endlessly missing segment cannot leave the channel wedged forever.
+    setIntPropertyIfPresent(element, "retries", -1);
+    setDoublePropertyIfPresent(element, "retry-backoff-factor", 0.25);
+    setDoublePropertyIfPresent(element, "retry-backoff-max", 2.0);
     if (cfg.hlsAccessKeyMode == "query" && hasProperty(element, "location")) {
         if (!g_object_get_data(G_OBJECT(element), "tvs-network-hls-location-watch")) {
             g_signal_connect(element, "notify::location",
@@ -398,10 +410,10 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.36: protocol=HLS source=souphttpsrc+hlsdemux"
+    std::cerr << "Network TS input 202.44: protocol=HLS source=souphttpsrc+hlsdemux"
               << " queue_ms=5000 leaky=off prebuffer=off do_timestamp=on"
               << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
-              << " hls_path=restored-from-202.29"
+              << " http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;
     return src;
 }
