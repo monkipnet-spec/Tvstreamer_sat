@@ -1,0 +1,12 @@
+TVStreammerSAT5 202.51
+
+SRT / HTTP MPEG-TS periodic freeze fix:
+- periodic UDP shaper statistics are no longer written synchronously from the real-time sender loop
+- detailed UDP shaper stats are opt-in with TVS_UDP_SHAPER_STATS=1
+- SRT source stats polling/serialization every 10 seconds is disabled by default
+- detailed SRT stats are opt-in with TVS_SRT_INPUT_STATS=1
+- error/recovery logging remains enabled
+- 202.50 quality-history memory fix and 202.49 SRT/HTTP 8 s / 32 MiB input buffers are preserved
+
+Reason:
+With many active streams, large std::cerr -> journald writes from each sender every 5 seconds and SRT stats reads every 10 seconds could align and briefly stall media threads. Production hot paths now contain no periodic diagnostic journal I/O.
