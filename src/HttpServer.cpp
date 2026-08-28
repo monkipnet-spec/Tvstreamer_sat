@@ -1092,7 +1092,16 @@ std::string HttpServer::listInterfaces() {
     if (lastMemoryDiagLog.time_since_epoch().count() == 0 ||
         now - lastMemoryDiagLog >= std::chrono::seconds(60)) {
       lastMemoryDiagLog = now;
-      std::cerr << "MEMORY DIAG 202.51: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      // 202.52: enumerate live GStreamer queue occupancy only once per minute.
+      // Doing this on every /api/system-metrics request would add avoidable
+      // pipeline locking to the media server hot path.
+      const Json::Value gstQueueMemory = streamManager.queueMemorySnapshot();
+      const uint64_t gstQueueBytes = gstQueueMemory.get("bytes", Json::UInt64(0)).asUInt64();
+      const uint64_t gstQueueCount = gstQueueMemory.get("queue_count", Json::UInt64(0)).asUInt64();
+      const uint64_t gstQueueMaxBytes = gstQueueMemory.get("max_queue_bytes", Json::UInt64(0)).asUInt64();
+      const std::string gstQueueMaxName = gstQueueMemory.get("max_queue_name", "").asString();
+      const std::string gstQueueMaxStream = gstQueueMemory.get("max_stream_id", "").asString();
+      std::cerr << "MEMORY DIAG 202.52: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1101,6 +1110,11 @@ std::string HttpServer::listInterfaces() {
                 << " malloc_mmap_mb=" << (static_cast<double>(mallocMmapBytes) / (1024.0 * 1024.0))
                 << " quality_samples=" << qualitySampleCount
                 << " mpts_queue_mb=" << (static_cast<double>(mptsQueueBytes) / (1024.0 * 1024.0))
+                << " gst_queue_mb=" << (static_cast<double>(gstQueueBytes) / (1024.0 * 1024.0))
+                << " gst_queue_count=" << gstQueueCount
+                << " gst_queue_max_mb=" << (static_cast<double>(gstQueueMaxBytes) / (1024.0 * 1024.0))
+                << " gst_queue_max=" << (gstQueueMaxStream.empty() ? "-" : gstQueueMaxStream)
+                << ":" << (gstQueueMaxName.empty() ? "-" : gstQueueMaxName)
                 << " threads=" << processThreads
                 << " fds=" << processFds
                 << std::endl;
@@ -3993,7 +4007,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.51'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.52'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>

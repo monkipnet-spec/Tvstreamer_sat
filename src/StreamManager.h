@@ -226,6 +226,7 @@ public:
     bool startMptsOutput(const std::string& id, std::string* error = nullptr);
     bool stopMptsOutput(const std::string& id);
     Json::Value mptsSnapshot() const;
+    Json::Value queueMemorySnapshot() const;
 
 private:
     bool gstreamerInitialized;

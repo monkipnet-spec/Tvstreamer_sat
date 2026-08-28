@@ -5822,6 +5822,77 @@ Json::Value StreamManager::mptsSnapshot() const {
     return mptsOutputManager ? mptsOutputManager->snapshot() : Json::Value(Json::objectValue);
 }
 
+Json::Value StreamManager::queueMemorySnapshot() const {
+    Json::Value result(Json::objectValue);
+    uint64_t totalBytes = 0;
+    uint64_t queueCount = 0;
+    uint64_t maxQueueBytes = 0;
+    std::string maxQueueName;
+    std::string maxStreamId;
+
+    auto collectPipeline = [&](const std::string& streamId, GstElement* pipeline) {
+        if (!pipeline || !GST_IS_BIN(pipeline)) return;
+
+        GstIterator* iterator = gst_bin_iterate_recurse(GST_BIN(pipeline));
+        if (!iterator) return;
+
+        GValue value = G_VALUE_INIT;
+        bool done = false;
+        while (!done) {
+            switch (gst_iterator_next(iterator, &value)) {
+            case GST_ITERATOR_OK: {
+                GstElement* element = GST_ELEMENT(g_value_get_object(&value));
+                if (element &&
+                    g_object_class_find_property(G_OBJECT_GET_CLASS(element), "current-level-bytes")) {
+                    guint bytes = 0;
+                    g_object_get(element, "current-level-bytes", &bytes, nullptr);
+                    totalBytes += static_cast<uint64_t>(bytes);
+                    ++queueCount;
+                    if (static_cast<uint64_t>(bytes) > maxQueueBytes) {
+                        maxQueueBytes = static_cast<uint64_t>(bytes);
+                        maxStreamId = streamId;
+                        const gchar* name = GST_OBJECT_NAME(element);
+                        maxQueueName = name ? name : "queue";
+                    }
+                }
+                g_value_reset(&value);
+                break;
+            }
+            case GST_ITERATOR_RESYNC:
+                gst_iterator_resync(iterator);
+                break;
+            case GST_ITERATOR_ERROR:
+            case GST_ITERATOR_DONE:
+                done = true;
+                break;
+            }
+        }
+        if (G_VALUE_TYPE(&value) != 0) {
+            g_value_unset(&value);
+        }
+        gst_iterator_free(iterator);
+    };
+
+    std::lock_guard<std::mutex> lock(managerMutex);
+    for (const auto& [id, statePtr] : streams) {
+        if (!statePtr) continue;
+        collectPipeline(id, statePtr->pipeline);
+        for (const auto& output : statePtr->externalSrtOutputs) {
+            if (output) collectPipeline(id, output->pipeline);
+        }
+    }
+    for (const auto& [key, shared] : sharedDvbFrontends) {
+        if (shared) collectPipeline("dvb:" + key, shared->pipeline);
+    }
+
+    result["bytes"] = Json::UInt64(totalBytes);
+    result["queue_count"] = Json::UInt64(queueCount);
+    result["max_queue_bytes"] = Json::UInt64(maxQueueBytes);
+    result["max_queue_name"] = maxQueueName;
+    result["max_stream_id"] = maxStreamId;
+    return result;
+}
+
 bool StreamManager::isStreamActive(const std::string& id) {
     std::lock_guard<std::mutex> lock(managerMutex);
     auto found = streams.find(id);
