@@ -4,6 +4,12 @@
 #include <iostream>
 #include <sstream>
 
+namespace {
+size_t discardTelegramResponse(char*, size_t size, size_t nmemb, void*) {
+    return size * nmemb;
+}
+}
+
 TelegramNotifier::TelegramNotifier(ConfigManager& cfg)
     : manager(cfg) {
 }
@@ -50,6 +56,14 @@ void TelegramNotifier::sendMessage(const std::string& text) {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    // 202.54: libcurl writes the Telegram JSON response to stdout when no
+    // write callback is installed. During a recovery storm that flooded
+    // journald with large JSON bodies and added synchronous I/O to monitor
+    // threads. Discard successful bodies and bound a failed API request.
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discardTelegramResponse);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 4000L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         std::cerr << "Telegram send error: " << curl_easy_strerror(res) << std::endl;

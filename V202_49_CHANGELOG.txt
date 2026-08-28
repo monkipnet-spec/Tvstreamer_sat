@@ -1,9 +1,0 @@
-TVStreammerSAT5 202.49
-
-SRT / HTTP MPEG-TS input buffering:
-- increase SRT and progressive HTTP MPEG-TS input queue from 5 s to 8 s
-- increase hard byte cap for those network input queues from 20 MB to 32 MB
-- keep HLS input queue unchanged at 5 s / 20 MB
-- keep SRT latency at 1000 ms
-- keep watchdog/recovery timings unchanged
-- retain 202.48 memory teardown fixes and allocator diagnostics

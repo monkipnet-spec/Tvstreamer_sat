@@ -1310,11 +1310,19 @@ private:
         // Keep a short tail and join it with the next chunk instead of dropping
         // it. Dropping that tail created real packet loss and analyzer CC errors
         // on PAT/CAT/SDT/PMT/audio/video even after counter normalization.
+        // 202.54: the common path is already packet aligned. Move the owned
+        // chunk buffer directly instead of allocating and copying the complete
+        // TS buffer a second time. Only concatenate when a <188-byte remainder
+        // from the preceding GstBuffer actually exists.
         std::vector<guint8> bytes;
-        bytes.reserve(inputRemainder.size() + chunk.bytes.size());
-        bytes.insert(bytes.end(), inputRemainder.begin(), inputRemainder.end());
-        bytes.insert(bytes.end(), chunk.bytes.begin(), chunk.bytes.end());
-        inputRemainder.clear();
+        if (inputRemainder.empty()) {
+            bytes = std::move(chunk.bytes);
+        } else {
+            bytes.reserve(inputRemainder.size() + chunk.bytes.size());
+            bytes.insert(bytes.end(), inputRemainder.begin(), inputRemainder.end());
+            bytes.insert(bytes.end(), chunk.bytes.begin(), chunk.bytes.end());
+            inputRemainder.clear();
+        }
 
         if (bytes.empty()) return;
 

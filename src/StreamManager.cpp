@@ -58,6 +58,12 @@ constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
 constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(6);
+// 202.54: six seconds remains the network-loss detector, but an 8-second
+// SRT/HTTP input queue must be allowed to bridge that gap. Rebuilding at 6 s
+// destroyed a still-buffered pipeline and caused synchronized recovery storms.
+// Wait 12 s of continuous silence before rebuilding SRT/HTTP MPEG-TS.
+constexpr auto kNetworkNoInputRebuildDelay = std::chrono::seconds(12);
+constexpr auto kNetworkRecoveryJitterMax = std::chrono::milliseconds(2500);
 // 202.38: HLS is segmented delivery, so a several-second gap in emitted TS
 // buffers can be normal while hlsdemux waits for/reloads the next media
 // segment.  Do not treat the generic 6-second live-input watchdog as signal
@@ -80,6 +86,13 @@ constexpr auto kNetworkRecoveryRetryDelay = std::chrono::seconds(5);
 constexpr auto kSrtStartupFailoverDelay = std::chrono::seconds(15);
 constexpr auto kSrtPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
+
+std::chrono::milliseconds networkRecoveryJitterForStream(const std::string& streamId) {
+    if (streamId.empty()) return std::chrono::milliseconds(0);
+    const auto span = static_cast<uint64_t>(kNetworkRecoveryJitterMax.count()) + 1ULL;
+    return std::chrono::milliseconds(
+        static_cast<long long>(std::hash<std::string>{}(streamId) % span));
+}
 
 std::chrono::milliseconds inputProbeTimeoutForUri(
     const StreamConfig& baseConfig, const std::string& inputUri) {
@@ -8975,14 +8988,15 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.49: startup_wait_ms=15000"
-                  << " steady_loss_ms=6000 primary_probe_ms=15000"
-                  << " source_auto_reconnect=on pipeline_recovery=on"
+        std::cerr << "SRT input watchdog 202.54: startup_wait_ms=15000"
+                  << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
+                  << " source_auto_reconnect=on pipeline_recovery=two-stage+jitter"
                   << " latency_ms=1000 queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
-        std::cerr << "HTTP MPEG-TS watchdog 202.49: steady_loss_ms=6000"
+        std::cerr << "HTTP MPEG-TS watchdog 202.54: loss_detect_ms=6000 rebuild_ms=12000"
                   << " source_retries=infinite error_recovery=on eos_recovery=on"
-                  << " pipeline_retry_ms=5000 queue_ms=8000 queue_max_mb=32" << std::endl;
+                  << " pipeline_retry_ms=5000 recovery_jitter_ms=0..2500"
+                  << " queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
         std::cerr << "HLS input watchdog 202.44: loss_wait_ms=15000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
@@ -8991,6 +9005,7 @@ void StreamManager::monitorBus(const std::string& id) {
     }
 
     bool networkRecoveryPending = false;
+    bool networkLossWarningActive = false;
     unsigned networkRecoveryAttempts = 0;
     auto networkRecoveryDue = std::chrono::steady_clock::time_point::min();
 
@@ -9008,7 +9023,7 @@ void StreamManager::monitorBus(const std::string& id) {
             !state->usingBackup &&
             activeInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
 
-        // 202.45: SRT/HTTP MPEG-TS self-healing. Keep monitorBus alive across
+        // 202.54: SRT/HTTP MPEG-TS self-healing with two-stage no-input recovery. Keep monitorBus alive across
         // transient ERROR/EOS and rebuild only the active network input. One fast
         // primary retry is attempted before normal backup failover; without a
         // backup the same URL is retried at a bounded interval.
@@ -9019,7 +9034,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 const bool recoverBackup = state->usingBackup;
                 ++networkRecoveryAttempts;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                           << " protocol=" << protocolName
                           << " attempt=" << networkRecoveryAttempts
                           << " action=pipeline-rebuild" << std::endl;
@@ -9034,14 +9049,14 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->active = true;
                 if (!recoverBackup && !state->config.backupInputUri.empty()) {
                     networkRecoveryPending = false;
-                    state->lastInputActivity = now - kInputFailoverDelay;
-                    std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                    state->lastInputActivity = now - kNetworkNoInputRebuildDelay;
+                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                               << " protocol=" << protocolName
                               << " result=primary-rebuild-failed action=allow-backup-failover"
                               << std::endl;
                 } else {
                     networkRecoveryDue = now + kNetworkRecoveryRetryDelay;
-                    std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                               << " protocol=" << protocolName
                               << " result=retry-pending retry_ms="
                               << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -9239,9 +9254,10 @@ void StreamManager::monitorBus(const std::string& id) {
                     telegramText(configManager, "Активный источник: основной", "Active source: primary") + "\nURL: " + state->activeInputUri);
             }
             state->inputLossNotified = false;
+            networkLossWarningActive = false;
             if (recoverableNetworkInput) {
                 if (networkRecoveryAttempts > 0) {
-                    std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                               << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                               << " result=media-restored attempts="
                               << networkRecoveryAttempts << std::endl;
@@ -9278,27 +9294,55 @@ void StreamManager::monitorBus(const std::string& id) {
                 srtInput && networkRecoveryAttempts == 0 &&
                 state->lastInputBytesSeen == 0 &&
                 state->inputBytes.load(std::memory_order_relaxed) == 0;
+
+            // 202.54 two-stage network watchdog. At 6 s we only mark a gap and
+            // let the 8 s queue plus soup/SRT internal retry absorb it. A real
+            // pipeline rebuild is allowed only after 12 s of continuous silence
+            // (15 s for the first SRT media). This prevents the 6 s watchdog from
+            // throwing away buffered media and rebuilding many channels together.
+            const bool networkLossDetected =
+                recoverableNetworkInput && !waitingForFirstSrtMedia &&
+                now - state->lastInputActivity >= kInputFailoverDelay;
+            if (networkLossDetected && !networkLossWarningActive && !networkRecoveryPending) {
+                networkLossWarningActive = true;
+                const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
+                state->statusMessage = std::string(protocolName) +
+                    " input gap - buffering/retry";
+                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                          << " protocol=" << protocolName
+                          << " reason=no-input-6s action=buffer-and-wait"
+                          << " rebuild_after_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 kNetworkNoInputRebuildDelay).count()
+                          << std::endl;
+            }
+
             const auto inputFailoverDelay = hlsInput
                 ? kHlsInputFailoverDelay
-                : (waitingForFirstSrtMedia ? kSrtStartupFailoverDelay : kInputFailoverDelay);
+                : (waitingForFirstSrtMedia
+                    ? kSrtStartupFailoverDelay
+                    : (recoverableNetworkInput
+                        ? kNetworkNoInputRebuildDelay
+                        : kInputFailoverDelay));
             const bool inputTimedOut =
                 now - state->lastInputActivity >= inputFailoverDelay;
 
-            // 202.45: before declaring SRT/HTTP MPEG-TS dead, rebuild the active
-            // network input once. If a backup exists and that retry also fails
-            // to produce media, the existing failover path runs on the next
-            // timeout. A network backup self-heals the same way instead of dying.
+            // After the grace window, rebuild once. Deterministic per-stream
+            // jitter spreads a common network outage over 0..2.5 s instead of
+            // constructing dozens of pipelines in the same scheduler slice.
             if (inputTimedOut && recoverableNetworkInput && !networkRecoveryPending &&
                 (state->usingBackup || networkRecoveryAttempts == 0 ||
                  state->config.backupInputUri.empty())) {
                 networkRecoveryPending = true;
-                networkRecoveryDue = now;
+                const auto jitter = networkRecoveryJitterForStream(id);
+                networkRecoveryDue = now + jitter;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                           << " protocol=" << protocolName
                           << " reason=no-input-"
                           << std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()
-                          << "s action=schedule-rebuild" << std::endl;
+                          << "s action=schedule-rebuild jitter_ms=" << jitter.count()
+                          << std::endl;
                 if (!state->inputLossNotified) {
                     state->inputLossNotified = true;
                     state->statusMessage = std::string(protocolName) + " input stalled - reconnecting";
@@ -9497,7 +9541,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     gchar* sourcePath = GST_MESSAGE_SRC(msg)
                         ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
                     const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                    std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                               << " protocol=" << protocolName
                               << " reason=gstreamer-error source="
                               << (sourcePath ? sourcePath : "unknown")
@@ -9510,7 +9554,8 @@ void StreamManager::monitorBus(const std::string& id) {
                         networkRecoveryPending = true;
                         networkRecoveryDue = now +
                             (networkRecoveryAttempts == 0
-                                ? kNetworkErrorRecoveryDelay : kNetworkRecoveryRetryDelay);
+                                ? kNetworkErrorRecoveryDelay : kNetworkRecoveryRetryDelay) +
+                            networkRecoveryJitterForStream(id) / 3;
                     }
                     gst_message_unref(msg);
                     continue;
@@ -9556,7 +9601,7 @@ void StreamManager::monitorBus(const std::string& id) {
             case GST_MESSAGE_EOS:
                 if (recoverableNetworkInput) {
                     const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                    std::cerr << "NETWORK INPUT RECOVERY 202.45: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
                               << " protocol=" << protocolName
                               << " reason=EOS action=schedule-rebuild" << std::endl;
                     state->statusMessage = std::string(protocolName) + " EOS - reconnecting";
@@ -9565,7 +9610,8 @@ void StreamManager::monitorBus(const std::string& id) {
                         networkRecoveryPending = true;
                         networkRecoveryDue = now +
                             (networkRecoveryAttempts == 0
-                                ? kNetworkErrorRecoveryDelay : kNetworkRecoveryRetryDelay);
+                                ? kNetworkErrorRecoveryDelay : kNetworkRecoveryRetryDelay) +
+                            networkRecoveryJitterForStream(id) / 3;
                     }
                     gst_message_unref(msg);
                     continue;
