@@ -13,11 +13,12 @@
 
 namespace {
 
-constexpr guint64 kNetworkInputQueue = 5 * GST_SECOND;
+constexpr guint64 kNetworkInputQueue = 8 * GST_SECOND;
 constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 constexpr gint kSrtLatencyMs = 1000;
-constexpr guint kNetworkQueueHardMaxBytes = 20U * 1024U * 1024U;
+constexpr guint kNetworkQueueHardMaxBytes = 32U * 1024U * 1024U;
+constexpr guint kHlsQueueHardMaxBytes = 20U * 1024U * 1024U;
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -58,7 +59,8 @@ bool addElementOrFail(GstElement* pipeline, GstElement* element) {
     return pipeline && element && gst_bin_add(GST_BIN(pipeline), element);
 }
 
-GstElement* addQueue(GstElement* pipeline, const char* name, guint64 maxSizeTime) {
+GstElement* addQueue(
+    GstElement* pipeline, const char* name, guint64 maxSizeTime, guint maxSizeBytes) {
     GstElement* queue = gst_element_factory_make("queue", name);
     if (!queue || !addElementOrFail(pipeline, queue)) {
         if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
@@ -69,8 +71,8 @@ GstElement* addQueue(GstElement* pipeline, const char* name, guint64 maxSizeTime
         // 202.46: never rely on buffer timestamps as the only queue bound.
         // MPEG-TS buffers can temporarily have missing/irregular duration during
         // reconnect/remap; a time-only queue can then retain far more memory than
-        // the configured five-second window.
-        "max-size-bytes", kNetworkQueueHardMaxBytes,
+        // the configured queue window.
+        "max-size-bytes", maxSizeBytes,
         "max-size-time", maxSizeTime,
         "leaky", 0,
         nullptr);
@@ -225,7 +227,7 @@ GstElement* buildSrt(
     }
 
     GstElement* src = gst_element_factory_make(factory, "input_src");
-    GstElement* queue = addQueue(pipeline, "input_queue", kNetworkInputQueue);
+    GstElement* queue = addQueue(pipeline, "input_queue", kNetworkInputQueue, kNetworkQueueHardMaxBytes);
     if (!src || !queue || !addElementOrFail(pipeline, src)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
         error = "SRT input: failed to create srtsrc/srtclientsrc or queue";
@@ -255,10 +257,10 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.45: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.49: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
-              << " queue_ms=5000 leaky=off prebuffer=off"
+              << " queue_ms=8000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;
 }
@@ -274,7 +276,7 @@ GstElement* buildHttp(
     }
 
     GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
-    GstElement* queue = addQueue(pipeline, "input_queue", kNetworkInputQueue);
+    GstElement* queue = addQueue(pipeline, "input_queue", kNetworkInputQueue, kNetworkQueueHardMaxBytes);
     if (!src || !queue || !addElementOrFail(pipeline, src)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
         error = "HTTP MPEG-TS input: failed to create souphttpsrc/queue";
@@ -309,8 +311,8 @@ GstElement* buildHttp(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.45: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
-              << " queue_ms=5000 leaky=off prebuffer=off"
+    std::cerr << "Network TS input 202.49: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
+              << " queue_ms=8000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on libcurl_appsrc=off input_pacing=off"
               << " http_retries=infinite recovery=watchdog+error+eos"
               << " access=" << (cfg.hlsAccessKeyMode.empty() ? "none" : cfg.hlsAccessKeyMode)
@@ -345,7 +347,7 @@ GstElement* buildHls(
     GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
     GstElement* selector =
         gst_element_factory_make("input-selector", "input_hls_transport_selector");
-    GstElement* queue = addQueue(pipeline, "input_queue", kHlsInputQueue);
+    GstElement* queue = addQueue(pipeline, "input_queue", kHlsInputQueue, kHlsQueueHardMaxBytes);
     if (!src || !demux || !mux || !selector || !queue ||
         !addElementOrFail(pipeline, src) ||
         !addElementOrFail(pipeline, demux) ||
@@ -423,7 +425,7 @@ GstElement* buildHls(
 
     terminalElement = queue;
     std::cerr << "Network TS input 202.44: protocol=HLS source=souphttpsrc+hlsdemux"
-              << " queue_ms=5000 leaky=off prebuffer=off do_timestamp=on"
+              << " queue_ms=5000 queue_max_mb=20 leaky=off prebuffer=off do_timestamp=on"
               << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
               << " http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;

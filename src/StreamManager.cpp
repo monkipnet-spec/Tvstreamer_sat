@@ -8883,14 +8883,14 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.45: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.49: startup_wait_ms=15000"
                   << " steady_loss_ms=6000 primary_probe_ms=15000"
                   << " source_auto_reconnect=on pipeline_recovery=on"
-                  << " latency_ms=1000 queue_ms=5000" << std::endl;
+                  << " latency_ms=1000 queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
-        std::cerr << "HTTP MPEG-TS watchdog 202.45: steady_loss_ms=6000"
+        std::cerr << "HTTP MPEG-TS watchdog 202.49: steady_loss_ms=6000"
                   << " source_retries=infinite error_recovery=on eos_recovery=on"
-                  << " pipeline_retry_ms=5000" << std::endl;
+                  << " pipeline_retry_ms=5000 queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
         std::cerr << "HLS input watchdog 202.44: loss_wait_ms=15000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
