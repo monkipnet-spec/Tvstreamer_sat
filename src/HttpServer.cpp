@@ -48,6 +48,13 @@ constexpr int64_t kQualityDayResolutionSeconds = 30LL;
 constexpr int64_t kQualityMonthResolutionSeconds = 5LL * 60LL;
 constexpr int64_t kQualityCompactionIntervalSeconds = 60LL;
 
+// 202.47: the web UI polls /api/state and /api/system-metrics continuously.
+// Creating a detached pthread for every request churned pthread stacks and
+// glibc/GStreamer allocator arenas, making anonymous RSS climb even while all
+// streaming queues stayed bounded. Reuse a fixed worker pool instead.
+constexpr std::size_t kHttpSessionWorkers = 24;
+constexpr uint32_t kMaxQueuedHttpSessions = 256;
+
 struct CaDecodeUiMemory {
     std::string state;
     std::chrono::steady_clock::time_point holdUntil{};
@@ -452,7 +459,11 @@ std::string extractStreamIdFromTarget(const std::string& target) {
 }
 
 HttpServer::HttpServer(boost::asio::io_context& ioc, ConfigManager& cfg, StreamManager& sm)
-    : ioContext(ioc), configManager(cfg), streamManager(sm) {
+    : ioContext(ioc), sessionPool(kHttpSessionWorkers),
+      configManager(cfg), streamManager(sm) {
+    std::cerr << "HTTP worker pool 202.47: workers=" << kHttpSessionWorkers
+              << " max_queued=" << kMaxQueuedHttpSessions
+              << " thread_per_request=off" << std::endl;
 }
 
 bool HttpServer::start() {
@@ -469,14 +480,29 @@ void HttpServer::doAccept(std::shared_ptr<tcp::acceptor> listener, int port, uin
             return;
         }
         if (!ec) {
-            try {
-                std::thread(&HttpServer::handleSession, this, std::move(socket)).detach();
-            } catch (const std::exception& ex) {
-                // Never let pthread/resource exhaustion escape the Asio handler
-                // and terminate the complete streaming process.
-                std::cerr << "HTTP session thread creation failed: " << ex.what() << std::endl;
+            const uint32_t queued = queuedHttpSessions.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (queued > kMaxQueuedHttpSessions) {
+                queuedHttpSessions.fetch_sub(1, std::memory_order_relaxed);
+                std::cerr << "HTTP worker pool overload: queued=" << queued
+                          << " limit=" << kMaxQueuedHttpSessions << std::endl;
                 boost::system::error_code closeEc;
                 socket.close(closeEc);
+            } else {
+                try {
+                    boost::asio::post(sessionPool,
+                        [this, socket = std::move(socket)]() mutable {
+                            struct PendingGuard {
+                                std::atomic<uint32_t>& counter;
+                                ~PendingGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+                            } guard{queuedHttpSessions};
+                            handleSession(std::move(socket));
+                        });
+                } catch (const std::exception& ex) {
+                    queuedHttpSessions.fetch_sub(1, std::memory_order_relaxed);
+                    std::cerr << "HTTP session enqueue failed: " << ex.what() << std::endl;
+                    boost::system::error_code closeEc;
+                    socket.close(closeEc);
+                }
             }
         } else if (ec != boost::asio::error::operation_aborted) {
             std::cerr << "HTTP accept failed on port " << port << ": " << ec.message() << std::endl;

@@ -80,6 +80,8 @@ private:
     void recordQualitySample(const StreamConfig& cfg, const Json::Value& state);
 
     boost::asio::io_context& ioContext;
+    boost::asio::thread_pool sessionPool;
+    std::atomic<uint32_t> queuedHttpSessions{0};
     std::unordered_map<int, std::shared_ptr<tcp::acceptor>> acceptors;
     mutable std::mutex acceptorsMutex;
     std::atomic<uint64_t> acceptGeneration{0};
