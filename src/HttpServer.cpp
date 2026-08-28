@@ -41,15 +41,18 @@ namespace {
 
 constexpr const char* kProgramVersion = tvs::app::kProgramVersion;
 
-// 202.43: /api/state is normally polled every 2 seconds. Keeping every sample
-// for 30 days would retain ~1.3 million string-heavy objects per stream and a
-// month chart would create another very large transient JSON tree. Keep full
-// resolution for the recent hour, then compact old samples into time buckets.
+// 202.50: quality history must not follow the web UI polling rate.  /api/state
+// is normally requested every ~2 seconds and recording one string-heavy sample
+// per stream on every poll made malloc_inuse grow almost linearly with
+// quality_samples.  Keep at most one sample every 30 seconds per stream, compact
+// older data further, and enforce a hard per-stream cap as a final safety bound.
 constexpr int64_t kQualityRetentionSeconds = 30LL * 24LL * 60LL * 60LL;
+constexpr int64_t kQualityRecordIntervalSeconds = 30LL;
 constexpr int64_t kQualityFullResolutionSeconds = 60LL * 60LL;
-constexpr int64_t kQualityDayResolutionSeconds = 30LL;
+constexpr int64_t kQualityDayResolutionSeconds = 60LL;
 constexpr int64_t kQualityMonthResolutionSeconds = 5LL * 60LL;
 constexpr int64_t kQualityCompactionIntervalSeconds = 60LL;
+constexpr std::size_t kQualityMaxSamplesPerStream = 10000;
 
 // 202.47: the web UI polls /api/state and /api/system-metrics continuously.
 // Creating a detached pthread for every request churned pthread stacks and
@@ -1089,7 +1092,7 @@ std::string HttpServer::listInterfaces() {
     if (lastMemoryDiagLog.time_since_epoch().count() == 0 ||
         now - lastMemoryDiagLog >= std::chrono::seconds(60)) {
       lastMemoryDiagLog = now;
-      std::cerr << "MEMORY DIAG 202.49: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.50: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1859,6 +1862,19 @@ std::string HttpServer::qualityHistory(const std::string& target) {
 
 void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value& state) {
     const int64_t now = unixNowSeconds();
+
+    // 202.50: do not allocate/copy status/message strings for every /api/state
+    // poll.  The quality chart does not need 2-second resolution, and this early
+    // check also avoids allocator churn on the skipped polls.
+    {
+        std::lock_guard<std::mutex> lock(qualityMutex);
+        const auto found = qualitySamples.find(cfg.id);
+        if (found != qualitySamples.end() && !found->second.empty() &&
+            now - found->second.back().timestamp < kQualityRecordIntervalSeconds) {
+            return;
+        }
+    }
+
     QualitySample sample;
     sample.timestamp = now;
     sample.active = state.get("active", false).asBool();
@@ -1902,6 +1918,12 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
 
     std::lock_guard<std::mutex> lock(qualityMutex);
     auto& samples = qualitySamples[cfg.id];
+    // Another HTTP worker may have recorded this stream while the sample was
+    // being prepared.  Re-check under the owning mutex before appending.
+    if (!samples.empty() &&
+        now - samples.back().timestamp < kQualityRecordIntervalSeconds) {
+        return;
+    }
     if (!samples.empty() && samples.back().timestamp == sample.timestamp) {
         samples.back() = sample;
     } else {
@@ -1938,6 +1960,10 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
         }
         samples.swap(compacted);
         lastCompaction = now;
+    }
+
+    while (samples.size() > kQualityMaxSamplesPerStream) {
+        samples.pop_front();
     }
 }
 
@@ -3967,7 +3993,7 @@ function openAboutModal() {
     <h2>${t('about')}</h2>
     <div class="about-list">
       <div class="about-row"><strong>${t('product')}</strong><span>TVStreammerSAT5</span></div>
-      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.49'}</span></div>
+      <div class="about-row"><strong>${t('version')}</strong><span>${state.program_version||'202.50'}</span></div>
       <div class="about-row"><strong>${t('name')}</strong><span>Лукомский Виталий</span></div>
       <div class="about-row"><strong>${t('country')}</strong><span>Беларусь, г. Борисов</span></div>
       <div class="about-row"><strong>Email</strong><a href="mailto:monkipnet@gmail.com">monkipnet@gmail.com</a></div>
