@@ -3,6 +3,7 @@
 #include "protocols/inputs/GstSrtInputProtocol.h"
 
 #include <gst/app/gstappsink.h>
+#include <boost/circular_buffer.hpp>
 
 #include <algorithm>
 #include <array>
@@ -47,6 +48,11 @@ constexpr std::size_t kMaxBufferedBytes = 8 * 1024 * 1024;
 constexpr std::size_t kTvStreamer5MaxBufferedBytes = 32 * 1024 * 1024;
 constexpr uint64_t kTvStreamer5StartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kTvStreamer5StartupMinimumPcrSamples = 5;
+// 202.56: real MPEG-TS packets used to live in std::deque. At steady state
+// push_back/pop_front continuously allocates/frees deque blocks on every output
+// thread. With dozens of channels that feeds glibc tcache/arenas indefinitely
+// even though the logical reservoir size is bounded. Keep one reusable ring.
+constexpr std::size_t kInitialRealPacketRingCapacity = 1024;
 constexpr int kSocketBufferSize = 128 * 1024 * 1024;
 constexpr int kMulticastTtl = 32;
 constexpr uint64_t kDefaultStartupReservoirMilliseconds = 1500ULL;
@@ -69,6 +75,9 @@ constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL *
 constexpr uint64_t kVbrTransportHeadroomBitrate = 120000ULL;
 constexpr uint64_t kMinimumVbrTransportBitrate = 500000ULL;
 constexpr uint64_t kMaximumTransportBitrate = 200000000ULL;
+
+std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
+std::atomic<uint64_t> gStableUdpSenderCount{0};
 
 enum class UdpShapingMode {
     Cbr,
@@ -740,7 +749,13 @@ public:
                     ? (cfg.serviceId ? cfg.serviceId : cfg.inputServiceId)
                     : (cfg.inputServiceId ? cfg.inputServiceId : cfg.serviceId))) & 0xFFFFU)),
           remapServiceName(cfg.serviceName.empty() ? cfg.name : cfg.serviceName),
-          remapServiceProvider(cfg.serviceProvider) {
+          remapServiceProvider(cfg.serviceProvider),
+          realPackets(kInitialRealPacketRingCapacity) {
+        gRealPacketRingCapacityBytes.fetch_add(
+            realPackets.capacity() * sizeof(TimedTsPacket), std::memory_order_relaxed);
+        gStableUdpSenderCount.fetch_add(1, std::memory_order_relaxed);
+        memoryAccountingRegistered = true;
+
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
@@ -840,6 +855,12 @@ public:
             senderThread.join();
         }
         closeSocket();
+        if (memoryAccountingRegistered) {
+            gRealPacketRingCapacityBytes.fetch_sub(
+                realPackets.capacity() * sizeof(TimedTsPacket), std::memory_order_relaxed);
+            gStableUdpSenderCount.fetch_sub(1, std::memory_order_relaxed);
+            memoryAccountingRegistered = false;
+        }
     }
 
     bool isReady() const {
@@ -1299,6 +1320,38 @@ private:
         }
     }
 
+    void ensureRealPacketCapacity(std::size_t additionalPackets = 1) {
+        const std::size_t required = realPackets.size() + additionalPackets;
+        if (required <= realPackets.capacity()) {
+            return;
+        }
+
+        std::size_t nextCapacity = std::max<std::size_t>(
+            realPackets.capacity(), kInitialRealPacketRingCapacity);
+        while (nextCapacity < required) {
+            nextCapacity += std::max<std::size_t>(nextCapacity / 2, 1024);
+        }
+
+        // bufferedBytes is already hard-bounded, so this is only a defensive
+        // ceiling. The extra packet covers a partially-accounted boundary.
+        const std::size_t maximumPackets =
+            (bufferLimitBytes / kTsPacketSize) + kTsPacketsPerDatagram + 1;
+        if (nextCapacity > maximumPackets) {
+            nextCapacity = maximumPackets;
+        }
+        if (nextCapacity < required) {
+            nextCapacity = required;
+        }
+
+        const std::size_t oldCapacity = realPackets.capacity();
+        realPackets.set_capacity(nextCapacity);
+        if (nextCapacity > oldCapacity) {
+            gRealPacketRingCapacityBytes.fetch_add(
+                (nextCapacity - oldCapacity) * sizeof(TimedTsPacket),
+                std::memory_order_relaxed);
+        }
+    }
+
     void queueChunk(TimedChunk chunk) {
         if (chunk.bytes.empty() && inputRemainder.empty()) {
             return;
@@ -1370,6 +1423,7 @@ private:
             if (segmentedHlsInput || continuousNetworkMpegTsInput) {
                 observePcrRate(packet);
             }
+            ensureRealPacketCapacity();
             realPackets.push_back(std::move(packet));
             offset += kTsPacketSize;
         }
@@ -2430,7 +2484,8 @@ private:
     std::condition_variable queueReady;
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
-    std::deque<TimedTsPacket> realPackets;
+    boost::circular_buffer<TimedTsPacket> realPackets;
+    bool memoryAccountingRegistered = false;
     std::vector<guint8> inputRemainder;
     uint64_t firstChunkArrivalNanoseconds = 0;
 
@@ -2516,6 +2571,14 @@ void destroySender(gpointer data) {
 
 namespace StableUdpOutput {
 
+MemoryStats memoryStats() {
+    MemoryStats stats;
+    stats.packetRingCapacityBytes =
+        gRealPacketRingCapacityBytes.load(std::memory_order_relaxed);
+    stats.senderCount = gStableUdpSenderCount.load(std::memory_order_relaxed);
+    return stats;
+}
+
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
@@ -2574,7 +2637,7 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.55: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.56: source="
                   << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)

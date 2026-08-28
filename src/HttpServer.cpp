@@ -1,5 +1,6 @@
 #include "HttpServer.h"
 #include "AppVersion.h"
+#include "StableUdpOutput.h"
 
 #include "utils.h"
 #include "TranscoderModule.h"
@@ -1101,7 +1102,8 @@ std::string HttpServer::listInterfaces() {
       const uint64_t gstQueueMaxBytes = gstQueueMemory.get("max_queue_bytes", Json::UInt64(0)).asUInt64();
       const std::string gstQueueMaxName = gstQueueMemory.get("max_queue_name", "").asString();
       const std::string gstQueueMaxStream = gstQueueMemory.get("max_stream_id", "").asString();
-      std::cerr << "MEMORY DIAG 202.55: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      const auto stableUdpMemory = StableUdpOutput::memoryStats();
+      std::cerr << "MEMORY DIAG 202.56: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1115,6 +1117,9 @@ std::string HttpServer::listInterfaces() {
                 << " gst_queue_max_mb=" << (static_cast<double>(gstQueueMaxBytes) / (1024.0 * 1024.0))
                 << " gst_queue_max=" << (gstQueueMaxStream.empty() ? "-" : gstQueueMaxStream)
                 << ":" << (gstQueueMaxName.empty() ? "-" : gstQueueMaxName)
+                << " stable_ring_cap_mb="
+                << (static_cast<double>(stableUdpMemory.packetRingCapacityBytes) / (1024.0 * 1024.0))
+                << " stable_senders=" << stableUdpMemory.senderCount
                 << " threads=" << processThreads
                 << " fds=" << processFds
                 << std::endl;

@@ -10,6 +10,13 @@
 
 namespace StableUdpOutput {
 
+struct MemoryStats {
+    uint64_t packetRingCapacityBytes = 0;
+    uint64_t senderCount = 0;
+};
+
+MemoryStats memoryStats();
+
 GstElement* createSink(
     GstElement* pipeline,
     const StreamConfig& config,
