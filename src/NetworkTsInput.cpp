@@ -13,10 +13,10 @@
 
 namespace {
 
-constexpr guint64 kNetworkInputQueue = 3 * GST_SECOND;
+constexpr guint64 kNetworkInputQueue = 5 * GST_SECOND;
 constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
-constexpr gint kSrtLatencyMs = 500;
+constexpr gint kSrtLatencyMs = 1000;
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -250,10 +250,10 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.28: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.45: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
-              << " queue_ms=3000 leaky=off prebuffer=off"
+              << " queue_ms=5000 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;
 }
@@ -285,6 +285,12 @@ GstElement* buildHttp(
         nullptr);
     configureHttpCredentials(src, cfg);
     setBooleanPropertyIfPresent(src, "compress", FALSE);
+    // 202.45: progressive HTTP MPEG-TS is a long-lived transport, not a finite
+    // file download. Allow souphttpsrc to retry transient socket/HTTP failures
+    // internally; monitorBus still rebuilds the pipeline if data really stops.
+    setIntPropertyIfPresent(src, "retries", -1);
+    setDoublePropertyIfPresent(src, "retry-backoff-factor", 0.25);
+    setDoublePropertyIfPresent(src, "retry-backoff-max", 2.0);
 
     const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     if (!inputInterface.empty()) {
@@ -298,9 +304,10 @@ GstElement* buildHttp(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.28: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
-              << " queue_ms=3000 leaky=off prebuffer=off"
+    std::cerr << "Network TS input 202.45: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
+              << " queue_ms=5000 leaky=off prebuffer=off"
               << " do_timestamp=on libcurl_appsrc=off input_pacing=off"
+              << " http_retries=infinite recovery=watchdog+error+eos"
               << " access=" << (cfg.hlsAccessKeyMode.empty() ? "none" : cfg.hlsAccessKeyMode)
               << std::endl;
     return src;

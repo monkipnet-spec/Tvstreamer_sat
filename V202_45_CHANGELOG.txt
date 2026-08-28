@@ -1,0 +1,12 @@
+TVStreammerSAT5 202.45
+
+SRT / HTTP MPEG-TS input stability:
+- SRT and progressive HTTP MPEG-TS no longer permanently stop the channel on transient GStreamer ERROR/EOS.
+- Added controlled input pipeline recovery: first retry after ~1 s, later retries bounded to 5 s.
+- No-input watchdog now rebuilds SRT/HTTP input before declaring the source dead; with backup configured, one recovery attempt is made before failover.
+- Network backups using SRT/HTTP can self-heal as well.
+- Active protocol detection now uses runtimeConfig, avoiding primary-protocol watchdog logic being applied to a different backup protocol.
+- SRT latency increased from 500 ms to 1000 ms and network input queue from 3 s to 5 s.
+- HTTP MPEG-TS souphttpsrc gets infinite transient retries with a small retry backoff.
+- Generic overload/continuity recovery no longer competes with SRT/HTTP/HLS network recovery.
+- Existing generic steady-state no-input timeout remains 6 s; initial SRT startup allowance remains 15 s.
