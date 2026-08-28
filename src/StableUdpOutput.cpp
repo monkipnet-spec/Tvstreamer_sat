@@ -41,8 +41,9 @@ constexpr std::size_t kUdpPayloadSize = kTsPacketSize * kTsPacketsPerDatagram;
 // 8 MiB is still >12 s at 5 Mbit/s and comfortably covers the configurable
 // startup reservoir, while bounding worst-case memory for 20-30 outputs.
 constexpr std::size_t kMaxBufferedBytes = 8 * 1024 * 1024;
-// 202.25: TVStreamer5-compatible SRT/HTTP profile uses its original 32 MiB
-// reservoir and five-second startup; DVB/HLS keep the SAT5 limits unchanged.
+// TVStreamer5-compatible SRT/HTTP profile keeps its established 32 MiB
+// reservoir and five-second cold-start buffer. 202.55 avoids paying this
+// cold-start cost on normal reconnect by preserving the output pipeline.
 constexpr std::size_t kTvStreamer5MaxBufferedBytes = 32 * 1024 * 1024;
 constexpr uint64_t kTvStreamer5StartupReservoirNanoseconds = 5000ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kTvStreamer5StartupMinimumPcrSamples = 5;
@@ -701,8 +702,11 @@ public:
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           hlsInput(isSegmentedHlsInput(cfg)),
           segmentedHlsInput(isSegmentedHlsInput(cfg)),
-          continuousNetworkMpegTsInput(
-              useTvStreamer5IpShaperProfile(cfg) ? false : isContinuousNetworkMpegTsInput(cfg)),
+          // 202.55: enable the existing long-window arrival-rate/slow-PLL
+          // controller for SRT and progressive HTTP MPEG-TS as well. Keep the
+          // TVStreamer5 PCR/CC profile unchanged; only useful-packet pacing stops
+          // chasing short TCP/SRT burst-rate changes. HLS has its own PLL path.
+          continuousNetworkMpegTsInput(isContinuousNetworkMpegTsInput(cfg)),
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
           // Non-IP streams keep the proven 202.22 source-PCR behaviour.
           forceSyntheticPcr(
@@ -2570,12 +2574,13 @@ GstElement* createSink(
            tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.36: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.55: source="
                   << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
                   << " profile=tvstreamer5-compatible"
-                  << " startup_reservoir_ms=5000 startup_pcr_min=5"
+                  << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
+                  << " startup_pcr_min=5"
                   << " buffer_limit_mb=32"
-                  << " timing=reservoir-rate-controller"
+                  << " timing=network-arrival-slow-pll"
                   << " pcr_mode="
                   << (srtRemapCbrSourcePcr ? "mpegtsmux-source-pcr" : "periodic-pcr-only-20ms")
                   << " source_pcr="
@@ -2611,7 +2616,11 @@ GstElement* createSink(
               << (tv5IpProfile ? 0ULL : (kStartupPcrGraceNanoseconds / 1000000ULL))
               << " target_reservoir_ms=2500 low_watermark_ms=800"
               << " null_pid=0x1fff source_timing="
-              << (isSegmentedHlsInput(config) ? "hls-pts-window-controller" : "reservoir-rate-controller")
+              << (isSegmentedHlsInput(config)
+                    ? "hls-pts-window-controller"
+                    : (isContinuousNetworkMpegTsInput(config)
+                        ? "network-arrival-slow-pll"
+                        : "reservoir-rate-controller"))
               << " pcr_mode="
               << (syntheticPcr
                     ? "synthetic-continuous-20ms"

@@ -53,6 +53,13 @@ constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kCaBatchPackets = 77;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
+// 202.55: SRT/HTTP MPEG-TS already has an 8-second input jitter queue and
+// StableUdpOutput owns the real output reservoir/clock. A second 10-second
+// non-leaky queue in front of StableUdpOutput can turn a short downstream stall
+// into seconds of stale replay. Keep only a small live queue for these two
+// network inputs; all other input/output combinations retain the legacy limits.
+constexpr guint64 kNetworkStableUdpOutputQueueLatency = 750 * GST_MSECOND;
+constexpr guint kNetworkStableUdpOutputQueueBytes = 4U * 1024U * 1024U;
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
@@ -3891,8 +3898,41 @@ void configureLiveQueue(GstElement* queue, guint64 maxSizeTime = 750000000ULL) {
     setIntPropertyIfPresent(queue, "leaky", 2);
 }
 
-void configureOutputQueue(GstElement* queue, const StreamConfig& cfg) {
-    configureQueue(queue, isUdpOutput(cfg) ? kUdpQueueLatency : 3000000000ULL);
+bool isContinuousSrtOrHttpInput(const StreamConfig& cfg) {
+    const auto kind = tvs::stream_protocols::inputKind(cfg);
+    return kind == tvs::stream_protocols::InputProtocolKind::Srt ||
+           kind == tvs::stream_protocols::InputProtocolKind::Http;
+}
+
+void configureOutputQueue(
+    GstElement* queue,
+    const StreamConfig& outputCfg,
+    const StreamConfig* activeInputCfg = nullptr) {
+    if (!queue) return;
+
+    // 202.55 is intentionally scoped to SRT/HTTP MPEG-TS feeding Stable UDP.
+    // HLS, DVB, UDP/RTP input, test pattern and non-UDP outputs keep their
+    // existing queue behaviour. Drop the oldest stale live TS if downstream
+    // scheduling is briefly delayed instead of backpressuring the network input.
+    if (usesStableUdpShaper(outputCfg) && activeInputCfg &&
+        isContinuousSrtOrHttpInput(*activeInputCfg)) {
+        configureQueue(queue, kNetworkStableUdpOutputQueueLatency);
+        g_object_set(queue,
+            "max-size-bytes", kNetworkStableUdpOutputQueueBytes,
+            "leaky", 2,  // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest
+            nullptr);
+        std::cerr << "Network Stable UDP queue 202.55: input="
+                  << (tvs::stream_protocols::inputKind(*activeInputCfg) ==
+                          tvs::stream_protocols::InputProtocolKind::Srt
+                        ? "SRT" : "HTTP-MPEGTS")
+                  << " max_time_ms="
+                  << (kNetworkStableUdpOutputQueueLatency / GST_MSECOND)
+                  << " max_bytes=" << kNetworkStableUdpOutputQueueBytes
+                  << " leaky=drop-oldest" << std::endl;
+        return;
+    }
+
+    configureQueue(queue, isUdpOutput(outputCfg) ? kUdpQueueLatency : 3000000000ULL);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -4221,6 +4261,72 @@ void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SE
     if (result == GST_STATE_CHANGE_ASYNC) {
         gst_element_get_state(pipeline, nullptr, nullptr, timeout);
     }
+}
+
+// 202.55: restart only the long-lived SRT/HTTP source element while leaving the
+// downstream queue/remap/mux/StableUdpOutput pipeline running. This preserves
+// the UDP clock and reservoir, so a transient network reconnect no longer
+// guarantees a fresh multi-second StableUdp startup pause. This helper refuses
+// every other input protocol.
+bool restartContinuousNetworkSourceInPlace(StreamState* state) {
+    if (!state || !state->pipeline || !isContinuousSrtOrHttpInput(state->runtimeConfig)) {
+        return false;
+    }
+
+    GstElement* source = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_src");
+    if (!source) {
+        return false;
+    }
+
+    const auto activeKind = tvs::stream_protocols::inputKind(state->runtimeConfig);
+    const char* expectedProtocol =
+        activeKind == tvs::stream_protocols::InputProtocolKind::Srt ? "SRT" : "HTTP-MPEGTS";
+
+    GstElementFactory* factory = gst_element_get_factory(source);
+    const gchar* factoryName = factory
+        ? gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory))
+        : nullptr;
+    const bool factoryMatches = activeKind == tvs::stream_protocols::InputProtocolKind::Srt
+        ? (g_strcmp0(factoryName, "srtsrc") == 0 ||
+           g_strcmp0(factoryName, "srtclientsrc") == 0)
+        : (g_strcmp0(factoryName, "souphttpsrc") == 0 ||
+           g_strcmp0(factoryName, "curlhttpsrc") == 0);
+    if (!factoryMatches) {
+        gst_object_unref(source);
+        return false;
+    }
+
+    // Drive only the source to NULL so the socket/session is actually closed.
+    // The parent pipeline stays PLAYING and StableUdpOutput continues its CBR/PCR
+    // timeline (NULL stuffing if the real TS reservoir runs dry).
+    GstStateChangeReturn down = gst_element_set_state(source, GST_STATE_NULL);
+    if (down == GST_STATE_CHANGE_FAILURE) {
+        gst_object_unref(source);
+        return false;
+    }
+    if (down == GST_STATE_CHANGE_ASYNC) {
+        const GstStateChangeReturn waited =
+            gst_element_get_state(source, nullptr, nullptr, 1500 * GST_MSECOND);
+        if (waited == GST_STATE_CHANGE_FAILURE || waited == GST_STATE_CHANGE_ASYNC) {
+            // Do not race a source that did not finish shutting down within the
+            // bounded source-only window. The caller will use the existing full
+            // pipeline fallback instead.
+            gst_object_unref(source);
+            return false;
+        }
+    }
+
+    const gboolean synced = gst_element_sync_state_with_parent(source);
+    gst_object_unref(source);
+    if (!synced) {
+        return false;
+    }
+
+    std::cerr << "NETWORK SOURCE RECONNECT 202.55: stream=" << state->config.id
+              << " protocol=" << expectedProtocol
+              << " action=source-only-restart output_pipeline=preserved"
+              << std::endl;
+    return true;
 }
 
 bool srtInputStatsEnabled() {
@@ -7571,7 +7677,7 @@ bool StreamManager::buildPassthroughPipeline(
         return false;
     }
 
-    configureOutputQueue(queue, cfg);
+    configureOutputQueue(queue, cfg, state ? &state->runtimeConfig : nullptr);
     if (cbrPacingActive) {
         configureNetworkCbrTimestamping(tsparse);
         configureNetworkCbrClock(pacer);
@@ -7731,7 +7837,7 @@ bool StreamManager::buildRemapPipeline(
     }
 
     configureQueue(preDemuxQueue);
-    configureOutputQueue(outputQueue, cfg);
+    configureOutputQueue(outputQueue, cfg, state ? &state->runtimeConfig : nullptr);
     configureTsMux(mux, cfg);
     if (cbrActive) {
         configureNetworkCbrTimestamping(cbrTsparse);
@@ -8988,14 +9094,14 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.54: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.55: startup_wait_ms=15000"
                   << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
-                  << " source_auto_reconnect=on pipeline_recovery=two-stage+jitter"
+                  << " source_auto_reconnect=on pipeline_recovery=source-only-first+jitter"
                   << " latency_ms=1000 queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
-        std::cerr << "HTTP MPEG-TS watchdog 202.54: loss_detect_ms=6000 rebuild_ms=12000"
+        std::cerr << "HTTP MPEG-TS watchdog 202.55: loss_detect_ms=6000 rebuild_ms=12000"
                   << " source_retries=infinite error_recovery=on eos_recovery=on"
-                  << " pipeline_retry_ms=5000 recovery_jitter_ms=0..2500"
+                  << " pipeline_retry_ms=5000 recovery=source-only-first recovery_jitter_ms=0..2500"
                   << " queue_ms=8000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
         std::cerr << "HLS input watchdog 202.44: loss_wait_ms=15000"
@@ -9023,7 +9129,7 @@ void StreamManager::monitorBus(const std::string& id) {
             !state->usingBackup &&
             activeInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
 
-        // 202.54: SRT/HTTP MPEG-TS self-healing with two-stage no-input recovery. Keep monitorBus alive across
+        // 202.55: SRT/HTTP MPEG-TS self-healing uses source-only reconnect first. Keep monitorBus alive across
         // transient ERROR/EOS and rebuild only the active network input. One fast
         // primary retry is attempted before normal backup failover; without a
         // backup the same URL is retried at a bounded interval.
@@ -9034,10 +9140,47 @@ void StreamManager::monitorBus(const std::string& id) {
                 const bool recoverBackup = state->usingBackup;
                 ++networkRecoveryAttempts;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+
+                // First recovery is source-only. The downstream pipeline remains
+                // PLAYING, so StableUdpOutput keeps the same PCR/CBR clock and
+                // reservoir. If media is still absent after the grace window,
+                // the existing full rebuild/backup path remains the fallback.
+                if (networkRecoveryAttempts == 1) {
+                    if (restartContinuousNetworkSourceInPlace(state)) {
+                        networkRecoveryPending = false;
+                        networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                        state->statusMessage = std::string(protocolName) +
+                            " source reconnecting (output preserved)";
+                        state->active = true;
+                        state->lastInputBytesSeen =
+                            state->inputBytes.load(std::memory_order_relaxed);
+                        // Give the source-only restart another ~6 seconds. If it does
+                        // not deliver data, the 12-second full-rebuild threshold is
+                        // reached and the normal backup/full-rebuild logic takes over.
+                        state->lastInputActivity = now - kInputFailoverDelay;
+                        continue;
+                    }
+
+                    // Even if the bounded source-only state cycle itself fails,
+                    // do not destroy the complete channel at the six-second
+                    // detector. Preserve the downstream pipeline until the normal
+                    // 12-second fallback threshold is reached.
+                    networkRecoveryPending = false;
+                    networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+                    state->lastInputActivity = now - kInputFailoverDelay;
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
+                              << " protocol=" << protocolName
+                              << " result=source-only-restart-failed"
+                              << " action=wait-full-rebuild-threshold"
+                              << std::endl;
+                    continue;
+                }
+
+                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                           << " protocol=" << protocolName
                           << " attempt=" << networkRecoveryAttempts
-                          << " action=pipeline-rebuild" << std::endl;
+                          << " action=pipeline-rebuild fallback=source-only-failed-or-exhausted"
+                          << std::endl;
                 if (restartActiveInput(state, recoveryUri, recoverBackup)) {
                     bus = state->bus;
                     networkRecoveryPending = false;
@@ -9050,13 +9193,13 @@ void StreamManager::monitorBus(const std::string& id) {
                 if (!recoverBackup && !state->config.backupInputUri.empty()) {
                     networkRecoveryPending = false;
                     state->lastInputActivity = now - kNetworkNoInputRebuildDelay;
-                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << protocolName
                               << " result=primary-rebuild-failed action=allow-backup-failover"
                               << std::endl;
                 } else {
                     networkRecoveryDue = now + kNetworkRecoveryRetryDelay;
-                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << protocolName
                               << " result=retry-pending retry_ms="
                               << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -9257,7 +9400,7 @@ void StreamManager::monitorBus(const std::string& id) {
             networkLossWarningActive = false;
             if (recoverableNetworkInput) {
                 if (networkRecoveryAttempts > 0) {
-                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                               << " result=media-restored attempts="
                               << networkRecoveryAttempts << std::endl;
@@ -9295,7 +9438,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->lastInputBytesSeen == 0 &&
                 state->inputBytes.load(std::memory_order_relaxed) == 0;
 
-            // 202.54 two-stage network watchdog. At 6 s we only mark a gap and
+            // 202.55 two-stage network watchdog. At 6 s restart only input_src and
             // let the 8 s queue plus soup/SRT internal retry absorb it. A real
             // pipeline rebuild is allowed only after 12 s of continuous silence
             // (15 s for the first SRT media). This prevents the 6 s watchdog from
@@ -9307,11 +9450,20 @@ void StreamManager::monitorBus(const std::string& id) {
                 networkLossWarningActive = true;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
                 state->statusMessage = std::string(protocolName) +
-                    " input gap - buffering/retry";
-                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    " input gap - source reconnect";
+                // Source-only restart is safe at the six-second detector because
+                // it does not destroy downstream media state. Spread it slightly
+                // across streams, but keep the full pipeline rebuild threshold at
+                // 12 seconds as a second-level fallback.
+                networkRecoveryPending = true;
+                const auto softJitter = std::chrono::milliseconds(
+                    networkRecoveryJitterForStream(id).count() / 5);
+                networkRecoveryDue = now + softJitter;
+                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                           << " protocol=" << protocolName
-                          << " reason=no-input-6s action=buffer-and-wait"
-                          << " rebuild_after_ms="
+                          << " reason=no-input-6s action=schedule-source-only-reconnect"
+                          << " jitter_ms=" << softJitter.count()
+                          << " full_rebuild_after_ms="
                           << std::chrono::duration_cast<std::chrono::milliseconds>(
                                  kNetworkNoInputRebuildDelay).count()
                           << std::endl;
@@ -9337,7 +9489,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 const auto jitter = networkRecoveryJitterForStream(id);
                 networkRecoveryDue = now + jitter;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                           << " protocol=" << protocolName
                           << " reason=no-input-"
                           << std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()
@@ -9541,7 +9693,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     gchar* sourcePath = GST_MESSAGE_SRC(msg)
                         ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
                     const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << protocolName
                               << " reason=gstreamer-error source="
                               << (sourcePath ? sourcePath : "unknown")
@@ -9601,9 +9753,9 @@ void StreamManager::monitorBus(const std::string& id) {
             case GST_MESSAGE_EOS:
                 if (recoverableNetworkInput) {
                     const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                    std::cerr << "NETWORK INPUT RECOVERY 202.54: stream=" << id
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
                               << " protocol=" << protocolName
-                              << " reason=EOS action=schedule-rebuild" << std::endl;
+                              << " reason=EOS action=schedule-source-only-reconnect" << std::endl;
                     state->statusMessage = std::string(protocolName) + " EOS - reconnecting";
                     state->active = true;
                     if (!networkRecoveryPending) {
