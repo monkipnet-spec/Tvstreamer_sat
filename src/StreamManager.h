@@ -185,7 +185,7 @@ struct StreamState {
     unsigned hlsRecoveryAttempts = 0;
     std::chrono::steady_clock::time_point hlsRecoveryDue =
         std::chrono::steady_clock::time_point::min();
-    // 202.65: after a successful HLS pipeline rebuild, give hlsdemux enough
+    // 202.66: after a successful HLS pipeline rebuild, give hlsdemux enough
     // time to reload the playlist/segments before another ERROR/EOS/no-input
     // is allowed to schedule a new rebuild. This prevents the 5-second rebuild
     // storm seen on a temporarily unavailable HLS origin.
@@ -334,8 +334,9 @@ private:
     // NULL, all sender/remap state is released and the pipeline GObject is
     // actually finalized. This closes the stop/start race exposed by 202.59.
     std::set<std::string> stoppingStreamIds;
-    // 202.65: teardown generations prevent a late completion from an old,
-    // force-retired stop worker from releasing the barrier of a newer stop.
+    // 202.66: teardown generations prevent a late completion from an old
+    // stop worker from releasing the barrier of a newer stop. A timed-out old
+    // generation is never force-retired; systemd replaces the process instead.
     std::map<std::string, uint64_t> stoppingStreamTokens;
     uint64_t nextStreamTeardownToken = 0;
     std::set<std::string> startingStreamIds;
@@ -343,6 +344,8 @@ private:
     std::atomic<uint64_t> streamStartWaitCount{0};
     std::atomic<uint64_t> streamStartWaitTimeoutCount{0};
     std::atomic<uint64_t> streamFinalizeTimeoutCount{0};
+    // Retained for diagnostics/backward compatibility. 202.66 never increments
+    // this counter because a retained generation is not allowed to start over.
     std::atomic<uint64_t> streamForcedRetireCount{0};
     std::atomic<uint64_t> hlsRecoveryRebuildCount{0};
     std::atomic<uint64_t> hlsRecoverySuppressedCount{0};

@@ -83,11 +83,18 @@ constexpr auto kNetworkRecoveryJitterMax = std::chrono::milliseconds(2500);
 constexpr auto kHlsInputFailoverDelay = std::chrono::seconds(15);
 constexpr auto kHlsPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kHlsErrorRecoveryDelay = std::chrono::seconds(1);
-// 202.65: HLS rebuild success only means that a new pipeline reached PLAYING;
+// 202.66: HLS rebuild success only means that a new pipeline reached PLAYING;
 // it does not mean the playlist has already produced media. Hold recovery for
 // one full HLS no-input window, then use a bounded increasing retry delay.
 constexpr auto kHlsRecoveryRetryDelay = std::chrono::seconds(15);
 constexpr auto kHlsRecoveryMaxRetryDelay = std::chrono::seconds(60);
+// 202.66: never perform a potentially blocking GStreamer NULL transition on
+// the lifecycle/monitor thread. A stuck source may block gst_element_set_state()
+// before it even returns, so run the transition behind a bounded watchdog.
+// If it does not complete, keep the same-id barrier closed and let systemd
+// replace the process instead of creating a second pipeline generation.
+constexpr auto kPipelineNullTransitionTimeout = std::chrono::seconds(8);
+constexpr auto kAutomaticServiceRestartDelay = std::chrono::milliseconds(500);
 // 202.45: SRT and progressive HTTP MPEG-TS are long-lived network transports.
 // A temporary socket failure/EOS must rebuild only the active input pipeline,
 // not mark the channel permanently stopped.
@@ -120,12 +127,17 @@ std::atomic<uint64_t> gSourceReconnectCompleted{0};
 std::atomic<uint64_t> gSourceReconnectSuppressed{0};
 std::atomic<uint64_t> gSourceReconnectTimeouts{0};
 std::atomic<uint64_t> gSourceReconnectFailed{0};
-// 202.63/202.65: persistent automatic CBR raises. In addition to counters, keep
+// 202.63/202.66: persistent automatic CBR raises. In addition to counters, keep
 // the last successful decision in process memory so MEMORY DIAG still exposes
 // it even when journald rate limiting drops the one-shot AUTO CBR log line.
 std::atomic<uint64_t> gAutoCbrRaiseCount{0};
 std::atomic<uint64_t> gAutoCbrConfigSaveCount{0};
 std::atomic<uint64_t> gAutoCbrConfigSaveFailed{0};
+// 202.66: a retained pipeline is no longer force-retired. The first bounded
+// teardown failure schedules one systemd restart; subsequent failures only
+// record/suppress duplicate requests until PID 1 replaces the process.
+std::atomic<uint64_t> gTeardownRestartRequests{0};
+std::atomic<bool> gAutomaticServiceRestartScheduled{false};
 std::mutex gAutoCbrDiagMutex;
 std::string gAutoCbrLastStream;
 uint64_t gAutoCbrLastMeasuredBitrate = 0;
@@ -141,6 +153,102 @@ GstElement* trackManagedPipeline(GstElement* pipeline) {
     gManagedPipelineCreated.fetch_add(1, std::memory_order_relaxed);
     g_object_weak_ref(G_OBJECT(pipeline), onManagedPipelineFinalized, nullptr);
     return pipeline;
+}
+
+// 202.66: gst_element_set_state(..., GST_STATE_NULL) itself can block before
+// returning (observed with network sources). Execute it on a sacrificial helper
+// thread that holds its own pipeline reference. The caller gets a hard deadline
+// and can request a clean process restart without ever starting a duplicate
+// generation. On timeout the helper/reference intentionally survives until
+// systemd replaces the process.
+struct PipelineNullTransitionSignal {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool complete = false;
+    bool reachedNull = false;
+};
+
+bool transitionPipelineToNullBounded(
+    GstElement* pipeline, std::chrono::milliseconds timeout) {
+    if (!pipeline) return true;
+
+    const auto signal = std::make_shared<PipelineNullTransitionSignal>();
+    gst_object_ref(pipeline);
+    try {
+        std::thread([pipeline, signal]() {
+            bool reachedNull = false;
+            const GstStateChangeReturn down =
+                gst_element_set_state(pipeline, GST_STATE_NULL);
+            if (down != GST_STATE_CHANGE_FAILURE) {
+                if (down == GST_STATE_CHANGE_ASYNC) {
+                    GstState current = GST_STATE_VOID_PENDING;
+                    GstState pending = GST_STATE_VOID_PENDING;
+                    const GstStateChangeReturn waited = gst_element_get_state(
+                        pipeline, &current, &pending, 3 * GST_SECOND);
+                    reachedNull = waited != GST_STATE_CHANGE_FAILURE &&
+                                  waited != GST_STATE_CHANGE_ASYNC &&
+                                  current == GST_STATE_NULL;
+                } else {
+                    reachedNull = true;
+                }
+            }
+            gst_object_unref(pipeline);
+            {
+                std::lock_guard<std::mutex> lock(signal->mutex);
+                signal->reachedNull = reachedNull;
+                signal->complete = true;
+            }
+            signal->condition.notify_all();
+        }).detach();
+    } catch (const std::exception& ex) {
+        gst_object_unref(pipeline);
+        std::cerr << "STREAM TEARDOWN 202.66: result=null-worker-create-failed error="
+                  << ex.what() << std::endl;
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(signal->mutex);
+    const bool complete = signal->condition.wait_for(lock, timeout, [&signal]() {
+        return signal->complete;
+    });
+    return complete && signal->reachedNull;
+}
+
+void scheduleAutomaticServiceRestart(
+    const std::string& streamId, const std::string& reason) {
+    gTeardownRestartRequests.fetch_add(1, std::memory_order_relaxed);
+    bool expected = false;
+    if (!gAutomaticServiceRestartScheduled.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+        std::cerr << "PROGRAM RESTART 202.66: trigger=stuck-pipeline-teardown stream="
+                  << streamId << " reason=" << reason
+                  << " result=already-scheduled" << std::endl;
+        return;
+    }
+
+    std::cerr << "PROGRAM RESTART 202.66: trigger=stuck-pipeline-teardown stream="
+              << streamId << " reason=" << reason
+              << " delay_ms=" << kAutomaticServiceRestartDelay.count()
+              << " action=systemd-full-restart" << std::endl;
+    try {
+        std::thread([streamId, reason]() {
+            std::this_thread::sleep_for(kAutomaticServiceRestartDelay);
+            const int rc = std::system(
+                "/usr/bin/systemctl --no-block restart tvstreammersat5.service >/dev/null 2>&1");
+            if (rc != 0) {
+                std::cerr << "PROGRAM RESTART 202.66: trigger=stuck-pipeline-teardown stream="
+                          << streamId << " reason=" << reason
+                          << " result=systemctl-failed rc=" << rc << std::endl;
+                gAutomaticServiceRestartScheduled.store(false, std::memory_order_release);
+            }
+        }).detach();
+    } catch (const std::exception& ex) {
+        gAutomaticServiceRestartScheduled.store(false, std::memory_order_release);
+        std::cerr << "PROGRAM RESTART 202.66: trigger=stuck-pipeline-teardown stream="
+                  << streamId << " reason=" << reason
+                  << " result=restart-worker-create-failed error=" << ex.what()
+                  << std::endl;
+    }
 }
 
 // 202.60: application-side gst_object_unref() is not enough to prove that the
@@ -184,7 +292,7 @@ bool releasePipelineAndWaitForFinalize(
         return signal->finalized;
     });
     if (!finalized) {
-        std::cerr << "STREAM TEARDOWN 202.65: stream=" << streamId
+        std::cerr << "STREAM TEARDOWN 202.66: stream=" << streamId
                   << " result=pipeline-finalize-timeout timeout_ms=" << timeout.count()
                   << " action=block-same-id-restart" << std::endl;
     }
@@ -4387,7 +4495,7 @@ void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SE
     }
 }
 
-// 202.65: detach appsink callbacks before any potentially blocking GStreamer
+// 202.66: detach appsink callbacks before any potentially blocking GStreamer
 // state transition during teardown. StableUdpOutput owns its sender through the
 // appsink callback destroy-notify, so this stops the old UDP sender immediately
 // even if a network source/demux later takes too long to reach NULL.
@@ -5955,33 +6063,32 @@ bool StreamManager::waitForStreamTeardown(
     }
 
     streamStartWaitCount.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "STREAM START BARRIER 202.65: stream=" << id
+    std::cerr << "STREAM START BARRIER 202.66: stream=" << id
               << " action=wait-for-old-teardown timeout_ms=" << timeout.count()
               << std::endl;
     const bool complete = streamLifecycleCondition.wait_for(lock, timeout, [this, &id]() {
         return !stoppingStreamIds.count(id);
     });
     if (!complete) {
-        // 202.65: the teardown worker has already removed the StreamState from
-        // the active table. Its StableUdp appsink callbacks are detached before
-        // any blocking state transition, so after this bounded wait it is safe
-        // to retire the old generation and allow a replacement instead of
-        // requiring a full process restart. The old worker keeps ownership of
-        // its StreamState until GStreamer eventually unwinds.
+        // 202.66: never clear the barrier while the previous GStreamer object
+        // is still alive. 202.65 proved that doing so creates one hidden
+        // pipeline per force-retire and turns the retained objects into a
+        // linear RSS/heap leak. Keep the id reserved and replace the whole
+        // process through systemd; configured streams will be rebuilt from a
+        // clean GStreamer/allocator state by the new process.
         streamStartWaitTimeoutCount.fetch_add(1, std::memory_order_relaxed);
-        streamForcedRetireCount.fetch_add(1, std::memory_order_relaxed);
-        stoppingStreamIds.erase(id);
-        stoppingStreamTokens.erase(id);
-        if (error) error->clear();
-        std::cerr << "STREAM START BARRIER 202.65: stream=" << id
-                  << " result=timeout action=force-retire-old-generation-start-allowed"
+        if (error) {
+            *error = "old stream teardown is stuck; automatic service restart scheduled: " + id;
+        }
+        std::cerr << "STREAM START BARRIER 202.66: stream=" << id
+                  << " result=timeout action=schedule-systemd-restart start_allowed=no"
                   << std::endl;
         lock.unlock();
-        streamLifecycleCondition.notify_all();
-        return true;
+        scheduleAutomaticServiceRestart(id, "start-barrier-timeout");
+        return false;
     }
 
-    std::cerr << "STREAM START BARRIER 202.65: stream=" << id
+    std::cerr << "STREAM START BARRIER 202.66: stream=" << id
               << " result=old-instance-cleaned action=start-allowed" << std::endl;
     return true;
 }
@@ -5999,7 +6106,7 @@ void StreamManager::finishStreamTeardown(const std::string& id, uint64_t teardow
         const auto tokenIt = stoppingStreamTokens.find(id);
         if (tokenIt == stoppingStreamTokens.end() || tokenIt->second != teardownToken) {
             // A newer generation may already be stopping under the same id. A
-            // late worker from the force-retired generation must not release it.
+            // late worker from an older teardown must never release its barrier.
             return;
         }
         stoppingStreamTokens.erase(tokenIt);
@@ -6016,18 +6123,18 @@ bool StreamManager::teardownStreamState(
     if (!statePtr) return true;
     auto& state = *statePtr;
 
-    // 202.65: stop externally visible outputs before any potentially blocking
-    // source/demux state transition. In particular, detach appsink callbacks so
-    // StableUdpSender is destroyed immediately. This makes a bounded force-retire
-    // safe: an old GStreamer object may linger, but it cannot keep sending UDP.
+    // 202.66: stop externally visible outputs first, then stop the bus monitor
+    // before touching pipeline state. The NULL transition itself runs behind a
+    // hard watchdog because network source plugins can block inside
+    // gst_element_set_state() before it returns.
     if (state.pipeline) {
         detachAppSinkCallbacksForTeardown(state.pipeline);
     }
     stopHttpMpegTsInput(&state);
     stopExternalSrtOutputs(&state);
     releaseSharedDvbInput(&state);
-    if (state.pipeline) {
-        gst_element_set_state(state.pipeline, GST_STATE_NULL);
+    if (state.bus) {
+        gst_bus_set_flushing(state.bus, TRUE);
     }
     if (state.busThread.joinable()) {
         state.busThread.join();
@@ -6036,8 +6143,23 @@ bool StreamManager::teardownStreamState(
         state.gstTranscoder->stop();
         state.gstTranscoder.reset();
     }
-    if (state.pipeline) {
-        stopPipelineAndWait(state.pipeline, 3 * GST_SECOND);
+    if (state.pipeline && !transitionPipelineToNullBounded(
+            state.pipeline,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                kPipelineNullTransitionTimeout))) {
+        state.statusMessage = "error: pipeline teardown stuck; service restart scheduled";
+        std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
+                  << " result=pipeline-null-timeout timeout_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         kPipelineNullTransitionTimeout).count()
+                  << " action=hold-start-barrier-and-restart-service" << std::endl;
+        scheduleAutomaticServiceRestart(id, "pipeline-null-transition-timeout");
+        // The pipeline can still execute callbacks while the plugin is blocked
+        // in its state transition. Preserve the entire StreamState/context
+        // generation until PID 1 replaces this process; destroying callback
+        // user-data here would be unsafe.
+        statePtr.release();
+        return false;
     }
 
     // These contexts own request-pad references and are used as signal callback
@@ -6067,6 +6189,7 @@ bool StreamManager::teardownStreamState(
             state.pipeline, id, std::chrono::seconds(10));
         if (!finalized) {
             streamFinalizeTimeoutCount.fetch_add(1, std::memory_order_relaxed);
+            scheduleAutomaticServiceRestart(id, "pipeline-finalize-timeout");
         }
     }
 
@@ -6085,7 +6208,7 @@ bool StreamManager::teardownStreamState(
     }
 
     if (finalized) {
-        std::cerr << "STREAM TEARDOWN 202.65: stream=" << id
+        std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
                   << " result=finalized action=release-start-barrier" << std::endl;
     }
     return finalized;
@@ -6107,6 +6230,10 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
                     lock, std::chrono::seconds(20), [this, &id]() {
                         return !stoppingStreamIds.count(id);
                     });
+                if (!complete) {
+                    lock.unlock();
+                    scheduleAutomaticServiceRestart(id, "synchronous-stop-barrier-timeout");
+                }
                 return complete;
             }
             return false;
@@ -6138,13 +6265,14 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
 
     const bool finalized = teardownStreamState(
         std::move(statePtr), id, stoppedConfig, notifyManualStop);
-    finishStreamTeardown(id, teardownToken);
-    if (!finalized) {
-        std::cerr << "STREAM TEARDOWN 202.65: stream=" << id
-                  << " result=pipeline-object-retained action=old-generation-quarantined-start-allowed"
-                  << std::endl;
+    if (finalized) {
+        finishStreamTeardown(id, teardownToken);
+        return true;
     }
-    return true;
+    std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
+              << " result=retained action=keep-start-barrier-until-service-restart"
+              << std::endl;
+    return false;
 }
 
 bool StreamManager::stopStream(const std::string& id) {
@@ -6195,21 +6323,24 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
         std::thread([this, id, teardownToken, asyncState, stoppedConfig]() mutable {
             const bool finalized = teardownStreamState(
                 std::move(*asyncState), id, stoppedConfig, true);
-            finishStreamTeardown(id, teardownToken);
-            if (!finalized) {
-                std::cerr << "STREAM TEARDOWN 202.65: stream=" << id
-                          << " result=pipeline-object-retained action=old-generation-quarantined-start-allowed"
+            if (finalized) {
+                finishStreamTeardown(id, teardownToken);
+            } else {
+                std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
+                          << " result=retained action=keep-start-barrier-until-service-restart"
                           << std::endl;
             }
         }).detach();
     } catch (const std::exception& ex) {
-        std::cerr << "STREAM TEARDOWN 202.65: stream=" << id
+        std::cerr << "STREAM TEARDOWN 202.66: stream=" << id
                   << " async-thread-error=" << ex.what()
                   << " action=synchronous-cleanup" << std::endl;
-        teardownStreamState(
+        const bool finalized = teardownStreamState(
             std::move(*asyncState), id, stoppedConfig, true);
-        finishStreamTeardown(id, teardownToken);
-        return true;
+        if (finalized) {
+            finishStreamTeardown(id, teardownToken);
+        }
+        return finalized;
     }
     return true;
 }
@@ -6473,6 +6604,8 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["stream_start_wait_timeouts"] = Json::UInt64(streamStartWaitTimeoutCount.load(std::memory_order_relaxed));
     result["stream_finalize_timeouts"] = Json::UInt64(streamFinalizeTimeoutCount.load(std::memory_order_relaxed));
     result["stream_forced_retires"] = Json::UInt64(streamForcedRetireCount.load(std::memory_order_relaxed));
+    result["teardown_restart_requests"] = Json::UInt64(gTeardownRestartRequests.load(std::memory_order_relaxed));
+    result["service_restart_pending"] = gAutomaticServiceRestartScheduled.load(std::memory_order_relaxed);
     result["hls_rebuilds"] = Json::UInt64(hlsRecoveryRebuildCount.load(std::memory_order_relaxed));
     result["hls_recovery_suppressed"] = Json::UInt64(hlsRecoverySuppressedCount.load(std::memory_order_relaxed));
     result["remap_created"] = Json::UInt64(RemapContext::createdCount.load(std::memory_order_relaxed));
@@ -7113,12 +7246,25 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     stopHttpMpegTsInput(state);
     if (oldPipeline) {
-        // 202.48: network/HLS recovery used to start the replacement pipeline
-        // immediately after requesting NULL on the old one.  Network sources and
-        // demuxers can complete NULL asynchronously, leaving old buffer pools and
-        // allocator pages alive while the next pipeline is already filling. Wait
-        // for deterministic teardown before allocating the replacement.
-        stopPipelineAndWait(oldPipeline, 2 * GST_SECOND);
+        // 202.66: never create the recovery generation until the previous
+        // pipeline has actually completed its NULL transition. Some network
+        // source plugins can block inside gst_element_set_state() itself, so a
+        // normal get_state timeout cannot protect the monitor thread.
+        if (!transitionPipelineToNullBounded(
+                oldPipeline,
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    kPipelineNullTransitionTimeout))) {
+            state->statusMessage = "error: recovery teardown stuck; service restart scheduled";
+            state->active = false;
+            std::cerr << "STREAM TEARDOWN 202.66: stream=" << state->config.id
+                      << " result=recovery-pipeline-null-timeout timeout_ms="
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             kPipelineNullTransitionTimeout).count()
+                      << " action=abort-rebuild-and-restart-service" << std::endl;
+            scheduleAutomaticServiceRestart(
+                state->config.id, "recovery-pipeline-null-transition-timeout");
+            return false;
+        }
     }
 
     // A manual Stop may have arrived while a recovery was blocked inside the
@@ -9397,7 +9543,7 @@ bool StreamManager::applyAutoRaisedUdpCbr(
     }
     gAutoCbrRaiseCount.fetch_add(1, std::memory_order_relaxed);
     state->outputBitrate.store(newTargetBitrate, std::memory_order_relaxed);
-    std::cerr << "AUTO CBR 202.65: stream=" << state->config.id
+    std::cerr << "AUTO CBR 202.66: stream=" << state->config.id
               << " measured_bitrate=" << measuredBitrate
               << " old_target=" << oldTarget
               << " new_target=" << newTargetBitrate
@@ -9746,7 +9892,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.65: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.66: startup_wait_ms=15000"
                   << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
                   << " source_poll_timeout_ms=1000 app_reconnect=full-pipeline-only"
                   << " source_only_restart=disabled loss_action=wait-12s-then-rebuild"
@@ -9757,7 +9903,7 @@ void StreamManager::monitorBus(const std::string& id) {
                   << " pipeline_retry_ms=5000 recovery=source-only-first recovery_jitter_ms=0..2500"
                   << " queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
-        std::cerr << "HLS input watchdog 202.65: loss_wait_ms=15000"
+        std::cerr << "HLS input watchdog 202.66: loss_wait_ms=15000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
                   << " recovery=serialized startup_grace_ms=15000,30000,60000"
                   << " retry_backoff_ms=15000,30000,60000"
@@ -9804,7 +9950,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
                 gSourceReconnectTimeouts.fetch_add(1, std::memory_order_relaxed);
-                std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-deadline-expired"
                           << " action=allow-full-rebuild" << std::endl;
@@ -9829,7 +9975,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 ++networkRecoveryAttempts;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
 
-                // 202.65: source-only NULL->PLAYING is disabled for SRT. On the
+                // 202.66: source-only NULL->PLAYING is disabled for SRT. On the
                 // installed older GStreamer SRT plugin gst_element_set_state(NULL)
                 // can block inside the source and strand the monitor thread. HTTP
                 // keeps the source-only fast path; SRT always uses the proven full
@@ -9841,7 +9987,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
                         networkRecoveryPending = false;
                         networkRecoveryDue = std::chrono::steady_clock::time_point::min();
-                        std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=duplicate-source-reconnect"
                                   << " action=suppress-inflight" << std::endl;
@@ -9869,7 +10015,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->lastInputActivity = now;
                         state->networkRecoveryGraceUntil =
                             std::chrono::steady_clock::time_point::min();
-                        std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                                   << " protocol=" << protocolName
                                   << " action=source-reconnect-started grace_ms="
                                   << sourceReconnectGraceForState(state).count()
@@ -9897,7 +10043,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     continue;
                 }
 
-                std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                           << " protocol=" << protocolName
                           << " attempt=" << networkRecoveryAttempts
                           << " action=pipeline-rebuild mode="
@@ -9931,7 +10077,7 @@ void StreamManager::monitorBus(const std::string& id) {
             }
         }
 
-        // 202.65: HLS self-healing is serialized around a startup grace. A
+        // 202.66: HLS self-healing is serialized around a startup grace. A
         // rebuild that successfully reaches PLAYING gets 15 seconds to produce
         // media. ERROR/EOS/no-input events in that window are suppressed instead
         // of rebuilding a fresh pipeline every five seconds. If media never
@@ -9945,7 +10091,7 @@ void StreamManager::monitorBus(const std::string& id) {
             if (!recoveryUri.empty()) {
                 ++state->hlsRecoveryAttempts;
                 hlsRecoveryRebuildCount.fetch_add(1, std::memory_order_relaxed);
-                std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                std::cerr << "HLS RECOVERY 202.66: stream=" << id
                           << " attempt=" << state->hlsRecoveryAttempts
                           << " action=pipeline-rebuild serialized=yes"
                           << std::endl;
@@ -9958,7 +10104,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         std::chrono::steady_clock::now() + startupGrace;
                     state->statusMessage = "HLS reconnecting - startup grace";
                     state->active = true;
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " result=pipeline-started action=wait-for-media grace_ms="
                               << std::chrono::duration_cast<std::chrono::milliseconds>(
                                      startupGrace).count()
@@ -9972,13 +10118,13 @@ void StreamManager::monitorBus(const std::string& id) {
                 if (!state->config.backupInputUri.empty()) {
                     state->hlsRecoveryPending = false;
                     state->lastInputActivity = now - kHlsInputFailoverDelay;
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " result=primary-rebuild-failed action=allow-backup-failover"
                               << std::endl;
                 } else {
                     const auto retryDelay = hlsRecoveryBackoff(state->hlsRecoveryAttempts);
                     state->hlsRecoveryDue = now + retryDelay;
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " result=retry-pending retry_ms="
                               << std::chrono::duration_cast<std::chrono::milliseconds>(
                                      retryDelay).count()
@@ -10144,7 +10290,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 gSourceReconnectCompleted.fetch_add(1, std::memory_order_relaxed);
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
-                std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-media-restored"
                           << " action=normal-watchdog-resumed" << std::endl;
@@ -10162,7 +10308,7 @@ void StreamManager::monitorBus(const std::string& id) {
             }
             if (hlsInput) {
                 if (state->hlsRecoveryAttempts > 0) {
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " result=media-restored attempts="
                               << state->hlsRecoveryAttempts
                               << " suppressed=" << state->hlsRecoverySuppressed
@@ -10214,7 +10360,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     : state->networkRecoveryGraceUntil;
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     activeDeadline - now);
-                std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " reason=no-input-6s action=suppress-during-"
                           << (sourceReconnectInFlight ? "source-reconnect" : "startup-grace")
@@ -10238,7 +10384,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     // will schedule one complete pipeline rebuild if media remains
                     // absent.
                     state->statusMessage = "SRT input gap - waiting full rebuild threshold";
-                    std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                    std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                               << " protocol=SRT reason=no-input-6s"
                               << " action=wait-full-rebuild-threshold full_rebuild_after_ms="
                               << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -10282,7 +10428,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 const auto jitter = networkRecoveryJitterForStream(id);
                 networkRecoveryDue = now + jitter;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << (srtInput ? "NETWORK RECOVERY 202.65: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
+                std::cerr << (srtInput ? "NETWORK RECOVERY 202.66: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
                           << " protocol=" << protocolName
                           << " reason=no-input-"
                           << std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()
@@ -10379,7 +10525,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     state->inputLossNotified = false;
                 }
             } else if (inputTimedOut && hlsInput && state->config.backupInputUri.empty()) {
-                // 202.65: if a freshly rebuilt HLS pipeline is still inside its
+                // 202.66: if a freshly rebuilt HLS pipeline is still inside its
                 // startup grace, count the no-input event but do not rebuild it
                 // again. Once grace expires, schedule one serialized retry.
                 if (now < state->hlsRecoveryGraceUntil) {
@@ -10390,7 +10536,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 } else if (!state->hlsRecoveryPending) {
                     state->hlsRecoveryPending = true;
                     state->hlsRecoveryDue = now;
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " reason=no-input-15s action=schedule-serialized-rebuild"
                               << std::endl;
                 }
@@ -10494,7 +10640,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=gstreamer-error source="
                                   << (sourcePath ? sourcePath : "unknown")
@@ -10532,7 +10678,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     if (now < state->hlsRecoveryGraceUntil) {
                         ++state->hlsRecoverySuppressed;
                         hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                        std::cerr << "HLS RECOVERY 202.66: stream=" << id
                                   << " reason=gstreamer-error source="
                                   << (sourcePath ? sourcePath : "unknown")
                                   << " action=suppress-during-startup-grace"
@@ -10541,7 +10687,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         gst_message_unref(msg);
                         continue;
                     }
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " reason=gstreamer-error source="
                               << (sourcePath ? sourcePath : "unknown")
                               << " message=" << message
@@ -10552,7 +10698,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     if (!state->config.backupInputUri.empty() && state->hlsRecoveryAttempts > 0) {
                         state->hlsRecoveryPending = false;
                         state->lastInputActivity = now - kHlsInputFailoverDelay;
-                        std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                        std::cerr << "HLS RECOVERY 202.66: stream=" << id
                                   << " action=allow-backup-after-fast-retry" << std::endl;
                     } else if (!state->hlsRecoveryPending) {
                         state->hlsRecoveryPending = true;
@@ -10583,14 +10729,14 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.65: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=EOS action=suppress-during-reconnect"
                                   << std::endl;
                         gst_message_unref(msg);
                         continue;
                     }
-                    std::cerr << (srtInput ? "NETWORK RECOVERY 202.65: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
+                    std::cerr << (srtInput ? "NETWORK RECOVERY 202.66: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
                               << " protocol=" << protocolName
                               << " reason=EOS action="
                               << (srtInput ? "schedule-full-pipeline-rebuild" : "schedule-source-only-reconnect")
@@ -10611,13 +10757,13 @@ void StreamManager::monitorBus(const std::string& id) {
                     if (now < state->hlsRecoveryGraceUntil) {
                         ++state->hlsRecoverySuppressed;
                         hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                        std::cerr << "HLS RECOVERY 202.66: stream=" << id
                                   << " reason=EOS action=suppress-during-startup-grace"
                                   << std::endl;
                         gst_message_unref(msg);
                         continue;
                     }
-                    std::cerr << "HLS RECOVERY 202.65: stream=" << id
+                    std::cerr << "HLS RECOVERY 202.66: stream=" << id
                               << " reason=EOS action=schedule-serialized-rebuild" << std::endl;
                     state->statusMessage = "HLS EOS - reconnecting";
                     state->active = true;

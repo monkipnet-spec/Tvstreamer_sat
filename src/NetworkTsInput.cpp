@@ -268,7 +268,7 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.65: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.66: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
               << " poll_timeout_ms=" << kSrtPollTimeoutMs
