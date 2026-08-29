@@ -1176,10 +1176,11 @@ int32_t init_config(void)
 		*value++ = '\0';
 		char *tvalue = trim(value);
 		char *ttoken = trim(strtolower(token));
-		if(cur_section && !config_list_parse(cur_section->config, ttoken, tvalue, &cfg))
+		if(cur_section)
 		{
-			fprintf(stderr, "WARNING: %s line %d section [%s] contains unknown setting '%s=%s'\n",
-					cs_conf, line, cur_section->section, ttoken, tvalue);
+			// Reduced oscam-mini build: silently ignore directives whose feature
+			// support was intentionally compiled out. Unknown sections remain logged.
+			(void)config_list_parse(cur_section->config, ttoken, tvalue, &cfg);
 		}
 	}
 	NULLFREE(token);

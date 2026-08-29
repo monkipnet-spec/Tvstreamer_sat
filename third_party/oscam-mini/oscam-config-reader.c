@@ -997,7 +997,7 @@ void chk_reader(char *token, char *value, struct s_reader *rdr)
 	if(config_list_parse(reader_opts, token, value, rdr))
 		{ return; }
 	else if(token[0] != '#')
-		{ fprintf(stderr, "Warning: keyword '%s' in reader section not recognized\n", token); }
+		{ /* Reduced oscam-mini build: excluded reader directives are intentionally silent. */ }
 }
 
 void reader_set_defaults(struct s_reader *rdr)

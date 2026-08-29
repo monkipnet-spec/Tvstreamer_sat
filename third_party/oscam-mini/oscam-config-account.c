@@ -406,7 +406,7 @@ void chk_account(const char *token, char *value, struct s_auth *account)
 	if(config_list_parse(account_opts, token, value, account))
 		{ return; }
 	else if(token[0] != '#')
-		{ fprintf(stderr, "Warning: keyword '%s' in account section not recognized\n", token); }
+		{ /* Reduced oscam-mini build: excluded account directives are intentionally silent. */ }
 }
 
 void account_set_defaults(struct s_auth *account)

@@ -917,7 +917,7 @@ public:
                     current, bitrate, std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 transportBitrate.store(bitrate, std::memory_order_relaxed);
                 queueReady.notify_all();
-                std::cerr << "AUTO CBR 202.63: stream=" << streamId
+                std::cerr << "AUTO CBR 202.64: stream=" << streamId
                           << " output=" << outputEndpoint
                           << " old_bitrate=" << current
                           << " new_bitrate=" << bitrate
@@ -2843,7 +2843,7 @@ GstElement* createSink(
     bool expectedWisiLog = false;
     if (gWisiCompatibilityLogged.compare_exchange_strong(
             expectedWisiLog, true, std::memory_order_acq_rel)) {
-        std::cerr << "WISI UDP compatibility 202.63: format=MPEG-TS-over-UDP"
+        std::cerr << "WISI UDP compatibility 202.64: format=MPEG-TS-over-UDP"
                   << " ts_packet_bytes=" << kTsPacketSize
                   << " packets_per_datagram=" << kTsPacketsPerDatagram
                   << " udp_payload_bytes=" << kUdpPayloadSize

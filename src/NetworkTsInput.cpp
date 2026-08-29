@@ -268,12 +268,12 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.63: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.64: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
               << " poll_timeout_ms=" << kSrtPollTimeoutMs
               << " auto_reconnect_property=" << (hasAutoReconnect ? "yes" : "no")
-              << " app_reconnect=enabled"
+              << " app_reconnect=full-pipeline-only"
               << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;

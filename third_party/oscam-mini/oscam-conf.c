@@ -454,11 +454,10 @@ void config_set_value(const struct config_sections *conf, char *section, const c
 	}
 	if(config_section_is_active(sec))
 	{
-		if(!config_list_parse(sec->config, token, value, var))
-		{
-			fprintf(stderr, "WARNING: In section [%s] unknown setting '%s=%s' tried.\n",
-					section, token, value);
-		}
+		// TVStreammerSAT5 oscam-mini intentionally builds a reduced option set.
+		// Silently ignore directives excluded from this mini build; operational
+		// errors and unknown sections are still logged.
+		(void)config_list_parse(sec->config, token, value, var);
 	}
 	else
 	{

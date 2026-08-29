@@ -115,11 +115,17 @@ std::atomic<uint64_t> gSourceReconnectCompleted{0};
 std::atomic<uint64_t> gSourceReconnectSuppressed{0};
 std::atomic<uint64_t> gSourceReconnectTimeouts{0};
 std::atomic<uint64_t> gSourceReconnectFailed{0};
-// 202.63: persistent automatic CBR raises. These are diagnostic counters only;
-// the actual target lives in StreamConfig and StableUdpSender.
+// 202.63/202.64: persistent automatic CBR raises. In addition to counters, keep
+// the last successful decision in process memory so MEMORY DIAG still exposes
+// it even when journald rate limiting drops the one-shot AUTO CBR log line.
 std::atomic<uint64_t> gAutoCbrRaiseCount{0};
 std::atomic<uint64_t> gAutoCbrConfigSaveCount{0};
 std::atomic<uint64_t> gAutoCbrConfigSaveFailed{0};
+std::mutex gAutoCbrDiagMutex;
+std::string gAutoCbrLastStream;
+uint64_t gAutoCbrLastMeasuredBitrate = 0;
+uint64_t gAutoCbrLastOldTargetBitrate = 0;
+uint64_t gAutoCbrLastNewTargetBitrate = 0;
 
 void onManagedPipelineFinalized(gpointer, GObject*) {
     gManagedPipelineFinalized.fetch_add(1, std::memory_order_relaxed);
@@ -6227,6 +6233,17 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     uint64_t sourceReconnectInflightCount = 0;
     std::string telemetryScratchMaxName;
     std::string telemetryScratchMaxStream;
+    std::string autoCbrLastStream;
+    uint64_t autoCbrLastMeasuredBitrate = 0;
+    uint64_t autoCbrLastOldTargetBitrate = 0;
+    uint64_t autoCbrLastNewTargetBitrate = 0;
+    {
+        std::lock_guard<std::mutex> diagLock(gAutoCbrDiagMutex);
+        autoCbrLastStream = gAutoCbrLastStream;
+        autoCbrLastMeasuredBitrate = gAutoCbrLastMeasuredBitrate;
+        autoCbrLastOldTargetBitrate = gAutoCbrLastOldTargetBitrate;
+        autoCbrLastNewTargetBitrate = gAutoCbrLastNewTargetBitrate;
+    }
 
     auto collectPipeline = [&](const std::string& streamId, GstElement* pipeline) {
         if (!pipeline || !GST_IS_BIN(pipeline)) return;
@@ -6367,6 +6384,10 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["source_reconnect_failed"] = Json::UInt64(gSourceReconnectFailed.load(std::memory_order_relaxed));
     result["source_reconnect_inflight"] = Json::UInt64(sourceReconnectInflightCount);
     result["auto_cbr_raises"] = Json::UInt64(gAutoCbrRaiseCount.load(std::memory_order_relaxed));
+    result["auto_cbr_last_stream"] = autoCbrLastStream;
+    result["auto_cbr_last_measured_bitrate"] = Json::UInt64(autoCbrLastMeasuredBitrate);
+    result["auto_cbr_last_old_target"] = Json::UInt64(autoCbrLastOldTargetBitrate);
+    result["auto_cbr_last_new_target"] = Json::UInt64(autoCbrLastNewTargetBitrate);
     result["auto_cbr_config_saves"] = Json::UInt64(gAutoCbrConfigSaveCount.load(std::memory_order_relaxed));
     result["auto_cbr_config_save_failed"] = Json::UInt64(gAutoCbrConfigSaveFailed.load(std::memory_order_relaxed));
     result["stream_stopping_count"] = Json::UInt64(stoppingStreamIds.size());
@@ -9269,9 +9290,16 @@ bool StreamManager::applyAutoRaisedUdpCbr(
         gAutoCbrConfigSaveFailed.fetch_add(1, std::memory_order_relaxed);
     }
 
+    {
+        std::lock_guard<std::mutex> diagLock(gAutoCbrDiagMutex);
+        gAutoCbrLastStream = state->config.id;
+        gAutoCbrLastMeasuredBitrate = measuredBitrate;
+        gAutoCbrLastOldTargetBitrate = oldTarget;
+        gAutoCbrLastNewTargetBitrate = newTargetBitrate;
+    }
     gAutoCbrRaiseCount.fetch_add(1, std::memory_order_relaxed);
     state->outputBitrate.store(newTargetBitrate, std::memory_order_relaxed);
-    std::cerr << "AUTO CBR 202.63: stream=" << state->config.id
+    std::cerr << "AUTO CBR 202.64: stream=" << state->config.id
               << " measured_bitrate=" << measuredBitrate
               << " old_target=" << oldTarget
               << " new_target=" << newTargetBitrate
@@ -9620,9 +9648,10 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.63: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.64: startup_wait_ms=15000"
                   << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
-                  << " source_poll_timeout_ms=1000 app_reconnect=source-only-first+jitter"
+                  << " source_poll_timeout_ms=1000 app_reconnect=full-pipeline-only"
+                  << " source_only_restart=disabled loss_action=wait-12s-then-rebuild"
                   << " latency_ms=500 queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
         std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=6000 rebuild_ms=12000"
@@ -9675,7 +9704,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
                 gSourceReconnectTimeouts.fetch_add(1, std::memory_order_relaxed);
-                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-deadline-expired"
                           << " action=allow-full-rebuild" << std::endl;
@@ -9700,17 +9729,19 @@ void StreamManager::monitorBus(const std::string& id) {
                 ++networkRecoveryAttempts;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
 
-                // First recovery is source-only. The downstream pipeline remains
-                // PLAYING, so StableUdpOutput keeps the same PCR/CBR clock and
-                // reservoir. If media is still absent after the grace window,
-                // the existing full rebuild/backup path remains the fallback.
-                if (networkRecoveryAttempts == 1) {
+                // 202.64: source-only NULL->PLAYING is disabled for SRT. On the
+                // installed older GStreamer SRT plugin gst_element_set_state(NULL)
+                // can block inside the source and strand the monitor thread. HTTP
+                // keeps the source-only fast path; SRT always uses the proven full
+                // pipeline rebuild/lifecycle path.
+                const bool allowSourceOnlyRecovery = httpMpegTsInput;
+                if (networkRecoveryAttempts == 1 && allowSourceOnlyRecovery) {
                     if (state->networkSourceReconnectInFlight.exchange(
                             true, std::memory_order_acq_rel)) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
                         networkRecoveryPending = false;
                         networkRecoveryDue = std::chrono::steady_clock::time_point::min();
-                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=duplicate-source-reconnect"
                                   << " action=suppress-inflight" << std::endl;
@@ -9738,7 +9769,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->lastInputActivity = now;
                         state->networkRecoveryGraceUntil =
                             std::chrono::steady_clock::time_point::min();
-                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                                   << " protocol=" << protocolName
                                   << " action=source-reconnect-started grace_ms="
                                   << sourceReconnectGraceForState(state).count()
@@ -9766,10 +9797,11 @@ void StreamManager::monitorBus(const std::string& id) {
                     continue;
                 }
 
-                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                           << " protocol=" << protocolName
                           << " attempt=" << networkRecoveryAttempts
-                          << " action=pipeline-rebuild fallback=source-only-failed-or-exhausted"
+                          << " action=pipeline-rebuild mode="
+                          << (srtInput ? "srt-full-only" : "source-only-failed-or-exhausted")
                           << std::endl;
                 if (restartActiveInput(state, recoveryUri, recoverBackup)) {
                     bus = state->bus;
@@ -9996,7 +10028,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 gSourceReconnectCompleted.fetch_add(1, std::memory_order_relaxed);
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
-                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-media-restored"
                           << " action=normal-watchdog-resumed" << std::endl;
@@ -10062,7 +10094,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     : state->networkRecoveryGraceUntil;
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     activeDeadline - now);
-                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " reason=no-input-6s action=suppress-during-"
                           << (sourceReconnectInFlight ? "source-reconnect" : "startup-grace")
@@ -10080,24 +10112,33 @@ void StreamManager::monitorBus(const std::string& id) {
             if (networkLossDetected && !networkLossWarningActive && !networkRecoveryPending) {
                 networkLossWarningActive = true;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                state->statusMessage = std::string(protocolName) +
-                    " input gap - source reconnect";
-                // Source-only restart is safe at the six-second detector because
-                // it does not destroy downstream media state. Spread it slightly
-                // across streams, but keep the full pipeline rebuild threshold at
-                // 12 seconds as a second-level fallback.
-                networkRecoveryPending = true;
-                const auto softJitter = std::chrono::milliseconds(
-                    networkRecoveryJitterForStream(id).count() / 5);
-                networkRecoveryDue = now + softJitter;
-                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
-                          << " protocol=" << protocolName
-                          << " reason=no-input-6s action=schedule-source-only-reconnect"
-                          << " jitter_ms=" << softJitter.count()
-                          << " full_rebuild_after_ms="
-                          << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 kNetworkNoInputRebuildDelay).count()
-                          << std::endl;
+                if (srtInput) {
+                    // Keep the six-second detector for status/telemetry, but do not
+                    // touch the old SRT source here. The 12-second watchdog below
+                    // will schedule one complete pipeline rebuild if media remains
+                    // absent.
+                    state->statusMessage = "SRT input gap - waiting full rebuild threshold";
+                    std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
+                              << " protocol=SRT reason=no-input-6s"
+                              << " action=wait-full-rebuild-threshold full_rebuild_after_ms="
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     kNetworkNoInputRebuildDelay).count()
+                              << std::endl;
+                } else {
+                    state->statusMessage = "HTTP-MPEGTS input gap - source reconnect";
+                    networkRecoveryPending = true;
+                    const auto softJitter = std::chrono::milliseconds(
+                        networkRecoveryJitterForStream(id).count() / 5);
+                    networkRecoveryDue = now + softJitter;
+                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
+                              << " protocol=HTTP-MPEGTS"
+                              << " reason=no-input-6s action=schedule-source-only-reconnect"
+                              << " jitter_ms=" << softJitter.count()
+                              << " full_rebuild_after_ms="
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     kNetworkNoInputRebuildDelay).count()
+                              << std::endl;
+                }
             }
 
             const auto inputFailoverDelay = hlsInput
@@ -10121,7 +10162,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 const auto jitter = networkRecoveryJitterForStream(id);
                 networkRecoveryDue = now + jitter;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
+                std::cerr << (srtInput ? "NETWORK RECOVERY 202.64: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
                           << " protocol=" << protocolName
                           << " reason=no-input-"
                           << std::chrono::duration_cast<std::chrono::seconds>(inputFailoverDelay).count()
@@ -10329,7 +10370,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=gstreamer-error source="
                                   << (sourcePath ? sourcePath : "unknown")
@@ -10349,6 +10390,8 @@ void StreamManager::monitorBus(const std::string& id) {
                         " transport error - reconnecting: " + message;
                     state->active = true;
                     if (!networkRecoveryPending) {
+                        // For SRT make attempt #1 a full rebuild by skipping the
+                        // source-only branch above. HTTP still uses its fast path.
                         networkRecoveryPending = true;
                         networkRecoveryDue = now +
                             (networkRecoveryAttempts == 0
@@ -10403,16 +10446,18 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.64: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=EOS action=suppress-during-reconnect"
                                   << std::endl;
                         gst_message_unref(msg);
                         continue;
                     }
-                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
+                    std::cerr << (srtInput ? "NETWORK RECOVERY 202.64: stream=" : "NETWORK INPUT RECOVERY 202.55: stream=") << id
                               << " protocol=" << protocolName
-                              << " reason=EOS action=schedule-source-only-reconnect" << std::endl;
+                              << " reason=EOS action="
+                              << (srtInput ? "schedule-full-pipeline-rebuild" : "schedule-source-only-reconnect")
+                              << std::endl;
                     state->statusMessage = std::string(protocolName) + " EOS - reconnecting";
                     state->active = true;
                     if (!networkRecoveryPending) {

@@ -1091,6 +1091,10 @@ std::string HttpServer::listInterfaces() {
       const uint64_t sourceReconnectFailed = gstQueueMemory.get("source_reconnect_failed", Json::UInt64(0)).asUInt64();
       const uint64_t sourceReconnectInflight = gstQueueMemory.get("source_reconnect_inflight", Json::UInt64(0)).asUInt64();
       const uint64_t autoCbrRaises = gstQueueMemory.get("auto_cbr_raises", Json::UInt64(0)).asUInt64();
+      const std::string autoCbrLastStream = gstQueueMemory.get("auto_cbr_last_stream", "").asString();
+      const uint64_t autoCbrLastMeasuredBitrate = gstQueueMemory.get("auto_cbr_last_measured_bitrate", Json::UInt64(0)).asUInt64();
+      const uint64_t autoCbrLastOldTarget = gstQueueMemory.get("auto_cbr_last_old_target", Json::UInt64(0)).asUInt64();
+      const uint64_t autoCbrLastNewTarget = gstQueueMemory.get("auto_cbr_last_new_target", Json::UInt64(0)).asUInt64();
       const uint64_t autoCbrConfigSaves = gstQueueMemory.get("auto_cbr_config_saves", Json::UInt64(0)).asUInt64();
       const uint64_t autoCbrConfigSaveFailed = gstQueueMemory.get("auto_cbr_config_save_failed", Json::UInt64(0)).asUInt64();
       const uint64_t streamStoppingCount = gstQueueMemory.get("stream_stopping_count", Json::UInt64(0)).asUInt64();
@@ -1101,7 +1105,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.63: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.64: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1162,6 +1166,10 @@ std::string HttpServer::listInterfaces() {
                 << " source_reconnect_failed=" << sourceReconnectFailed
                 << " source_reconnect_inflight=" << sourceReconnectInflight
                 << " auto_cbr_raises=" << autoCbrRaises
+                << " auto_cbr_last_stream=" << (autoCbrLastStream.empty() ? "-" : autoCbrLastStream)
+                << " auto_cbr_last_measured_kbps=" << (autoCbrLastMeasuredBitrate / 1000ULL)
+                << " auto_cbr_last_old_target_kbps=" << (autoCbrLastOldTarget / 1000ULL)
+                << " auto_cbr_last_new_target_kbps=" << (autoCbrLastNewTarget / 1000ULL)
                 << " auto_cbr_config_saves=" << autoCbrConfigSaves
                 << " auto_cbr_config_save_failed=" << autoCbrConfigSaveFailed
                 << " stream_stopping=" << streamStoppingCount

@@ -167,7 +167,7 @@ void chk_sidtab(char *token, char *value, struct s_sidtab *sidtab)
 		return;
 	}
 	if(token[0] != '#')
-		{ fprintf(stderr, "Warning: keyword '%s' in sidtab section not recognized\n", token); }
+		{ /* Reduced oscam-mini build: excluded sidtab directives are intentionally silent. */ }
 }
 
 void init_free_sidtab(void)
