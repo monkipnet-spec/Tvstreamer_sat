@@ -1102,10 +1102,13 @@ std::string HttpServer::listInterfaces() {
       const uint64_t streamStartWaits = gstQueueMemory.get("stream_start_waits", Json::UInt64(0)).asUInt64();
       const uint64_t streamStartWaitTimeouts = gstQueueMemory.get("stream_start_wait_timeouts", Json::UInt64(0)).asUInt64();
       const uint64_t streamFinalizeTimeouts = gstQueueMemory.get("stream_finalize_timeouts", Json::UInt64(0)).asUInt64();
+      const uint64_t streamForcedRetires = gstQueueMemory.get("stream_forced_retires", Json::UInt64(0)).asUInt64();
+      const uint64_t hlsRebuilds = gstQueueMemory.get("hls_rebuilds", Json::UInt64(0)).asUInt64();
+      const uint64_t hlsRecoverySuppressed = gstQueueMemory.get("hls_recovery_suppressed", Json::UInt64(0)).asUInt64();
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.64: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.65: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1177,6 +1180,9 @@ std::string HttpServer::listInterfaces() {
                 << " stream_start_waits=" << streamStartWaits
                 << " stream_start_wait_timeouts=" << streamStartWaitTimeouts
                 << " stream_finalize_timeouts=" << streamFinalizeTimeouts
+                << " stream_forced_retires=" << streamForcedRetires
+                << " hls_rebuilds=" << hlsRebuilds
+                << " hls_recovery_suppressed=" << hlsRecoverySuppressed
                 << " threads=" << processThreads
                 << " fds=" << processFds
                 << std::endl;

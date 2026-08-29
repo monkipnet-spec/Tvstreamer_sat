@@ -185,6 +185,13 @@ struct StreamState {
     unsigned hlsRecoveryAttempts = 0;
     std::chrono::steady_clock::time_point hlsRecoveryDue =
         std::chrono::steady_clock::time_point::min();
+    // 202.65: after a successful HLS pipeline rebuild, give hlsdemux enough
+    // time to reload the playlist/segments before another ERROR/EOS/no-input
+    // is allowed to schedule a new rebuild. This prevents the 5-second rebuild
+    // storm seen on a temporarily unavailable HLS origin.
+    std::chrono::steady_clock::time_point hlsRecoveryGraceUntil =
+        std::chrono::steady_clock::time_point::min();
+    uint64_t hlsRecoverySuppressed = 0;
     // v200: overload recovery watchdog.  It uses raw TS byte/continuity counters
     // rather than CPU percentage, so it detects the actual damage caused by a
     // scheduling stall.  Recovery is armed while errors are occurring and is
@@ -294,7 +301,8 @@ private:
     bool waitForStreamTeardown(const std::string& id, std::chrono::milliseconds timeout, std::string* error = nullptr);
     bool teardownStreamState(std::unique_ptr<StreamState> statePtr, const std::string& id,
                              const StreamConfig& stoppedConfig, bool notifyManualStop);
-    void finishStreamTeardown(const std::string& id);
+    void finishStreamTeardown(const std::string& id, uint64_t teardownToken);
+    uint64_t reserveStreamTeardownLocked(const std::string& id);
     uint16_t allocateDvbServiceRelayPort(const std::string& streamId);
     void releaseDvbServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
@@ -326,11 +334,18 @@ private:
     // NULL, all sender/remap state is released and the pipeline GObject is
     // actually finalized. This closes the stop/start race exposed by 202.59.
     std::set<std::string> stoppingStreamIds;
+    // 202.65: teardown generations prevent a late completion from an old,
+    // force-retired stop worker from releasing the barrier of a newer stop.
+    std::map<std::string, uint64_t> stoppingStreamTokens;
+    uint64_t nextStreamTeardownToken = 0;
     std::set<std::string> startingStreamIds;
     std::condition_variable streamLifecycleCondition;
     std::atomic<uint64_t> streamStartWaitCount{0};
     std::atomic<uint64_t> streamStartWaitTimeoutCount{0};
     std::atomic<uint64_t> streamFinalizeTimeoutCount{0};
+    std::atomic<uint64_t> streamForcedRetireCount{0};
+    std::atomic<uint64_t> hlsRecoveryRebuildCount{0};
+    std::atomic<uint64_t> hlsRecoverySuppressedCount{0};
     std::map<std::string, std::unique_ptr<SharedDvbFrontendState>> sharedDvbFrontends;
     std::unique_ptr<MptsOutputManager> mptsOutputManager;
     // When the last consumer stops, frontend shutdown happens on the stop
