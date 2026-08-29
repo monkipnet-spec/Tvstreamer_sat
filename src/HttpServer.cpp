@@ -604,7 +604,19 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = listBackupFiles();
             } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
-                std::string stateBody = currentState();
+                // 202.68: server-side A/B probe for the /api/state allocation path.
+                // With TVS_STATE_API_DIAG_BYPASS=1 the remote browser may remain
+                // open and keep polling, but currentState() and its large JSON tree
+                // are not built. Streaming/media paths are untouched.
+                const char* stateBypassEnv = std::getenv("TVS_STATE_API_DIAG_BYPASS");
+                const bool stateBypass =
+                    stateBypassEnv && *stateBypassEnv && std::strcmp(stateBypassEnv, "0") != 0;
+                std::string stateBody;
+                if (stateBypass) {
+                    stateBody = R"({"diagnostic_state_bypass":true,"program_version":"202.68"})";
+                } else {
+                    stateBody = currentState();
+                }
                 httpStateRequestCount.fetch_add(1, std::memory_order_relaxed);
                 httpStateResponseBytes.fetch_add(
                     static_cast<uint64_t>(stateBody.size()), std::memory_order_relaxed);
@@ -1096,6 +1108,9 @@ std::string HttpServer::listInterfaces() {
       const uint64_t stateResponseBytes = httpStateResponseBytes.load(std::memory_order_relaxed);
       const uint64_t stateLastResponseBytes = httpStateLastResponseBytes.load(std::memory_order_relaxed);
       const uint64_t metricsRequests = httpMetricsRequestCount.load(std::memory_order_relaxed);
+      const char* stateBypassEnv = std::getenv("TVS_STATE_API_DIAG_BYPASS");
+      const bool stateBypassEnabled =
+          stateBypassEnv && *stateBypassEnv && std::strcmp(stateBypassEnv, "0") != 0;
       uint64_t stateWorkerCount = 0;
       {
         std::lock_guard<std::mutex> diagLock(httpDiagMutex);
@@ -1189,7 +1204,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.67: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.68: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1205,6 +1220,7 @@ std::string HttpServer::listInterfaces() {
                 << " http_state_last_kb=" << (static_cast<double>(stateLastResponseBytes) / 1024.0)
                 << " http_state_total_mb=" << (static_cast<double>(stateResponseBytes) / (1024.0 * 1024.0))
                 << " http_metrics_calls=" << metricsRequests
+                << " state_bypass=" << (stateBypassEnabled ? 1 : 0)
                 << " trim_enabled=" << (trimEnabled ? 1 : 0)
                 << " trim_result=" << trimResult
                 << " post_trim_rss_mb=" << (static_cast<double>(postTrimRssKb) / 1024.0)
