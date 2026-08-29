@@ -5940,6 +5940,12 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     uint64_t maxQueueBytes = 0;
     std::string maxQueueName;
     std::string maxStreamId;
+    uint64_t telemetryScratchUsedBytes = 0;
+    uint64_t telemetryScratchCapacityBytes = 0;
+    uint64_t telemetryScratchMaxCapacityBytes = 0;
+    uint64_t telemetryRemainderCapacityBytes = 0;
+    std::string telemetryScratchMaxName;
+    std::string telemetryScratchMaxStream;
 
     auto collectPipeline = [&](const std::string& streamId, GstElement* pipeline) {
         if (!pipeline || !GST_IS_BIN(pipeline)) return;
@@ -5984,12 +5990,42 @@ Json::Value StreamManager::queueMemorySnapshot() const {
         gst_iterator_free(iterator);
     };
 
+    auto collectScratch = [&](const std::string& streamId, const char* name,
+                              const std::vector<uint8_t>& scratch,
+                              const std::vector<uint8_t>& remainder) {
+        telemetryScratchUsedBytes += static_cast<uint64_t>(scratch.size());
+        telemetryScratchCapacityBytes += static_cast<uint64_t>(scratch.capacity());
+        telemetryRemainderCapacityBytes += static_cast<uint64_t>(remainder.capacity());
+        if (static_cast<uint64_t>(scratch.capacity()) > telemetryScratchMaxCapacityBytes) {
+            telemetryScratchMaxCapacityBytes = static_cast<uint64_t>(scratch.capacity());
+            telemetryScratchMaxName = name ? name : "scratch";
+            telemetryScratchMaxStream = streamId;
+        }
+    };
+
     std::lock_guard<std::mutex> lock(managerMutex);
     for (const auto& [id, statePtr] : streams) {
         if (!statePtr) continue;
         collectPipeline(id, statePtr->pipeline);
         for (const auto& output : statePtr->externalSrtOutputs) {
             if (output) collectPipeline(id, output->pipeline);
+        }
+
+        // 202.58: allocator diagnostics only. Read vector metadata under the
+        // same mutexes already used by the telemetry callbacks. No TS bytes are
+        // copied and no media-path settings are changed.
+        {
+            std::lock_guard<std::mutex> inputLock(statePtr->inputContinuityMutex);
+            collectScratch(id, "input", statePtr->inputTsScratch, statePtr->inputTsRemainder);
+        }
+        {
+            std::lock_guard<std::mutex> outputLock(statePtr->outputContinuityMutex);
+            collectScratch(id, "output", statePtr->outputTsScratch, statePtr->outputTsRemainder);
+        }
+        {
+            std::lock_guard<std::mutex> scramblingLock(statePtr->outputScramblingMutex);
+            collectScratch(id, "scrambling", statePtr->outputScramblingScratch,
+                           statePtr->outputScramblingRemainder);
         }
     }
     for (const auto& [key, shared] : sharedDvbFrontends) {
@@ -6001,6 +6037,12 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["max_queue_bytes"] = Json::UInt64(maxQueueBytes);
     result["max_queue_name"] = maxQueueName;
     result["max_stream_id"] = maxStreamId;
+    result["telemetry_scratch_used_bytes"] = Json::UInt64(telemetryScratchUsedBytes);
+    result["telemetry_scratch_capacity_bytes"] = Json::UInt64(telemetryScratchCapacityBytes);
+    result["telemetry_scratch_max_capacity_bytes"] = Json::UInt64(telemetryScratchMaxCapacityBytes);
+    result["telemetry_remainder_capacity_bytes"] = Json::UInt64(telemetryRemainderCapacityBytes);
+    result["telemetry_scratch_max_name"] = telemetryScratchMaxName;
+    result["telemetry_scratch_max_stream"] = telemetryScratchMaxStream;
     return result;
 }
 

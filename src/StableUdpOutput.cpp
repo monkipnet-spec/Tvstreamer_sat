@@ -79,6 +79,12 @@ constexpr uint64_t kMaximumTransportBitrate = 200000000ULL;
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
 
+// 202.58 diagnostic-only registry. It is sampled once per minute by
+// MEMORY DIAG and never participates in media pacing or queue decisions.
+class StableUdpSender;
+std::mutex gStableUdpRegistryMutex;
+std::vector<StableUdpSender*> gStableUdpSenders;
+
 enum class UdpShapingMode {
     Cbr,
     Vbr
@@ -847,9 +853,24 @@ public:
             closeSocket();
             return;
         }
+
+        {
+            std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
+            gStableUdpSenders.push_back(this);
+            diagnosticRegistryRegistered = true;
+        }
     }
 
     ~StableUdpSender() {
+        if (diagnosticRegistryRegistered) {
+            std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
+            const auto it = std::find(gStableUdpSenders.begin(), gStableUdpSenders.end(), this);
+            if (it != gStableUdpSenders.end()) {
+                gStableUdpSenders.erase(it);
+            }
+            diagnosticRegistryRegistered = false;
+        }
+
         stopping.store(true, std::memory_order_relaxed);
         queueReady.notify_all();
         queueSpace.notify_all();
@@ -985,10 +1006,16 @@ public:
                 chunk.bytes.assign(map.data + directReleaseOffset, map.data + map.size);
             } else {
                 caCleanStartDroppedBytes += map.size;
+                cleanStartCapacityObserved.store(
+                    static_cast<uint64_t>(caCleanStartCandidate.capacity()),
+                    std::memory_order_relaxed);
                 gst_buffer_unmap(buffer, &map);
                 return GST_FLOW_OK;
             }
 
+            cleanStartCapacityObserved.store(
+                static_cast<uint64_t>(caCleanStartCandidate.capacity()),
+                std::memory_order_relaxed);
             caCleanStartReleased = true;
             cleanStartRelease = true;
             std::cerr << "UDP keyframe synchronized clean-start released: first_clear_pes_pid="
@@ -1062,6 +1089,46 @@ public:
         lock.unlock();
         queueReady.notify_one();
         return GST_FLOW_OK;
+    }
+
+    // 202.58: read-only allocator diagnostics. Called at most once per minute.
+    // Holding queueMutex here only protects the container metadata while it is
+    // sampled; no media data is copied and no queue behaviour is changed.
+    void accumulateMemoryStats(StableUdpOutput::MemoryStats& stats) {
+        uint64_t queuedPayload = 0;
+        uint64_t queuedCapacity = 0;
+        uint64_t queuedCount = 0;
+        uint64_t queuedMaxCapacity = 0;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            for (const auto& chunk : queuedChunks) {
+                queuedPayload += static_cast<uint64_t>(chunk.bytes.size());
+                queuedCapacity += static_cast<uint64_t>(chunk.bytes.capacity());
+                ++queuedCount;
+                queuedMaxCapacity = std::max<uint64_t>(
+                    queuedMaxCapacity, static_cast<uint64_t>(chunk.bytes.capacity()));
+            }
+        }
+
+        const uint64_t processingPayload =
+            processingChunkPayloadBytes.load(std::memory_order_relaxed);
+        const uint64_t processingCapacity =
+            processingChunkCapacityBytes.load(std::memory_order_relaxed);
+        const uint64_t processingCount =
+            processingChunkCount.load(std::memory_order_relaxed);
+        const uint64_t processingMaxCapacity =
+            processingChunkMaxCapacityBytes.load(std::memory_order_relaxed);
+
+        stats.queuedChunkPayloadBytes += queuedPayload + processingPayload;
+        stats.queuedChunkCapacityBytes += queuedCapacity + processingCapacity;
+        stats.queuedChunkCount += queuedCount + processingCount;
+        stats.queuedChunkMaxCapacityBytes = std::max<uint64_t>(
+            stats.queuedChunkMaxCapacityBytes,
+            std::max<uint64_t>(queuedMaxCapacity, processingMaxCapacity));
+        stats.inputRemainderCapacityBytes +=
+            inputRemainderCapacityObserved.load(std::memory_order_relaxed);
+        stats.cleanStartCapacityBytes +=
+            cleanStartCapacityObserved.load(std::memory_order_relaxed);
     }
 
 private:
@@ -1316,10 +1383,30 @@ private:
             }
         }
 
+        uint64_t processingPayload = 0;
+        uint64_t processingCapacity = 0;
+        uint64_t processingMaxCapacity = 0;
+        for (const auto& chunk : available) {
+            processingPayload += static_cast<uint64_t>(chunk.bytes.size());
+            processingCapacity += static_cast<uint64_t>(chunk.bytes.capacity());
+            processingMaxCapacity = std::max<uint64_t>(
+                processingMaxCapacity, static_cast<uint64_t>(chunk.bytes.capacity()));
+        }
+        processingChunkPayloadBytes.store(processingPayload, std::memory_order_relaxed);
+        processingChunkCapacityBytes.store(processingCapacity, std::memory_order_relaxed);
+        processingChunkCount.store(static_cast<uint64_t>(available.size()), std::memory_order_relaxed);
+        processingChunkMaxCapacityBytes.store(processingMaxCapacity, std::memory_order_relaxed);
+
         while (!available.empty()) {
+            const uint64_t payload = static_cast<uint64_t>(available.front().bytes.size());
+            const uint64_t capacity = static_cast<uint64_t>(available.front().bytes.capacity());
             queueChunk(std::move(available.front()));
             available.pop_front();
+            processingChunkPayloadBytes.fetch_sub(payload, std::memory_order_relaxed);
+            processingChunkCapacityBytes.fetch_sub(capacity, std::memory_order_relaxed);
+            processingChunkCount.fetch_sub(1, std::memory_order_relaxed);
         }
+        processingChunkMaxCapacityBytes.store(0, std::memory_order_relaxed);
     }
 
     void ensureRealPacketCapacity(std::size_t additionalPackets = 1) {
@@ -1443,6 +1530,9 @@ private:
                 queueSpace.notify_all();
             }
         }
+        inputRemainderCapacityObserved.store(
+            static_cast<uint64_t>(inputRemainder.capacity()),
+            std::memory_order_relaxed);
     }
 
     void observeHlsTimestampRate(const TimedChunk& chunk) {
@@ -2486,9 +2576,16 @@ private:
     std::condition_variable queueReady;
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
+    std::atomic<uint64_t> processingChunkPayloadBytes{0};
+    std::atomic<uint64_t> processingChunkCapacityBytes{0};
+    std::atomic<uint64_t> processingChunkCount{0};
+    std::atomic<uint64_t> processingChunkMaxCapacityBytes{0};
     boost::circular_buffer<TimedTsPacket> realPackets;
     bool memoryAccountingRegistered = false;
+    bool diagnosticRegistryRegistered = false;
     std::vector<guint8> inputRemainder;
+    std::atomic<uint64_t> inputRemainderCapacityObserved{0};
+    std::atomic<uint64_t> cleanStartCapacityObserved{0};
     uint64_t firstChunkArrivalNanoseconds = 0;
 
     uint64_t estimatedInputBitrate = 0;
@@ -2578,6 +2675,13 @@ MemoryStats memoryStats() {
     stats.packetRingCapacityBytes =
         gRealPacketRingCapacityBytes.load(std::memory_order_relaxed);
     stats.senderCount = gStableUdpSenderCount.load(std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
+    for (auto* sender : gStableUdpSenders) {
+        if (sender) {
+            sender->accumulateMemoryStats(stats);
+        }
+    }
     return stats;
 }
 

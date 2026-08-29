@@ -1102,8 +1102,20 @@ std::string HttpServer::listInterfaces() {
       const uint64_t gstQueueMaxBytes = gstQueueMemory.get("max_queue_bytes", Json::UInt64(0)).asUInt64();
       const std::string gstQueueMaxName = gstQueueMemory.get("max_queue_name", "").asString();
       const std::string gstQueueMaxStream = gstQueueMemory.get("max_stream_id", "").asString();
+      const uint64_t telemetryScratchUsedBytes =
+          gstQueueMemory.get("telemetry_scratch_used_bytes", Json::UInt64(0)).asUInt64();
+      const uint64_t telemetryScratchCapacityBytes =
+          gstQueueMemory.get("telemetry_scratch_capacity_bytes", Json::UInt64(0)).asUInt64();
+      const uint64_t telemetryScratchMaxCapacityBytes =
+          gstQueueMemory.get("telemetry_scratch_max_capacity_bytes", Json::UInt64(0)).asUInt64();
+      const uint64_t telemetryRemainderCapacityBytes =
+          gstQueueMemory.get("telemetry_remainder_capacity_bytes", Json::UInt64(0)).asUInt64();
+      const std::string telemetryScratchMaxName =
+          gstQueueMemory.get("telemetry_scratch_max_name", "").asString();
+      const std::string telemetryScratchMaxStream =
+          gstQueueMemory.get("telemetry_scratch_max_stream", "").asString();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.57: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.58: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1119,6 +1131,28 @@ std::string HttpServer::listInterfaces() {
                 << ":" << (gstQueueMaxName.empty() ? "-" : gstQueueMaxName)
                 << " stable_ring_cap_mb="
                 << (static_cast<double>(stableUdpMemory.packetRingCapacityBytes) / (1024.0 * 1024.0))
+                << " stable_chunk_mb="
+                << (static_cast<double>(stableUdpMemory.queuedChunkPayloadBytes) / (1024.0 * 1024.0))
+                << " stable_chunk_cap_mb="
+                << (static_cast<double>(stableUdpMemory.queuedChunkCapacityBytes) / (1024.0 * 1024.0))
+                << " stable_chunk_count=" << stableUdpMemory.queuedChunkCount
+                << " stable_chunk_max_mb="
+                << (static_cast<double>(stableUdpMemory.queuedChunkMaxCapacityBytes) / (1024.0 * 1024.0))
+                << " stable_remainder_cap_mb="
+                << (static_cast<double>(stableUdpMemory.inputRemainderCapacityBytes) / (1024.0 * 1024.0))
+                << " stable_cleanstart_cap_mb="
+                << (static_cast<double>(stableUdpMemory.cleanStartCapacityBytes) / (1024.0 * 1024.0))
+                << " telemetry_scratch_used_mb="
+                << (static_cast<double>(telemetryScratchUsedBytes) / (1024.0 * 1024.0))
+                << " telemetry_scratch_cap_mb="
+                << (static_cast<double>(telemetryScratchCapacityBytes) / (1024.0 * 1024.0))
+                << " telemetry_scratch_max_mb="
+                << (static_cast<double>(telemetryScratchMaxCapacityBytes) / (1024.0 * 1024.0))
+                << " telemetry_scratch_max="
+                << (telemetryScratchMaxStream.empty() ? "-" : telemetryScratchMaxStream)
+                << ":" << (telemetryScratchMaxName.empty() ? "-" : telemetryScratchMaxName)
+                << " telemetry_remainder_cap_mb="
+                << (static_cast<double>(telemetryRemainderCapacityBytes) / (1024.0 * 1024.0))
                 << " stable_senders=" << stableUdpMemory.senderCount
                 << " threads=" << processThreads
                 << " fds=" << processFds
