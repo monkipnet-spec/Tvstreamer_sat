@@ -155,6 +155,12 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSrtStatsLog = std::chrono::steady_clock::now();
+    // 202.61: serialize source-only network recovery. After a fresh SRT start
+    // or a source-only reconnect, the 6-second detector must not immediately
+    // schedule another recovery while the transport is still starting.
+    std::atomic<bool> networkSourceReconnectInFlight{false};
+    std::chrono::steady_clock::time_point networkRecoveryGraceUntil =
+        std::chrono::steady_clock::time_point::min();
     // 202.44: live HLS transport errors/EOS are recoverable. Keep the monitor
     // thread alive and schedule a controlled pipeline rebuild instead of
     // marking the whole channel stopped on a transient segment/HTTP failure.
