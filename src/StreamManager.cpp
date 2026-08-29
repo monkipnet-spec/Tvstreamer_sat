@@ -88,6 +88,16 @@ constexpr auto kHlsRecoveryRetryDelay = std::chrono::seconds(5);
 // not mark the channel permanently stopped.
 constexpr auto kNetworkErrorRecoveryDelay = std::chrono::seconds(1);
 constexpr auto kNetworkRecoveryRetryDelay = std::chrono::seconds(5);
+// 202.63: automatic UDP-CBR protection. Three consecutive one-second windows
+// above the configured target are required before raising it. The new target
+// keeps 5% (at least 300 kbit/s) transport headroom and is rounded upward to
+// 100 kbit/s. Automatic adjustment is intentionally raise-only.
+constexpr auto kAutoCbrSampleInterval = std::chrono::seconds(1);
+constexpr auto kAutoCbrRaiseCooldown = std::chrono::seconds(10);
+constexpr unsigned kAutoCbrRequiredExcessSamples = 3;
+constexpr uint64_t kAutoCbrMinimumHeadroomBitrate = 300000ULL;
+constexpr uint64_t kAutoCbrRoundBitrate = 100000ULL;
+constexpr uint64_t kAutoCbrMaximumBitrate = 100000000ULL;
 
 // 202.59/202.60 lifecycle counters. Weak references count actual
 // GObject finalization, not just application-side unref calls, so a gap between
@@ -105,6 +115,11 @@ std::atomic<uint64_t> gSourceReconnectCompleted{0};
 std::atomic<uint64_t> gSourceReconnectSuppressed{0};
 std::atomic<uint64_t> gSourceReconnectTimeouts{0};
 std::atomic<uint64_t> gSourceReconnectFailed{0};
+// 202.63: persistent automatic CBR raises. These are diagnostic counters only;
+// the actual target lives in StreamConfig and StableUdpSender.
+std::atomic<uint64_t> gAutoCbrRaiseCount{0};
+std::atomic<uint64_t> gAutoCbrConfigSaveCount{0};
+std::atomic<uint64_t> gAutoCbrConfigSaveFailed{0};
 
 void onManagedPipelineFinalized(gpointer, GObject*) {
     gManagedPipelineFinalized.fetch_add(1, std::memory_order_relaxed);
@@ -6351,6 +6366,9 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["source_reconnect_timeouts"] = Json::UInt64(gSourceReconnectTimeouts.load(std::memory_order_relaxed));
     result["source_reconnect_failed"] = Json::UInt64(gSourceReconnectFailed.load(std::memory_order_relaxed));
     result["source_reconnect_inflight"] = Json::UInt64(sourceReconnectInflightCount);
+    result["auto_cbr_raises"] = Json::UInt64(gAutoCbrRaiseCount.load(std::memory_order_relaxed));
+    result["auto_cbr_config_saves"] = Json::UInt64(gAutoCbrConfigSaveCount.load(std::memory_order_relaxed));
+    result["auto_cbr_config_save_failed"] = Json::UInt64(gAutoCbrConfigSaveFailed.load(std::memory_order_relaxed));
     result["stream_stopping_count"] = Json::UInt64(stoppingStreamIds.size());
     result["stream_starting_count"] = Json::UInt64(startingStreamIds.size());
     result["stream_start_waits"] = Json::UInt64(streamStartWaitCount.load(std::memory_order_relaxed));
@@ -9212,6 +9230,152 @@ void StreamManager::attachBitrateProbes(StreamState* state) {
     gst_iterator_free(iterator);
 }
 
+bool StreamManager::applyAutoRaisedUdpCbr(
+    StreamState* state, uint64_t measuredBitrate, uint64_t newTargetBitrate) {
+    if (!state || state->config.id.empty() || newTargetBitrate <= state->config.targetBitrate) {
+        return false;
+    }
+
+    const uint64_t oldTarget = state->config.targetBitrate;
+    state->config.targetBitrate = newTargetBitrate;
+    state->runtimeConfig.targetBitrate = newTargetBitrate;
+
+    const std::size_t liveSenders = StableUdpOutput::raiseCbrTargetBitrate(
+        state->config.id, newTargetBitrate);
+
+    bool configFound = false;
+    bool saved = false;
+    {
+        std::lock_guard<std::mutex> configLock(autoCbrConfigMutex);
+        for (auto& configured : configManager.config.streams) {
+            if (configured.id == state->config.id) {
+                configured.targetBitrate = newTargetBitrate;
+                configFound = true;
+                break;
+            }
+        }
+        if (configFound) {
+            saved = configManager.save();
+        }
+    }
+
+    if (configFound) {
+        if (saved) {
+            gAutoCbrConfigSaveCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            gAutoCbrConfigSaveFailed.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        gAutoCbrConfigSaveFailed.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    gAutoCbrRaiseCount.fetch_add(1, std::memory_order_relaxed);
+    state->outputBitrate.store(newTargetBitrate, std::memory_order_relaxed);
+    std::cerr << "AUTO CBR 202.63: stream=" << state->config.id
+              << " measured_bitrate=" << measuredBitrate
+              << " old_target=" << oldTarget
+              << " new_target=" << newTargetBitrate
+              << " live_senders_updated=" << liveSenders
+              << " config_saved=" << (saved ? "yes" : "no")
+              << " policy=raise-only sustained_samples=" << kAutoCbrRequiredExcessSamples
+              << std::endl;
+    return true;
+}
+
+void StreamManager::maybeAutoRaiseUdpCbr(
+    StreamState* state, std::chrono::steady_clock::time_point now) {
+    if (!state) return;
+
+    const auto autoCbrOutputs = outputConfigs(state->config);
+    const bool hasUdpCbr = std::any_of(
+        autoCbrOutputs.begin(), autoCbrOutputs.end(),
+        [](const StreamConfig& output) { return udpCbrOutputEnabled(output); });
+    if (!hasUdpCbr || state->config.targetBitrate == 0) {
+        state->autoCbrExcessSamples = 0;
+        state->autoCbrPeakBitrate = 0;
+        return;
+    }
+
+    if (now - state->autoCbrLastSample < kAutoCbrSampleInterval) return;
+
+    const uint64_t inputBytesNow = state->inputBytes.load(std::memory_order_relaxed);
+    if (!state->autoCbrSampleInitialized) {
+        state->autoCbrSampleInitialized = true;
+        state->autoCbrLastInputBytes = inputBytesNow;
+        state->autoCbrLastSample = now;
+        return;
+    }
+
+    const auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - state->autoCbrLastSample).count();
+    if (elapsedUs <= 0) return;
+
+    const uint64_t inputDelta = inputBytesNow - state->autoCbrLastInputBytes;
+    state->autoCbrLastInputBytes = inputBytesNow;
+    state->autoCbrLastSample = now;
+
+    const uint64_t rawInputBitrate = static_cast<uint64_t>(
+        (static_cast<long double>(inputDelta) * 8.0L * 1000000.0L) /
+        static_cast<long double>(elapsedUs));
+    const uint64_t shaperInputBitrate = StableUdpOutput::maxInputBitrateEstimate(
+        state->config.id);
+    const auto autoCbrInputKind = tvs::stream_protocols::inputKind(state->runtimeConfig);
+    // Prefer the shaper's media-clock estimate when available. This avoids
+    // treating a fast HLS/HTTP segment download as a real TS bitrate jump.
+    // For segmented/progressive HTTP wait for that estimate instead of using
+    // raw socket delivery speed.
+    if (!state->config.transcodeEnabled && shaperInputBitrate == 0 &&
+        (autoCbrInputKind == tvs::stream_protocols::InputProtocolKind::Hls ||
+         autoCbrInputKind == tvs::stream_protocols::InputProtocolKind::Http)) {
+        state->autoCbrExcessSamples = 0;
+        state->autoCbrPeakBitrate = 0;
+        return;
+    }
+    uint64_t measuredBitrate = shaperInputBitrate > 0
+        ? shaperInputBitrate : rawInputBitrate;
+    if (state->config.transcodeEnabled) {
+        // External transcoding can hide the post-encoder byte stream from the
+        // normal input probe. Its mux requirement is deterministic and is the
+        // correct lower bound for the final StableUDP transport.
+        measuredBitrate = std::max<uint64_t>(
+            measuredBitrate, transcodeMuxBitrateForStats(state->config));
+    }
+
+    const uint64_t currentTarget = state->config.targetBitrate;
+    if (measuredBitrate <= currentTarget) {
+        state->autoCbrExcessSamples = 0;
+        state->autoCbrPeakBitrate = 0;
+        return;
+    }
+
+    ++state->autoCbrExcessSamples;
+    state->autoCbrPeakBitrate = std::max<uint64_t>(
+        state->autoCbrPeakBitrate, measuredBitrate);
+    if (state->autoCbrExcessSamples < kAutoCbrRequiredExcessSamples) return;
+    if (state->autoCbrLastRaise != std::chrono::steady_clock::time_point::min() &&
+        now - state->autoCbrLastRaise < kAutoCbrRaiseCooldown) {
+        return;
+    }
+
+    const uint64_t peak = state->autoCbrPeakBitrate;
+    const uint64_t headroom = std::max<uint64_t>(
+        kAutoCbrMinimumHeadroomBitrate, peak / 20ULL); // 5%
+    uint64_t desired = kAutoCbrMaximumBitrate;
+    if (peak < kAutoCbrMaximumBitrate &&
+        headroom <= kAutoCbrMaximumBitrate - peak) {
+        desired = peak + headroom;
+    }
+    desired = ((desired + kAutoCbrRoundBitrate - 1ULL) / kAutoCbrRoundBitrate) *
+        kAutoCbrRoundBitrate;
+    desired = std::min<uint64_t>(desired, kAutoCbrMaximumBitrate);
+
+    if (desired > currentTarget && applyAutoRaisedUdpCbr(state, peak, desired)) {
+        state->autoCbrLastRaise = now;
+    }
+    state->autoCbrExcessSamples = 0;
+    state->autoCbrPeakBitrate = 0;
+}
+
 void StreamManager::updateBitrateEstimates(StreamState* state) {
     if (!state) {
         return;
@@ -9356,6 +9520,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
         while (state->running.load()) {
             const auto now = std::chrono::steady_clock::now();
+            maybeAutoRaiseUdpCbr(state, now);
 
             if (!state->gstTranscoder->isRunning()) {
                 if (!state->usingBackup && !state->config.backupInputUri.empty()) {
@@ -9455,9 +9620,9 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.57: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.63: startup_wait_ms=15000"
                   << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
-                  << " source_auto_reconnect=on pipeline_recovery=source-only-first+jitter"
+                  << " source_poll_timeout_ms=1000 app_reconnect=source-only-first+jitter"
                   << " latency_ms=500 queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
         std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=6000 rebuild_ms=12000"
@@ -9479,6 +9644,7 @@ void StreamManager::monitorBus(const std::string& id) {
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
+        maybeAutoRaiseUdpCbr(state, now);
         // Use runtimeConfig here: after failover the configured primary protocol
         // may differ from the protocol that is actually feeding this pipeline.
         const auto activeInputKind = tvs::stream_protocols::inputKind(state->runtimeConfig);
@@ -9509,7 +9675,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
                 gSourceReconnectTimeouts.fetch_add(1, std::memory_order_relaxed);
-                std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-deadline-expired"
                           << " action=allow-full-rebuild" << std::endl;
@@ -9544,13 +9710,18 @@ void StreamManager::monitorBus(const std::string& id) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
                         networkRecoveryPending = false;
                         networkRecoveryDue = std::chrono::steady_clock::time_point::min();
-                        std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=duplicate-source-reconnect"
                                   << " action=suppress-inflight" << std::endl;
                         continue;
                     }
                     gSourceReconnectStarted.fetch_add(1, std::memory_order_relaxed);
+                    // 202.63: own the reconnect deadline before touching the SRT
+                    // element. Together with finite poll-timeout this prevents a
+                    // blocking source state transition from creating an unbounded
+                    // reconnect-inflight state.
+                    armSourceReconnectGrace(state, now);
                     if (restartContinuousNetworkSourceInPlace(state)) {
                         networkRecoveryPending = false;
                         networkRecoveryDue = std::chrono::steady_clock::time_point::min();
@@ -9567,8 +9738,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->lastInputActivity = now;
                         state->networkRecoveryGraceUntil =
                             std::chrono::steady_clock::time_point::min();
-                        armSourceReconnectGrace(state, now);
-                        std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                                   << " protocol=" << protocolName
                                   << " action=source-reconnect-started grace_ms="
                                   << sourceReconnectGraceForState(state).count()
@@ -9826,7 +9996,7 @@ void StreamManager::monitorBus(const std::string& id) {
                 gSourceReconnectCompleted.fetch_add(1, std::memory_order_relaxed);
                 state->networkSourceReconnectDeadline =
                     std::chrono::steady_clock::time_point::min();
-                std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " result=source-reconnect-media-restored"
                           << " action=normal-watchdog-resumed" << std::endl;
@@ -9892,7 +10062,7 @@ void StreamManager::monitorBus(const std::string& id) {
                     : state->networkRecoveryGraceUntil;
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     activeDeadline - now);
-                std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                           << " protocol=" << (srtInput ? "SRT" : "HTTP-MPEGTS")
                           << " reason=no-input-6s action=suppress-during-"
                           << (sourceReconnectInFlight ? "source-reconnect" : "startup-grace")
@@ -10159,7 +10329,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=gstreamer-error source="
                                   << (sourcePath ? sourcePath : "unknown")
@@ -10233,7 +10403,7 @@ void StreamManager::monitorBus(const std::string& id) {
                         state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
                     if (suppressRecovery) {
                         gSourceReconnectSuppressed.fetch_add(1, std::memory_order_relaxed);
-                        std::cerr << "NETWORK RECOVERY 202.62: stream=" << id
+                        std::cerr << "NETWORK RECOVERY 202.63: stream=" << id
                                   << " protocol=" << protocolName
                                   << " reason=EOS action=suppress-during-reconnect"
                                   << std::endl;

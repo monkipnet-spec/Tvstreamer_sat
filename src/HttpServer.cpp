@@ -1090,6 +1090,9 @@ std::string HttpServer::listInterfaces() {
       const uint64_t sourceReconnectTimeouts = gstQueueMemory.get("source_reconnect_timeouts", Json::UInt64(0)).asUInt64();
       const uint64_t sourceReconnectFailed = gstQueueMemory.get("source_reconnect_failed", Json::UInt64(0)).asUInt64();
       const uint64_t sourceReconnectInflight = gstQueueMemory.get("source_reconnect_inflight", Json::UInt64(0)).asUInt64();
+      const uint64_t autoCbrRaises = gstQueueMemory.get("auto_cbr_raises", Json::UInt64(0)).asUInt64();
+      const uint64_t autoCbrConfigSaves = gstQueueMemory.get("auto_cbr_config_saves", Json::UInt64(0)).asUInt64();
+      const uint64_t autoCbrConfigSaveFailed = gstQueueMemory.get("auto_cbr_config_save_failed", Json::UInt64(0)).asUInt64();
       const uint64_t streamStoppingCount = gstQueueMemory.get("stream_stopping_count", Json::UInt64(0)).asUInt64();
       const uint64_t streamStartingCount = gstQueueMemory.get("stream_starting_count", Json::UInt64(0)).asUInt64();
       const uint64_t streamStartWaits = gstQueueMemory.get("stream_start_waits", Json::UInt64(0)).asUInt64();
@@ -1098,7 +1101,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.62: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.63: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1158,6 +1161,9 @@ std::string HttpServer::listInterfaces() {
                 << " source_reconnect_timeouts=" << sourceReconnectTimeouts
                 << " source_reconnect_failed=" << sourceReconnectFailed
                 << " source_reconnect_inflight=" << sourceReconnectInflight
+                << " auto_cbr_raises=" << autoCbrRaises
+                << " auto_cbr_config_saves=" << autoCbrConfigSaves
+                << " auto_cbr_config_save_failed=" << autoCbrConfigSaveFailed
                 << " stream_stopping=" << streamStoppingCount
                 << " stream_starting=" << streamStartingCount
                 << " stream_start_waits=" << streamStartWaits

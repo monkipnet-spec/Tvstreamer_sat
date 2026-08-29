@@ -3,6 +3,7 @@
 #include <gst/gst.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -24,6 +25,14 @@ struct MemoryStats {
 };
 
 MemoryStats memoryStats();
+
+// 202.63: raise the live target of every CBR StableUDP sender belonging to
+// a stream without rebuilding the pipeline. Returns the number of updated
+// sender instances; the caller persists the stream-level target separately.
+std::size_t raiseCbrTargetBitrate(const std::string& streamId, uint64_t bitrate);
+// Highest current media-rate estimate among StableUDP senders for this stream.
+// Unlike socket arrival bitrate, HLS uses its PTS/PCR-derived media clock here.
+uint64_t maxInputBitrateEstimate(const std::string& streamId);
 
 GstElement* createSink(
     GstElement* pipeline,

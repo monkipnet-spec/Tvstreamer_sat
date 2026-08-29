@@ -768,15 +768,15 @@ public:
         gStableUdpSenderCreated.fetch_add(1, std::memory_order_relaxed);
         memoryAccountingRegistered = true;
 
-        if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
+        if (mode == UdpShapingMode::Cbr && currentTargetBitrate() == 0) {
             error = "UDP CBR target_bitrate must be greater than zero";
             return;
         }
 
         const uint64_t initialTransportBitrate = mode == UdpShapingMode::Cbr
-            ? configuredTargetBitrate
+            ? currentTargetBitrate()
             : std::max<uint64_t>(kMinimumVbrTransportBitrate,
-                configuredTargetBitrate > 0 ? configuredTargetBitrate : 1000000ULL);
+                currentTargetBitrate() > 0 ? currentTargetBitrate() : 1000000ULL);
         if (initialTransportBitrate == 0 || initialTransportBitrate > kMaximumTransportBitrate) {
             error = "UDP transport bitrate is outside the supported range";
             return;
@@ -893,6 +893,39 @@ public:
 
     bool isReady() const {
         return ready;
+    }
+
+    uint64_t currentTargetBitrate() const {
+        return configuredTargetBitrate.load(std::memory_order_relaxed);
+    }
+
+    bool streamMatches(const std::string& id) const {
+        return streamId == id;
+    }
+
+    uint64_t inputBitrateEstimateValue() const {
+        return inputBitrateEstimate.load(std::memory_order_relaxed);
+    }
+
+    bool raiseCbrTargetBitrate(uint64_t bitrate) {
+        if (mode != UdpShapingMode::Cbr || bitrate == 0 || bitrate > kMaximumTransportBitrate) {
+            return false;
+        }
+        uint64_t current = currentTargetBitrate();
+        while (bitrate > current) {
+            if (configuredTargetBitrate.compare_exchange_weak(
+                    current, bitrate, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                transportBitrate.store(bitrate, std::memory_order_relaxed);
+                queueReady.notify_all();
+                std::cerr << "AUTO CBR 202.63: stream=" << streamId
+                          << " output=" << outputEndpoint
+                          << " old_bitrate=" << current
+                          << " new_bitrate=" << bitrate
+                          << " action=stableudp-live-update" << std::endl;
+                return true;
+            }
+        }
+        return false;
     }
 
     GstFlowReturn pushBuffer(GstBuffer* buffer) {
@@ -1202,7 +1235,7 @@ private:
             activeBitrate = std::clamp<uint64_t>(
                 activeBitrate, kMinimumVbrTransportBitrate, kMaximumTransportBitrate);
             if (mode == UdpShapingMode::Cbr) {
-                activeBitrate = configuredTargetBitrate;
+                activeBitrate = currentTargetBitrate();
             }
             if (scheduleBitrate != activeBitrate) {
                 scheduleBitrate = activeBitrate;
@@ -1338,7 +1371,7 @@ private:
                 // broadcaster's clock.
                 const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
                 estimatedInputBitrate = srtRemapCbrSourcePcr
-                    ? configuredTargetBitrate
+                    ? currentTargetBitrate()
                     : (segmentedHlsInput && hlsPtsRate > 0
                         ? hlsPtsRate
                         : (segmentedHlsInput && pcrDerivedInputBitrate > 0
@@ -1346,7 +1379,7 @@ private:
                             : arrivalRate));
                 if (estimatedInputBitrate == 0) {
                     estimatedInputBitrate = mode == UdpShapingMode::Cbr
-                        ? std::min<uint64_t>(configuredTargetBitrate, 1000000ULL)
+                        ? std::min<uint64_t>(currentTargetBitrate(), 1000000ULL)
                         : 1000000ULL;
                 }
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
@@ -1789,12 +1822,12 @@ private:
         // paths such as segmented HLS.
         if (srtRemapCbrSourcePcr ||
             (continuousNetworkMpegTsInput && !forceSyntheticPcr)) {
-            return configuredTargetBitrate;
+            return currentTargetBitrate();
         }
-        if (configuredTargetBitrate <= 100000ULL) {
-            return configuredTargetBitrate;
+        if (currentTargetBitrate() <= 100000ULL) {
+            return currentTargetBitrate();
         }
-        return configuredTargetBitrate - 100000ULL;
+        return currentTargetBitrate() - 100000ULL;
     }
 
     bool sourcePcrPassthrough() const {
@@ -1806,7 +1839,7 @@ private:
 
     void updateTransportBitrate() {
         if (mode == UdpShapingMode::Cbr) {
-            transportBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
+            transportBitrate.store(currentTargetBitrate(), std::memory_order_relaxed);
             return;
         }
 
@@ -1895,24 +1928,24 @@ private:
         // useful-packet entitlement while preserving mux PCR is exactly what
         // caused the periodic late freezes after longer playback.
         if (srtRemapCbrSourcePcr) {
-            estimatedInputBitrate = configuredTargetBitrate;
-            inputBitrateEstimate.store(configuredTargetBitrate, std::memory_order_relaxed);
-            currentRealPaceBitrate = configuredTargetBitrate;
-            realPaceBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
-            transportBitrate.store(configuredTargetBitrate, std::memory_order_relaxed);
+            estimatedInputBitrate = currentTargetBitrate();
+            inputBitrateEstimate.store(currentTargetBitrate(), std::memory_order_relaxed);
+            currentRealPaceBitrate = currentTargetBitrate();
+            realPaceBitrate.store(currentTargetBitrate(), std::memory_order_relaxed);
+            transportBitrate.store(currentTargetBitrate(), std::memory_order_relaxed);
 
             const uint64_t targetBytes = std::max<uint64_t>(
                 kUdpPayloadSize * 32ULL,
-                bytesForDuration(configuredTargetBitrate, kTargetReservoirNanoseconds));
+                bytesForDuration(currentTargetBitrate(), kTargetReservoirNanoseconds));
             targetReservoirBytes.store(targetBytes, std::memory_order_relaxed);
             reservoirMilliseconds.store(
                 multiplyDivide(bufferNow * 8ULL, 1000ULL,
-                               std::max<uint64_t>(1ULL, configuredTargetBitrate)),
+                               std::max<uint64_t>(1ULL, currentTargetBitrate())),
                 std::memory_order_relaxed);
 
             if (!srtPrePaddedCbrAnnounced) {
                 std::cerr << "SRT remap CBR sender 202.32: mode=1to1-prepadded-single-pacer"
-                          << " bitrate=" << configuredTargetBitrate
+                          << " bitrate=" << currentTargetBitrate()
                           << " reservoir_controller=off"
                           << " source_pcr=passthrough"
                           << " source_null=passthrough"
@@ -2428,7 +2461,7 @@ private:
                                                     : (continuousNetworkMpegTsInput
                                                           ? "http-mpegts" : "other")))
                   << " mode=" << shapingModeName(mode)
-                  << " configured_target=" << configuredTargetBitrate
+                  << " configured_target=" << currentTargetBitrate()
                   << " transport=" << transportBitrate.load(std::memory_order_relaxed)
                   << " real=" << realBitrate
                   << " input_est=" << inputBitrateEstimate.load(std::memory_order_relaxed)
@@ -2546,7 +2579,7 @@ private:
     int socketFd = -1;
     bool ready = false;
     UdpShapingMode mode = UdpShapingMode::Cbr;
-    uint64_t configuredTargetBitrate = 0;
+    std::atomic<uint64_t> configuredTargetBitrate{0};
     bool normalizeOutputContinuity = true;
     bool remapPsiNormalization = false;
     uint16_t remapOutputServiceId = 0;
@@ -2678,6 +2711,32 @@ void destroySender(gpointer data) {
 
 namespace StableUdpOutput {
 
+std::size_t raiseCbrTargetBitrate(const std::string& streamId, uint64_t bitrate) {
+    if (streamId.empty() || bitrate == 0) return 0;
+
+    std::size_t updated = 0;
+    std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
+    for (auto* sender : gStableUdpSenders) {
+        if (sender && sender->streamMatches(streamId) && sender->raiseCbrTargetBitrate(bitrate)) {
+            ++updated;
+        }
+    }
+    return updated;
+}
+
+uint64_t maxInputBitrateEstimate(const std::string& streamId) {
+    if (streamId.empty()) return 0;
+
+    uint64_t maximum = 0;
+    std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
+    for (auto* sender : gStableUdpSenders) {
+        if (sender && sender->streamMatches(streamId)) {
+            maximum = std::max<uint64_t>(maximum, sender->inputBitrateEstimateValue());
+        }
+    }
+    return maximum;
+}
+
 MemoryStats memoryStats() {
     MemoryStats stats;
     stats.packetRingCapacityBytes =
@@ -2784,7 +2843,7 @@ GstElement* createSink(
     bool expectedWisiLog = false;
     if (gWisiCompatibilityLogged.compare_exchange_strong(
             expectedWisiLog, true, std::memory_order_acq_rel)) {
-        std::cerr << "WISI UDP compatibility 202.62: format=MPEG-TS-over-UDP"
+        std::cerr << "WISI UDP compatibility 202.63: format=MPEG-TS-over-UDP"
                   << " ts_packet_bytes=" << kTsPacketSize
                   << " packets_per_datagram=" << kTsPacketsPerDatagram
                   << " udp_payload_bytes=" << kUdpPayloadSize

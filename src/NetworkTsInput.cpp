@@ -21,6 +21,7 @@ constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 // TVStreamer5/main uses 500 ms SRT latency for this path.
 constexpr gint kSrtLatencyMs = 500;
+constexpr gint kSrtPollTimeoutMs = 1000;
 constexpr guint kNetworkQueueHardMaxBytes = 32U * 1024U * 1024U;
 constexpr guint kHlsQueueHardMaxBytes = 20U * 1024U * 1024U;
 
@@ -241,8 +242,14 @@ GstElement* buildSrt(
     const std::string uri = tvs::protocols::inputs::srtInputUri(cfg);
     g_object_set(src, "uri", uri.c_str(), nullptr);
     setBooleanPropertyIfPresent(src, "do-timestamp", TRUE);
+    const bool hasAutoReconnect = hasProperty(src, "auto-reconnect");
     setBooleanPropertyIfPresent(src, "auto-reconnect", TRUE);
     setIntPropertyIfPresent(src, "latency", kSrtLatencyMs);
+    // 202.63: older GStreamer SRT sources default poll-timeout to -1. A source
+    // stuck in an infinite libsrt poll can then block gst_element_set_state(NULL)
+    // and prevent the application recovery deadline from ever running. Keep the
+    // media latency at 500 ms, but bound the control-path poll to one second.
+    setIntPropertyIfPresent(src, "poll-timeout", kSrtPollTimeoutMs);
     setStringPropertyIfPresent(src, "localaddress", configuredInputInterfaceAddress(cfg));
 
     if (mode == "listener") {
@@ -261,9 +268,12 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.57: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.63: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
+              << " poll_timeout_ms=" << kSrtPollTimeoutMs
+              << " auto_reconnect_property=" << (hasAutoReconnect ? "yes" : "no")
+              << " app_reconnect=enabled"
               << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;

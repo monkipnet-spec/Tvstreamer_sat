@@ -155,6 +155,17 @@ struct StreamState {
     std::chrono::steady_clock::time_point lastInputActivity = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastPrimaryRetry = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point lastSrtStatsLog = std::chrono::steady_clock::now();
+    // 202.63: auto-CBR observes the incoming TS independently of the web/UI
+    // bitrate sampler. It only raises the configured CBR after several
+    // consecutive one-second windows above the current target; it never
+    // automatically lowers a user/configured target.
+    bool autoCbrSampleInitialized = false;
+    uint64_t autoCbrLastInputBytes = 0;
+    std::chrono::steady_clock::time_point autoCbrLastSample = std::chrono::steady_clock::now();
+    unsigned autoCbrExcessSamples = 0;
+    uint64_t autoCbrPeakBitrate = 0;
+    std::chrono::steady_clock::time_point autoCbrLastRaise =
+        std::chrono::steady_clock::time_point::min();
     // 202.61: serialize source-only network recovery. After a fresh SRT start
     // or a source-only reconnect, the 6-second detector must not immediately
     // schedule another recovery while the transport is still starting.
@@ -295,6 +306,8 @@ private:
     GstElement* createTranscodedUdpRelayPipeline(StreamState* state, std::string& error);
     void attachBitrateProbes(StreamState* state);
     void updateBitrateEstimates(StreamState* state);
+    void maybeAutoRaiseUdpCbr(StreamState* state, std::chrono::steady_clock::time_point now);
+    bool applyAutoRaisedUdpCbr(StreamState* state, uint64_t measuredBitrate, uint64_t newTargetBitrate);
     static GstPadProbeReturn inputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     static GstPadProbeReturn outputPadProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
@@ -335,6 +348,9 @@ private:
     std::map<int, HttpClientSession> httpClients;
     std::map<std::string, HttpClientSession> adHocSessions;
     mutable std::mutex managerMutex;
+    // Serialize automatic target updates/config writes coming from independent
+    // per-stream monitor threads.
+    std::mutex autoCbrConfigMutex;
     std::atomic<uint64_t> nextSessionId{0};
     static void onHttpClientFdRemoved(GstElement* sink, gint fd, gpointer userData);
 };
