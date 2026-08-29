@@ -80,6 +80,7 @@ std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
 std::atomic<uint64_t> gStableUdpSenderCreated{0};
 std::atomic<uint64_t> gStableUdpSenderDestroyed{0};
+std::atomic<bool> gWisiCompatibilityLogged{false};
 
 // 202.58 diagnostic-only registry. It is sampled once per minute by
 // MEMORY DIAG and never participates in media pacing or queue decisions.
@@ -1378,19 +1379,20 @@ private:
     }
 
     void moveAvailableChunks() {
-        std::deque<TimedChunk> available;
+        // 202.62: heaptrack showed millions of _Deque_base::_M_initialize_map
+        // allocations from constructing a temporary std::deque on every sender
+        // tick. Keep a second deque for the lifetime of the sender and swap the
+        // producer queue into it in O(1). This preserves packet ordering and all
+        // pacing/PCR behaviour while removing the hot-path deque constructor.
         {
             std::lock_guard<std::mutex> lock(queueMutex);
-            while (!queuedChunks.empty()) {
-                available.push_back(std::move(queuedChunks.front()));
-                queuedChunks.pop_front();
-            }
+            queuedChunks.swap(processingChunks);
         }
 
         uint64_t processingPayload = 0;
         uint64_t processingCapacity = 0;
         uint64_t processingMaxCapacity = 0;
-        for (const auto& chunk : available) {
+        for (const auto& chunk : processingChunks) {
             processingPayload += static_cast<uint64_t>(chunk.bytes.size());
             processingCapacity += static_cast<uint64_t>(chunk.bytes.capacity());
             processingMaxCapacity = std::max<uint64_t>(
@@ -1398,14 +1400,14 @@ private:
         }
         processingChunkPayloadBytes.store(processingPayload, std::memory_order_relaxed);
         processingChunkCapacityBytes.store(processingCapacity, std::memory_order_relaxed);
-        processingChunkCount.store(static_cast<uint64_t>(available.size()), std::memory_order_relaxed);
+        processingChunkCount.store(static_cast<uint64_t>(processingChunks.size()), std::memory_order_relaxed);
         processingChunkMaxCapacityBytes.store(processingMaxCapacity, std::memory_order_relaxed);
 
-        while (!available.empty()) {
-            const uint64_t payload = static_cast<uint64_t>(available.front().bytes.size());
-            const uint64_t capacity = static_cast<uint64_t>(available.front().bytes.capacity());
-            queueChunk(std::move(available.front()));
-            available.pop_front();
+        while (!processingChunks.empty()) {
+            const uint64_t payload = static_cast<uint64_t>(processingChunks.front().bytes.size());
+            const uint64_t capacity = static_cast<uint64_t>(processingChunks.front().bytes.capacity());
+            queueChunk(std::move(processingChunks.front()));
+            processingChunks.pop_front();
             processingChunkPayloadBytes.fetch_sub(payload, std::memory_order_relaxed);
             processingChunkCapacityBytes.fetch_sub(capacity, std::memory_order_relaxed);
             processingChunkCount.fetch_sub(1, std::memory_order_relaxed);
@@ -2580,6 +2582,8 @@ private:
     std::condition_variable queueReady;
     std::condition_variable queueSpace;
     std::deque<TimedChunk> queuedChunks;
+    // 202.62: persistent sender-side drain queue. Never reconstructed per tick.
+    std::deque<TimedChunk> processingChunks;
     std::atomic<uint64_t> processingChunkPayloadBytes{0};
     std::atomic<uint64_t> processingChunkCapacityBytes{0};
     std::atomic<uint64_t> processingChunkCount{0};
@@ -2777,6 +2781,20 @@ GstElement* createSink(
                   << " scope=srt+remap+cbr-only"
                   << std::endl;
     }
+    bool expectedWisiLog = false;
+    if (gWisiCompatibilityLogged.compare_exchange_strong(
+            expectedWisiLog, true, std::memory_order_acq_rel)) {
+        std::cerr << "WISI UDP compatibility 202.62: format=MPEG-TS-over-UDP"
+                  << " ts_packet_bytes=" << kTsPacketSize
+                  << " packets_per_datagram=" << kTsPacketsPerDatagram
+                  << " udp_payload_bytes=" << kUdpPayloadSize
+                  << " packetization=188x7"
+                  << " unicast=on multicast=on cbr=on vbr=on"
+                  << " null_pid=0x1fff pcr_interval_ms="
+                  << (kPeriodicPcrIntervalNanoseconds / 1000000ULL)
+                  << std::endl;
+    }
+
     std::cerr << "Unified UDP reservoir TS shaper: mode="
               << shapingModeName(mode)
               << " target_bitrate=" << (mode == UdpShapingMode::Cbr ? config.targetBitrate : 0)

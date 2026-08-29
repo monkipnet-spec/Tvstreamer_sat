@@ -159,7 +159,13 @@ struct StreamState {
     // or a source-only reconnect, the 6-second detector must not immediately
     // schedule another recovery while the transport is still starting.
     std::atomic<bool> networkSourceReconnectInFlight{false};
+    // Fresh-pipeline startup grace and source-reconnect grace are deliberately
+    // separate. 202.61 reused one deadline for both states; a later startup/
+    // rebuild arm could leave a source reconnect reported as permanently
+    // in-flight. The reconnect deadline is owned only by source-only recovery.
     std::chrono::steady_clock::time_point networkRecoveryGraceUntil =
+        std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point networkSourceReconnectDeadline =
         std::chrono::steady_clock::time_point::min();
     // 202.44: live HLS transport errors/EOS are recoverable. Keep the monitor
     // thread alive and schedule a controlled pipeline rebuild instead of

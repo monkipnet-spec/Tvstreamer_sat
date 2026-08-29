@@ -1098,7 +1098,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.61: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.62: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
