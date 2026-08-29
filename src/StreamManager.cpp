@@ -84,6 +84,25 @@ constexpr auto kHlsRecoveryRetryDelay = std::chrono::seconds(5);
 // not mark the channel permanently stopped.
 constexpr auto kNetworkErrorRecoveryDelay = std::chrono::seconds(1);
 constexpr auto kNetworkRecoveryRetryDelay = std::chrono::seconds(5);
+
+// 202.59 diagnostic-only lifecycle counters. Weak references count actual
+// GObject finalization, not just application-side unref calls, so a gap between
+// created/finalized exposes pipelines that remain retained after a restart.
+std::atomic<uint64_t> gManagedPipelineCreated{0};
+std::atomic<uint64_t> gManagedPipelineFinalized{0};
+std::atomic<uint64_t> gSourceOnlyRestartAttempts{0};
+std::atomic<uint64_t> gFullPipelineRestartAttempts{0};
+
+void onManagedPipelineFinalized(gpointer, GObject*) {
+    gManagedPipelineFinalized.fetch_add(1, std::memory_order_relaxed);
+}
+
+GstElement* trackManagedPipeline(GstElement* pipeline) {
+    if (!pipeline) return nullptr;
+    gManagedPipelineCreated.fetch_add(1, std::memory_order_relaxed);
+    g_object_weak_ref(G_OBJECT(pipeline), onManagedPipelineFinalized, nullptr);
+    return pipeline;
+}
 // 202.33: SRT caller/listener startup can legitimately take longer than the
 // generic live-input watchdog, especially when remap has to discover the
 // program and build dynamic pads before media counters start moving.  Give a
@@ -4254,6 +4273,7 @@ bool restartContinuousNetworkSourceInPlace(StreamState* state) {
         return false;
     }
 
+    gSourceOnlyRestartAttempts.fetch_add(1, std::memory_order_relaxed);
     GstElement* source = gst_bin_get_by_name(GST_BIN(state->pipeline), "input_src");
     if (!source) {
         return false;
@@ -4492,7 +4512,7 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
     shared->consumerPids = initialConsumers;
     shared->requestedPids = frontendPids;
 
-    GstElement* pipeline = gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str());
+    GstElement* pipeline = trackManagedPipeline(gst_pipeline_new(("dvb_shared_" + std::to_string(params.adapter) + "_" + std::to_string(params.frontend)).c_str()));
     GstElement* source = gst_element_factory_make("dvbsrc", "shared_dvb_src");
     GstElement* queue = gst_element_factory_make("queue", "shared_dvb_queue");
     GstElement* sink = gst_element_factory_make("fakesink", "shared_dvb_dispatch_sink");
@@ -5101,7 +5121,7 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
         }
     }
 
-    GstElement* pipeline = gst_pipeline_new(nullptr);
+    GstElement* pipeline = trackManagedPipeline(gst_pipeline_new(nullptr));
     GstElement* src = gst_element_factory_make("udpsrc", nullptr);
     GstElement* inputQueue = gst_element_factory_make("queue", nullptr);
     GstElement* tsparse = gst_element_factory_make("tsparse", nullptr);
@@ -5267,7 +5287,7 @@ GstElement* StreamManager::createTranscodedUdpRelayPipeline(StreamState* state, 
     }
 
     const std::string fifoPath = tvs::protocols::transcodedFifoRelayPath(state->config);
-    GstElement* pipeline = gst_pipeline_new((state->config.id + "_transcoded_udp_relay").c_str());
+    GstElement* pipeline = trackManagedPipeline(gst_pipeline_new((state->config.id + "_transcoded_udp_relay").c_str()));
     GstElement* src = gst_element_factory_make("filesrc", "transcoded_udp_fifo_src");
     GstElement* queue = gst_element_factory_make("queue", "transcoded_udp_fifo_queue");
     if (!pipeline || !src || !queue ||
@@ -5944,11 +5964,15 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     uint64_t telemetryScratchCapacityBytes = 0;
     uint64_t telemetryScratchMaxCapacityBytes = 0;
     uint64_t telemetryRemainderCapacityBytes = 0;
+    uint64_t managedPipelineCount = 0;
+    uint64_t gstElementCount = 0;
+    uint64_t gstPadCount = 0;
     std::string telemetryScratchMaxName;
     std::string telemetryScratchMaxStream;
 
     auto collectPipeline = [&](const std::string& streamId, GstElement* pipeline) {
         if (!pipeline || !GST_IS_BIN(pipeline)) return;
+        ++managedPipelineCount;
 
         GstIterator* iterator = gst_bin_iterate_recurse(GST_BIN(pipeline));
         if (!iterator) return;
@@ -5959,6 +5983,31 @@ Json::Value StreamManager::queueMemorySnapshot() const {
             switch (gst_iterator_next(iterator, &value)) {
             case GST_ITERATOR_OK: {
                 GstElement* element = GST_ELEMENT(g_value_get_object(&value));
+                if (element) {
+                    ++gstElementCount;
+                    GstIterator* padIterator = gst_element_iterate_pads(element);
+                    if (padIterator) {
+                        GValue padValue = G_VALUE_INIT;
+                        bool padsDone = false;
+                        while (!padsDone) {
+                            switch (gst_iterator_next(padIterator, &padValue)) {
+                            case GST_ITERATOR_OK:
+                                ++gstPadCount;
+                                g_value_reset(&padValue);
+                                break;
+                            case GST_ITERATOR_RESYNC:
+                                gst_iterator_resync(padIterator);
+                                break;
+                            case GST_ITERATOR_ERROR:
+                            case GST_ITERATOR_DONE:
+                                padsDone = true;
+                                break;
+                            }
+                        }
+                        if (G_VALUE_TYPE(&padValue) != 0) g_value_unset(&padValue);
+                        gst_iterator_free(padIterator);
+                    }
+                }
                 if (element &&
                     g_object_class_find_property(G_OBJECT_GET_CLASS(element), "current-level-bytes")) {
                     guint bytes = 0;
@@ -6043,6 +6092,15 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["telemetry_remainder_capacity_bytes"] = Json::UInt64(telemetryRemainderCapacityBytes);
     result["telemetry_scratch_max_name"] = telemetryScratchMaxName;
     result["telemetry_scratch_max_stream"] = telemetryScratchMaxStream;
+    result["managed_pipeline_count"] = Json::UInt64(managedPipelineCount);
+    result["gst_element_count"] = Json::UInt64(gstElementCount);
+    result["gst_pad_count"] = Json::UInt64(gstPadCount);
+    result["pipeline_created"] = Json::UInt64(gManagedPipelineCreated.load(std::memory_order_relaxed));
+    result["pipeline_finalized"] = Json::UInt64(gManagedPipelineFinalized.load(std::memory_order_relaxed));
+    result["source_only_restarts"] = Json::UInt64(gSourceOnlyRestartAttempts.load(std::memory_order_relaxed));
+    result["full_pipeline_restarts"] = Json::UInt64(gFullPipelineRestartAttempts.load(std::memory_order_relaxed));
+    result["remap_created"] = Json::UInt64(RemapContext::createdCount.load(std::memory_order_relaxed));
+    result["remap_destroyed"] = Json::UInt64(RemapContext::destroyedCount.load(std::memory_order_relaxed));
     return result;
 }
 
@@ -6604,7 +6662,7 @@ bool StreamManager::probeInputAvailable(
     probeState.sourceContext = std::make_unique<RemapContext>();
     probeState.sourceContext->config = probeState.runtimeConfig;
 
-    GstElement* pipeline = gst_pipeline_new(nullptr);
+    GstElement* pipeline = trackManagedPipeline(gst_pipeline_new(nullptr));
     if (!pipeline) {
         return false;
     }
@@ -6672,6 +6730,7 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     if (!state || inputUri.empty()) {
         return false;
     }
+    gFullPipelineRestartAttempts.fetch_add(1, std::memory_order_relaxed);
 
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
@@ -6966,7 +7025,7 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
         return nullptr;
     }
     const StreamConfig& cfg = state->config;
-    GstElement* pipeline = gst_pipeline_new(cfg.id.c_str());
+    GstElement* pipeline = trackManagedPipeline(gst_pipeline_new(cfg.id.c_str()));
     if (!pipeline) {
         return nullptr;
     }

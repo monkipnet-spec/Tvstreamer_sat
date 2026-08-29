@@ -365,43 +365,6 @@ bool sameStreamConfig(const StreamConfig& left, const StreamConfig& right) {
     return left.toJson() == right.toJson();
 }
 
-std::vector<std::string> currentProcessArgs() {
-    std::vector<std::string> args;
-    std::ifstream input("/proc/self/cmdline", std::ios::binary);
-    std::string arg;
-    while (std::getline(input, arg, '\0')) {
-        args.push_back(arg);
-    }
-    if (args.empty()) {
-        args.push_back("TVStreammerSAT5");
-    }
-    return args;
-}
-
-void closeInheritedFileDescriptors() {
-    long maxFd = sysconf(_SC_OPEN_MAX);
-    if (maxFd < 0 || maxFd > 65536) {
-        maxFd = 65536;
-    }
-    for (int fd = 3; fd < maxFd; ++fd) {
-        close(fd);
-    }
-}
-
-[[noreturn]] void execCurrentProcess(const std::vector<std::string>& args) {
-    std::vector<std::string> argvStorage = args;
-    std::vector<char*> argv;
-    argv.reserve(argvStorage.size() + 1);
-    for (auto& arg : argvStorage) {
-        argv.push_back(arg.data());
-    }
-    argv.push_back(nullptr);
-
-    execv("/proc/self/exe", argv.data());
-    std::cerr << "Program restart failed: " << std::strerror(errno) << std::endl;
-    std::_Exit(1);
-}
-
 std::string streamLink(const StreamConfig& cfg, int httpPort) {
     const std::string type = normalizedOutputType(cfg);
     if (type == "rtp") {
@@ -1114,8 +1077,17 @@ std::string HttpServer::listInterfaces() {
           gstQueueMemory.get("telemetry_scratch_max_name", "").asString();
       const std::string telemetryScratchMaxStream =
           gstQueueMemory.get("telemetry_scratch_max_stream", "").asString();
+      const uint64_t managedPipelineCount = gstQueueMemory.get("managed_pipeline_count", Json::UInt64(0)).asUInt64();
+      const uint64_t gstElementCount = gstQueueMemory.get("gst_element_count", Json::UInt64(0)).asUInt64();
+      const uint64_t gstPadCount = gstQueueMemory.get("gst_pad_count", Json::UInt64(0)).asUInt64();
+      const uint64_t pipelineCreated = gstQueueMemory.get("pipeline_created", Json::UInt64(0)).asUInt64();
+      const uint64_t pipelineFinalized = gstQueueMemory.get("pipeline_finalized", Json::UInt64(0)).asUInt64();
+      const uint64_t sourceOnlyRestarts = gstQueueMemory.get("source_only_restarts", Json::UInt64(0)).asUInt64();
+      const uint64_t fullPipelineRestarts = gstQueueMemory.get("full_pipeline_restarts", Json::UInt64(0)).asUInt64();
+      const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
+      const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.58: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.59: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1154,6 +1126,21 @@ std::string HttpServer::listInterfaces() {
                 << " telemetry_remainder_cap_mb="
                 << (static_cast<double>(telemetryRemainderCapacityBytes) / (1024.0 * 1024.0))
                 << " stable_senders=" << stableUdpMemory.senderCount
+                << " stable_created=" << stableUdpMemory.senderCreated
+                << " stable_destroyed=" << stableUdpMemory.senderDestroyed
+                << " pipelines_live=" << managedPipelineCount
+                << " pipelines_created=" << pipelineCreated
+                << " pipelines_finalized=" << pipelineFinalized
+                << " pipelines_unaccounted="
+                << ((pipelineCreated >= pipelineFinalized + managedPipelineCount)
+                        ? pipelineCreated - pipelineFinalized - managedPipelineCount : 0)
+                << " gst_elements=" << gstElementCount
+                << " gst_pads=" << gstPadCount
+                << " remap_live=" << (remapCreated >= remapDestroyed ? remapCreated - remapDestroyed : 0)
+                << " remap_created=" << remapCreated
+                << " remap_destroyed=" << remapDestroyed
+                << " source_restarts=" << sourceOnlyRestarts
+                << " full_restarts=" << fullPipelineRestarts
                 << " threads=" << processThreads
                 << " fds=" << processFds
                 << std::endl;
@@ -2433,14 +2420,21 @@ std::string HttpServer::handleStopStream(const std::string& body) {
 }
 
 void HttpServer::handleRestartProgram() {
-    const auto args = currentProcessArgs();
     try {
-        std::thread([this, args]() {
+        std::thread([]() {
+            // Let the HTTP response leave the socket before systemd stops this
+            // process. --no-block is essential: a synchronous `systemctl restart`
+            // launched from the service can wait for the very process that is
+            // executing it. Queue the restart job and let PID 1 perform a full
+            // stop/start with a new process, new allocator and new GStreamer state.
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            std::cerr << "Restarting TVStreammerSAT5 process" << std::endl;
-            streamManager.stopAll();
-            closeInheritedFileDescriptors();
-            execCurrentProcess(args);
+            std::cerr << "PROGRAM RESTART 202.59: action=systemd-full-restart service=tvstreammersat5.service"
+                      << std::endl;
+            const int rc = std::system(
+                "/usr/bin/systemctl --no-block restart tvstreammersat5.service >/dev/null 2>&1");
+            if (rc != 0) {
+                std::cerr << "PROGRAM RESTART 202.59: systemctl failed rc=" << rc << std::endl;
+            }
         }).detach();
     } catch (const std::exception& ex) {
         std::cerr << "Restart worker thread creation failed: " << ex.what() << std::endl;
@@ -2896,7 +2890,7 @@ const translations = {
     subtitle:'Broadcast monitoring and stream control', total:'Total:', active:'Active:', network:'Network', system:'System', user:'User', addStream:'+ Add stream', addChannel:'+ Add channel',
     interfacesNotFound:'No interfaces found', output:'Output', activeInput:'Active input', primary:'Primary', backup:'Backup', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Status',
     online:'Online', backupOnline:'Backup', offline:'Offline', start:'Start', stop:'Stop', edit:'Edit', chart:'Chart', delete:'Delete stream', removeConfirm:'Delete stream',
-    restartProgram:'Restart', restartConfirm:'Restart TVStreammerSAT5 now?', restarting:'Restarting...',
+    restartProgram:'Full program restart', restartConfirm:'Fully restart TVStreammerSAT5 service now?', restarting:'Restarting service...',
     networkLoad:'Network interface load', interface:'Interface', incoming:'Incoming', outgoing:'Outgoing', close:'Close',
     about:'About', product:'Product', version:'Version', name:'Name', country:'Country', donate:'Donate', donateQr:'Donate QR code', donateWallet:'Telegram Wallet', cancel:'Cancel', save:'Save', userTitle:'User', telegram:'Telegram API', quality:'Stream quality', playlist:'VLC playlist', subscribers:'Subscribers', streams:'Streams', filtering:'Enable IP filtering', addSubscriber:'Add subscriber', primaryIp:'Primary IP', backupIp:'Backup IP', addedAt:'Added at', subscriberName:'Subscriber name', noSubscribers:'No subscribers added', noStreams:'No streams configured', enabled:'Enabled', disabled:'Disabled', exportSubscribers:'Export TXT', session:'Session', activeSession:'Online', offlineSession:'Offline', resetSession:'Reset'
   },
@@ -2904,7 +2898,7 @@ const translations = {
     subtitle:'Мониторинг трансляций и управление потоками', total:'Всего:', active:'Активно:', network:'Сеть', system:'Система', user:'Пользователь', addStream:'+ Добавить поток', addChannel:'+ Добавить канал',
     interfacesNotFound:'Интерфейсы не найдены', output:'Вывод', activeInput:'Активный вход', primary:'Основной', backup:'Резерв', sid:'SID', bitrateIn:'Bitrate In', bitrateOut:'Bitrate Out', status:'Статус',
     online:'Онлайн', backupOnline:'Резерв', offline:'Офлайн', start:'Старт', stop:'Стоп', edit:'Ред.', chart:'График', delete:'Удалить поток', removeConfirm:'Удалить поток',
-    restartProgram:'Перезапуск', restartConfirm:'Перезапустить TVStreammerSAT5 сейчас?', restarting:'Перезапуск...',
+    restartProgram:'Полный перезапуск программы', restartConfirm:'Полностью перезапустить TVStreammerSAT5 через systemd?', restarting:'Перезапуск программы...',
     networkLoad:'Загрузка сетевых интерфейсов', interface:'Интерфейс', incoming:'Входящий', outgoing:'Исходящий', close:'Закрыть',
     about:'О программе', product:'Программа', version:'Версия', name:'Имя', country:'Страна', donate:'Донат', donateQr:'QR-код доната', donateWallet:'Telegram-кошелёк', cancel:'Отмена', save:'Сохранить', userTitle:'Пользователь', telegram:'Telegram API', quality:'Качество потока', playlist:'Плейлист VLC', subscribers:'Абоненты', streams:'Потоки', filtering:'Включить фильтрацию по IP', addSubscriber:'Добавить абонента', primaryIp:'Основной IP', backupIp:'Резервный IP', addedAt:'Дата добавления', subscriberName:'Наименование абонента', noSubscribers:'Абоненты не добавлены', noStreams:'Потоки не настроены', enabled:'Включен', disabled:'Отключен', exportSubscribers:'Экспорт TXT', session:'Сессия', activeSession:'Онлайн', offlineSession:'Офлайн', resetSession:'Сбросить'
   }
@@ -3518,18 +3512,40 @@ function deleteStream(id) {
       uiError(error?.message || error);
     });
 }
-function restartProgram() {
+async function restartProgram() {
   if (!window.confirm(t('restartConfirm'))) return;
   const button = document.querySelector('.restart-button');
   if (button) {
     button.disabled = true;
     button.textContent = t('restarting');
   }
-  fetch('/api/restart-program', {method:'POST'})
-    .catch(()=>{})
-    .finally(()=>{
-      setTimeout(()=>window.location.reload(), 3500);
-    });
+  try {
+    await fetch('/api/restart-program', {method:'POST', cache:'no-store'});
+  } catch (_) {
+    // The old process may disappear while the response is in flight.
+  }
+
+  let sawOffline = false;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 900);
+      const response = await fetch('/health?restart=' + Date.now(), {
+        cache:'no-store', signal:controller.signal
+      });
+      clearTimeout(timeout);
+      if (response.ok && sawOffline) {
+        window.location.reload();
+        return;
+      }
+    } catch (_) {
+      sawOffline = true;
+    }
+  }
+  // Fallback for an extremely fast local restart where the polling interval
+  // never observed the short offline window.
+  window.location.reload();
 }
 function mptsConfigOnly(output) {
   return {

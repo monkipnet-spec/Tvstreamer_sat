@@ -78,6 +78,8 @@ constexpr uint64_t kMaximumTransportBitrate = 200000000ULL;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
+std::atomic<uint64_t> gStableUdpSenderCreated{0};
+std::atomic<uint64_t> gStableUdpSenderDestroyed{0};
 
 // 202.58 diagnostic-only registry. It is sampled once per minute by
 // MEMORY DIAG and never participates in media pacing or queue decisions.
@@ -762,6 +764,7 @@ public:
         gRealPacketRingCapacityBytes.fetch_add(
             realPackets.capacity() * sizeof(TimedTsPacket), std::memory_order_relaxed);
         gStableUdpSenderCount.fetch_add(1, std::memory_order_relaxed);
+        gStableUdpSenderCreated.fetch_add(1, std::memory_order_relaxed);
         memoryAccountingRegistered = true;
 
         if (mode == UdpShapingMode::Cbr && configuredTargetBitrate == 0) {
@@ -882,6 +885,7 @@ public:
             gRealPacketRingCapacityBytes.fetch_sub(
                 realPackets.capacity() * sizeof(TimedTsPacket), std::memory_order_relaxed);
             gStableUdpSenderCount.fetch_sub(1, std::memory_order_relaxed);
+            gStableUdpSenderDestroyed.fetch_add(1, std::memory_order_relaxed);
             memoryAccountingRegistered = false;
         }
     }
@@ -2675,6 +2679,8 @@ MemoryStats memoryStats() {
     stats.packetRingCapacityBytes =
         gRealPacketRingCapacityBytes.load(std::memory_order_relaxed);
     stats.senderCount = gStableUdpSenderCount.load(std::memory_order_relaxed);
+    stats.senderCreated = gStableUdpSenderCreated.load(std::memory_order_relaxed);
+    stats.senderDestroyed = gStableUdpSenderDestroyed.load(std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> registryLock(gStableUdpRegistryMutex);
     for (auto* sender : gStableUdpSenders) {

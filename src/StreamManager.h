@@ -24,6 +24,11 @@
 class MptsOutputManager;
 
 struct RemapContext {
+    inline static std::atomic<uint64_t> createdCount{0};
+    inline static std::atomic<uint64_t> destroyedCount{0};
+
+    RemapContext() { createdCount.fetch_add(1, std::memory_order_relaxed); }
+
     GstElement* mux = nullptr;
     GstElement* sink = nullptr;
     StreamConfig config;
@@ -47,6 +52,7 @@ struct RemapContext {
     std::string audioPadName;
 
     ~RemapContext() {
+        destroyedCount.fetch_add(1, std::memory_order_relaxed);
         if (hlsMuxSelectorPad) gst_object_unref(hlsMuxSelectorPad);
         if (hlsDirectSelectorPad) gst_object_unref(hlsDirectSelectorPad);
         if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);

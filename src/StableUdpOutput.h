@@ -19,6 +19,8 @@ struct MemoryStats {
     uint64_t queuedChunkMaxCapacityBytes = 0;
     uint64_t inputRemainderCapacityBytes = 0;
     uint64_t cleanStartCapacityBytes = 0;
+    uint64_t senderCreated = 0;
+    uint64_t senderDestroyed = 0;
 };
 
 MemoryStats memoryStats();
