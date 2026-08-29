@@ -1176,6 +1176,10 @@ std::string HttpServer::listInterfaces() {
       const uint64_t gstPadCount = gstQueueMemory.get("gst_pad_count", Json::UInt64(0)).asUInt64();
       const uint64_t pipelineCreated = gstQueueMemory.get("pipeline_created", Json::UInt64(0)).asUInt64();
       const uint64_t pipelineFinalized = gstQueueMemory.get("pipeline_finalized", Json::UInt64(0)).asUInt64();
+      const uint64_t sharedDvbBusDropped =
+          gstQueueMemory.get("shared_dvb_bus_dropped", Json::UInt64(0)).asUInt64();
+      const uint64_t externalSrtBusDropped =
+          gstQueueMemory.get("external_srt_bus_dropped", Json::UInt64(0)).asUInt64();
       const uint64_t sourceOnlyRestarts = gstQueueMemory.get("source_only_restarts", Json::UInt64(0)).asUInt64();
       const uint64_t fullPipelineRestarts = gstQueueMemory.get("full_pipeline_restarts", Json::UInt64(0)).asUInt64();
       const uint64_t sourceReconnectStarted = gstQueueMemory.get("source_reconnect_started", Json::UInt64(0)).asUInt64();
@@ -1204,7 +1208,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.68: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.69: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1267,6 +1271,8 @@ std::string HttpServer::listInterfaces() {
                 << " pipelines_live=" << managedPipelineCount
                 << " pipelines_created=" << pipelineCreated
                 << " pipelines_finalized=" << pipelineFinalized
+                << " shared_dvb_bus_dropped=" << sharedDvbBusDropped
+                << " external_srt_bus_dropped=" << externalSrtBusDropped
                 << " pipelines_unaccounted="
                 << ((pipelineCreated >= pipelineFinalized + managedPipelineCount)
                         ? pipelineCreated - pipelineFinalized - managedPipelineCount : 0)

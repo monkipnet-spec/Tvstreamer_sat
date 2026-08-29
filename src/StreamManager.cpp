@@ -116,6 +116,12 @@ constexpr uint64_t kAutoCbrMaximumBitrate = 100000000ULL;
 // created/finalized exposes pipelines that remain retained after a restart.
 std::atomic<uint64_t> gManagedPipelineCreated{0};
 std::atomic<uint64_t> gManagedPipelineFinalized{0};
+// 202.69: some long-lived auxiliary pipelines own a GstBus but have no bus
+// monitor. GstBus retains posted GstMessages until the application consumes
+// them. Count and synchronously drop messages on those deliberately
+// unmonitored buses so they cannot build an unbounded FIFO.
+std::atomic<uint64_t> gSharedDvbBusMessagesDropped{0};
+std::atomic<uint64_t> gExternalSrtBusMessagesDropped{0};
 std::atomic<uint64_t> gSourceOnlyRestartAttempts{0};
 std::atomic<uint64_t> gFullPipelineRestartAttempts{0};
 // 202.61: source-only recovery lifecycle. `source_only_restarts` is retained
@@ -153,6 +159,26 @@ GstElement* trackManagedPipeline(GstElement* pipeline) {
     gManagedPipelineCreated.fetch_add(1, std::memory_order_relaxed);
     g_object_weak_ref(G_OBJECT(pipeline), onManagedPipelineFinalized, nullptr);
     return pipeline;
+}
+
+GstBusSyncReply dropUnmonitoredBusMessage(
+    GstBus*, GstMessage* message, gpointer userData) {
+    auto* counter = static_cast<std::atomic<uint64_t>*>(userData);
+    if (counter) counter->fetch_add(1, std::memory_order_relaxed);
+    // GstBusSyncHandler owns the message when returning GST_BUS_DROP.
+    gst_message_unref(message);
+    return GST_BUS_DROP;
+}
+
+void installUnmonitoredBusDropHandler(
+    GstBus* bus, std::atomic<uint64_t>& droppedCounter) {
+    if (!bus) return;
+    // Flush messages accumulated during startup, then switch to a synchronous
+    // drop handler. This adds no monitor thread and does not touch media flow.
+    gst_bus_set_flushing(bus, TRUE);
+    gst_bus_set_sync_handler(
+        bus, dropUnmonitoredBusMessage, &droppedCounter, nullptr);
+    gst_bus_set_flushing(bus, FALSE);
 }
 
 // 202.66: gst_element_set_state(..., GST_STATE_NULL) itself can block before
@@ -5006,6 +5032,12 @@ bool StreamManager::acquireSharedDvbFrontend(StreamState* state, std::string& er
         return false;
     }
 
+    // 202.69: waitForGstStartup() consumes startup/error messages only. The
+    // shared DVB pipeline has no long-lived bus monitor after this point, so
+    // dvbsrc/state/statistics messages would otherwise remain queued forever.
+    installUnmonitoredBusDropHandler(
+        shared->bus, gSharedDvbBusMessagesDropped);
+
     shared->requestedPids = frontendPids;
     shared->fullTsCapture = true;
 
@@ -5548,6 +5580,11 @@ bool StreamManager::startExternalSrtOutputs(StreamState* state, std::string& err
             stopExternalSrtOutputs(state);
             return false;
         }
+
+        // 202.69: this auxiliary pipeline has no monitorExternalSrtBus
+        // implementation. Do not leave its GstBus as an unbounded message FIFO.
+        installUnmonitoredBusDropHandler(
+            output->bus, gExternalSrtBusMessagesDropped);
 
         state->externalSrtOutputs.push_back(std::move(output));
     }
@@ -6583,6 +6620,10 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["gst_pad_count"] = Json::UInt64(gstPadCount);
     result["pipeline_created"] = Json::UInt64(gManagedPipelineCreated.load(std::memory_order_relaxed));
     result["pipeline_finalized"] = Json::UInt64(gManagedPipelineFinalized.load(std::memory_order_relaxed));
+    result["shared_dvb_bus_dropped"] = Json::UInt64(
+        gSharedDvbBusMessagesDropped.load(std::memory_order_relaxed));
+    result["external_srt_bus_dropped"] = Json::UInt64(
+        gExternalSrtBusMessagesDropped.load(std::memory_order_relaxed));
     result["source_only_restarts"] = Json::UInt64(gSourceOnlyRestartAttempts.load(std::memory_order_relaxed));
     result["full_pipeline_restarts"] = Json::UInt64(gFullPipelineRestartAttempts.load(std::memory_order_relaxed));
     result["source_reconnect_started"] = Json::UInt64(gSourceReconnectStarted.load(std::memory_order_relaxed));
