@@ -1084,10 +1084,15 @@ std::string HttpServer::listInterfaces() {
       const uint64_t pipelineFinalized = gstQueueMemory.get("pipeline_finalized", Json::UInt64(0)).asUInt64();
       const uint64_t sourceOnlyRestarts = gstQueueMemory.get("source_only_restarts", Json::UInt64(0)).asUInt64();
       const uint64_t fullPipelineRestarts = gstQueueMemory.get("full_pipeline_restarts", Json::UInt64(0)).asUInt64();
+      const uint64_t streamStoppingCount = gstQueueMemory.get("stream_stopping_count", Json::UInt64(0)).asUInt64();
+      const uint64_t streamStartingCount = gstQueueMemory.get("stream_starting_count", Json::UInt64(0)).asUInt64();
+      const uint64_t streamStartWaits = gstQueueMemory.get("stream_start_waits", Json::UInt64(0)).asUInt64();
+      const uint64_t streamStartWaitTimeouts = gstQueueMemory.get("stream_start_wait_timeouts", Json::UInt64(0)).asUInt64();
+      const uint64_t streamFinalizeTimeouts = gstQueueMemory.get("stream_finalize_timeouts", Json::UInt64(0)).asUInt64();
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.59: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.60: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1141,6 +1146,11 @@ std::string HttpServer::listInterfaces() {
                 << " remap_destroyed=" << remapDestroyed
                 << " source_restarts=" << sourceOnlyRestarts
                 << " full_restarts=" << fullPipelineRestarts
+                << " stream_stopping=" << streamStoppingCount
+                << " stream_starting=" << streamStartingCount
+                << " stream_start_waits=" << streamStartWaits
+                << " stream_start_wait_timeouts=" << streamStartWaitTimeouts
+                << " stream_finalize_timeouts=" << streamFinalizeTimeouts
                 << " threads=" << processThreads
                 << " fds=" << processFds
                 << std::endl;
@@ -2428,12 +2438,12 @@ void HttpServer::handleRestartProgram() {
             // executing it. Queue the restart job and let PID 1 perform a full
             // stop/start with a new process, new allocator and new GStreamer state.
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            std::cerr << "PROGRAM RESTART 202.59: action=systemd-full-restart service=tvstreammersat5.service"
+            std::cerr << "PROGRAM RESTART 202.60: action=systemd-full-restart service=tvstreammersat5.service"
                       << std::endl;
             const int rc = std::system(
                 "/usr/bin/systemctl --no-block restart tvstreammersat5.service >/dev/null 2>&1");
             if (rc != 0) {
-                std::cerr << "PROGRAM RESTART 202.59: systemctl failed rc=" << rc << std::endl;
+                std::cerr << "PROGRAM RESTART 202.60: systemctl failed rc=" << rc << std::endl;
             }
         }).detach();
     } catch (const std::exception& ex) {

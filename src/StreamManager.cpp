@@ -85,7 +85,7 @@ constexpr auto kHlsRecoveryRetryDelay = std::chrono::seconds(5);
 constexpr auto kNetworkErrorRecoveryDelay = std::chrono::seconds(1);
 constexpr auto kNetworkRecoveryRetryDelay = std::chrono::seconds(5);
 
-// 202.59 diagnostic-only lifecycle counters. Weak references count actual
+// 202.59/202.60 lifecycle counters. Weak references count actual
 // GObject finalization, not just application-side unref calls, so a gap between
 // created/finalized exposes pipelines that remain retained after a restart.
 std::atomic<uint64_t> gManagedPipelineCreated{0};
@@ -102,6 +102,54 @@ GstElement* trackManagedPipeline(GstElement* pipeline) {
     gManagedPipelineCreated.fetch_add(1, std::memory_order_relaxed);
     g_object_weak_ref(G_OBJECT(pipeline), onManagedPipelineFinalized, nullptr);
     return pipeline;
+}
+
+// 202.60: application-side gst_object_unref() is not enough to prove that the
+// old pipeline has gone away. A child callback/pad/reference can keep the
+// GObject alive, which in turn keeps StableUdpSender and its thread/socket alive.
+// Attach a one-shot weak reference immediately before the final unref and wait
+// for the exact pipeline object to finalize before allowing the same stream id
+// to start again.
+struct PipelineFinalizeSignal {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool finalized = false;
+};
+
+void onPipelineFinalizeSignal(gpointer data, GObject*) {
+    auto* holder = static_cast<std::shared_ptr<PipelineFinalizeSignal>*>(data);
+    if (!holder) return;
+    const auto signal = *holder;
+    {
+        std::lock_guard<std::mutex> lock(signal->mutex);
+        signal->finalized = true;
+    }
+    signal->condition.notify_all();
+    delete holder;
+}
+
+bool releasePipelineAndWaitForFinalize(
+    GstElement*& pipeline, const std::string& streamId, std::chrono::milliseconds timeout) {
+    if (!pipeline) return true;
+
+    const auto signal = std::make_shared<PipelineFinalizeSignal>();
+    auto* callbackHolder = new std::shared_ptr<PipelineFinalizeSignal>(signal);
+    g_object_weak_ref(G_OBJECT(pipeline), onPipelineFinalizeSignal, callbackHolder);
+
+    GstElement* releasing = pipeline;
+    pipeline = nullptr;
+    gst_object_unref(releasing);
+
+    std::unique_lock<std::mutex> lock(signal->mutex);
+    const bool finalized = signal->condition.wait_for(lock, timeout, [&signal]() {
+        return signal->finalized;
+    });
+    if (!finalized) {
+        std::cerr << "STREAM TEARDOWN 202.60: stream=" << streamId
+                  << " result=pipeline-finalize-timeout timeout_ms=" << timeout.count()
+                  << " action=block-same-id-restart" << std::endl;
+    }
+    return finalized;
 }
 // 202.33: SRT caller/listener startup can legitimately take longer than the
 // generic live-input watchdog, especially when remap has to discover the
@@ -4263,6 +4311,34 @@ void stopPipelineAndWait(GstElement* pipeline, GstClockTime timeout = 2 * GST_SE
     }
 }
 
+void disconnectSignalHandlersByData(GstElement* pipeline, gpointer userData) {
+    if (!pipeline || !userData || !GST_IS_BIN(pipeline)) return;
+
+    GstIterator* iterator = gst_bin_iterate_recurse(GST_BIN(pipeline));
+    if (!iterator) return;
+    GValue value = G_VALUE_INIT;
+    bool done = false;
+    while (!done) {
+        switch (gst_iterator_next(iterator, &value)) {
+        case GST_ITERATOR_OK: {
+            GstElement* element = GST_ELEMENT(g_value_get_object(&value));
+            if (element) g_signal_handlers_disconnect_by_data(element, userData);
+            g_value_reset(&value);
+            break;
+        }
+        case GST_ITERATOR_RESYNC:
+            gst_iterator_resync(iterator);
+            break;
+        case GST_ITERATOR_ERROR:
+        case GST_ITERATOR_DONE:
+            done = true;
+            break;
+        }
+    }
+    if (G_VALUE_TYPE(&value) != 0) g_value_unset(&value);
+    gst_iterator_free(iterator);
+}
+
 // 202.55: restart only the long-lived SRT/HTTP source element while leaving the
 // downstream queue/remap/mux/StableUdpOutput pipeline running. This preserves
 // the UDP clock and reservoir, so a transient network reconnect no longer
@@ -5323,6 +5399,31 @@ GstElement* StreamManager::createTranscodedUdpRelayPipeline(StreamState* state, 
 bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* error) {
     if (error) error->clear();
 
+    // 202.60: stopStreamAsync removes the state from `streams` immediately, but
+    // its detached teardown can still own the old pipeline for several seconds.
+    // Never construct a replacement while that teardown is in progress.
+    if (!waitForStreamTeardown(streamConfig.id, std::chrono::seconds(20), error)) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        if (startingStreamIds.count(streamConfig.id)) {
+            if (error) *error = "stream start is already in progress: " + streamConfig.id;
+            return false;
+        }
+        startingStreamIds.insert(streamConfig.id);
+    }
+    auto startSlotGuard = std::unique_ptr<void, std::function<void(void*)>>(
+        reinterpret_cast<void*>(1),
+        [this, id = streamConfig.id](void*) {
+            {
+                std::lock_guard<std::mutex> lock(managerMutex);
+                startingStreamIds.erase(id);
+            }
+            streamLifecycleCondition.notify_all();
+        });
+
     // A stream can remain in the runtime table after its bus thread reports a
     // terminal ERROR/EOS: the UI correctly shows it as OFFLINE, but a later
     // Start used to fail with "stream is already active" simply because the
@@ -5724,16 +5825,141 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     return true;
 }
 
+bool StreamManager::waitForStreamTeardown(
+    const std::string& id, std::chrono::milliseconds timeout, std::string* error) {
+    std::unique_lock<std::mutex> lock(managerMutex);
+    if (!stoppingStreamIds.count(id)) {
+        return true;
+    }
+
+    streamStartWaitCount.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "STREAM START BARRIER 202.60: stream=" << id
+              << " action=wait-for-old-pipeline-finalize timeout_ms=" << timeout.count()
+              << std::endl;
+    const bool complete = streamLifecycleCondition.wait_for(lock, timeout, [this, &id]() {
+        return !stoppingStreamIds.count(id);
+    });
+    if (!complete) {
+        streamStartWaitTimeoutCount.fetch_add(1, std::memory_order_relaxed);
+        if (error) {
+            *error = "previous stream instance is still stopping; full program restart required: " + id;
+        }
+        std::cerr << "STREAM START BARRIER 202.60: stream=" << id
+                  << " result=timeout action=reject-duplicate-start" << std::endl;
+    } else {
+        std::cerr << "STREAM START BARRIER 202.60: stream=" << id
+                  << " result=old-instance-finalized action=start-allowed" << std::endl;
+    }
+    return complete;
+}
+
+void StreamManager::finishStreamTeardown(const std::string& id) {
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        stoppingStreamIds.erase(id);
+    }
+    streamLifecycleCondition.notify_all();
+}
+
+bool StreamManager::teardownStreamState(
+    std::unique_ptr<StreamState> statePtr,
+    const std::string& id,
+    const StreamConfig& stoppedConfig,
+    bool notifyManualStop) {
+    if (!statePtr) return true;
+    auto& state = *statePtr;
+
+    // Stop media first, then wait for the bus monitor to leave before releasing
+    // callback contexts and the last application reference to the pipeline.
+    if (state.pipeline) {
+        gst_element_set_state(state.pipeline, GST_STATE_NULL);
+    }
+    stopHttpMpegTsInput(&state);
+    releaseSharedDvbInput(&state);
+    stopExternalSrtOutputs(&state);
+    if (state.busThread.joinable()) {
+        state.busThread.join();
+    }
+    if (state.gstTranscoder) {
+        state.gstTranscoder->stop();
+        state.gstTranscoder.reset();
+    }
+    if (state.pipeline) {
+        stopPipelineAndWait(state.pipeline, 3 * GST_SECOND);
+    }
+
+    // These contexts own request-pad references and are used as signal callback
+    // user-data. Disconnect those handlers first, then release the pad/context
+    // references while the pipeline is NULL. This both avoids a dangling callback
+    // during object disposal and removes references that can delay finalization.
+    if (state.pipeline) {
+        if (state.sourceContext) {
+            disconnectSignalHandlersByData(state.pipeline, state.sourceContext.get());
+        }
+        for (const auto& context : state.outputContexts) {
+            if (context) disconnectSignalHandlersByData(state.pipeline, context.get());
+        }
+    }
+    state.outputContexts.clear();
+    state.sourceContext.reset();
+
+    if (state.bus) {
+        gst_bus_set_flushing(state.bus, TRUE);
+        gst_object_unref(state.bus);
+        state.bus = nullptr;
+    }
+
+    bool finalized = true;
+    if (state.pipeline) {
+        finalized = releasePipelineAndWaitForFinalize(
+            state.pipeline, id, std::chrono::seconds(10));
+        if (!finalized) {
+            streamFinalizeTimeoutCount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    trimReleasedPipelineMemory();
+    tvs::protocols::removeFifoRelay(stoppedConfig);
+    CardManager::instance().releaseService(id);
+
+    if (notifyManualStop) {
+        notifyStreamState(
+            stoppedConfig,
+            "stop",
+            "Stream stopped",
+            "Stopped manually");
+    } else {
+        std::cerr << "Inactive stream state cleaned: " << id << std::endl;
+    }
+
+    if (finalized) {
+        std::cerr << "STREAM TEARDOWN 202.60: stream=" << id
+                  << " result=finalized action=release-start-barrier" << std::endl;
+    }
+    return finalized;
+}
+
 bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualStop) {
     std::unique_ptr<StreamState> statePtr;
     StreamConfig stoppedConfig;
     {
-        std::lock_guard<std::mutex> lock(managerMutex);
+        std::unique_lock<std::mutex> lock(managerMutex);
         auto found = streams.find(id);
         if (found == streams.end()) {
+            // If an asynchronous stop already owns this id, synchronously join
+            // its lifecycle barrier instead of pretending that the stream is
+            // gone and immediately creating another pipeline.
+            if (stoppingStreamIds.count(id)) {
+                const bool complete = streamLifecycleCondition.wait_for(
+                    lock, std::chrono::seconds(20), [this, &id]() {
+                        return !stoppingStreamIds.count(id);
+                    });
+                return complete;
+            }
             return false;
         }
 
+        stoppingStreamIds.insert(id);
         statePtr = std::move(found->second);
         streams.erase(found);
         stoppedConfig = statePtr->config;
@@ -5757,47 +5983,18 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
         }
     }
 
-    auto& state = *statePtr;
-    if (state.pipeline) {
-        gst_element_set_state(state.pipeline, GST_STATE_NULL);
-    }
-    stopHttpMpegTsInput(&state);
-    // Release DVB immediately after shutdown starts; do not wait for output
-    // threads/transcoders before returning the adapter to the kernel.
-    releaseSharedDvbInput(&state);
-    stopExternalSrtOutputs(&state);
-    if (state.busThread.joinable()) {
-        state.busThread.join();
-    }
-    if (state.gstTranscoder) {
-        state.gstTranscoder->stop();
-        state.gstTranscoder.reset();
-    }
-    if (state.bus) {
-        gst_object_unref(state.bus);
-        state.bus = nullptr;
-    }
-    if (state.pipeline) {
-        gst_element_get_state(state.pipeline, nullptr, nullptr, GST_SECOND);
-        gst_object_unref(state.pipeline);
-        state.pipeline = nullptr;
-    }
-    state.outputContexts.clear();
-    state.sourceContext.reset();
-    trimReleasedPipelineMemory();
-    tvs::protocols::removeFifoRelay(stoppedConfig);
-    CardManager::instance().releaseService(id);
-
-    if (notifyManualStop) {
-        notifyStreamState(
-            stoppedConfig,
-            "stop",
-            "Stream stopped",
-            "Stopped manually");
+    const bool finalized = teardownStreamState(
+        std::move(statePtr), id, stoppedConfig, notifyManualStop);
+    if (finalized) {
+        finishStreamTeardown(id);
     } else {
-        std::cerr << "Inactive stream state cleaned: " << id << std::endl;
+        // Keep the id in stoppingStreamIds. A replacement pipeline would create
+        // exactly the duplicate sender/pipeline leak seen in 202.59. A full
+        // process restart is the safe recovery if finalization never completes.
+        std::cerr << "STREAM TEARDOWN 202.60: stream=" << id
+                  << " result=blocked action=full-program-restart-required" << std::endl;
     }
-    return true;
+    return finalized;
 }
 
 bool StreamManager::stopStream(const std::string& id) {
@@ -5811,9 +6008,11 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
         std::lock_guard<std::mutex> lock(managerMutex);
         auto found = streams.find(id);
         if (found == streams.end()) {
-            return false;
+            // Repeated Stop while teardown is running is idempotent.
+            return stoppingStreamIds.count(id) != 0;
         }
 
+        stoppingStreamIds.insert(id);
         statePtr = std::move(found->second);
         streams.erase(found);
         stoppedConfig = statePtr->config;
@@ -5837,42 +6036,32 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
         }
     }
 
-    std::thread([this, id, statePtr = std::move(statePtr), stoppedConfig]() mutable {
-        auto& state = *statePtr;
-        if (state.pipeline) {
-            gst_element_set_state(state.pipeline, GST_STATE_NULL);
+    // Keep ownership outside the thread constructor so a rare std::thread
+    // creation failure can still fall back to synchronous teardown without
+    // losing the StreamState to a moved lambda temporary.
+    auto asyncState = std::make_shared<std::unique_ptr<StreamState>>(std::move(statePtr));
+    try {
+        std::thread([this, id, asyncState, stoppedConfig]() mutable {
+            const bool finalized = teardownStreamState(
+                std::move(*asyncState), id, stoppedConfig, true);
+            if (finalized) {
+                finishStreamTeardown(id);
+            } else {
+                std::cerr << "STREAM TEARDOWN 202.60: stream=" << id
+                          << " result=blocked action=full-program-restart-required" << std::endl;
+            }
+        }).detach();
+    } catch (const std::exception& ex) {
+        std::cerr << "STREAM TEARDOWN 202.60: stream=" << id
+                  << " async-thread-error=" << ex.what()
+                  << " action=synchronous-cleanup" << std::endl;
+        const bool finalized = teardownStreamState(
+            std::move(*asyncState), id, stoppedConfig, true);
+        if (finalized) {
+            finishStreamTeardown(id);
         }
-        // Fast stop path: the adapter is released before the detached cleanup
-        // waits for the main bus thread, external outputs or transcoder.
-        releaseSharedDvbInput(&state);
-        stopExternalSrtOutputs(&state);
-        if (state.busThread.joinable()) {
-            state.busThread.join();
-        }
-        if (state.gstTranscoder) {
-            state.gstTranscoder->stop();
-            state.gstTranscoder.reset();
-        }
-        if (state.bus) {
-            gst_object_unref(state.bus);
-            state.bus = nullptr;
-        }
-        if (state.pipeline) {
-            gst_element_get_state(state.pipeline, nullptr, nullptr, GST_SECOND);
-            gst_object_unref(state.pipeline);
-            state.pipeline = nullptr;
-        }
-        state.outputContexts.clear();
-        state.sourceContext.reset();
-        trimReleasedPipelineMemory();
-        tvs::protocols::removeFifoRelay(stoppedConfig);
-        CardManager::instance().releaseService(id);
-        notifyStreamState(
-            stoppedConfig,
-            "stop",
-            "Stream stopped",
-            "Stopped manually");
-    }).detach();
+        return finalized;
+    }
     return true;
 }
 
@@ -5880,9 +6069,11 @@ bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string*
     if (error) error->clear();
     std::cerr << "Hard restarting stream: " << streamConfig.id << std::endl;
     const bool stopped = stopStream(streamConfig.id);
-    if (stopped) {
-        std::this_thread::sleep_for(kSrtRestartRetryDelay);
+    if (!stopped) {
+        if (error) *error = "old stream pipeline did not finalize: " + streamConfig.id;
+        return false;
     }
+    std::this_thread::sleep_for(kSrtRestartRetryDelay);
     return startStream(streamConfig, error);
 }
 
@@ -6099,6 +6290,11 @@ Json::Value StreamManager::queueMemorySnapshot() const {
     result["pipeline_finalized"] = Json::UInt64(gManagedPipelineFinalized.load(std::memory_order_relaxed));
     result["source_only_restarts"] = Json::UInt64(gSourceOnlyRestartAttempts.load(std::memory_order_relaxed));
     result["full_pipeline_restarts"] = Json::UInt64(gFullPipelineRestartAttempts.load(std::memory_order_relaxed));
+    result["stream_stopping_count"] = Json::UInt64(stoppingStreamIds.size());
+    result["stream_starting_count"] = Json::UInt64(startingStreamIds.size());
+    result["stream_start_waits"] = Json::UInt64(streamStartWaitCount.load(std::memory_order_relaxed));
+    result["stream_start_wait_timeouts"] = Json::UInt64(streamStartWaitTimeoutCount.load(std::memory_order_relaxed));
+    result["stream_finalize_timeouts"] = Json::UInt64(streamFinalizeTimeoutCount.load(std::memory_order_relaxed));
     result["remap_created"] = Json::UInt64(RemapContext::createdCount.load(std::memory_order_relaxed));
     result["remap_destroyed"] = Json::UInt64(RemapContext::destroyedCount.load(std::memory_order_relaxed));
     return result;

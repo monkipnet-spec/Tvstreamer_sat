@@ -268,6 +268,10 @@ private:
     bool startDvbServiceRelay(StreamState* state, std::string& error);
     void stopDvbServiceRelay(StreamState* state);
     bool cleanupStreamState(const std::string& id, bool notifyManualStop);
+    bool waitForStreamTeardown(const std::string& id, std::chrono::milliseconds timeout, std::string* error = nullptr);
+    bool teardownStreamState(std::unique_ptr<StreamState> statePtr, const std::string& id,
+                             const StreamConfig& stoppedConfig, bool notifyManualStop);
+    void finishStreamTeardown(const std::string& id);
     uint16_t allocateDvbServiceRelayPort(const std::string& streamId);
     void releaseDvbServiceRelayPort(uint16_t port);
     void notifyStreamState(const StreamConfig& cfg, const std::string& color, const std::string& title, const std::string& details);
@@ -292,6 +296,16 @@ private:
     ConfigManager& configManager;
     TelegramNotifier& telegramNotifier;
     std::map<std::string, std::unique_ptr<StreamState>> streams;
+    // 202.60: a stream removed from `streams` is not immediately safe to start
+    // again. Keep its id reserved until the old GStreamer pipeline has reached
+    // NULL, all sender/remap state is released and the pipeline GObject is
+    // actually finalized. This closes the stop/start race exposed by 202.59.
+    std::set<std::string> stoppingStreamIds;
+    std::set<std::string> startingStreamIds;
+    std::condition_variable streamLifecycleCondition;
+    std::atomic<uint64_t> streamStartWaitCount{0};
+    std::atomic<uint64_t> streamStartWaitTimeoutCount{0};
+    std::atomic<uint64_t> streamFinalizeTimeoutCount{0};
     std::map<std::string, std::unique_ptr<SharedDvbFrontendState>> sharedDvbFrontends;
     std::unique_ptr<MptsOutputManager> mptsOutputManager;
     // When the last consumer stops, frontend shutdown happens on the stop
