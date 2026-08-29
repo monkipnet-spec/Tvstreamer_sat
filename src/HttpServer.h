@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <functional>
 #include <unordered_map>
 
@@ -93,6 +94,15 @@ private:
     uint64_t previousCpuIdle = 0;
     std::chrono::steady_clock::time_point previousMetricsSample;
     std::chrono::steady_clock::time_point lastMemoryDiagLog;
+    // 202.67: read-only HTTP allocator diagnostics. These counters let MEMORY
+    // DIAG distinguish retained media objects from allocator high-water caused
+    // by repeatedly building/serializing the large /api/state response.
+    std::atomic<uint64_t> httpStateRequestCount{0};
+    std::atomic<uint64_t> httpStateResponseBytes{0};
+    std::atomic<uint64_t> httpStateLastResponseBytes{0};
+    std::atomic<uint64_t> httpMetricsRequestCount{0};
+    std::mutex httpDiagMutex;
+    std::set<std::thread::id> httpStateWorkerThreads;
     std::map<std::string, std::pair<uint64_t, uint64_t>> previousNetworkBytes;
     std::unordered_map<std::string, std::deque<QualitySample>> qualitySamples;
     std::unordered_map<std::string, int64_t> qualityLastCompaction;

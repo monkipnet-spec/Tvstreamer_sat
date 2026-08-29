@@ -593,6 +593,7 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = listInterfaces();
             } else if (target == "/api/system-metrics") {
               res.set(http::field::content_type, "application/json");
+              httpMetricsRequestCount.fetch_add(1, std::memory_order_relaxed);
               res.body() = systemMetrics();
             } else if (target == "/api/mpts/status") {
                 res.set(http::field::content_type, "application/json");
@@ -603,7 +604,17 @@ void HttpServer::handleSession(tcp::socket socket) {
                 res.body() = listBackupFiles();
             } else if (target == "/api/state") {
                 res.set(http::field::content_type, "application/json");
-                res.body() = currentState();
+                std::string stateBody = currentState();
+                httpStateRequestCount.fetch_add(1, std::memory_order_relaxed);
+                httpStateResponseBytes.fetch_add(
+                    static_cast<uint64_t>(stateBody.size()), std::memory_order_relaxed);
+                httpStateLastResponseBytes.store(
+                    static_cast<uint64_t>(stateBody.size()), std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> diagLock(httpDiagMutex);
+                    httpStateWorkerThreads.insert(std::this_thread::get_id());
+                }
+                res.body() = std::move(stateBody);
             } else if (target == "/api/dvb-adapters") {
                 res.set(http::field::content_type, "application/json");
                 res.body() = dvbAdapters();
@@ -993,9 +1004,22 @@ std::string HttpServer::listInterfaces() {
 #endif
 
     uint64_t qualitySampleCount = 0;
+    uint64_t qualitySampleObjectBytes = 0;
+    uint64_t qualityStringCapacityBytes = 0;
+    uint64_t qualityStreamKeyCapacityBytes = 0;
     {
       std::lock_guard<std::mutex> qualityLock(qualityMutex);
-      for (const auto& entry : qualitySamples) qualitySampleCount += entry.second.size();
+      for (const auto& entry : qualitySamples) {
+        qualitySampleCount += entry.second.size();
+        qualitySampleObjectBytes +=
+            static_cast<uint64_t>(entry.second.size()) * sizeof(QualitySample);
+        qualityStreamKeyCapacityBytes += static_cast<uint64_t>(entry.first.capacity() + 1);
+        for (const auto& sample : entry.second) {
+          qualityStringCapacityBytes += static_cast<uint64_t>(sample.status.capacity() + 1);
+          qualityStringCapacityBytes += static_cast<uint64_t>(sample.level.capacity() + 1);
+          qualityStringCapacityBytes += static_cast<uint64_t>(sample.message.capacity() + 1);
+        }
+      }
     }
 
     uint64_t mptsQueueBytes = 0;
@@ -1049,6 +1073,17 @@ std::string HttpServer::listInterfaces() {
     root["malloc_free_mb"] = static_cast<double>(mallocFreeBytes) / (1024.0 * 1024.0);
     root["malloc_mmap_mb"] = static_cast<double>(mallocMmapBytes) / (1024.0 * 1024.0);
     root["quality_samples"] = Json::UInt64(qualitySampleCount);
+    root["quality_live_mb"] = static_cast<double>(
+        qualitySampleObjectBytes + qualityStringCapacityBytes + qualityStreamKeyCapacityBytes) /
+        (1024.0 * 1024.0);
+    root["http_state_requests"] = Json::UInt64(
+        httpStateRequestCount.load(std::memory_order_relaxed));
+    root["http_state_last_kb"] = static_cast<double>(
+        httpStateLastResponseBytes.load(std::memory_order_relaxed)) / 1024.0;
+    root["http_state_total_mb"] = static_cast<double>(
+        httpStateResponseBytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0);
+    root["http_metrics_requests"] = Json::UInt64(
+        httpMetricsRequestCount.load(std::memory_order_relaxed));
     root["mpts_queue_mb"] = static_cast<double>(mptsQueueBytes) / (1024.0 * 1024.0);
     root["cgroup_pids_current"] = Json::UInt64(cgroupPidsCurrent);
     root["cgroup_pids_max"] = cgroupPidsMax;
@@ -1056,9 +1091,53 @@ std::string HttpServer::listInterfaces() {
     if (lastMemoryDiagLog.time_since_epoch().count() == 0 ||
         now - lastMemoryDiagLog >= std::chrono::seconds(60)) {
       lastMemoryDiagLog = now;
-      // 202.53: enumerate live GStreamer queue occupancy only once per minute.
-      // Doing this on every /api/system-metrics request would add avoidable
-      // pipeline locking to the media server hot path.
+      // 202.67: allocator/HTTP attribution. No media-path state is changed.
+      const uint64_t stateRequests = httpStateRequestCount.load(std::memory_order_relaxed);
+      const uint64_t stateResponseBytes = httpStateResponseBytes.load(std::memory_order_relaxed);
+      const uint64_t stateLastResponseBytes = httpStateLastResponseBytes.load(std::memory_order_relaxed);
+      const uint64_t metricsRequests = httpMetricsRequestCount.load(std::memory_order_relaxed);
+      uint64_t stateWorkerCount = 0;
+      {
+        std::lock_guard<std::mutex> diagLock(httpDiagMutex);
+        stateWorkerCount = static_cast<uint64_t>(httpStateWorkerThreads.size());
+      }
+
+      // Optional one-minute trim probe. Disabled by default because malloc_trim()
+      // is process-wide and can briefly contend with media allocator activity.
+      // Enable only for diagnosis with TVS_MEMORY_TRIM_DIAG=1.
+      bool trimEnabled = false;
+      int trimResult = -1;
+      uint64_t postTrimRssKb = processRssKb;
+      uint64_t postTrimAnonKb = processAnonKb;
+      uint64_t postTrimMallocArenaBytes = mallocArenaBytes;
+      uint64_t postTrimMallocInUseBytes = mallocInUseBytes;
+      uint64_t postTrimMallocFreeBytes = mallocFreeBytes;
+#if defined(__GLIBC__)
+      const char* trimEnv = std::getenv("TVS_MEMORY_TRIM_DIAG");
+      trimEnabled = trimEnv && *trimEnv && std::strcmp(trimEnv, "0") != 0;
+      if (trimEnabled) {
+        trimResult = malloc_trim(0);
+        const struct mallinfo2 postTrimInfo = mallinfo2();
+        postTrimMallocArenaBytes = static_cast<uint64_t>(postTrimInfo.arena);
+        postTrimMallocInUseBytes = static_cast<uint64_t>(postTrimInfo.uordblks);
+        postTrimMallocFreeBytes = static_cast<uint64_t>(postTrimInfo.fordblks);
+        std::ifstream postTrimStatus("/proc/self/status");
+        std::string postTrimLine;
+        while (std::getline(postTrimStatus, postTrimLine)) {
+          if (postTrimLine.rfind("VmRSS:", 0) == 0) {
+            std::istringstream value(postTrimLine.substr(6));
+            value >> postTrimRssKb;
+          } else if (postTrimLine.rfind("RssAnon:", 0) == 0) {
+            std::istringstream value(postTrimLine.substr(8));
+            value >> postTrimAnonKb;
+          }
+        }
+      }
+#endif
+
+      // Enumerate live GStreamer queue occupancy only once per minute. Doing
+      // this on every /api/system-metrics request would add avoidable pipeline
+      // locking to the media server hot path.
       const Json::Value gstQueueMemory = streamManager.queueMemorySnapshot();
       const uint64_t gstQueueBytes = gstQueueMemory.get("bytes", Json::UInt64(0)).asUInt64();
       const uint64_t gstQueueCount = gstQueueMemory.get("queue_count", Json::UInt64(0)).asUInt64();
@@ -1110,7 +1189,7 @@ std::string HttpServer::listInterfaces() {
       const uint64_t remapCreated = gstQueueMemory.get("remap_created", Json::UInt64(0)).asUInt64();
       const uint64_t remapDestroyed = gstQueueMemory.get("remap_destroyed", Json::UInt64(0)).asUInt64();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.66: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.67: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))
@@ -1118,6 +1197,24 @@ std::string HttpServer::listInterfaces() {
                 << " malloc_arena_mb=" << (static_cast<double>(mallocArenaBytes) / (1024.0 * 1024.0))
                 << " malloc_mmap_mb=" << (static_cast<double>(mallocMmapBytes) / (1024.0 * 1024.0))
                 << " quality_samples=" << qualitySampleCount
+                << " quality_live_mb="
+                << (static_cast<double>(qualitySampleObjectBytes + qualityStringCapacityBytes +
+                                        qualityStreamKeyCapacityBytes) / (1024.0 * 1024.0))
+                << " http_state_calls=" << stateRequests
+                << " http_state_workers=" << stateWorkerCount
+                << " http_state_last_kb=" << (static_cast<double>(stateLastResponseBytes) / 1024.0)
+                << " http_state_total_mb=" << (static_cast<double>(stateResponseBytes) / (1024.0 * 1024.0))
+                << " http_metrics_calls=" << metricsRequests
+                << " trim_enabled=" << (trimEnabled ? 1 : 0)
+                << " trim_result=" << trimResult
+                << " post_trim_rss_mb=" << (static_cast<double>(postTrimRssKb) / 1024.0)
+                << " post_trim_anon_mb=" << (static_cast<double>(postTrimAnonKb) / 1024.0)
+                << " post_trim_malloc_inuse_mb="
+                << (static_cast<double>(postTrimMallocInUseBytes) / (1024.0 * 1024.0))
+                << " post_trim_malloc_free_mb="
+                << (static_cast<double>(postTrimMallocFreeBytes) / (1024.0 * 1024.0))
+                << " post_trim_malloc_arena_mb="
+                << (static_cast<double>(postTrimMallocArenaBytes) / (1024.0 * 1024.0))
                 << " mpts_queue_mb=" << (static_cast<double>(mptsQueueBytes) / (1024.0 * 1024.0))
                 << " gst_queue_mb=" << (static_cast<double>(gstQueueBytes) / (1024.0 * 1024.0))
                 << " gst_queue_count=" << gstQueueCount
