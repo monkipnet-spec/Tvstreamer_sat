@@ -1103,7 +1103,7 @@ std::string HttpServer::listInterfaces() {
       const std::string gstQueueMaxName = gstQueueMemory.get("max_queue_name", "").asString();
       const std::string gstQueueMaxStream = gstQueueMemory.get("max_stream_id", "").asString();
       const auto stableUdpMemory = StableUdpOutput::memoryStats();
-      std::cerr << "MEMORY DIAG 202.56: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
+      std::cerr << "MEMORY DIAG 202.57: rss_mb=" << (static_cast<double>(processRssKb) / 1024.0)
                 << " anon_mb=" << (static_cast<double>(processAnonKb) / 1024.0)
                 << " data_mb=" << (static_cast<double>(processDataKb) / 1024.0)
                 << " malloc_inuse_mb=" << (static_cast<double>(mallocInUseBytes) / (1024.0 * 1024.0))

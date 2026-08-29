@@ -13,10 +13,14 @@
 
 namespace {
 
-constexpr guint64 kNetworkInputQueue = 8 * GST_SECOND;
+// 202.57: restore the proven TVStreamer5 SRT/HTTP input timing.  The
+// later 8-second SAT5 queue changed the dynamics of the original reservoir
+// controller and did not remove the freezes.
+constexpr guint64 kNetworkInputQueue = 3 * GST_SECOND;
 constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
-constexpr gint kSrtLatencyMs = 1000;
+// TVStreamer5/main uses 500 ms SRT latency for this path.
+constexpr gint kSrtLatencyMs = 500;
 constexpr guint kNetworkQueueHardMaxBytes = 32U * 1024U * 1024U;
 constexpr guint kHlsQueueHardMaxBytes = 20U * 1024U * 1024U;
 
@@ -257,10 +261,10 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.49: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.57: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
-              << " queue_ms=8000 queue_max_mb=32 leaky=off prebuffer=off"
+              << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;
 }
@@ -292,12 +296,9 @@ GstElement* buildHttp(
         nullptr);
     configureHttpCredentials(src, cfg);
     setBooleanPropertyIfPresent(src, "compress", FALSE);
-    // 202.45: progressive HTTP MPEG-TS is a long-lived transport, not a finite
-    // file download. Allow souphttpsrc to retry transient socket/HTTP failures
-    // internally; monitorBus still rebuilds the pipeline if data really stops.
-    setIntPropertyIfPresent(src, "retries", -1);
-    setDoublePropertyIfPresent(src, "retry-backoff-factor", 0.25);
-    setDoublePropertyIfPresent(src, "retry-backoff-max", 2.0);
+    // 202.57: TVStreamer5/main leaves souphttpsrc retry policy at its normal
+    // GStreamer setting.  Do not run a second infinite retry/backoff loop inside
+    // the source while StreamManager already owns reconnect/recovery policy.
 
     const std::string inputInterface = configuredInputInterfaceAddress(cfg);
     if (!inputInterface.empty()) {
@@ -311,10 +312,10 @@ GstElement* buildHttp(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.49: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
-              << " queue_ms=8000 queue_max_mb=32 leaky=off prebuffer=off"
+    std::cerr << "Network TS input 202.57: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
+              << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
               << " do_timestamp=on libcurl_appsrc=off input_pacing=off"
-              << " http_retries=infinite recovery=watchdog+error+eos"
+              << " http_retries=gstreamer-default recovery=watchdog+error+eos"
               << " access=" << (cfg.hlsAccessKeyMode.empty() ? "none" : cfg.hlsAccessKeyMode)
               << std::endl;
     return src;

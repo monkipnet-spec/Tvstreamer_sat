@@ -53,13 +53,12 @@ constexpr guint kTsPacketSize = 188;
 constexpr guint kTsPacketsPerUdpBuffer = 7;
 constexpr guint kCaBatchPackets = 77;
 constexpr guint64 kUdpQueueLatency = 10 * GST_SECOND;
-// 202.55: SRT/HTTP MPEG-TS already has an 8-second input jitter queue and
-// StableUdpOutput owns the real output reservoir/clock. A second 10-second
-// non-leaky queue in front of StableUdpOutput can turn a short downstream stall
-// into seconds of stale replay. Keep only a small live queue for these two
-// network inputs; all other input/output combinations retain the legacy limits.
-constexpr guint64 kNetworkStableUdpOutputQueueLatency = 750 * GST_MSECOND;
-constexpr guint kNetworkStableUdpOutputQueueBytes = 4U * 1024U * 1024U;
+// TVStreamer5/main timestamps UDP TS with tsparse and 300 ms smoothing before
+// the StableUdpOutput reservoir.  This is restored only for SRT/HTTP inputs.
+constexpr guint64 kTvStreamer5TsSmoothingLatency = 300 * GST_MSECOND;
+// 202.57: SRT/HTTP now follows TVStreamer5/main again. The normal UDP output
+// queue below remains 10 seconds and non-leaky; protocol-specific short/leaky
+// queueing is intentionally removed.
 constexpr guint64 kStableUdpAudioReservoir = 1500 * GST_MSECOND;
 constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
@@ -2972,12 +2971,11 @@ bool udpCbrOutputEnabled(const StreamConfig& cfg) {
 // the late freezes seen when StableUdpOutput independently re-spaced the
 // remuxed real packets while preserving the mux PCR.
 bool srtRemapUdpCbrPrePadded(const StreamConfig& cfg) {
-    return tvs::stream_protocols::inputKind(cfg) ==
-               tvs::stream_protocols::InputProtocolKind::Srt &&
-           cfg.remapEnabled &&
-           usesStableUdpShaper(cfg) &&
-           udpCbrOutputEnabled(cfg) &&
-           cfg.targetBitrate > 0;
+    // 202.57: TVStreamer5/main keeps mpegtsmux unpadded for Stable UDP and lets
+    // StableUdpOutput own NULL stuffing, periodic PCR and final packet pacing.
+    // The SAT5 SRT-remap pre-padding experiment is intentionally disabled.
+    (void)cfg;
+    return false;
 }
 
 bool cbrMuxEnabled(const StreamConfig& cfg) {
@@ -3909,30 +3907,13 @@ void configureOutputQueue(
     const StreamConfig& outputCfg,
     const StreamConfig* activeInputCfg = nullptr) {
     if (!queue) return;
+    (void)activeInputCfg;
 
-    // 202.55 is intentionally scoped to SRT/HTTP MPEG-TS feeding Stable UDP.
-    // HLS, DVB, UDP/RTP input, test pattern and non-UDP outputs keep their
-    // existing queue behaviour. Drop the oldest stale live TS if downstream
-    // scheduling is briefly delayed instead of backpressuring the network input.
-    if (usesStableUdpShaper(outputCfg) && activeInputCfg &&
-        isContinuousSrtOrHttpInput(*activeInputCfg)) {
-        configureQueue(queue, kNetworkStableUdpOutputQueueLatency);
-        g_object_set(queue,
-            "max-size-bytes", kNetworkStableUdpOutputQueueBytes,
-            "leaky", 2,  // GST_QUEUE_LEAK_DOWNSTREAM: drop oldest
-            nullptr);
-        std::cerr << "Network Stable UDP queue 202.55: input="
-                  << (tvs::stream_protocols::inputKind(*activeInputCfg) ==
-                          tvs::stream_protocols::InputProtocolKind::Srt
-                        ? "SRT" : "HTTP-MPEGTS")
-                  << " max_time_ms="
-                  << (kNetworkStableUdpOutputQueueLatency / GST_MSECOND)
-                  << " max_bytes=" << kNetworkStableUdpOutputQueueBytes
-                  << " leaky=drop-oldest" << std::endl;
-        return;
-    }
-
+    // 202.57: restore TVStreamer5/main semantics.  Stable UDP uses the normal
+    // 10-second non-leaky output queue; there is no 750 ms drop-oldest stage.
+    // Other output types retain the existing 3-second queue.
     configureQueue(queue, isUdpOutput(outputCfg) ? kUdpQueueLatency : 3000000000ULL);
+    setIntPropertyIfPresent(queue, "leaky", 0);
 }
 
 void configureTsPacketAlignment(GstElement* element) {
@@ -7654,7 +7635,12 @@ bool StreamManager::buildPassthroughPipeline(
     // Bitrate Out=0.  Feed the already-normalised MPEG-TS directly to the
     // reservoir for UDP; all source chains reaching this function expose TS,
     // and DVB/test chains are already packet-aligned upstream.
-    const bool directStableUdpTs = usesStableUdpShaper(cfg) && !hlsPacketRemap;
+    const bool tvStreamer5NetworkStableUdp = usesStableUdpShaper(cfg) &&
+        (sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt ||
+         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Http) &&
+        !hlsPacketRemap;
+    const bool directStableUdpTs = usesStableUdpShaper(cfg) && !hlsPacketRemap &&
+        !tvStreamer5NetworkStableUdp;
     GstElement* tsparse = directStableUdpTs
         ? nullptr
         : gst_element_factory_make("tsparse", branchName("tsparse", branchIndex).c_str());
@@ -7740,6 +7726,22 @@ bool StreamManager::buildPassthroughPipeline(
     }
 
     configureTsPacketAlignment(tsparse);
+    if (tvStreamer5NetworkStableUdp) {
+        // TVStreamer5/main direct UDP path: rebuild a stable running-time on
+        // the incoming transport before the reservoir.  This is intentionally
+        // limited to SRT/HTTP; DVB/HLS direct paths remain SAT5-specific.
+        setBooleanPropertyIfPresent(tsparse, "set-timestamps", TRUE);
+        setUInt64PropertyIfPresent(
+            tsparse, "smoothing-latency", kTvStreamer5TsSmoothingLatency);
+        std::cerr << "TVStreamer5 network TS path 202.57: input="
+                  << (sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt
+                        ? "SRT" : "HTTP-MPEGTS")
+                  << " tsparse=set-timestamps"
+                  << " smoothing_ms="
+                  << (kTvStreamer5TsSmoothingLatency / GST_MSECOND)
+                  << " output_queue_ms=10000 leaky=off"
+                  << std::endl;
+    }
     if (hlsPacketRemap) {
         // Alignment only: set-timestamps stays OFF. The provider PCR/PTS/DTS and
         // buffer timing are preserved; tsparse only guarantees complete 7x188 TS
@@ -9094,15 +9096,15 @@ void StreamManager::monitorBus(const std::string& id) {
 
     const auto configuredInputKind = tvs::stream_protocols::inputKind(state->config);
     if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Srt) {
-        std::cerr << "SRT input watchdog 202.55: startup_wait_ms=15000"
+        std::cerr << "SRT input watchdog 202.57: startup_wait_ms=15000"
                   << " loss_detect_ms=6000 rebuild_ms=12000 primary_probe_ms=15000"
                   << " source_auto_reconnect=on pipeline_recovery=source-only-first+jitter"
-                  << " latency_ms=1000 queue_ms=8000 queue_max_mb=32" << std::endl;
+                  << " latency_ms=500 queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
-        std::cerr << "HTTP MPEG-TS watchdog 202.55: loss_detect_ms=6000 rebuild_ms=12000"
-                  << " source_retries=infinite error_recovery=on eos_recovery=on"
+        std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=6000 rebuild_ms=12000"
+                  << " source_retries=gstreamer-default error_recovery=on eos_recovery=on"
                   << " pipeline_retry_ms=5000 recovery=source-only-first recovery_jitter_ms=0..2500"
-                  << " queue_ms=8000 queue_max_mb=32" << std::endl;
+                  << " queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
         std::cerr << "HLS input watchdog 202.44: loss_wait_ms=15000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
