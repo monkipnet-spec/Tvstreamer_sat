@@ -94,6 +94,13 @@ constexpr auto kHlsRecoveryMaxRetryDelay = std::chrono::seconds(60);
 // If it does not complete, keep the same-id barrier closed and let systemd
 // replace the process instead of creating a second pipeline generation.
 constexpr auto kPipelineNullTransitionTimeout = std::chrono::seconds(8);
+// 202.70: a normal asynchronous teardown may spend up to 8 s driving the
+// pipeline to NULL and another 10 s waiting for final GObject destruction.
+// The old 12 s start barrier could therefore restart the whole service while
+// the previous generation was still inside its own legitimate teardown budget.
+// Keep a small margin beyond the combined bounded phases; only a genuinely
+// stuck teardown should escalate to the systemd fallback.
+constexpr auto kStreamStartBarrierTimeout = std::chrono::seconds(22);
 constexpr auto kAutomaticServiceRestartDelay = std::chrono::milliseconds(500);
 // 202.45: SRT and progressive HTTP MPEG-TS are long-lived network transports.
 // A temporary socket failure/EOS must rebuild only the active input pipeline,
@@ -122,6 +129,10 @@ std::atomic<uint64_t> gManagedPipelineFinalized{0};
 // unmonitored buses so they cannot build an unbounded FIFO.
 std::atomic<uint64_t> gSharedDvbBusMessagesDropped{0};
 std::atomic<uint64_t> gExternalSrtBusMessagesDropped{0};
+// 202.70: count public HTTP relay connections explicitly disconnected when a
+// stream pipeline is rebuilt/stopped. Old detached relay threads otherwise can
+// remain blocked on an obsolete tcpserversink generation.
+std::atomic<uint64_t> gHttpRelayForcedDisconnects{0};
 std::atomic<uint64_t> gSourceOnlyRestartAttempts{0};
 std::atomic<uint64_t> gFullPipelineRestartAttempts{0};
 // 202.61: source-only recovery lifecycle. `source_only_restarts` is retained
@@ -5666,7 +5677,7 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     // 202.60: stopStreamAsync removes the state from `streams` immediately, but
     // its detached teardown can still own the old pipeline for several seconds.
     // Never construct a replacement while that teardown is in progress.
-    if (!waitForStreamTeardown(streamConfig.id, std::chrono::seconds(12), error)) {
+    if (!waitForStreamTeardown(streamConfig.id, kStreamStartBarrierTimeout, error)) {
         return false;
     }
 
@@ -6100,14 +6111,14 @@ bool StreamManager::waitForStreamTeardown(
     }
 
     streamStartWaitCount.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "STREAM START BARRIER 202.66: stream=" << id
+    std::cerr << "STREAM START BARRIER 202.70: stream=" << id
               << " action=wait-for-old-teardown timeout_ms=" << timeout.count()
               << std::endl;
     const bool complete = streamLifecycleCondition.wait_for(lock, timeout, [this, &id]() {
         return !stoppingStreamIds.count(id);
     });
     if (!complete) {
-        // 202.66: never clear the barrier while the previous GStreamer object
+        // 202.70: never clear the barrier while the previous GStreamer object
         // is still alive. 202.65 proved that doing so creates one hidden
         // pipeline per force-retire and turns the retained objects into a
         // linear RSS/heap leak. Keep the id reserved and replace the whole
@@ -6117,7 +6128,7 @@ bool StreamManager::waitForStreamTeardown(
         if (error) {
             *error = "old stream teardown is stuck; automatic service restart scheduled: " + id;
         }
-        std::cerr << "STREAM START BARRIER 202.66: stream=" << id
+        std::cerr << "STREAM START BARRIER 202.70: stream=" << id
                   << " result=timeout action=schedule-systemd-restart start_allowed=no"
                   << std::endl;
         lock.unlock();
@@ -6125,7 +6136,7 @@ bool StreamManager::waitForStreamTeardown(
         return false;
     }
 
-    std::cerr << "STREAM START BARRIER 202.66: stream=" << id
+    std::cerr << "STREAM START BARRIER 202.70: stream=" << id
               << " result=old-instance-cleaned action=start-allowed" << std::endl;
     return true;
 }
@@ -6284,13 +6295,6 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
         statePtr->active = false;
         statePtr->statusMessage = notifyManualStop ? "stopped" : "cleaning inactive state";
 
-        for (auto it = httpClients.begin(); it != httpClients.end();) {
-            if (it->second.streamId == id) {
-                it = httpClients.erase(it);
-            } else {
-                ++it;
-            }
-        }
         for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
             if (it->second.streamId == id) {
                 it = adHocSessions.erase(it);
@@ -6299,6 +6303,9 @@ bool StreamManager::cleanupStreamState(const std::string& id, bool notifyManualS
             }
         }
     }
+
+    disconnectHttpRelaySessionsForStream(
+        id, notifyManualStop ? "manual-stop" : "inactive-cleanup");
 
     const bool finalized = teardownStreamState(
         std::move(statePtr), id, stoppedConfig, notifyManualStop);
@@ -6336,13 +6343,6 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
         statePtr->active = false;
         statePtr->statusMessage = "stopping";
 
-        for (auto it = httpClients.begin(); it != httpClients.end();) {
-            if (it->second.streamId == id) {
-                it = httpClients.erase(it);
-            } else {
-                ++it;
-            }
-        }
         for (auto it = adHocSessions.begin(); it != adHocSessions.end();) {
             if (it->second.streamId == id) {
                 it = adHocSessions.erase(it);
@@ -6351,6 +6351,8 @@ bool StreamManager::stopStreamAsync(const std::string& id) {
             }
         }
     }
+
+    disconnectHttpRelaySessionsForStream(id, "async-stop");
 
     // Keep ownership outside the thread constructor so a rare std::thread
     // creation failure can still fall back to synchronous teardown without
@@ -6397,8 +6399,13 @@ bool StreamManager::restartStream(const StreamConfig& streamConfig, std::string*
 void StreamManager::stopAll() {
     if (mptsOutputManager) mptsOutputManager->stopAll();
     std::vector<std::unique_ptr<StreamState>> stoppedStreams;
+    std::vector<std::pair<int, int>> httpRelayFds;
     {
         std::lock_guard<std::mutex> lock(managerMutex);
+        httpRelayFds.reserve(httpClients.size());
+        for (const auto& [fd, session] : httpClients) {
+            httpRelayFds.emplace_back(fd, session.upstreamFd);
+        }
         httpClients.clear();
         adHocSessions.clear();
         for (auto& [id, statePtr] : streams) {
@@ -6408,6 +6415,10 @@ void StreamManager::stopAll() {
             stoppedStreams.push_back(std::move(statePtr));
         }
         streams.clear();
+    }
+    for (const auto& [fd, upstreamFd] : httpRelayFds) {
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
     }
     CardManager::instance().releaseAll();
 
@@ -6624,6 +6635,8 @@ Json::Value StreamManager::queueMemorySnapshot() const {
         gSharedDvbBusMessagesDropped.load(std::memory_order_relaxed));
     result["external_srt_bus_dropped"] = Json::UInt64(
         gExternalSrtBusMessagesDropped.load(std::memory_order_relaxed));
+    result["http_relay_forced_disconnects"] = Json::UInt64(
+        gHttpRelayForcedDisconnects.load(std::memory_order_relaxed));
     result["source_only_restarts"] = Json::UInt64(gSourceOnlyRestartAttempts.load(std::memory_order_relaxed));
     result["full_pipeline_restarts"] = Json::UInt64(gFullPipelineRestartAttempts.load(std::memory_order_relaxed));
     result["source_reconnect_started"] = Json::UInt64(gSourceReconnectStarted.load(std::memory_order_relaxed));
@@ -6750,7 +6763,8 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
 
     {
         std::lock_guard<std::mutex> lock(managerMutex);
-        httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts"};
+        httpClients[fd] = {id, normalizeIpAddress(clientIp), "mpegts",
+                           std::chrono::steady_clock::now(), upstreamFd};
     }
 
     try {
@@ -6780,6 +6794,41 @@ bool StreamManager::addHttpClient(const std::string& id, int fd, const std::stri
         return false;
     }
     return true;
+}
+
+size_t StreamManager::disconnectHttpRelaySessionsForStream(
+    const std::string& streamId, const char* reason) {
+    if (streamId.empty()) return 0;
+
+    std::vector<std::pair<int, int>> relayFds;
+    {
+        std::lock_guard<std::mutex> lock(managerMutex);
+        for (auto it = httpClients.begin(); it != httpClients.end();) {
+            if (it->second.streamId != streamId) {
+                ++it;
+                continue;
+            }
+            relayFds.emplace_back(it->first, it->second.upstreamFd);
+            it = httpClients.erase(it);
+        }
+    }
+
+    // Relay threads own close(). shutdown() is deliberately used here so a
+    // thread blocked on either downstream write or upstream read is awakened
+    // without risking a close/reuse race on the descriptor number.
+    for (const auto& [clientFd, upstreamFd] : relayFds) {
+        if (clientFd >= 0) ::shutdown(clientFd, SHUT_RDWR);
+        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
+    }
+
+    if (!relayFds.empty()) {
+        gHttpRelayForcedDisconnects.fetch_add(relayFds.size(), std::memory_order_relaxed);
+        std::cerr << "HTTP RELAY CLEANUP 202.70: stream=" << streamId
+                  << " sessions=" << relayFds.size()
+                  << " reason=" << (reason ? reason : "unspecified")
+                  << " action=shutdown-client-and-upstream" << std::endl;
+    }
+    return relayFds.size();
 }
 
 bool StreamManager::addStreamSession(const std::string& streamId, const std::string& clientIp, const std::string& protocol) {
@@ -6925,7 +6974,7 @@ std::vector<ActiveStreamSession> StreamManager::activeStreamSessions() {
 }
 
 size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
-    std::vector<int> httpFds;
+    std::vector<std::pair<int, int>> httpFds;
     size_t removed = 0;
     const std::string normalizedClientIp = normalizeIpAddress(clientIp);
     {
@@ -6938,7 +6987,7 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
             }
             // The relay thread owns close(fd). shutdown() wakes a blocked write
             // without risking a double-close after the descriptor is recycled.
-            httpFds.push_back(it->first);
+            httpFds.emplace_back(it->first, it->second.upstreamFd);
             ++removed;
             it = httpClients.erase(it);
         }
@@ -6951,14 +7000,15 @@ size_t StreamManager::resetHttpSessions(const std::string& clientIp) {
             }
         }
     }
-    for (int fd : httpFds) {
+    for (const auto& [fd, upstreamFd] : httpFds) {
         if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
     }
     return removed;
 }
 
 size_t StreamManager::enforceSubscriberAccess() {
-    std::vector<int> httpFds;
+    std::vector<std::pair<int, int>> httpFds;
     std::vector<std::string> srtStreams;
     size_t removed = 0;
     {
@@ -6972,7 +7022,7 @@ size_t StreamManager::enforceSubscriberAccess() {
             std::cerr << "Disconnecting unauthorized " << it->second.protocol
                       << " session stream=" << it->second.streamId
                       << " ip=" << it->second.clientIp << std::endl;
-            httpFds.push_back(it->first);
+            httpFds.emplace_back(it->first, it->second.upstreamFd);
             ++removed;
             it = httpClients.erase(it);
         }
@@ -6993,8 +7043,9 @@ size_t StreamManager::enforceSubscriberAccess() {
         }
     }
 
-    for (int fd : httpFds) {
+    for (const auto& [fd, upstreamFd] : httpFds) {
         if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+        if (upstreamFd >= 0) ::shutdown(upstreamFd, SHUT_RDWR);
     }
     if (!srtStreams.empty()) {
         restartSrtOutputsForStreams(srtStreams);
@@ -7284,6 +7335,11 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
+
+    // 202.70: a public HTTP relay is tied to the tcpserversink generation that
+    // lives inside this pipeline. Never carry that detached relay thread across
+    // a full rebuild; force the client to reconnect to the new generation.
+    disconnectHttpRelaySessionsForStream(state->config.id, "pipeline-rebuild");
 
     stopHttpMpegTsInput(state);
     if (oldPipeline) {
@@ -10016,12 +10072,13 @@ void StreamManager::monitorBus(const std::string& id) {
                 ++networkRecoveryAttempts;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
 
-                // 202.66: source-only NULL->PLAYING is disabled for SRT. On the
-                // installed older GStreamer SRT plugin gst_element_set_state(NULL)
-                // can block inside the source and strand the monitor thread. HTTP
-                // keeps the source-only fast path; SRT always uses the proven full
-                // pipeline rebuild/lifecycle path.
-                const bool allowSourceOnlyRecovery = httpMpegTsInput;
+                // 202.70: source-only NULL->PLAYING is disabled for both SRT and
+                // progressive HTTP. A souphttpsrc generation can appear to complete
+                // NULL->PLAYING while retaining a stale HTTP session/transport state;
+                // observed channels then remain hung until a manual hard restart.
+                // Use the same bounded full-pipeline lifecycle path for both network
+                // protocols so every recovery gets a fresh source and output branch.
+                const bool allowSourceOnlyRecovery = false;
                 if (networkRecoveryAttempts == 1 && allowSourceOnlyRecovery) {
                     if (state->networkSourceReconnectInFlight.exchange(
                             true, std::memory_order_acq_rel)) {
@@ -10419,33 +10476,18 @@ void StreamManager::monitorBus(const std::string& id) {
             if (networkLossDetected && !networkLossWarningActive && !networkRecoveryPending) {
                 networkLossWarningActive = true;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                if (srtInput) {
-                    // Keep the six-second detector for status/telemetry, but do not
-                    // touch the old SRT source here. The 12-second watchdog below
-                    // will schedule one complete pipeline rebuild if media remains
-                    // absent.
-                    state->statusMessage = "SRT input gap - waiting full rebuild threshold";
-                    std::cerr << "NETWORK RECOVERY 202.66: stream=" << id
-                              << " protocol=SRT reason=no-input-6s"
-                              << " action=wait-full-rebuild-threshold full_rebuild_after_ms="
-                              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     kNetworkNoInputRebuildDelay).count()
-                              << std::endl;
-                } else {
-                    state->statusMessage = "HTTP-MPEGTS input gap - source reconnect";
-                    networkRecoveryPending = true;
-                    const auto softJitter = std::chrono::milliseconds(
-                        networkRecoveryJitterForStream(id).count() / 5);
-                    networkRecoveryDue = now + softJitter;
-                    std::cerr << "NETWORK INPUT RECOVERY 202.55: stream=" << id
-                              << " protocol=HTTP-MPEGTS"
-                              << " reason=no-input-6s action=schedule-source-only-reconnect"
-                              << " jitter_ms=" << softJitter.count()
-                              << " full_rebuild_after_ms="
-                              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     kNetworkNoInputRebuildDelay).count()
-                              << std::endl;
-                }
+                // 202.70: both SRT and HTTP only report the six-second gap here.
+                // The 12-second watchdog below owns the actual full-pipeline rebuild.
+                // This avoids carrying a half-restarted souphttpsrc session forward.
+                state->statusMessage = std::string(protocolName) +
+                    " input gap - waiting full rebuild threshold";
+                std::cerr << "NETWORK RECOVERY 202.70: stream=" << id
+                          << " protocol=" << protocolName
+                          << " reason=no-input-6s"
+                          << " action=wait-full-rebuild-threshold full_rebuild_after_ms="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 kNetworkNoInputRebuildDelay).count()
+                          << std::endl;
             }
 
             const auto inputFailoverDelay = hlsInput

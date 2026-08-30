@@ -321,6 +321,7 @@ private:
     bool isClientAllowedForStream(const std::string& streamId, const std::string& clientIp) const;
     void attachSrtConnectionMonitoring(GstElement* sink, const StreamConfig& cfg);
     void pruneExpiredAdHocSessionsLocked(std::chrono::steady_clock::time_point now);
+    size_t disconnectHttpRelaySessionsForStream(const std::string& streamId, const char* reason);
     static gboolean onSrtCallerConnecting(GstElement* sink, GSocketAddress* addr, const gchar* streamId, gpointer userData);
     static void onSrtCallerAdded(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
     static void onSrtCallerRemoved(GstElement* sink, gint, GSocketAddress* addr, gpointer userData);
@@ -362,6 +363,10 @@ private:
         std::string clientIp;
         std::string protocol;
         std::chrono::steady_clock::time_point lastActivity = std::chrono::steady_clock::now();
+        // Local tcpserversink side of the detached HTTP relay. The relay thread
+        // owns close(); lifecycle/recovery code only shutdown()s this descriptor
+        // to wake a thread blocked on read when the stream pipeline is rebuilt.
+        int upstreamFd = -1;
     };
     std::map<int, HttpClientSession> httpClients;
     std::map<std::string, HttpClientSession> adHocSessions;
