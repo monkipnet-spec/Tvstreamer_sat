@@ -184,7 +184,7 @@ bool resolveHlsTarget(const std::vector<StreamConfig>& streams, const std::strin
         if (slash == std::string::npos) return false;
         streamId = cleanPathToken(path.substr(legacyPrefix.size(), slash - legacyPrefix.size()));
         fileName = cleanPathToken(path.substr(slash + 1), true);
-        if (fileName == "playlist.m3u8") fileName = "video.m3u8";
+        if (fileName == "playlist.m3u8" || fileName == "index.m3u8") fileName = "video.m3u8";
         return !streamId.empty() && !fileName.empty();
     }
     if (path.size() < 3 || path.front() != '/') return false;
@@ -192,6 +192,7 @@ bool resolveHlsTarget(const std::vector<StreamConfig>& streams, const std::strin
     if (slash == std::string::npos) return false;
     const std::string publicName = cleanPathToken(path.substr(1, slash - 1));
     fileName = cleanPathToken(path.substr(slash + 1), true);
+    if (fileName == "index.m3u8") fileName = "video.m3u8";
     if (publicName.empty() || fileName.empty()) return false;
     for (const auto& cfg : streams) {
         bool hasHls = toLower(cfg.outputType) == "hls";
@@ -201,6 +202,50 @@ bool resolveHlsTarget(const std::vector<StreamConfig>& streams, const std::strin
         if (hasHls && hlsPublicName(cfg) == publicName) {
             streamId = cfg.id;
             return true;
+        }
+    }
+    return false;
+}
+
+
+bool hasOutputType(const StreamConfig& cfg, const std::string& wantedType) {
+    if (toLower(cfg.outputType) == wantedType) return true;
+    for (const auto& extra : cfg.additionalOutputs) {
+        if (toLower(extra.outputType) == wantedType) return true;
+    }
+    return false;
+}
+
+bool resolveHttpMpegTsTarget(const std::vector<StreamConfig>& streams,
+                             const std::string& target,
+                             std::string& streamId) {
+    streamId.clear();
+    const std::string path = target.substr(0, target.find('?'));
+
+    // Legacy URL kept for existing receivers:
+    //   /stream/<internal-id>.ts
+    const std::string legacyPrefix = "/stream/";
+    if (path.rfind(legacyPrefix, 0) == 0) {
+        const auto start = legacyPrefix.size();
+        if (path.size() <= start + 3 || path.substr(path.size() - 3) != ".ts") return false;
+        const auto end = path.find('.', start);
+        streamId = cleanPathToken(path.substr(start,
+            end == std::string::npos ? std::string::npos : end - start));
+        return !streamId.empty();
+    }
+
+    // 202.71 public HTTP MPEG-TS URL:
+    //   /<channel-name>/mpegts
+    if (path.size() < 9 || path.front() != '/') return false;
+    const auto slash = path.find('/', 1);
+    if (slash == std::string::npos || path.substr(slash) != "/mpegts") return false;
+    const std::string publicName = cleanPathToken(path.substr(1, slash - 1));
+    if (publicName.empty()) return false;
+
+    for (const auto& cfg : streams) {
+        if (hasOutputType(cfg, "http") && hlsPublicName(cfg) == publicName) {
+            streamId = cfg.id;
+            return !streamId.empty();
         }
     }
     return false;
@@ -388,7 +433,8 @@ std::string streamLink(const StreamConfig& cfg, int httpPort) {
             : "rtmp://" + advertisedHost(cfg) + ":" + std::to_string(cfg.outputPort) + "/live/" + cfg.id;
     }
     if (type == "http") {
-        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) + "/stream/" + cfg.id + ".ts";
+        return "http://" + advertisedHost(cfg, true) + ":" + std::to_string(streamHttpPort(cfg, httpPort)) +
+            "/" + hlsPublicName(cfg) + "/mpegts";
     }
     if (type == "rtsp") {
         const std::string hostLower = toLower(cfg.outputHost);
@@ -513,7 +559,8 @@ void HttpServer::handleSession(tcp::socket socket) {
             // Strict URL receivers (including NetUP Stream Processor) may probe
             // HTTP Progressive/HLS URLs with HEAD before opening the media GET.
             // Answer those probes without creating a playback session.
-            if (target.rfind("/stream/", 0) == 0) {
+            std::string httpMpegTsId;
+            if (resolveHttpMpegTsTarget(configManager.config.streams, target, httpMpegTsId)) {
                 if (!isStreamClientAllowed(socket, target)) {
                     res.result(http::status::forbidden);
                     res.set(http::field::content_type, "text/plain");
@@ -561,7 +608,8 @@ void HttpServer::handleSession(tcp::socket socket) {
         }
 
         if (req.method() == http::verb::get) {
-          if (target.rfind("/stream/", 0) == 0) {
+          std::string httpMpegTsId;
+          if (resolveHttpMpegTsTarget(configManager.config.streams, target, httpMpegTsId)) {
             if (!isStreamClientAllowed(socket, target)) {
               res.result(http::status::forbidden);
               res.set(http::field::content_type, "text/plain");
@@ -731,8 +779,10 @@ void HttpServer::handleSession(tcp::socket socket) {
 bool HttpServer::requiresAuthentication(const std::string& target) const {
     std::string hlsId, hlsFile;
     const bool hlsTarget = resolveHlsTarget(configManager.config.streams, target, hlsId, hlsFile);
+    std::string httpMpegTsId;
+    const bool httpMpegTsTarget = resolveHttpMpegTsTarget(configManager.config.streams, target, httpMpegTsId);
     return target != "/health" &&
-           target.rfind("/stream/", 0) != 0 &&
+           !httpMpegTsTarget &&
            !hlsTarget;
 }
 
@@ -791,7 +841,8 @@ bool HttpServer::isStreamClientAllowed(const tcp::socket& socket, const std::str
   if (ec) {
     return false;
   }
-  std::string streamId = extractStreamIdFromTarget(target);
+  std::string streamId;
+  resolveHttpMpegTsTarget(configManager.config.streams, target, streamId);
   if (streamId.empty()) {
     std::string fileName;
     resolveHlsTarget(configManager.config.streams, target, streamId, fileName);
@@ -1933,13 +1984,8 @@ std::string HttpServer::handleDvbAddChannels(const std::string& body) {
 }
 
 bool HttpServer::handleHttpStream(tcp::socket& socket, const std::string& target) {
-    const std::string prefix = "/stream/";
-    if (target.size() <= prefix.size() + 3 || target.substr(target.size() - 3) != ".ts") {
-        return false;
-    }
-
-    const std::string id = cleanPathToken(target.substr(prefix.size(), target.size() - prefix.size() - 3));
-    if (id.empty()) {
+    std::string id;
+    if (!resolveHttpMpegTsTarget(configManager.config.streams, target, id) || id.empty()) {
         return false;
     }
 
