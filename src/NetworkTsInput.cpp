@@ -16,14 +16,17 @@ namespace {
 // 202.57: restore the proven TVStreamer5 SRT/HTTP input timing.  The
 // later 8-second SAT5 queue changed the dynamics of the original reservoir
 // controller and did not remove the freezes.
-constexpr guint64 kNetworkInputQueue = 3 * GST_SECOND;
-constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
+// 202.72: enlarge only the bounded network ingest reservoirs. Keep them below
+// the stream-level recovery windows so buffering absorbs short jitter/outages
+// without hiding a genuinely dead source.
+constexpr guint64 kNetworkInputQueue = 6 * GST_SECOND;
+constexpr guint64 kHlsInputQueue = 10 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 // TVStreamer5/main uses 500 ms SRT latency for this path.
 constexpr gint kSrtLatencyMs = 500;
 constexpr gint kSrtPollTimeoutMs = 1000;
-constexpr guint kNetworkQueueHardMaxBytes = 32U * 1024U * 1024U;
-constexpr guint kHlsQueueHardMaxBytes = 20U * 1024U * 1024U;
+constexpr guint kNetworkQueueHardMaxBytes = 64U * 1024U * 1024U;
+constexpr guint kHlsQueueHardMaxBytes = 40U * 1024U * 1024U;
 
 bool hasElementFactory(const char* name) {
     GstElementFactory* factory = gst_element_factory_find(name);
@@ -268,13 +271,13 @@ GstElement* buildSrt(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.66: protocol=SRT mode=" << mode
+    std::cerr << "Network TS input 202.72: protocol=SRT mode=" << mode
               << " factory=" << factory
               << " latency_ms=" << kSrtLatencyMs
               << " poll_timeout_ms=" << kSrtPollTimeoutMs
               << " auto_reconnect_property=" << (hasAutoReconnect ? "yes" : "no")
               << " app_reconnect=full-pipeline-only"
-              << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
+              << " queue_ms=6000 queue_max_mb=64 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;
 }
@@ -322,8 +325,8 @@ GstElement* buildHttp(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.57: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
-              << " queue_ms=3000 queue_max_mb=32 leaky=off prebuffer=off"
+    std::cerr << "Network TS input 202.72: protocol=HTTP transport=souphttpsrc direct_queue=on capsfilter=off"
+              << " queue_ms=6000 queue_max_mb=64 leaky=off prebuffer=off"
               << " do_timestamp=on libcurl_appsrc=off input_pacing=off"
               << " http_retries=gstreamer-default recovery=watchdog+error+eos"
               << " access=" << (cfg.hlsAccessKeyMode.empty() ? "none" : cfg.hlsAccessKeyMode)
@@ -435,8 +438,8 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.44: protocol=HLS source=souphttpsrc+hlsdemux"
-              << " queue_ms=5000 queue_max_mb=20 leaky=off prebuffer=off do_timestamp=on"
+    std::cerr << "Network TS input 202.72: protocol=HLS source=souphttpsrc+hlsdemux"
+              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off do_timestamp=on"
               << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
               << " http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;

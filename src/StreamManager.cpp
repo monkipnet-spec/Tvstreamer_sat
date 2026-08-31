@@ -343,6 +343,11 @@ bool releasePipelineAndWaitForFinalize(
 constexpr auto kSrtStartupFailoverDelay = std::chrono::seconds(15);
 constexpr auto kSrtPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kPrimaryRetryInterval = std::chrono::seconds(5);
+// 202.72: a failed SRT primary probe creates a temporary srtclientsrc pipeline.
+// Repeating that lifecycle continuously can outrun delayed GStreamer/libsrt
+// cleanup and accumulate large amounts of live heap. Give failed SRT probes a
+// long cool-down; HTTP/HLS keep the existing fast failback cadence.
+constexpr auto kSrtPrimaryRetryInterval = std::chrono::minutes(5);
 
 void armInitialNetworkStartupGrace(StreamState* state) {
     if (!state) return;
@@ -398,6 +403,19 @@ std::chrono::milliseconds inputProbeTimeoutForUri(
         return std::chrono::duration_cast<std::chrono::milliseconds>(kHlsPrimaryProbeTimeout);
     }
     return std::chrono::duration_cast<std::chrono::milliseconds>(kInputFailoverDelay);
+}
+
+std::chrono::milliseconds primaryRetryIntervalForUri(
+    const StreamConfig& baseConfig, const std::string& inputUri) {
+    StreamConfig probeConfig = baseConfig;
+    probeConfig.inputUri = inputUri;
+    const auto kind = tvs::stream_protocols::inputKind(probeConfig);
+    if (kind == tvs::stream_protocols::InputProtocolKind::Srt) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            kSrtPrimaryRetryInterval);
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        kPrimaryRetryInterval);
 }
 
 constexpr long kHttpConnectTimeoutMs = 3000;
@@ -9936,7 +9954,8 @@ void StreamManager::monitorBus(const std::string& id) {
             }
 
             if (state->usingBackup &&
-                now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+                now - state->lastPrimaryRetry >=
+                    primaryRetryIntervalForUri(state->config, state->primaryInputUri)) {
                 state->lastPrimaryRetry = now;
                 const std::string primaryUri = state->primaryInputUri;
                 if (!primaryUri.empty() &&
@@ -10563,7 +10582,9 @@ void StreamManager::monitorBus(const std::string& id) {
                         telegramText(configManager, "Backup pipeline не стартовал", "Backup pipeline did not start") +
                             "\nBackup: " + state->config.backupInputUri);
                 }
-            } else if (state->usingBackup && now - state->lastPrimaryRetry >= kPrimaryRetryInterval) {
+            } else if (state->usingBackup &&
+                       now - state->lastPrimaryRetry >=
+                           primaryRetryIntervalForUri(state->config, state->primaryInputUri)) {
                 const std::string primaryUri = state->primaryInputUri;
                 state->lastPrimaryRetry = now;
 
