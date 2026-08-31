@@ -298,7 +298,9 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
         g_object_set(encoder, "option-string",
             "nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0", nullptr);
-        g_object_set(parser, "config-interval", 1, nullptr);
+        // 202.74: repeat parameter sets with every IDR so late SRT/UDP subscribers
+        // acquire decoder configuration immediately at the next keyframe.
+        g_object_set(parser, "config-interval", -1, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
             !add(context->bin, scale) || !add(context->bin, filter) ||
@@ -317,7 +319,8 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             std::cerr << "Transcoder: video linked using x264enc "
                       << width << "x" << height << " @ "
                       << context->config.transcodeVideoBitrate
-                      << " bit/s cadence=preserve-progressive/double-interlaced-fields" << std::endl;
+                      << " bit/s cadence=preserve-progressive/double-interlaced-fields"
+                      << " headers=every-idr" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
         for (GstElement* e : {queue, convert, deinterlace, scale, filter, encoder, parser, outQueue}) sync(e);
@@ -474,7 +477,7 @@ bool buildVideoPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps
     // Make late SRT/UDP subscribers recover quickly from a mid-GOP join.
     if ((parserFactory == "h264parse" || parserFactory == "h265parse") &&
         g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "config-interval")) {
-        g_object_set(parser, "config-interval", 1, nullptr);
+        g_object_set(parser, "config-interval", -1, nullptr);
     }
 
     GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");

@@ -311,7 +311,10 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "sliced-threads=true",
         "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
-        "!", "h264parse", property("config-interval", flv ? "-1" : "1"),
+        // 202.74: inject SPS/PPS with every IDR. Live SRT/UDP clients can join mid-GOP;
+        // waiting for a periodic codec-config interval produced long bursts of
+        // "non-existing PPS" before a decoder could recover.
+        "!", "h264parse", property("config-interval", "-1"),
         "!", flv
             ? "video/x-h264,stream-format=avc,alignment=au"
             : "video/x-h264,stream-format=byte-stream,alignment=au",
@@ -415,7 +418,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
         property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
         "aud=true", "insert-vui=true", "sliced-threads=true", "vbv-buf-capacity=1000",
         "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
-        "!", "h264parse", property("config-interval", spec.container == ContainerKind::Flv ? "-1" : "1"),
+        "!", "h264parse", property("config-interval", "-1"),
         "!", spec.container == ContainerKind::Flv
             ? "video/x-h264,stream-format=avc,alignment=au"
             : "video/x-h264,stream-format=byte-stream,alignment=au",
