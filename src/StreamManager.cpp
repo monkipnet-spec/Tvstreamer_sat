@@ -5809,7 +5809,10 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
     state->sourceContext = std::make_unique<RemapContext>();
     state->sourceContext->config = state->runtimeConfig;
 
-    if (effectiveConfig.transcodeEnabled && allOutputsUseStableUdp(effectiveConfig) &&
+    if (effectiveConfig.transcodeEnabled &&
+        effectiveConfig.transcodeVideoCodec != "copy" &&
+        effectiveConfig.transcodeAudioCodec != "copy" &&
+        allOutputsUseStableUdp(effectiveConfig) &&
         GstTranscoderProcess::isAvailable()) {
         std::string relayError;
         if (!tvs::protocols::prepareFifoRelay(effectiveConfig, relayError)) {
@@ -5921,7 +5924,10 @@ bool StreamManager::startStream(const StreamConfig& streamConfig, std::string* e
         return true;
     }
 
-    if (effectiveConfig.transcodeEnabled && GstTranscoderProcess::isAvailable()) {
+    if (effectiveConfig.transcodeEnabled &&
+        effectiveConfig.transcodeVideoCodec != "copy" &&
+        effectiveConfig.transcodeAudioCodec != "copy" &&
+        GstTranscoderProcess::isAvailable()) {
         std::string srtRelayError;
         if (!startExternalSrtOutputs(state.get(), srtRelayError)) {
             std::cerr << "Transcoded SRT output setup failed for " << streamConfig.id
@@ -7697,6 +7703,11 @@ GstElement* StreamManager::createPipeline(StreamState* state) {
 
     state->outputContexts.clear();
     if (cfg.transcodeEnabled) {
+        if (cfg.transcodeVideoCodec == "copy" || cfg.transcodeAudioCodec == "copy") {
+            std::cerr << "Transcoder 202.73: in-process mixed/passthrough mode"
+                      << " video=" << cfg.transcodeVideoCodec
+                      << " audio=" << cfg.transcodeAudioCodec << std::endl;
+        }
         std::string transcodeError;
         GstElement* transcoderBin = TranscoderModule::createBin(cfg, transcodeError);
         if (!transcoderBin || !addElementOrFail(pipeline, transcoderBin) ||

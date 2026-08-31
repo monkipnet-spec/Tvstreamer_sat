@@ -70,6 +70,7 @@ struct StreamConfig {
     uint64_t targetBitrate = 2000000;
     bool transcodeEnabled = false;
     std::string transcodeResolution = "1920x1080";
+    std::string transcodeVideoCodec = "h264"; // h264 | copy
     uint64_t transcodeVideoBitrate = 6000000;
     std::string transcodeAudioCodec = "aac";
     uint64_t transcodeAudioBitrate = 192000;

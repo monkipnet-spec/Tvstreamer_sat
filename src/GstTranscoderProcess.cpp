@@ -189,7 +189,7 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
 std::string scaledVideoCaps(int width, int height) {
     return "video/x-raw,format=I420,width=" + std::to_string(width) +
            ",height=" + std::to_string(height) +
-           ",framerate=25/1,pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
+           ",pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
 }
 
 bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
@@ -296,15 +296,14 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "timeout=5000",
         "!", "video/x-raw",
         "!", "videoconvert",
-        "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
+        "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
         "!", "videoscale", "add-borders=false", "method=lanczos",
-        "!", "videorate", "drop-only=false",
         "!", scaledVideoCaps(width, height),
         "!", "x264enc",
         "tune=zerolatency",
         "speed-preset=superfast",
         property("bitrate", std::to_string(bitrateKbps)),
-        "key-int-max=25",
+        "key-int-max=50",
         "bframes=0",
         property("byte-stream", flv ? "false" : "true"),
         "aud=true",
@@ -631,6 +630,10 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
         if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
             return {};
         }
+        std::cerr << "GStreamer transcoder 202.73: video=h264"
+                  << " deinterlace=yadif-all-fields"
+                  << " cadence=preserve-progressive/double-interlaced-fields"
+                  << " output=" << baseConfig.transcodeResolution << std::endl;
         addVideoBranch(args, baseConfig, outputSpec);
         addAudioBranch(args, baseConfig, outputSpec, error);
     }

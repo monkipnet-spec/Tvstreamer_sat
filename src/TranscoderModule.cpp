@@ -259,12 +259,11 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* convert = gst_element_factory_make("videoconvert", nullptr);
         GstElement* deinterlace = gst_element_factory_make("deinterlace", nullptr);
         GstElement* scale = gst_element_factory_make("videoscale", nullptr);
-        GstElement* rate = gst_element_factory_make("videorate", nullptr);
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         GstElement* encoder = gst_element_factory_make("x264enc", nullptr);
         GstElement* parser = gst_element_factory_make("h264parse", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !deinterlace || !scale || !rate || !filter || !encoder || !parser || !outQueue) {
+        if (!queue || !convert || !deinterlace || !scale || !filter || !encoder || !parser || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -275,12 +274,18 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             "format", G_TYPE_STRING, "I420",
             "width", G_TYPE_INT, width,
             "height", G_TYPE_INT, height,
-            "framerate", GST_TYPE_FRACTION, 25, 1,
             "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
             "interlace-mode", G_TYPE_STRING, "progressive",
             nullptr);
         g_object_set(filter, "caps", rawCaps, nullptr);
         gst_caps_unref(rawCaps);
+        // 202.73: preserve temporal resolution. 576i25/1080i25 carries 50 fields/s;
+        // YADIF all-fields converts that to 50 progressive frames/s. Progressive
+        // sources pass through auto-strict without an artificial videorate stage.
+        gst_util_set_object_arg(G_OBJECT(deinterlace), "method", "yadif");
+        gst_util_set_object_arg(G_OBJECT(deinterlace), "mode", "auto-strict");
+        gst_util_set_object_arg(G_OBJECT(deinterlace), "fields", "all");
+        gst_util_set_object_arg(G_OBJECT(deinterlace), "locking", "passive");
         g_object_set(encoder,
             "bitrate", bitrateKbps,
             "key-int-max", 50,
@@ -291,13 +296,14 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             nullptr);
         gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
         gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
-        g_object_set(encoder, "option-string", "nal-hrd=cbr:force-cfr=1", nullptr);
+        g_object_set(encoder, "option-string",
+            "nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0", nullptr);
         g_object_set(parser, "config-interval", 1, nullptr);
 
         if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
-            !add(context->bin, scale) || !add(context->bin, rate) || !add(context->bin, filter) ||
+            !add(context->bin, scale) || !add(context->bin, filter) ||
             !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue, nullptr) ||
+            !gst_element_link_many(queue, convert, deinterlace, scale, filter, encoder, parser, outQueue, nullptr) ||
             !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
@@ -310,10 +316,11 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             context->videoLinked = true;
             std::cerr << "Transcoder: video linked using x264enc "
                       << width << "x" << height << " @ "
-                      << context->config.transcodeVideoBitrate << " bit/s" << std::endl;
+                      << context->config.transcodeVideoBitrate
+                      << " bit/s cadence=preserve-progressive/double-interlaced-fields" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, deinterlace, scale, rate, filter, encoder, parser, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, deinterlace, scale, filter, encoder, parser, outQueue}) sync(e);
     } else if (media.rfind("audio/x-raw", 0) == 0 && !context->audioLinked) {
         const std::string codec = context->config.transcodeAudioCodec == "mp3" ? "mp3" : "aac";
         GstElement* queue = gst_element_factory_make("queue", nullptr);
@@ -425,6 +432,67 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 }
 
 
+bool buildVideoPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps* caps) {
+    if (!context || !context->bin || !context->mux || !pad || !caps || context->videoLinked) return false;
+
+    const GstStructure* structure = gst_caps_get_structure(caps, 0);
+    if (!structure) return false;
+    const char* mediaType = gst_structure_get_name(structure);
+    std::string parserFactory;
+
+    if (g_strcmp0(mediaType, "video/x-h264") == 0) {
+        parserFactory = "h264parse";
+    } else if (g_strcmp0(mediaType, "video/x-h265") == 0) {
+        parserFactory = "h265parse";
+    } else if (g_strcmp0(mediaType, "video/mpeg") == 0) {
+        parserFactory = "mpegvideoparse";
+    }
+
+    if (parserFactory.empty()) {
+        gchar* capsText = gst_caps_to_string(caps);
+        std::cerr << "Transcoder: video passthrough does not support caps="
+                  << (capsText ? capsText : "unknown") << std::endl;
+        g_free(capsText);
+        return false;
+    }
+
+    GstElement* queue = gst_element_factory_make("queue", nullptr);
+    GstElement* parser = gst_element_factory_make(parserFactory.c_str(), nullptr);
+    GstElement* outQueue = gst_element_factory_make("queue", nullptr);
+    if (!queue || !parser || !outQueue || !add(context->bin, queue) ||
+        !add(context->bin, parser) || !add(context->bin, outQueue) ||
+        !gst_element_link_many(queue, parser, outQueue, nullptr) ||
+        !linkElementToMux(outQueue, context->mux)) {
+        std::cerr << "Transcoder: failed to build video passthrough branch using "
+                  << parserFactory << std::endl;
+        return false;
+    }
+
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
+        g_object_set(parser, "disable-passthrough", FALSE, nullptr);
+    }
+    // Make late SRT/UDP subscribers recover quickly from a mid-GOP join.
+    if ((parserFactory == "h264parse" || parserFactory == "h265parse") &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "config-interval")) {
+        g_object_set(parser, "config-interval", 1, nullptr);
+    }
+
+    GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");
+    const bool linked = sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
+    if (sinkPad) gst_object_unref(sinkPad);
+    if (!linked) return false;
+
+    context->videoLinked = true;
+    gchar* capsText = gst_caps_to_string(caps);
+    std::cerr << "Transcoder: original video passthrough linked using " << parserFactory
+              << " caps=" << (capsText ? capsText : "unknown") << std::endl;
+    g_free(capsText);
+    sync(queue);
+    sync(parser);
+    sync(outQueue);
+    return true;
+}
+
 bool buildAudioPassthroughBranch(TranscodeContext* context, GstPad* pad, GstCaps* caps) {
     if (!context || !context->bin || !context->mux || !pad || !caps || context->audioLinked) return false;
 
@@ -515,6 +583,16 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
                           capsText.find("audio/") != std::string::npos;
     if (!mediaPad) {
         drainPad(context->bin, pad);
+        return;
+    }
+
+    if (context->config.transcodeVideoCodec == "copy" &&
+        capsText.find("video/") != std::string::npos) {
+        GstCaps* videoCaps = gst_pad_get_current_caps(pad);
+        if (!videoCaps) videoCaps = gst_pad_query_caps(pad, nullptr);
+        const bool linked = videoCaps && buildVideoPassthroughBranch(context, pad, videoCaps);
+        if (videoCaps) gst_caps_unref(videoCaps);
+        if (!linked) drainPad(context->bin, pad);
         return;
     }
 
@@ -632,8 +710,9 @@ uint64_t TranscoderModule::recommendedVideoBitrate(const std::string& value) {
 }
 
 GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string& error) {
+    const std::string videoCodec = config.transcodeVideoCodec == "copy" ? "copy" : "h264";
     int width = 0, height = 0;
-    if (!resolutionSize(config.transcodeResolution, width, height)) {
+    if (videoCodec != "copy" && !resolutionSize(config.transcodeResolution, width, height)) {
         error = "unsupported transcode resolution";
         return nullptr;
     }
@@ -670,11 +749,18 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         return nullptr;
     }
 
+    const guint64 muxBitrate = static_cast<guint64>(
+        (videoCodec == "copy" ? std::max<uint64_t>(config.transcodeVideoBitrate, 500000)
+                              : config.transcodeVideoBitrate) +
+        (audioCodec == "copy" ? 384000 : config.transcodeAudioBitrate) + 350000);
     g_object_set(mux,
         "alignment", 7,
-        "bitrate", static_cast<guint64>(config.transcodeVideoBitrate +
-            (audioCodec == "copy" ? 384000 : config.transcodeAudioBitrate) + 350000),
+        "bitrate", muxBitrate,
         nullptr);
+    std::cerr << "Transcoder 202.73: video=" << videoCodec
+              << " audio=" << audioCodec
+              << " cadence=preserve-progressive/double-interlaced-fields"
+              << " mux_bitrate=" << muxBitrate << std::endl;
     g_object_set(outputParse, "set-timestamps", TRUE, nullptr);
     if (!gst_element_link(inputQueue, parsebin) || !gst_element_link(mux, outputParse)) {
         error = "failed to link transcoder bin core";
