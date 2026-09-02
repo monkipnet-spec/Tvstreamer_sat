@@ -11,6 +11,7 @@ struct StreamOutputConfig {
     std::string outputMode = "listener";
     std::string outputHost = "127.0.0.1";
     int outputPort = 1234;
+    std::string interfaceAddress;
 
     Json::Value toJson() const;
     static StreamOutputConfig fromJson(const Json::Value& root);

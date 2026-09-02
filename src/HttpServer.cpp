@@ -360,6 +360,7 @@ StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
     output.outputMode = cfg.outputMode;
     output.outputHost = cfg.outputHost;
     output.outputPort = cfg.outputPort;
+    output.interfaceAddress = cfg.interfaceAddress;
     return output;
 }
 
@@ -369,6 +370,9 @@ StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig&
     cfg.outputMode = output.outputMode;
     cfg.outputHost = output.outputHost;
     cfg.outputPort = output.outputPort;
+    if (!output.interfaceAddress.empty()) {
+        cfg.interfaceAddress = output.interfaceAddress;
+    }
     cfg.additionalOutputs.clear();
     const std::string type = normalizedOutputType(cfg);
     if (type == "udp-cbr") {
@@ -1501,6 +1505,28 @@ std::string HttpServer::currentState() {
       return item;
     };
 
+    auto subscriberStreamClass = [&](const SubscriberConfig& subscriber) -> std::string {
+      bool hasHd = false;
+      bool hasSd = false;
+      for (const auto& streamId : subscriber.streamIds) {
+        const auto found = streamNames.find(streamId);
+        if (found == streamNames.end()) continue;
+        const std::string channelName = toLower(found->second);
+        if (channelName.find("hd") != std::string::npos) hasHd = true;
+        if (channelName.find("sd") != std::string::npos) hasSd = true;
+      }
+      if (hasHd && hasSd) return "HD+SD";
+      if (hasHd) return "HD";
+      if (hasSd) return "SD";
+      return "OTHER";
+    };
+    auto subscriberStreamRank = [](const std::string& streamClass) {
+      if (streamClass == "HD") return 0;
+      if (streamClass == "HD+SD") return 1;
+      if (streamClass == "SD") return 2;
+      return 3;
+    };
+
     std::set<std::string> registeredIps;
     for (const auto& subscriber : configManager.subscribers.subscribers) {
       const std::string primaryIp = normalizeIpAddress(subscriber.primaryIp);
@@ -1521,8 +1547,20 @@ std::string HttpServer::currentState() {
     root["unknown_stream_sessions"] = unknownSessions;
 
     Json::Value subscribers(Json::arrayValue);
+    std::vector<const SubscriberConfig*> sortedSubscribers;
+    sortedSubscribers.reserve(configManager.subscribers.subscribers.size());
     for (const auto& subscriber : configManager.subscribers.subscribers) {
+      sortedSubscribers.push_back(&subscriber);
+    }
+    std::stable_sort(sortedSubscribers.begin(), sortedSubscribers.end(),
+      [&](const SubscriberConfig* left, const SubscriberConfig* right) {
+        return subscriberStreamRank(subscriberStreamClass(*left)) <
+               subscriberStreamRank(subscriberStreamClass(*right));
+      });
+    for (const SubscriberConfig* subscriberPtr : sortedSubscribers) {
+      const auto& subscriber = *subscriberPtr;
       Json::Value item = subscriber.toJson();
+      item["stream_class"] = subscriberStreamClass(subscriber);
       const size_t activeSessions = streamManager.activeSubscriberSessions(subscriber);
       item["active_sessions"] = Json::UInt64(activeSessions);
       item["session_active"] = activeSessions > 0;
@@ -1698,6 +1736,7 @@ std::string HttpServer::currentState() {
             link["output_mode"] = output.outputMode;
             link["output_host"] = output.outputHost;
             link["output_port"] = output.outputPort;
+            link["interface_address"] = output.interfaceAddress;
             link["url"] = streamLink(output, configManager.config.httpPort);
             links.append(link);
         }
@@ -2901,7 +2940,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .modal-content{position:relative;background:rgba(11,15,22,.985);padding:18px 18px;border-radius:22px;width:min(520px,100%);max-height:calc(100vh - var(--header-height,58px) - 24px);overflow:auto;box-shadow:0 28px 70px rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.08);box-sizing:border-box;margin:0 auto}
 .modal-close{display:inline-flex;align-items:center;justify-content:center;position:absolute;top:8px;right:8px;width:20px;height:20px;padding:0;border:0;border-radius:50%;background:#d9363e;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:700;line-height:1;cursor:pointer;z-index:20;box-shadow:0 2px 7px rgba(0,0,0,.28)}
 .modal-close:hover{background:#f0444d;transform:scale(1.08)}
-.modal-content.stream-modal{width:min(680px,100%);max-height:calc(100% - 12px);margin:0 auto}
+.modal-content.stream-modal{width:min(820px,100%);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.quality-modal{width:min(1240px,100%);background:rgba(9,13,20,.99);max-height:calc(100% - 12px);margin:0 auto}
 .modal-content.network-modal{width:min(620px,100%)}
 .modal-content.subscriber-modal{width:min(1280px,100%);max-height:98%}
@@ -2952,7 +2991,7 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .row-inline{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .row-inline.compact-row input{width:100%;padding:7px 9px}
 .output-list{display:grid;gap:8px;width:100%}
-.output-row{display:grid;grid-template-columns:minmax(120px,1.1fr) minmax(106px,.8fr) minmax(130px,1fr) 86px 30px;gap:6px;align-items:end;padding:8px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);border-radius:8px}
+.output-row{display:grid;grid-template-columns:minmax(105px,1.05fr) minmax(86px,.75fr) minmax(110px,1fr) 74px minmax(125px,1fr) 30px;gap:6px;align-items:end;padding:8px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);border-radius:8px}
 .output-row .form-row{gap:5px}
 .output-row input,.output-row select{box-sizing:border-box;max-width:none}
 .output-row .remove-output{width:30px;height:30px;padding:0;border:0;border-radius:8px;background:rgba(255,95,95,.18);color:#ffc2c2;cursor:pointer}
@@ -3459,6 +3498,7 @@ function outputConfigsForStream(stream) {
     output_mode: output.output_mode || 'listener',
     output_host: output.output_host || '127.0.0.1',
     output_port: Number(output.output_port || 1234),
+    interface_address: String(output.interface_address || ''),
     cbr: stream.cbr
   });
   if (Array.isArray(stream.outputs) && stream.outputs.length) {
@@ -3947,6 +3987,23 @@ function openNetworkModal() {
 function closeNetworkModal() {
   closeModal();
 }
+function subscriberStreamClassFromIds(streamIds=[]) {
+  let hasHd = false;
+  let hasSd = false;
+  (streamIds || []).forEach(id => {
+    const stream = (state.streams || []).find(item => String(item.id) === String(id));
+    const name = String(stream?.name || stream?.id || '').toUpperCase();
+    if (name.includes('HD')) hasHd = true;
+    if (name.includes('SD')) hasSd = true;
+  });
+  if (hasHd && hasSd) return 'HD+SD';
+  if (hasHd) return 'HD';
+  if (hasSd) return 'SD';
+  return 'OTHER';
+}
+function subscriberStreamClassRank(streamClass) {
+  return {'HD':0, 'HD+SD':1, 'SD':2, 'OTHER':3}[streamClass] ?? 3;
+}
 function openSubscribersModal() {
   const renderSubscribers = () => {
     const subscribers = state.subscribers || [];
@@ -3956,7 +4013,7 @@ function openSubscribersModal() {
         <input data-field="primary_ip" value="${subscriber.primary_ip || ''}" placeholder="${t('primaryIp')}" />
         <input data-field="backup_ip" value="${subscriber.backup_ip || ''}" placeholder="${t('backupIp')}" />
         <details class="subscriber-stream-picker">
-          <summary id="subscriberStreamsSummary-${index}">${t('streams')} (${(subscriber.stream_ids || []).length})</summary>
+          <summary id="subscriberStreamsSummary-${index}">${t('streams')} (${(subscriber.stream_ids || []).length}) · ${subscriber.stream_class || subscriberStreamClassFromIds(subscriber.stream_ids || [])}</summary>
           <div class="subscriber-stream-options">
             ${(state.streams || []).map(stream => `<label><input type="checkbox" data-stream-id="${stream.id}" onchange="updateSubscriberStreamSummary(${index})" ${(subscriber.stream_ids || []).includes(stream.id) ? 'checked' : ''} />${stream.name || stream.id}</label>`).join('') || `<span>${t('noStreams')}</span>`}
           </div>
@@ -4209,7 +4266,8 @@ function updateSubscriberStreamSummary(index) {
   const row = document.querySelector(`.subscriber-row[data-index="${index}"]`);
   const summary = document.getElementById(`subscriberStreamsSummary-${index}`);
   if (!row || !summary) return;
-  summary.textContent = `${t('streams')} (${row.querySelectorAll('[data-stream-id]:checked').length})`;
+  const streamIds = [...row.querySelectorAll('[data-stream-id]:checked')].map(input => input.dataset.streamId);
+  summary.textContent = `${t('streams')} (${streamIds.length}) · ${subscriberStreamClassFromIds(streamIds)}`;
   updateSubscribersSaveButton();
 }
 function updateSubscriberStatus(input) {
@@ -4241,20 +4299,28 @@ function saveSubscribers() {
 }
 function exportSubscribers() {
   const rows = [...document.querySelectorAll('.subscriber-row')];
-  const lines = [t('subscribers')];
-  rows.forEach((row, index) => {
-    const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '—';
-    const enabled = row.querySelector('[data-field="enabled"]')?.checked !== false;
-    const streams = [...row.querySelectorAll('[data-stream-id]:checked')].map(input => {
-      const label = input.closest('label');
-      return label ? label.textContent.trim() : input.dataset.streamId;
-    });
-    lines.push('', `${index + 1}. ${value('name')}`,
-      `IP: ${value('primary_ip')}`,
-      `Backup IP: ${value('backup_ip')}`,
-      `${t('addedAt')}: ${row.dataset.addedAt || '—'}`,
-      `${t('status')}: ${enabled ? t('enabled') : t('disabled')}`,
-      `${t('streams')}: ${streams.length ? streams.join(', ') : '—'}`);
+  const cleanTxtField = value => String(value || '—').replace(/[\r\n,]+/g, ' ').trim() || '—';
+  const entries = rows.map(row => {
+    const value = field => row.querySelector(`[data-field="${field}"]`)?.value.trim() || '';
+    const streamIds = [...row.querySelectorAll('[data-stream-id]:checked')].map(input => input.dataset.streamId);
+    return {
+      name: cleanTxtField(value('name')),
+      ip: cleanTxtField(value('primary_ip') || value('backup_ip')),
+      online: row.querySelector('.subscriber-session')?.classList.contains('active') === true,
+      streamClass: subscriberStreamClassFromIds(streamIds)
+    };
+  });
+  entries.sort((left, right) => {
+    const classDiff = subscriberStreamClassRank(left.streamClass) - subscriberStreamClassRank(right.streamClass);
+    if (classDiff !== 0) return classDiff;
+    return left.name.localeCompare(right.name, language === 'ru' ? 'ru' : 'en', {sensitivity:'base'});
+  });
+  const lines = [language === 'ru' ? 'Имя абонента, IP адрес, Статус' : 'Subscriber, IP address, Status'];
+  entries.forEach(entry => {
+    const status = entry.online
+      ? (language === 'ru' ? 'онлайн' : 'online')
+      : (language === 'ru' ? 'офлайн' : 'offline');
+    lines.push(`${entry.name}, ${entry.ip}, ${status}`);
   });
   const blob = new Blob([lines.join('\n') + '\n'], {type:'text/plain;charset=utf-8'});
   const url = URL.createObjectURL(blob);
@@ -4907,17 +4973,30 @@ function outputTypeOptions(selected) {
   ];
   return options.map(([value, label]) => `<option value="${value}" ${selected===value?'selected':''}>${label}</option>`).join('');
 }
+function outputInterfaceOptions(selected, inheritLabel='Как основной') {
+  const selectedValue = String(selected || '');
+  const options = [`<option value="" ${selectedValue ? '' : 'selected'}>${inheritLabel}</option>`];
+  (state.interfaces || []).forEach(iface => {
+    const address = String(iface.address || '');
+    if (!address) return;
+    const label = `${String(iface.name || '')}${address ? ` (${address})` : ''}`;
+    options.push(`<option value="${escapeHtmlValue(address)}" ${address===selectedValue?'selected':''}>${escapeHtmlValue(label)}</option>`);
+  });
+  return options.join('');
+}
 function renderOutputRows(outputs, links=[], startIndex=0) {
   return outputs.map((output, offset) => {
     const index = startIndex + offset;
     const type = normalizedOutputType(output);
     const link = links[index]?.url || '';
+    const interfaceAddress = String(output.interface_address || '');
     return `
       <div class="output-row" data-output-index="${index}">
         <div class="form-row"><label>${index === 0 ? 'Основной формат' : 'Доп. формат'}</label><select data-output-field="output_type" onchange="updateOutputHints()">${outputTypeOptions(type)}</select></div>
         <div class="form-row"><label>SRT режим</label><select data-output-field="output_mode" onchange="updateOutputHints()"><option value="listener" ${(!output.output_mode || output.output_mode==='listener')?'selected':''}>Listener</option><option value="caller" ${output.output_mode==='caller'?'selected':''}>Caller</option></select></div>
         <div class="form-row"><label data-output-host-label>Адрес выхода</label><input data-output-field="output_host" value="${output.output_host||'239.0.0.1'}" placeholder="239.0.0.1" /></div>
         <div class="form-row"><label data-output-port-label>Порт</label><input data-output-field="output_port" type="number" min="1" max="65535" value="${output.output_port||1234}" placeholder="1234" /></div>
+        <div class="form-row"><label>Интерфейс</label><select data-output-field="interface_address" onchange="outputInterfaceChanged(this)" ${index === 0 ? 'disabled' : ''}>${outputInterfaceOptions(interfaceAddress, index === 0 ? 'Основной интерфейс' : 'Как основной')}</select></div>
         <button class="remove-output" type="button" onclick="removeStreamOutput(this)" ${index === 0 ? 'disabled' : ''}>×</button>
         <div class="form-row full" style="grid-column:1/-1"><label>URL для плеера</label><input readonly value="${link}" placeholder="Ссылка появится после сохранения" /></div>
       </div>
@@ -4938,7 +5017,7 @@ function addStreamOutput() {
   if (!list) return;
   const index = list.querySelectorAll('.output-row').length;
   const iface = document.getElementById('streamInterface')?.value || '127.0.0.1';
-  list.insertAdjacentHTML('beforeend', renderOutputRows([{output_type:'hls', output_mode:'listener', output_host:iface, output_port:state.http_port || 9000, cbr:document.getElementById('streamCbr')?.checked}], [], index));
+  list.insertAdjacentHTML('beforeend', renderOutputRows([{output_type:'hls', output_mode:'listener', output_host:iface, output_port:state.http_port || 9000, interface_address:'', cbr:document.getElementById('streamCbr')?.checked}], [], index));
   updateOutputHints();
 }
 function removeStreamOutput(button) {
@@ -4956,7 +5035,8 @@ function collectOutputRows() {
       output_type: value('output_type') || 'udp-cbr',
       output_mode: value('output_mode') || 'listener',
       output_host: value('output_host') || '127.0.0.1',
-      output_port: Number(value('output_port') || 1234)
+      output_port: Number(value('output_port') || 1234),
+      interface_address: value('interface_address')
     };
   });
 }
@@ -5268,16 +5348,33 @@ function updateOutputHints() {
   }
   syncOutputHostWithInterface();
 }
+function outputInterfaceChanged(select) {
+  const row = select?.closest('.output-row');
+  if (!row) return;
+  const mainInterface = document.getElementById('streamInterface')?.value || '';
+  const iface = select.value || mainInterface;
+  if (!iface) return;
+  const type = row.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
+  const outputMode = row.querySelector('[data-output-field="output_mode"]')?.value || 'listener';
+  const host = row.querySelector('[data-output-field="output_host"]');
+  if (host && (type === 'http' || type === 'hls' || (type === 'srt' && outputMode === 'listener'))) {
+    host.value = iface;
+  }
+}
 function syncOutputHostWithInterface() {
   const iface = document.getElementById('streamInterface')?.value || '';
-  if (!iface) return;
+  const primaryInterface = document.querySelector('.output-row[data-output-index="0"] [data-output-field="interface_address"]');
+  if (primaryInterface) primaryInterface.value = iface;
   document.querySelectorAll('.output-row').forEach(row => {
     const type = row.querySelector('[data-output-field="output_type"]')?.value || 'udp-cbr';
     const outputMode = row.querySelector('[data-output-field="output_mode"]')?.value || 'listener';
     const host = row.querySelector('[data-output-field="output_host"]');
+    const rowInterface = row.querySelector('[data-output-field="interface_address"]')?.value || '';
+    const effectiveInterface = rowInterface || iface;
+    if (!effectiveInterface) return;
     if (!host || (type !== 'http' && type !== 'hls' && !(type === 'srt' && outputMode === 'listener'))) return;
     if (!host.value || host.value === '0.0.0.0' || host.value === '127.0.0.1') {
-      host.value = iface;
+      host.value = effectiveInterface;
     }
   });
 }

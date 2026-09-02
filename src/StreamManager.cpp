@@ -3306,6 +3306,7 @@ StreamOutputConfig primaryOutputConfig(const StreamConfig& cfg) {
     output.outputMode = cfg.outputMode;
     output.outputHost = cfg.outputHost;
     output.outputPort = cfg.outputPort;
+    output.interfaceAddress = cfg.interfaceAddress;
     return output;
 }
 
@@ -3315,6 +3316,9 @@ StreamConfig configForOutput(const StreamConfig& base, const StreamOutputConfig&
     cfg.outputMode = output.outputMode;
     cfg.outputHost = output.outputHost;
     cfg.outputPort = output.outputPort;
+    if (!output.interfaceAddress.empty()) {
+        cfg.interfaceAddress = output.interfaceAddress;
+    }
     cfg.additionalOutputs.clear();
 
     const std::string type = outputType(cfg);

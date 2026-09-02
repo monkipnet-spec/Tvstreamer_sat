@@ -245,6 +245,7 @@ StreamOutputConfig StreamOutputConfig::fromJson(const Json::Value& root) {
     output.outputMode = root.get("output_mode", "listener").asString();
     output.outputHost = root.get("output_host", "127.0.0.1").asString();
     output.outputPort = root.get("output_port", 1234).asInt();
+    output.interfaceAddress = root.get("interface_address", "").asString();
     normalizeOutputEndpoint(output.outputHost, output.outputPort, output.outputType);
     if (toLower(output.outputType) == "srt" && (!root.isMember("output_port") || output.outputPort <= 0 || output.outputPort > 65535)) {
         output.outputPort = 7001;
@@ -258,6 +259,7 @@ Json::Value StreamOutputConfig::toJson() const {
     root["output_mode"] = outputMode;
     root["output_host"] = outputHost;
     root["output_port"] = outputPort;
+    root["interface_address"] = interfaceAddress;
     return root;
 }
 
