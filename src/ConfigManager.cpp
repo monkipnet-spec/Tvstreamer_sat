@@ -392,6 +392,11 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.transcodeResolution = root.get("transcode_resolution", "1920x1080").asString();
     config.transcodeVideoCodec = root.get("transcode_video_codec", "h264").asString();
     if (config.transcodeVideoCodec != "copy") config.transcodeVideoCodec = "h264";
+    config.transcodeVideoEncoder = toLower(root.get("transcode_video_encoder", "auto").asString());
+    if (config.transcodeVideoEncoder != "auto" && config.transcodeVideoEncoder != "x264" &&
+        config.transcodeVideoEncoder != "nvenc") {
+        config.transcodeVideoEncoder = "auto";
+    }
     config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
     config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();
     if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3" &&
@@ -458,6 +463,7 @@ Json::Value StreamConfig::toJson() const {
     root["transcode_enabled"] = transcodeEnabled;
     root["transcode_resolution"] = transcodeResolution;
     root["transcode_video_codec"] = transcodeVideoCodec;
+    root["transcode_video_encoder"] = transcodeVideoEncoder;
     root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);
     root["transcode_audio_codec"] = transcodeAudioCodec;
     root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);

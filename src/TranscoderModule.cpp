@@ -29,6 +29,60 @@ bool executableInPath(const std::string& name, std::string* path = nullptr) {
     return false;
 }
 
+bool factoryAvailable(const char* name) {
+    GstElementFactory* factory = gst_element_factory_find(name);
+    if (!factory) return false;
+    gst_object_unref(factory);
+    return true;
+}
+
+std::string selectedVideoEncoderFactory(const StreamConfig& config) {
+    const std::string requested = config.transcodeVideoEncoder;
+    if (requested == "nvenc") return factoryAvailable("nvh264enc") ? "nvh264enc" : std::string();
+    if (requested == "x264") return factoryAvailable("x264enc") ? "x264enc" : std::string();
+    // Auto mode prefers NVIDIA NVENC when the GStreamer nvcodec element is
+    // registered by a working NVIDIA driver, otherwise it falls back to CPU x264.
+    if (factoryAvailable("nvh264enc")) return "nvh264enc";
+    if (factoryAvailable("x264enc")) return "x264enc";
+    return {};
+}
+
+void configureVideoEncoder(GstElement* encoder, const std::string& factory, guint bitrateKbps) {
+    if (!encoder) return;
+    if (factory == "nvh264enc") {
+        // nvh264enc accepts system-memory NV12 and uploads it internally. Keep the
+        // same one-second GOP/header cadence used by the CPU path so SRT/UDP late
+        // joins still recover at the next IDR.
+        g_object_set(encoder,
+            "bitrate", bitrateKbps,
+            "gop-size", 50,
+            "bframes", 0u,
+            "aud", TRUE,
+            "zerolatency", TRUE,
+            "repeat-sequence-header", TRUE,
+            "strict-gop", TRUE,
+            "vbv-buffer-size", std::max<guint>(bitrateKbps, 500u),
+            nullptr);
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "rc-mode")) {
+            gst_util_set_object_arg(G_OBJECT(encoder), "rc-mode", "cbr");
+        }
+        return;
+    }
+
+    g_object_set(encoder,
+        "bitrate", bitrateKbps,
+        "key-int-max", 50,
+        "bframes", 2,
+        "byte-stream", TRUE,
+        "aud", TRUE,
+        "vbv-buf-capacity", 1000u,
+        nullptr);
+    gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
+    gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
+    g_object_set(encoder, "option-string",
+        "nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0", nullptr);
+}
+
 struct TimestampNormalizer {
     std::mutex mutex;
     GstClockTime lastPts = GST_CLOCK_TIME_NONE;
@@ -255,23 +309,32 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         const guint bitrateKbps = static_cast<guint>(
             std::max<uint64_t>(500000, context->config.transcodeVideoBitrate) / 1000);
 
+        const std::string videoEncoderFactory = selectedVideoEncoderFactory(context->config);
         GstElement* queue = gst_element_factory_make("queue", nullptr);
         GstElement* convert = gst_element_factory_make("videoconvert", nullptr);
         GstElement* deinterlace = gst_element_factory_make("deinterlace", nullptr);
         GstElement* scale = gst_element_factory_make("videoscale", nullptr);
+        GstElement* postScaleConvert = videoEncoderFactory == "nvh264enc"
+            ? gst_element_factory_make("videoconvert", nullptr)
+            : nullptr;
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
-        GstElement* encoder = gst_element_factory_make("x264enc", nullptr);
+        GstElement* encoder = videoEncoderFactory.empty()
+            ? nullptr
+            : gst_element_factory_make(videoEncoderFactory.c_str(), nullptr);
         GstElement* parser = gst_element_factory_make("h264parse", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
-        if (!queue || !convert || !deinterlace || !scale || !filter || !encoder || !parser || !outQueue) {
+        if (!queue || !convert || !deinterlace || !scale ||
+            (videoEncoderFactory == "nvh264enc" && !postScaleConvert) ||
+            !filter || !encoder || !parser || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
             return;
         }
 
+        const char* rawFormat = videoEncoderFactory == "nvh264enc" ? "NV12" : "I420";
         GstCaps* rawCaps = gst_caps_new_simple("video/x-raw",
-            "format", G_TYPE_STRING, "I420",
+            "format", G_TYPE_STRING, rawFormat,
             "width", G_TYPE_INT, width,
             "height", G_TYPE_INT, height,
             "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
@@ -286,27 +349,23 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         gst_util_set_object_arg(G_OBJECT(deinterlace), "mode", "auto-strict");
         gst_util_set_object_arg(G_OBJECT(deinterlace), "fields", "all");
         gst_util_set_object_arg(G_OBJECT(deinterlace), "locking", "passive");
-        g_object_set(encoder,
-            "bitrate", bitrateKbps,
-            "key-int-max", 50,
-            "bframes", 2,
-            "byte-stream", TRUE,
-            "aud", TRUE,
-            "vbv-buf-capacity", 1000u,
-            nullptr);
-        gst_util_set_object_arg(G_OBJECT(encoder), "speed-preset", "veryfast");
-        gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
-        g_object_set(encoder, "option-string",
-            "nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0", nullptr);
+        configureVideoEncoder(encoder, videoEncoderFactory, bitrateKbps);
         // 202.74: repeat parameter sets with every IDR so late SRT/UDP subscribers
         // acquire decoder configuration immediately at the next keyframe.
         g_object_set(parser, "config-interval", -1, nullptr);
 
-        if (!add(context->bin, queue) || !add(context->bin, convert) || !add(context->bin, deinterlace) ||
-            !add(context->bin, scale) || !add(context->bin, filter) ||
-            !add(context->bin, encoder) || !add(context->bin, parser) || !add(context->bin, outQueue) ||
-            !gst_element_link_many(queue, convert, deinterlace, scale, filter, encoder, parser, outQueue, nullptr) ||
-            !linkElementToMux(outQueue, context->mux)) {
+        const bool elementsAdded =
+            add(context->bin, queue) && add(context->bin, convert) && add(context->bin, deinterlace) &&
+            add(context->bin, scale) && (!postScaleConvert || add(context->bin, postScaleConvert)) &&
+            add(context->bin, filter) && add(context->bin, encoder) && add(context->bin, parser) &&
+            add(context->bin, outQueue);
+        const bool videoLinked = elementsAdded &&
+            (postScaleConvert
+                ? gst_element_link_many(queue, convert, deinterlace, scale, postScaleConvert,
+                                        filter, encoder, parser, outQueue, nullptr)
+                : gst_element_link_many(queue, convert, deinterlace, scale,
+                                        filter, encoder, parser, outQueue, nullptr));
+        if (!elementsAdded || !videoLinked || !linkElementToMux(outQueue, context->mux)) {
             std::cerr << "Transcoder: failed to build video branch" << std::endl;
             gst_caps_unref(caps);
             drainPad(context->bin, pad);
@@ -316,14 +375,14 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstPad* sinkPad = gst_element_get_static_pad(queue, "sink");
         if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
             context->videoLinked = true;
-            std::cerr << "Transcoder: video linked using x264enc "
+            std::cerr << "Transcoder: video linked using " << videoEncoderFactory << " "
                       << width << "x" << height << " @ "
                       << context->config.transcodeVideoBitrate
                       << " bit/s cadence=preserve-progressive/double-interlaced-fields"
                       << " headers=every-idr" << std::endl;
         }
         if (sinkPad) gst_object_unref(sinkPad);
-        for (GstElement* e : {queue, convert, deinterlace, scale, filter, encoder, parser, outQueue}) sync(e);
+        for (GstElement* e : {queue, convert, deinterlace, scale, postScaleConvert, filter, encoder, parser, outQueue}) sync(e);
     } else if (media.rfind("audio/x-raw", 0) == 0 && !context->audioLinked) {
         const std::string codec = context->config.transcodeAudioCodec == "mp3" ? "mp3" : "aac";
         GstElement* queue = gst_element_factory_make("queue", nullptr);
@@ -640,7 +699,7 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     const char* required[] = {
         "uridecodebin", "decodebin", "queue",
         "videoconvert", "deinterlace", "videoscale", "videorate", "capsfilter",
-        "x264enc", "h264parse",
+        "h264parse",
         "audioconvert", "audioresample",
         "aacparse", "mpegtsmux", "udpsink", nullptr
     };
@@ -651,11 +710,11 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
         else gst_object_unref(factory);
     }
 
-    GstElementFactory* videoFactory = gst_element_factory_find("x264enc");
-    if (videoFactory) {
-        result.videoEncoder = "x264enc";
-        gst_object_unref(videoFactory);
-    }
+    result.x264Available = factoryAvailable("x264enc");
+    result.nvencAvailable = factoryAvailable("nvh264enc");
+    if (result.nvencAvailable) result.videoEncoder = "nvh264enc";
+    else if (result.x264Available) result.videoEncoder = "x264enc";
+    else result.missingElements.emplace_back("H.264 encoder: nvh264enc or x264enc");
     GstElementFactory* aacParser = gst_element_factory_find("aacparse");
     if (aacParser) {
         gst_object_unref(aacParser);
@@ -687,7 +746,8 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     }
     result.available = result.missingElements.empty();
     result.message = result.available
-        ? "GStreamer software transcoding is available: " + gstLaunchPath
+        ? "GStreamer transcoding is available: preferred video encoder " + result.videoEncoder +
+              ", gst-launch=" + gstLaunchPath
         : "Transcoding is unavailable because required GStreamer elements are missing";
     return result;
 }
@@ -731,6 +791,17 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         }
         return nullptr;
     }
+    if (videoCodec != "copy") {
+        const std::string requestedEncoder = config.transcodeVideoEncoder;
+        if (requestedEncoder == "nvenc" && !capabilities.nvencAvailable) {
+            error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
+            return nullptr;
+        }
+        if (requestedEncoder == "x264" && !capabilities.x264Available) {
+            error = "CPU x264 was requested but GStreamer x264enc is not available";
+            return nullptr;
+        }
+    }
 
     const std::string audioCodec = config.transcodeAudioCodec == "copy" ? "copy" :
         (config.transcodeAudioCodec == "mp3" ? "mp3" : "aac");
@@ -760,7 +831,8 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         "alignment", 7,
         "bitrate", muxBitrate,
         nullptr);
-    std::cerr << "Transcoder 202.73: video=" << videoCodec
+    std::cerr << "Transcoder 202.78: video=" << videoCodec
+              << " video_encoder=" << (videoCodec == "copy" ? "copy" : selectedVideoEncoderFactory(config))
               << " audio=" << audioCodec
               << " cadence=preserve-progressive/double-interlaced-fields"
               << " mux_bitrate=" << muxBitrate << std::endl;

@@ -186,10 +186,65 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
     return ss.str();
 }
 
-std::string scaledVideoCaps(int width, int height) {
-    return "video/x-raw,format=I420,width=" + std::to_string(width) +
+std::string selectedVideoEncoderFactory(const StreamConfig& cfg) {
+    if (cfg.transcodeVideoEncoder == "nvenc") return hasFactory("nvh264enc") ? "nvh264enc" : std::string();
+    if (cfg.transcodeVideoEncoder == "x264") return hasFactory("x264enc") ? "x264enc" : std::string();
+    if (hasFactory("nvh264enc")) return "nvh264enc";
+    if (hasFactory("x264enc")) return "x264enc";
+    return {};
+}
+
+std::string scaledVideoCaps(int width, int height, const std::string& encoderFactory) {
+    const char* format = encoderFactory == "nvh264enc" ? "NV12" : "I420";
+    return "video/x-raw,format=" + std::string(format) + ",width=" + std::to_string(width) +
            ",height=" + std::to_string(height) +
            ",pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
+}
+
+bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
+                        bool flv, int keyInt, std::string& error) {
+    const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
+    if (encoderFactory.empty()) {
+        if (cfg.transcodeVideoEncoder == "nvenc") {
+            error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
+        } else if (cfg.transcodeVideoEncoder == "x264") {
+            error = "CPU x264 was requested but GStreamer x264enc is not available";
+        } else {
+            error = "no H.264 video encoder is available (need nvh264enc or x264enc)";
+        }
+        return false;
+    }
+
+    const uint64_t bitrateKbps = tvs::protocols::safeVideoBitrate(cfg) / 1000;
+    args.insert(args.end(), {"!", encoderFactory});
+    if (encoderFactory == "nvh264enc") {
+        args.insert(args.end(), {
+            property("bitrate", std::to_string(bitrateKbps)),
+            property("gop-size", std::to_string(keyInt)),
+            "bframes=0",
+            "rc-mode=cbr",
+            "zerolatency=true",
+            "aud=true",
+            "repeat-sequence-header=true",
+            "strict-gop=true",
+            property("vbv-buffer-size", std::to_string(std::max<uint64_t>(bitrateKbps, 500)))
+        });
+    } else {
+        args.insert(args.end(), {
+            "tune=zerolatency",
+            "speed-preset=superfast",
+            property("bitrate", std::to_string(bitrateKbps)),
+            property("key-int-max", std::to_string(keyInt)),
+            "bframes=0",
+            property("byte-stream", flv ? "false" : "true"),
+            "aud=true",
+            "insert-vui=true",
+            "sliced-threads=true",
+            "vbv-buf-capacity=1000",
+            "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0"
+        });
+    }
+    return true;
 }
 
 bool validateOutputAvailability(const StreamConfig& outputConfig, std::string& error) {
@@ -280,13 +335,19 @@ bool appendTranscoderDecodeInput(
     return true;
 }
 
-void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec) {
+void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
+                    const GstOutputSpec& spec, std::string& error) {
     int width = 1920;
     int height = 1080;
     TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height);
-    const uint64_t bitrateKbps = tvs::protocols::safeVideoBitrate(cfg) / 1000;
     const bool flv = spec.container == ContainerKind::Flv;
-    const bool rtsp = spec.container == ContainerKind::Rtsp;
+    const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
+    if (encoderFactory.empty()) {
+        if (cfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
+        else if (cfg.transcodeVideoEncoder == "x264") error = "CPU x264enc is not available";
+        else error = "no H.264 video encoder is available";
+        return;
+    }
 
     args.insert(args.end(), {"dec.", "!"});
     addQueue(args, "transcode_video_queue", 8000000000ULL);
@@ -297,23 +358,19 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
         "!", "video/x-raw",
         "!", "videoconvert",
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
-        "!", "videoscale", "add-borders=false", "method=lanczos",
-        "!", scaledVideoCaps(width, height),
-        "!", "x264enc",
-        "tune=zerolatency",
-        "speed-preset=superfast",
-        property("bitrate", std::to_string(bitrateKbps)),
-        "key-int-max=50",
-        "bframes=0",
-        property("byte-stream", flv ? "false" : "true"),
-        "aud=true",
-        "insert-vui=true",
-        "sliced-threads=true",
-        "vbv-buf-capacity=1000",
-        "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
-        // 202.74: inject SPS/PPS with every IDR. Live SRT/UDP clients can join mid-GOP;
-        // waiting for a periodic codec-config interval produced long bursts of
-        // "non-existing PPS" before a decoder could recover.
+        "!", "videoscale", "add-borders=false", "method=lanczos"
+    });
+    if (encoderFactory == "nvh264enc") {
+        // nvh264enc does not accept I420. Convert after YADIF/scale so the
+        // deinterlacer can keep its proven CPU format and hand NV12 to NVENC.
+        args.insert(args.end(), {"!", "videoconvert"});
+    }
+    args.insert(args.end(), {"!", scaledVideoCaps(width, height, encoderFactory)});
+    if (!appendVideoEncoder(args, cfg, flv, 50, error)) return;
+    args.insert(args.end(), {
+        // Keep parameter sets on every IDR for both CPU and NVENC. nvh264enc
+        // also enables repeat-sequence-header; h264parse normalizes the output
+        // for late SRT/UDP joins and FLV/TS stream-format requirements.
         "!", "h264parse", property("config-interval", "-1"),
         "!", flv
             ? "video/x-h264,stream-format=avc,alignment=au"
@@ -322,6 +379,12 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     });
     addQueue(args, "transcode_video_mux_queue", 3000000000ULL);
     args.insert(args.end(), {"!", spec.videoPad});
+
+    std::cerr << "GStreamer transcoder video encoder: requested=" << cfg.transcodeVideoEncoder
+              << " selected=" << encoderFactory
+              << " output=" << width << "x" << height
+              << " bitrate=" << tvs::protocols::safeVideoBitrate(cfg)
+              << " headers=every-idr" << std::endl;
 }
 
 void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
@@ -405,19 +468,24 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     int height = 720;
     TranscoderModule::resolutionSize(testCfg.transcodeResolution, width, height);
 
+    const std::string testVideoEncoder = selectedVideoEncoderFactory(testCfg);
+    if (testVideoEncoder.empty()) {
+        error = testCfg.transcodeVideoEncoder == "nvenc"
+            ? "NVIDIA NVENC nvh264enc is not available"
+            : "no H.264 video encoder is available";
+        return;
+    }
     args.insert(args.end(), {
         "videotestsrc", "is-live=true", "pattern=smpte", "!", "video/x-raw,framerate=25/1", "!"
     });
     addQueue(args, "test_video_queue", 3000000000ULL);
     args.insert(args.end(), {
-        "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate",
-        "!", scaledVideoCaps(width, height),
-        "!", "x264enc", "tune=zerolatency", "speed-preset=superfast",
-        property("bitrate", std::to_string(tvs::protocols::safeVideoBitrate(testCfg) / 1000)),
-        "key-int-max=25", "bframes=0",
-        property("byte-stream", spec.container == ContainerKind::Flv ? "false" : "true"),
-        "aud=true", "insert-vui=true", "sliced-threads=true", "vbv-buf-capacity=1000",
-        "option-string=nal-hrd=cbr:force-cfr=1:repeat-headers=1:scenecut=0",
+        "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate"
+    });
+    if (testVideoEncoder == "nvh264enc") args.insert(args.end(), {"!", "videoconvert"});
+    args.insert(args.end(), {"!", scaledVideoCaps(width, height, testVideoEncoder)});
+    if (!appendVideoEncoder(args, testCfg, spec.container == ContainerKind::Flv, 25, error)) return;
+    args.insert(args.end(), {
         "!", "h264parse", property("config-interval", "-1"),
         "!", spec.container == ContainerKind::Flv
             ? "video/x-h264,stream-format=avc,alignment=au"
@@ -456,12 +524,15 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
     std::vector<std::string> required = tvs::protocols::requiredInputElements();
     const std::vector<std::string> common = {
         "queue", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
-        "x264enc", "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
+        "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
     required.insert(required.end(), common.begin(), common.end());
 
     std::vector<std::string> missing;
     validateFactories(required, missing);
+    if (!hasFactory("nvh264enc") && !hasFactory("x264enc")) {
+        missing.emplace_back("H.264 encoder: nvh264enc or x264enc");
+    }
     if (findAacEncoder().empty()) {
         missing.emplace_back("AAC encoder: fdkaacenc, voaacenc or avenc_aac");
     }
@@ -633,11 +704,13 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
         if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
             return {};
         }
-        std::cerr << "GStreamer transcoder 202.73: video=h264"
+        std::cerr << "GStreamer transcoder 202.78: video=h264"
+                  << " encoder_request=" << baseConfig.transcodeVideoEncoder
                   << " deinterlace=yadif-all-fields"
                   << " cadence=preserve-progressive/double-interlaced-fields"
                   << " output=" << baseConfig.transcodeResolution << std::endl;
-        addVideoBranch(args, baseConfig, outputSpec);
+        addVideoBranch(args, baseConfig, outputSpec, error);
+        if (!error.empty()) return {};
         addAudioBranch(args, baseConfig, outputSpec, error);
     }
     if (!error.empty()) return {};

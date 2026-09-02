@@ -8,6 +8,8 @@
 struct TranscoderCapabilities {
     bool available = false;
     std::string videoEncoder;
+    bool x264Available = false;
+    bool nvencAvailable = false;
     std::string audioEncoder;
     std::string aacEncoder;
     std::string mp3Encoder;

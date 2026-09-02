@@ -21,7 +21,6 @@ required=(
   videoscale
   videorate
   capsfilter
-  x264enc
   h264parse
   audioconvert
   audioresample
@@ -46,6 +45,20 @@ for element in voaacenc fdkaacenc avenc_aac; do
     break
   fi
 done
+
+x264_encoder=""
+if gst-inspect-1.0 x264enc >/dev/null 2>&1; then
+  x264_encoder="x264enc"
+fi
+
+nvenc_encoder=""
+if gst-inspect-1.0 nvh264enc >/dev/null 2>&1; then
+  nvenc_encoder="nvh264enc"
+fi
+
+if [[ -z "$x264_encoder" && -z "$nvenc_encoder" ]]; then
+  missing+=("H.264 encoder: nvh264enc or x264enc")
+fi
 
 mp3_encoder=""
 for element in lamemp3enc avenc_mp3; do
@@ -113,7 +126,9 @@ print_group() {
 
 echo "TVStreammerSAT5 GStreamer core is available."
 echo "  gst-launch: $(command -v gst-launch-1.0)"
-echo "  Video encoder: x264enc"
+echo "  Auto video encoder: ${nvenc_encoder:-${x264_encoder:-not available}}"
+echo "  NVIDIA NVENC: ${nvenc_encoder:-not available}"
+echo "  CPU x264: ${x264_encoder:-not available}"
 echo "  AAC encoder: ${aac_encoder}"
 echo "  MP3 encoder: ${mp3_encoder:-not available}"
 echo
