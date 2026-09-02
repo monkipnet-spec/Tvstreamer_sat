@@ -4310,18 +4310,34 @@ function exportSubscribers() {
       streamClass: subscriberStreamClassFromIds(streamIds)
     };
   });
-  entries.sort((left, right) => {
-    const classDiff = subscriberStreamClassRank(left.streamClass) - subscriberStreamClassRank(right.streamClass);
-    if (classDiff !== 0) return classDiff;
-    return left.name.localeCompare(right.name, language === 'ru' ? 'ru' : 'en', {sensitivity:'base'});
+  entries.sort((left, right) =>
+    left.name.localeCompare(right.name, language === 'ru' ? 'ru' : 'en', {sensitivity:'base'})
+  );
+
+  const header = language === 'ru'
+    ? 'Имя абонента, IP адрес, Статус'
+    : 'Subscriber, IP address, Status';
+  const sectionNames = language === 'ru'
+    ? {'HD':'HD ПОТОКИ', 'HD+SD':'HD + SD ПОТОКИ', 'SD':'SD ПОТОКИ', 'OTHER':'БЕЗ МЕТКИ HD/SD'}
+    : {'HD':'HD STREAMS', 'HD+SD':'HD + SD STREAMS', 'SD':'SD STREAMS', 'OTHER':'NO HD/SD TAG'};
+  const orderedClasses = ['HD', 'HD+SD', 'SD', 'OTHER'];
+  const lines = [];
+
+  orderedClasses.forEach(streamClass => {
+    const group = entries.filter(entry => entry.streamClass === streamClass);
+    if (!group.length) return;
+    if (lines.length) lines.push('');
+    lines.push(`=== ${sectionNames[streamClass]} ===`);
+    lines.push(header);
+    group.forEach(entry => {
+      const status = entry.online
+        ? (language === 'ru' ? 'онлайн' : 'online')
+        : (language === 'ru' ? 'офлайн' : 'offline');
+      lines.push(`${entry.name}, ${entry.ip}, ${status}`);
+    });
   });
-  const lines = [language === 'ru' ? 'Имя абонента, IP адрес, Статус' : 'Subscriber, IP address, Status'];
-  entries.forEach(entry => {
-    const status = entry.online
-      ? (language === 'ru' ? 'онлайн' : 'online')
-      : (language === 'ru' ? 'офлайн' : 'offline');
-    lines.push(`${entry.name}, ${entry.ip}, ${status}`);
-  });
+
+  if (!lines.length) lines.push(header);
   const blob = new Blob([lines.join('\n') + '\n'], {type:'text/plain;charset=utf-8'});
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
