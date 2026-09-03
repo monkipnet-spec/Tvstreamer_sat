@@ -69,6 +69,10 @@ constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
 constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 20ULL * 1000ULL * 1000ULL;
+// 202.90: experimental HLS UDP-CBR PCR phase advance. Audio/video PTS are
+// left untouched; only the synthetic output PCR clock is moved forward so the
+// measured ~4.4 s PTS-PCR lead is reduced to ~1.4 s for receiver compatibility.
+constexpr uint64_t kHlsCbrPcrPhaseAdvanceNanoseconds = 3000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kStatsIntervalNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampBackwardToleranceNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -2234,7 +2238,15 @@ private:
                             periodicPcrPid = tvStreamer5IpProfile
                                 ? packet.pid
                                 : declaredPcrPid;
-                            periodicPcrOriginTicks = packet.sourcePcrTicks;
+                            const bool hlsCbrPcrPhaseAdvance =
+                                hlsInput && mode == UdpShapingMode::Cbr &&
+                                tvStreamer5IpProfile && !sourcePcrPassthrough();
+                            const uint64_t pcrPhaseAdvanceTicks = hlsCbrPcrPhaseAdvance
+                                ? nanosecondsToPcrTicks(kHlsCbrPcrPhaseAdvanceNanoseconds)
+                                : 0ULL;
+                            periodicPcrOriginTicks =
+                                (packet.sourcePcrTicks + pcrPhaseAdvanceTicks) %
+                                kPcrTicksModulus;
                             periodicPcrOriginNanoseconds = slotTime;
                             nextPeriodicPcrNanoseconds =
                                 slotTime + kPeriodicPcrIntervalNanoseconds;
@@ -2255,6 +2267,10 @@ private:
                                               : (tvStreamer5IpProfile
                                                     ? "synthetic-tvstreamer5-20ms"
                                                     : "synthetic-cbr-20ms"))
+                                      << " pcr_phase_advance_ms="
+                                      << (hlsCbrPcrPhaseAdvance
+                                              ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                                              : 0ULL)
                                       << std::endl;
                         }
                     } else if (packet.pid == periodicPcrPid &&
@@ -2832,7 +2848,7 @@ GstElement* createSink(
         const char* tv5Source = isSegmentedHlsInput(config)
             ? "HLS"
             : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP");
-        std::cerr << "TVStreamer5 IP UDP shaper 202.89: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.90: source="
                   << tv5Source
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
@@ -2846,16 +2862,24 @@ GstElement* createSink(
                   << " source_pcr="
                   << (srtRemapCbrSourcePcr ? "preserved" : "stripped-after-lock")
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
+                  << " hls_cbr_pcr_phase_advance_ms="
+                  << (hlsTv5CbrReservoirProfile
+                          ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                          : 0ULL)
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.89: profile=TVStreamer5"
+        std::cerr << "HLS timing 202.90: profile=TVStreamer5"
                   << " pacing=reservoir-rate-controller"
                   << " startup_reservoir_ms=5000"
                   << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
                   << " steady_low_watermark_ms=" << steadyLowWatermarkMs
                   << " pcr=periodic-20ms source_pcr=stripped-after-lock"
                   << " cbr=null-stuffing+periodic-pcr"
+                  << " pcr_phase_advance_ms="
+                  << (hlsTv5CbrReservoirProfile
+                          ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                          : 0ULL)
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {
