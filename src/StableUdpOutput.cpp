@@ -69,10 +69,13 @@ constexpr uint64_t kPcrClockHz = 27000000ULL;
 constexpr uint64_t kPcrBaseModulus = (1ULL << 33);
 constexpr uint64_t kPcrTicksModulus = kPcrBaseModulus * 300ULL;
 constexpr uint64_t kPeriodicPcrIntervalNanoseconds = 20ULL * 1000ULL * 1000ULL;
-// 202.90: experimental HLS UDP-CBR PCR phase advance. Audio/video PTS are
-// left untouched; only the synthetic output PCR clock is moved forward so the
-// measured ~4.4 s PTS-PCR lead is reduced to ~1.4 s for receiver compatibility.
-constexpr uint64_t kHlsCbrPcrPhaseAdvanceNanoseconds = 3000ULL * 1000ULL * 1000ULL;
+// 202.91: HLS UDP-CBR no longer applies one fixed PCR phase to every service.
+// Measure each remuxed HLS program's own PTS-PCR lead before the sender starts,
+// then advance only its synthetic PCR enough to leave a receiver-friendly lead.
+constexpr uint64_t kHlsCbrTargetPtsPcrLeadNanoseconds = 1400ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsCbrMaxPcrPhaseAdvanceNanoseconds = 3000ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kHlsPtsPcrLeadSampleLimit = 512;
+constexpr std::size_t kHlsPtsPcrLeadMinimumSamples = 8;
 constexpr uint64_t kStatsIntervalNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampBackwardToleranceNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -344,6 +347,62 @@ bool parsePcr(const std::array<guint8, kTsPacketSize>& packet,
         static_cast<guint64>(packet[11]);
     pcrTicks = (base * 300ULL + extension) % kPcrTicksModulus;
     return true;
+}
+
+bool parsePesPts90k(const std::array<guint8, kTsPacketSize>& packet,
+                     uint64_t& pts90k) {
+    pts90k = 0;
+    if (packet[0] != 0x47 || (packet[1] & 0x40) == 0) {
+        return false;
+    }
+
+    const guint8 adaptationFieldControl =
+        static_cast<guint8>((packet[3] >> 4) & 0x03);
+    if (adaptationFieldControl != 1 && adaptationFieldControl != 3) {
+        return false;
+    }
+
+    std::size_t payloadOffset = 4;
+    if (adaptationFieldControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (5 + adaptationLength > kTsPacketSize) {
+            return false;
+        }
+        payloadOffset += 1 + adaptationLength;
+    }
+    if (payloadOffset + 14 > kTsPacketSize) {
+        return false;
+    }
+
+    const guint8* pes = packet.data() + payloadOffset;
+    const std::size_t payloadSize = kTsPacketSize - payloadOffset;
+    if (payloadSize < 14 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01) {
+        return false;
+    }
+
+    const guint8 ptsDtsFlags = static_cast<guint8>((pes[7] >> 6) & 0x03);
+    if ((ptsDtsFlags != 2 && ptsDtsFlags != 3) || pes[8] < 5) {
+        return false;
+    }
+
+    const guint8* p = pes + 9;
+    pts90k =
+        ((static_cast<uint64_t>((p[0] >> 1) & 0x07)) << 30) |
+        (static_cast<uint64_t>(p[1]) << 22) |
+        ((static_cast<uint64_t>((p[2] >> 1) & 0x7F)) << 15) |
+        (static_cast<uint64_t>(p[3]) << 7) |
+        static_cast<uint64_t>((p[4] >> 1) & 0x7F);
+    pts90k %= kPcrBaseModulus;
+    return true;
+}
+
+int64_t signedPtsPcrDifference90k(uint64_t pts90k, uint64_t pcrTicks) {
+    const uint64_t pcr90k = (pcrTicks / 300ULL) % kPcrBaseModulus;
+    uint64_t forward = (pts90k + kPcrBaseModulus - pcr90k) % kPcrBaseModulus;
+    if (forward >= kPcrBaseModulus / 2ULL) {
+        return static_cast<int64_t>(forward) - static_cast<int64_t>(kPcrBaseModulus);
+    }
+    return static_cast<int64_t>(forward);
 }
 
 void writePcr(std::array<guint8, kTsPacketSize>& packet, uint64_t pcrTicks) {
@@ -1564,6 +1623,7 @@ private:
             observeDeclaredPcrFromPmt(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
+            observeHlsPtsPcrLead(packet);
             if (segmentedHlsInput || continuousNetworkMpegTsInput) {
                 observePcrRate(packet);
             }
@@ -1588,6 +1648,70 @@ private:
         inputRemainderCapacityObserved.store(
             static_cast<uint64_t>(inputRemainder.capacity()),
             std::memory_order_relaxed);
+    }
+
+    void observeHlsPtsPcrLead(const TimedTsPacket& packet) {
+        if (!(hlsInput && mode == UdpShapingMode::Cbr && tvStreamer5IpProfile &&
+              !sourcePcrPassthrough())) {
+            return;
+        }
+
+        if (packet.hasPcr) {
+            hlsLeadLastPcrTicks = packet.sourcePcrTicks;
+            hlsLeadLastPcrValid = true;
+        }
+        if (!hlsLeadLastPcrValid) {
+            return;
+        }
+
+        uint64_t pts90k = 0;
+        if (!parsePesPts90k(packet.bytes, pts90k)) {
+            return;
+        }
+
+        const int64_t lead90k = signedPtsPcrDifference90k(pts90k, hlsLeadLastPcrTicks);
+        // Only plausible forward decoder lead is useful for phase selection.
+        // Ignore wrap/discontinuity artefacts and pathological values.
+        if (lead90k < 0 || lead90k > 10LL * 90000LL) {
+            return;
+        }
+
+        hlsPtsPcrLeadSamples90k.push_back(static_cast<uint64_t>(lead90k));
+        while (hlsPtsPcrLeadSamples90k.size() > kHlsPtsPcrLeadSampleLimit) {
+            hlsPtsPcrLeadSamples90k.pop_front();
+        }
+    }
+
+    uint64_t adaptiveHlsPcrPhaseAdvanceNanoseconds() {
+        if (hlsPtsPcrLeadSamples90k.size() < kHlsPtsPcrLeadMinimumSamples) {
+            hlsAdaptivePtsPcrLeadNanoseconds = 0;
+            hlsAdaptivePcrPhaseAdvanceNanoseconds = 0;
+            hlsAdaptivePcrPhaseSampleCount = hlsPtsPcrLeadSamples90k.size();
+            return 0;
+        }
+
+        std::vector<uint64_t> samples(
+            hlsPtsPcrLeadSamples90k.begin(), hlsPtsPcrLeadSamples90k.end());
+        const auto medianIt = samples.begin() + static_cast<std::ptrdiff_t>(samples.size() / 2);
+        std::nth_element(samples.begin(), medianIt, samples.end());
+        const uint64_t medianLead90k = *medianIt;
+        const uint64_t measuredLeadNs = multiplyDivide(
+            medianLead90k, 1000000000ULL, 90000ULL);
+
+        uint64_t advanceNs = measuredLeadNs > kHlsCbrTargetPtsPcrLeadNanoseconds
+            ? measuredLeadNs - kHlsCbrTargetPtsPcrLeadNanoseconds
+            : 0ULL;
+        advanceNs = std::min<uint64_t>(advanceNs, kHlsCbrMaxPcrPhaseAdvanceNanoseconds);
+
+        // Synthetic PCR is emitted every 20 ms. Round down to that grid so the
+        // adaptive correction never overshoots the requested minimum lead.
+        advanceNs = (advanceNs / kPeriodicPcrIntervalNanoseconds) *
+            kPeriodicPcrIntervalNanoseconds;
+
+        hlsAdaptivePtsPcrLeadNanoseconds = measuredLeadNs;
+        hlsAdaptivePcrPhaseAdvanceNanoseconds = advanceNs;
+        hlsAdaptivePcrPhaseSampleCount = samples.size();
+        return advanceNs;
     }
 
     void observeHlsTimestampRate(const TimedChunk& chunk) {
@@ -2238,12 +2362,15 @@ private:
                             periodicPcrPid = tvStreamer5IpProfile
                                 ? packet.pid
                                 : declaredPcrPid;
-                            const bool hlsCbrPcrPhaseAdvance =
+                            const bool hlsAdaptivePcrPhase =
                                 hlsInput && mode == UdpShapingMode::Cbr &&
                                 tvStreamer5IpProfile && !sourcePcrPassthrough();
-                            const uint64_t pcrPhaseAdvanceTicks = hlsCbrPcrPhaseAdvance
-                                ? nanosecondsToPcrTicks(kHlsCbrPcrPhaseAdvanceNanoseconds)
-                                : 0ULL;
+                            const uint64_t pcrPhaseAdvanceNanoseconds =
+                                hlsAdaptivePcrPhase
+                                    ? adaptiveHlsPcrPhaseAdvanceNanoseconds()
+                                    : 0ULL;
+                            const uint64_t pcrPhaseAdvanceTicks =
+                                nanosecondsToPcrTicks(pcrPhaseAdvanceNanoseconds);
                             periodicPcrOriginTicks =
                                 (packet.sourcePcrTicks + pcrPhaseAdvanceTicks) %
                                 kPcrTicksModulus;
@@ -2267,10 +2394,20 @@ private:
                                               : (tvStreamer5IpProfile
                                                     ? "synthetic-tvstreamer5-20ms"
                                                     : "synthetic-cbr-20ms"))
-                                      << " pcr_phase_advance_ms="
-                                      << (hlsCbrPcrPhaseAdvance
-                                              ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                                      << " pcr_phase_mode="
+                                      << (hlsAdaptivePcrPhase ? "adaptive" : "fixed-zero")
+                                      << " pcr_phase_samples="
+                                      << (hlsAdaptivePcrPhase ? hlsAdaptivePcrPhaseSampleCount : 0ULL)
+                                      << " measured_pts_pcr_lead_ms="
+                                      << (hlsAdaptivePcrPhase
+                                              ? (hlsAdaptivePtsPcrLeadNanoseconds / 1000000ULL)
                                               : 0ULL)
+                                      << " target_pts_pcr_lead_ms="
+                                      << (hlsAdaptivePcrPhase
+                                              ? (kHlsCbrTargetPtsPcrLeadNanoseconds / 1000000ULL)
+                                              : 0ULL)
+                                      << " pcr_phase_advance_ms="
+                                      << (pcrPhaseAdvanceNanoseconds / 1000000ULL)
                                       << std::endl;
                         }
                     } else if (packet.pid == periodicPcrPid &&
@@ -2678,6 +2815,16 @@ private:
     uint64_t lastRateSampleBytes = 0;
     uint64_t lastControllerUpdateNanoseconds = 0;
 
+    // 202.91: per-HLS-channel phase estimator. Samples are taken from the
+    // remuxed TS that StableUdpOutput actually receives, so they include the
+    // exact timing domain that the synthetic PCR will accompany on the wire.
+    uint64_t hlsLeadLastPcrTicks = 0;
+    bool hlsLeadLastPcrValid = false;
+    std::deque<uint64_t> hlsPtsPcrLeadSamples90k;
+    uint64_t hlsAdaptivePtsPcrLeadNanoseconds = 0;
+    uint64_t hlsAdaptivePcrPhaseAdvanceNanoseconds = 0;
+    uint64_t hlsAdaptivePcrPhaseSampleCount = 0;
+
     bool periodicPcrInitialized = false;
     uint16_t periodicPcrPid = 0x1FFF;
     uint64_t periodicPcrOriginTicks = 0;
@@ -2848,7 +2995,7 @@ GstElement* createSink(
         const char* tv5Source = isSegmentedHlsInput(config)
             ? "HLS"
             : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP");
-        std::cerr << "TVStreamer5 IP UDP shaper 202.90: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.91: source="
                   << tv5Source
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
@@ -2862,23 +3009,33 @@ GstElement* createSink(
                   << " source_pcr="
                   << (srtRemapCbrSourcePcr ? "preserved" : "stripped-after-lock")
                   << " final_cc_rewrite=off remap_psi_rewrite=off"
-                  << " hls_cbr_pcr_phase_advance_ms="
+                  << " hls_cbr_pcr_phase=adaptive"
+                  << " target_pts_pcr_lead_ms="
                   << (hlsTv5CbrReservoirProfile
-                          ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                          ? (kHlsCbrTargetPtsPcrLeadNanoseconds / 1000000ULL)
+                          : 0ULL)
+                  << " max_pcr_phase_advance_ms="
+                  << (hlsTv5CbrReservoirProfile
+                          ? (kHlsCbrMaxPcrPhaseAdvanceNanoseconds / 1000000ULL)
                           : 0ULL)
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.90: profile=TVStreamer5"
+        std::cerr << "HLS timing 202.91: profile=TVStreamer5"
                   << " pacing=reservoir-rate-controller"
                   << " startup_reservoir_ms=5000"
                   << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
                   << " steady_low_watermark_ms=" << steadyLowWatermarkMs
                   << " pcr=periodic-20ms source_pcr=stripped-after-lock"
                   << " cbr=null-stuffing+periodic-pcr"
-                  << " pcr_phase_advance_ms="
+                  << " pcr_phase=adaptive-per-hls-channel"
+                  << " target_pts_pcr_lead_ms="
                   << (hlsTv5CbrReservoirProfile
-                          ? (kHlsCbrPcrPhaseAdvanceNanoseconds / 1000000ULL)
+                          ? (kHlsCbrTargetPtsPcrLeadNanoseconds / 1000000ULL)
+                          : 0ULL)
+                  << " max_pcr_phase_advance_ms="
+                  << (hlsTv5CbrReservoirProfile
+                          ? (kHlsCbrMaxPcrPhaseAdvanceNanoseconds / 1000000ULL)
                           : 0ULL)
                   << std::endl;
     }
