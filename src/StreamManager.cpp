@@ -9048,7 +9048,6 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
 }
 
 void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data) {
-    (void)demux;
     auto* ctx = static_cast<RemapContext*>(user_data);
     if (!ctx || !ctx->mux) {
         return;
@@ -9090,7 +9089,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                 tsdemux = gst_element_factory_make("tsdemux", "hls_tvstreamer5_compat_tsdemux");
                 if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
                     if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
-                    std::cerr << "HLS TVStreamer5 compatibility 202.85: failed to create tsdemux"
+                    std::cerr << "HLS TVStreamer5 compatibility 202.86: failed to create tsdemux"
                               << std::endl;
                     if (caps) gst_caps_unref(caps);
                     gst_object_unref(pipeline);
@@ -9101,7 +9100,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                     G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
                 ctx->hlsCompatTsDemux = tsdemux;
                 gst_element_sync_state_with_parent(tsdemux);
-                std::cerr << "HLS TVStreamer5 compatibility 202.85: input_pad=mpegts"
+                std::cerr << "HLS TVStreamer5 compatibility 202.86: input_pad=mpegts"
                           << " adapter=tsdemux elementary_path=parser+mpegtsmux"
                           << " decode=off transcode=off" << std::endl;
             }
@@ -9125,7 +9124,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                 }
             }
 
-            std::cerr << "HLS TVStreamer5 compatibility 202.85: MPEG-TS pad link failed caps="
+            std::cerr << "HLS TVStreamer5 compatibility 202.86: MPEG-TS pad link failed caps="
                       << capsString << std::endl;
             if (caps) gst_caps_unref(caps);
             gst_object_unref(pipeline);
@@ -9173,8 +9172,17 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
+    // 202.86: the MPEG-TS pad exposed by hlsdemux on GStreamer 1.20 is first
+    // adapted through hlsCompatTsDemux into elementary A/V and remuxed back to
+    // transport. That intermediate adapter must remain parser -> mpegtsmux only.
+    // The final Stable UDP remap owns the single 1500 ms audio startup reservoir
+    // and clocksync. Applying both stages here created two independent audio
+    // pacing points on HLS, matching the duplicate reservoir-complete logs.
+    const bool hlsCompatibilityElementaryPad =
+        ctx->hlsCompatTsDemux && demux == ctx->hlsCompatTsDemux;
     const bool stableUdpAudioReservoir =
         isAudio && !ctx->flvMux &&
+        !hlsCompatibilityElementaryPad &&
         usesStableUdpShaper(ctx->config) &&
         udpCbrOutputEnabled(ctx->config);
     const auto remapInputKind = tvs::stream_protocols::inputKind(ctx->config);
@@ -9188,10 +9196,10 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    // 202.83: SRT/HTTP/HLS use the TVStreamer5 elementary-stream audio path
-    // exactly: 1500 ms startup reservoir followed by clocksync(sync-to-first).
-    // The HLS addition is intentional; it replaces the SAT5 startup-only HLS
-    // queue that could drift into repeated AAC stalls after several segments.
+    // SRT/HTTP and the final HLS Stable UDP remap use the TVStreamer5
+    // elementary-stream audio path: one 1500 ms startup reservoir followed by
+    // clocksync(sync-to-first). The intermediate HLS compatibility demux is
+    // deliberately excluded above so HLS is paced only once.
     GstElement* audioClockSync = tvStreamer5AudioClock
         ? gst_element_factory_make("clocksync", nullptr)
         : nullptr;
@@ -9372,6 +9380,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                       : "")
                   << (tvStreamer5NetworkRemap
                       ? " remap_profile=TVStreamer5"
+                      : "")
+                  << (hlsCompatibilityElementaryPad && isAudio
+                      ? " hls_compat_audio_pacer=off"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);
