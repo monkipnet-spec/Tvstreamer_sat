@@ -418,9 +418,10 @@ GstElement* buildHls(
     ctx->config = cfg;
     ctx->flvMux = false;
 
-    // Preserve the already proven direct MPEG-TS path.  TVStreamer5-style
-    // source handling is used up to hlsdemux; if hlsdemux exposes complete TS,
-    // no demux/remux cycle is introduced.  ES-only HLS keeps mpegtsmux fallback.
+    // 202.81: the mux branch is the only output branch for HLS. If hlsdemux
+    // exposes complete MPEG-TS fragments, StreamManager routes them through a
+    // persistent tsdemux and then back into this mux. This keeps codec payloads
+    // untouched while regenerating one continuous TS timeline/CC domain.
     GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src");
     GstPad* muxSelectorPad = gst_element_request_pad_simple(selector, "sink_%u");
     if (!muxSrcPad || !muxSelectorPad ||
@@ -451,11 +452,11 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.80: protocol=HLS source=souphttpsrc+hlsdemux"
+    std::cerr << "Network TS input 202.81: protocol=HLS source=souphttpsrc+hlsdemux"
               << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off"
-              << " http_is_live=off do_timestamp=off media_clock=provider-pcr-pts"
-              << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
-              << " http_retries=infinite watchdog_rebuild_ms=15000"
+              << " http_is_live=off do_timestamp=off"
+              << " direct_mpegts=off continuous_remux=on decode=off transcode=off"
+              << " regenerate_pat_pmt_pcr_cc=on http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;
     return src;
 }

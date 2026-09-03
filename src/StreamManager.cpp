@@ -4315,8 +4315,13 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    if (tvs::stream_protocols::inputKind(cfg) ==
-        tvs::stream_protocols::InputProtocolKind::Srt) {
+    const auto muxInputKind = tvs::stream_protocols::inputKind(cfg);
+    if (muxInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
+        muxInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
+        // 202.81: HLS segment boundaries may legally carry discontinuities or
+        // timestamp steps that are meaningful only together with the playlist.
+        // Once HLS is restreamed as one continuous TS, keep mux input timing
+        // monotonic when the installed GStreamer version exposes these guards.
         setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
         setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
     }
@@ -9072,44 +9077,72 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // v202.2 HLS fast path. Legacy hlsdemux commonly exposes complete MPEG-TS
-        // fragments. They already contain a coherent provider PAT/PMT/PCR/PTS
-        // timeline, so demuxing to elementary streams and rebuilding with
-        // mpegtsmux only adds timestamp jitter at every segment boundary.
-        // Select a direct transport path and keep every TS byte unchanged.
+        // 202.81: do not concatenate HLS MPEG-TS fragments byte-for-byte into a
+        // long-lived transport. EXT-X-DISCONTINUITY, per-fragment continuity
+        // counter resets and PCR/PTS steps are valid inside HLS, but those
+        // playlist semantics disappear after conversion to UDP/SRT/HTTP TS.
+        // Keep compressed payloads untouched while rebuilding only the TS
+        // container: hlsdemux -> tsdemux -> parser -> mpegtsmux. This regenerates
+        // PAT/PMT/PCR/continuity counters and gives downstream clients one
+        // continuous clock domain. No audio/video decoding is performed.
         if (ctx->hlsInputSelector) {
-            if (!ctx->hlsDirectSelectorPad) {
-                ctx->hlsDirectSelectorPad =
-                    gst_element_request_pad_simple(ctx->hlsInputSelector, "sink_%u");
+            GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+            if (!pipeline) {
+                if (caps) gst_caps_unref(caps);
+                return;
             }
-            GstPad* directSinkPad = ctx->hlsDirectSelectorPad;
-            if (directSinkPad) {
-                GstPad* oldPeer = gst_pad_get_peer(directSinkPad);
+
+            GstElement* tsdemux = ctx->hlsTsDemux;
+            if (!tsdemux) {
+                tsdemux = gst_element_factory_make("tsdemux", "hls_input_ts_demux");
+                if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
+                    if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
+                    std::cerr << "HLS input 202.81: failed to create persistent tsdemux"
+                              << std::endl;
+                    if (caps) gst_caps_unref(caps);
+                    gst_object_unref(pipeline);
+                    return;
+                }
+                // tsdemux defaults to 700 ms. A little more demux latency gives
+                // burst-delivered HLS fragments room to cross segment boundaries
+                // without changing the encoded audio/video payload.
+                setIntPropertyIfPresent(tsdemux, "latency", 1200);
+                g_signal_connect(
+                    tsdemux, "pad-added",
+                    G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
+                ctx->hlsTsDemux = tsdemux;
+                gst_element_sync_state_with_parent(tsdemux);
+                std::cerr << "HLS input 202.81: transport=mpegts continuous_remux=on"
+                          << " decode=off transcode=off tsdemux_latency_ms=1200"
+                          << " regenerate_pat_pmt_pcr_cc=on" << std::endl;
+            }
+
+            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
+            if (sinkPad) {
+                GstPad* oldPeer = gst_pad_get_peer(sinkPad);
                 if (oldPeer) {
-                    if (oldPeer != pad) {
-                        gst_pad_unlink(oldPeer, directSinkPad);
-                    }
+                    if (oldPeer != pad) gst_pad_unlink(oldPeer, sinkPad);
                     gst_object_unref(oldPeer);
                 }
-                if (gst_pad_is_linked(directSinkPad) ||
-                    gst_pad_link(pad, directSinkPad) == GST_PAD_LINK_OK) {
-                    g_object_set(ctx->hlsInputSelector, "active-pad", directSinkPad, nullptr);
-                    if (!ctx->hlsDirectTsActive) {
-                        ctx->hlsDirectTsActive = true;
-                        std::cerr << "HLS input 202.36: transport=mpegts direct_passthrough=on"
-                                  << " remux=off preserve_pcr_pts=on preserve_cc=on"
-                                  << std::endl;
-                    }
+                const bool linked = gst_pad_is_linked(sinkPad) ||
+                    gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
+                gst_object_unref(sinkPad);
+                if (linked) {
+                    ctx->hlsDirectTsActive = false;
                     if (caps) gst_caps_unref(caps);
+                    gst_object_unref(pipeline);
                     return;
                 }
             }
-            std::cerr << "HLS input 202.36: direct MPEG-TS link failed, falling back to remux"
+
+            std::cerr << "HLS input 202.81: MPEG-TS fragment link to tsdemux failed"
                       << std::endl;
+            if (caps) gst_caps_unref(caps);
+            gst_object_unref(pipeline);
+            return;
         }
 
-        // Compatibility fallback for builds where the direct selector cannot be
-        // used: reproduce the old tsdemux -> parser -> mpegtsmux path.
+        // Generic non-HLS compatibility path for any other dynamic MPEG-TS pad.
         GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
         GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
         if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {

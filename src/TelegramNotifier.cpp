@@ -1,12 +1,34 @@
 #include "TelegramNotifier.h"
 
 #include <curl/curl.h>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 
 namespace {
+constexpr auto kRepeatedStreamEventWindow = std::chrono::minutes(30);
+
 size_t discardTelegramResponse(char*, size_t size, size_t nmemb, void*) {
     return size * nmemb;
+}
+
+std::string extractBetween(
+    const std::string& text, const std::string& begin, const std::string& end,
+    size_t startAt = 0) {
+    const auto beginPos = text.find(begin, startAt);
+    if (beginPos == std::string::npos) return {};
+    const auto valueStart = beginPos + begin.size();
+    const auto endPos = text.find(end, valueStart);
+    if (endPos == std::string::npos || endPos <= valueStart) return {};
+    return text.substr(valueStart, endPos - valueStart);
+}
+
+std::string streamIdFromTelegramMessage(const std::string& text) {
+    return extractBetween(text, "ID: <code>", "</code>");
+}
+
+std::string eventTitleFromTelegramMessage(const std::string& text) {
+    return extractBetween(text, "<b>", "</b>");
 }
 }
 
@@ -20,8 +42,51 @@ void TelegramNotifier::sendMessage(const std::string& text) {
         return;
     }
 
+    // 202.81: a pipeline rebuild creates a fresh StreamState and can otherwise
+    // resend the same warning every few seconds while the same network incident
+    // is still active. Suppress the same event title for the same stream for
+    // 30 minutes. A different event for that stream (for example, recovery) is
+    // delivered immediately and resets the state, so a later real outage is not
+    // hidden. This dedupe is process-local and does not affect journald logging.
+    const std::string streamId = streamIdFromTelegramMessage(text);
+    const std::string eventTitle = eventTitleFromTelegramMessage(text);
+    const auto now = std::chrono::steady_clock::now();
+    bool hadPreviousStreamEvent = false;
+    StreamEventState previousStreamEvent;
+    if (!streamId.empty() && !eventTitle.empty()) {
+        std::lock_guard<std::mutex> lock(repeatMutex);
+        auto it = streamEvents.find(streamId);
+        if (it != streamEvents.end()) {
+            hadPreviousStreamEvent = true;
+            previousStreamEvent = it->second;
+            if (it->second.title == eventTitle &&
+                now - it->second.lastSent < kRepeatedStreamEventWindow) {
+                std::cerr << "Telegram duplicate stream event suppressed: stream="
+                          << streamId << " title=" << eventTitle << std::endl;
+                return;
+            }
+        }
+        streamEvents[streamId] = StreamEventState{eventTitle, now};
+    }
+
+    const auto rollbackRepeatReservation = [&]() {
+        if (streamId.empty() || eventTitle.empty()) return;
+        std::lock_guard<std::mutex> lock(repeatMutex);
+        auto it = streamEvents.find(streamId);
+        if (it == streamEvents.end() || it->second.title != eventTitle ||
+            it->second.lastSent != now) {
+            return;
+        }
+        if (hadPreviousStreamEvent) {
+            it->second = previousStreamEvent;
+        } else {
+            streamEvents.erase(it);
+        }
+    };
+
     CURL* curl = curl_easy_init();
     if (!curl) {
+        rollbackRepeatReservation();
         return;
     }
 
@@ -36,6 +101,7 @@ void TelegramNotifier::sendMessage(const std::string& text) {
         if (escapedChatId) curl_free(escapedChatId);
         if (escapedText) curl_free(escapedText);
         curl_easy_cleanup(curl);
+        rollbackRepeatReservation();
         return;
     }
 
@@ -67,6 +133,7 @@ void TelegramNotifier::sendMessage(const std::string& text) {
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         std::cerr << "Telegram send error: " << curl_easy_strerror(res) << std::endl;
+        rollbackRepeatReservation();
     }
     curl_easy_cleanup(curl);
 }
