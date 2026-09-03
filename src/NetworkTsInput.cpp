@@ -339,10 +339,10 @@ GstElement* buildHls(
         error = "HLS input: missing stream state";
         return nullptr;
     }
-    // 202.83: use the proven TVStreamer5/main HLS topology verbatim at the
-    // media level: souphttpsrc -> hlsdemux -> elementary parsers -> mpegtsmux
-    // -> queue. SAT5 keeps only its access-key/User-Agent integration and
-    // watchdog around that topology.
+    // 202.84: use TVStreamer5/main HLS source timing and media topology. On
+    // GStreamer builds where hlsdemux outputs a complete MPEG-TS pad instead of
+    // elementary pads, StreamManager inserts only a tsdemux compatibility
+    // adapter before the same TVStreamer5 parser -> mpegtsmux path.
     if (!hasElementFactory("souphttpsrc") || !hasElementFactory("hlsdemux") ||
         !hasElementFactory("mpegtsmux")) {
         error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux";
@@ -415,11 +415,11 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.83: protocol=HLS profile=TVStreamer5"
+    std::cerr << "Network TS input 202.84: protocol=HLS profile=TVStreamer5"
               << " source=souphttpsrc+hlsdemux+mpegtsmux"
               << " queue_ms=5000 queue_max_mb=40 leaky=off"
               << " http_is_live=on do_timestamp=on"
-              << " input_selector=off nested_tsdemux=off"
+              << " input_selector=off mpegts_pad_adapter=auto"
               << " http_retries=gstreamer-default watchdog_rebuild_ms=15000"
               << std::endl;
     return src;

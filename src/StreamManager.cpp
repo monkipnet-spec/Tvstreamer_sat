@@ -9069,18 +9069,66 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     const bool isMpegTs = capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // 202.83: TVStreamer5/main expects hlsdemux to expose elementary A/V
-        // pads and does not insert SAT5's 202.81 persistent nested tsdemux.
-        // Keep the old generic MPEG-TS compatibility fallback only for non-HLS
-        // dynamic sources. If an HLS provider/GStreamer combination exposes a
-        // transport pad here, report it explicitly rather than silently switching
-        // back to the old SAT5 HLS topology.
+        // 202.84: TVStreamer5/main usually gets elementary A/V pads directly
+        // from hlsdemux. The production GStreamer build used by SAT5 instead
+        // exposes a video/mpegts pad for these MPEG-TS HLS providers. Draining
+        // that pad in 202.83 discarded the complete HLS transport and caused
+        // every HLS watchdog to fire after 15 seconds. Adapt only this pad shape
+        // through one persistent tsdemux, then continue through the exact same
+        // parser -> mpegtsmux path used by TVStreamer5. No decode/transcode and
+        // no SAT5 HLS PLL/input-selector is reintroduced.
         if (tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Hls) {
-            std::cerr << "HLS TVStreamer5 input 202.83: unexpected MPEG-TS pad caps="
-                      << capsString << " action=drain" << std::endl;
+            GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+            if (!pipeline) {
+                if (caps) gst_caps_unref(caps);
+                return;
+            }
+
+            GstElement* tsdemux = ctx->hlsCompatTsDemux;
+            if (!tsdemux) {
+                tsdemux = gst_element_factory_make("tsdemux", "hls_tvstreamer5_compat_tsdemux");
+                if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
+                    if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
+                    std::cerr << "HLS TVStreamer5 compatibility 202.84: failed to create tsdemux"
+                              << std::endl;
+                    if (caps) gst_caps_unref(caps);
+                    gst_object_unref(pipeline);
+                    return;
+                }
+                g_signal_connect(
+                    tsdemux, "pad-added",
+                    G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
+                ctx->hlsCompatTsDemux = tsdemux;
+                gst_element_sync_state_with_parent(tsdemux);
+                std::cerr << "HLS TVStreamer5 compatibility 202.84: input_pad=mpegts"
+                          << " adapter=tsdemux elementary_path=parser+mpegtsmux"
+                          << " decode=off transcode=off" << std::endl;
+            }
+
+            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
+            if (sinkPad) {
+                GstPad* oldPeer = gst_pad_get_peer(sinkPad);
+                if (oldPeer) {
+                    if (oldPeer != pad) {
+                        gst_pad_unlink(oldPeer, sinkPad);
+                    }
+                    gst_object_unref(oldPeer);
+                }
+                const bool linked = gst_pad_is_linked(sinkPad) ||
+                    gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
+                gst_object_unref(sinkPad);
+                if (linked) {
+                    if (caps) gst_caps_unref(caps);
+                    gst_object_unref(pipeline);
+                    return;
+                }
+            }
+
+            std::cerr << "HLS TVStreamer5 compatibility 202.84: MPEG-TS pad link failed caps="
+                      << capsString << std::endl;
             if (caps) gst_caps_unref(caps);
-            drainDynamicPad(ctx->mux, pad);
+            gst_object_unref(pipeline);
             return;
         }
 

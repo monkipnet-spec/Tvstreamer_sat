@@ -37,6 +37,12 @@ struct RemapContext {
     bool flvMux = false;
     bool rtspPush = false;
     bool hlsSink2 = false;
+    // 202.84: TVStreamer5/main normally receives elementary pads directly from
+    // hlsdemux. On the GStreamer build used by SAT5 production, hlsdemux emits
+    // a video/mpegts transport pad instead. Keep one pipeline-owned tsdemux as
+    // a compatibility adapter only for that pad shape; timing/source settings
+    // remain the TVStreamer5 HLS profile.
+    GstElement* hlsCompatTsDemux = nullptr; // non-owning; parent pipeline owns it
     bool programMapApplied = false;
     GstPad* preallocatedVideoMuxPad = nullptr;
     GstPad* preallocatedAudioMuxPad = nullptr;
