@@ -1816,11 +1816,12 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
-        // 202.22: SRT/HTTP preserve source PCR and do not need synthetic
-        // PCR-only slots, so the whole configured CBR rate is available to
-        // useful source packets. Keep the legacy reservation for synthetic-PCR
-        // paths such as segmented HLS.
-        if (srtRemapCbrSourcePcr ||
+        // 202.82: HLS is already converted by the input path into one continuous
+        // mpegtsmux timeline before StableUdpOutput. Preserve that mux PCR and
+        // use the CBR shaper only to add NULL packets / pace the wire rate.
+        // No synthetic PCR-only slots are required, so the complete target rate
+        // remains available to useful TS packets.
+        if (segmentedHlsInput || srtRemapCbrSourcePcr ||
             (continuousNetworkMpegTsInput && !forceSyntheticPcr)) {
             return currentTargetBitrate();
         }
@@ -1833,8 +1834,13 @@ private:
     bool sourcePcrPassthrough() const {
         if (srtRemapCbrSourcePcr) return true;
         if (tvStreamer5IpProfile) return false;
-        return mode == UdpShapingMode::Vbr ||
-               (!segmentedHlsInput && !forceSyntheticPcr);
+        // 202.82: since 202.81 every HLS MPEG-TS input is demuxed/remuxed into
+        // one continuous transport before this sender. Replacing mpegtsmux PCR
+        // here while preserving its audio/video PTS/DTS creates a second clock
+        // domain and can accumulate into periodic audio stalls. Keep the mux PCR
+        // in both UDP-CBR and UDP-VBR; CBR adds only NULL stuffing.
+        if (segmentedHlsInput) return true;
+        return mode == UdpShapingMode::Vbr || !forceSyntheticPcr;
     }
 
     void updateTransportBitrate() {
@@ -2167,11 +2173,11 @@ private:
             // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
 
-            // Continuous MPEG-TS keeps the broadcaster's PCR in both VBR and CBR.
-            // NULL stuffing changes the wire bitrate, not the media clock. Replacing
-            // PCR while preserving source PTS/DTS creates two clock domains and was
-            // observed as video corrections and a small A/V offset on DVB services.
-            // Segmented HLS still needs a synthetic continuous PCR across segments.
+            // Continuous MPEG-TS keeps its PCR in both VBR and CBR. NULL
+            // stuffing changes the wire bitrate, not the media clock. Replacing
+            // PCR while preserving source PTS/DTS creates two clock domains.
+            // 202.82: HLS is continuous-remuxed by mpegtsmux upstream, so HLS now
+            // follows this same rule and preserves the remuxed PCR.
             if ((mode == UdpShapingMode::Cbr || tvStreamer5IpProfile) &&
                 !sourcePcrPassthrough() &&
                 periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
@@ -2808,8 +2814,8 @@ GstElement* createSink(
     const bool syntheticPcr = !srtRemapCbrSourcePcr &&
         (tv5IpProfile ||
          (mode == UdpShapingMode::Cbr &&
-          (isSegmentedHlsInput(config) ||
-           tvs::protocols::inputs::isSrtInput(config) ||
+          !isSegmentedHlsInput(config) &&
+          (tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
         std::cerr << "TVStreamer5 IP UDP shaper 202.57: source="
@@ -2827,9 +2833,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.36: profile=sat5-restored-202.29"
-                  << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=slow-playout-pll periodic_pcr=20ms"
+        std::cerr << "HLS timing 202.82: continuous_remux=on"
+                  << " pacing=slow-playout-pll"
+                  << " cbr=null-stuffing-only"
+                  << " pcr=mpegtsmux-passthrough synthetic_pcr=off"
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {

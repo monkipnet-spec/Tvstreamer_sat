@@ -9268,15 +9268,24 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
+    const bool hlsVideoParser =
+        isVideo &&
+        tvs::stream_protocols::inputKind(ctx->config) ==
+            tvs::stream_protocols::InputProtocolKind::Hls &&
+        (parserFactory == "h264parse" || parserFactory == "h265parse");
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
             // TVStreamer5 remap: do not force every-IDR parameter-set injection
             // and do not disable parser passthrough.
             g_object_set(parser, "config-interval", 1, nullptr);
         } else {
-            // Preserve SAT5 behaviour for DVB/HLS/other paths.
-            g_object_set(parser, "config-interval", (ctx->hlsSink2 || srtVideoParser) ? -1 : 1, nullptr);
-            if (srtVideoParser) {
+            // 202.82: the 202.81 HLS continuous-remux path can be joined by a
+            // downstream decoder at any point in the live stream. Force parser
+            // output and repeat SPS/PPS (or VPS/SPS/PPS) at every IDR so a join
+            // does not produce long runs of "non-existing PPS" errors.
+            const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser || hlsVideoParser;
+            g_object_set(parser, "config-interval", repeatHeadersEveryIdr ? -1 : 1, nullptr);
+            if (srtVideoParser || hlsVideoParser) {
                 setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
             }
         }
