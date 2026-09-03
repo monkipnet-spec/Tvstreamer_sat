@@ -10,6 +10,8 @@ struct TranscoderCapabilities {
     std::string videoEncoder;
     bool x264Available = false;
     bool nvencAvailable = false;
+    bool intelAvailable = false;
+    std::string intelEncoder;
     std::string audioEncoder;
     std::string aacEncoder;
     std::string mp3Encoder;

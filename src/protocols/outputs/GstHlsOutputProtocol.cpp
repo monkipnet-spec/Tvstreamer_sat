@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <chrono>
+#include <unistd.h>
 
 namespace tvs::protocols::outputs {
 
@@ -45,12 +47,36 @@ std::string hlsPublicPathName(const StreamConfig& cfg) {
 }
 
 std::string prepareHlsDirectory(const StreamConfig& cfg) {
-    const std::string dir = "/tmp/tvstreammersat5-hls/" + cfg.id;
+    const std::string dir = cfg.hlsArchiveEnabled
+        ? (std::filesystem::path(cfg.hlsArchivePath) / cfg.id).string()
+        : (std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id).string();
     std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-    ec.clear();
+    if (!cfg.hlsArchiveEnabled) {
+        std::filesystem::remove_all(dir, ec);
+        ec.clear();
+    }
     std::filesystem::create_directories(dir, ec);
+    if (cfg.hlsArchiveEnabled && !ec) {
+        const auto cutoff = std::chrono::system_clock::now() - std::chrono::hours(cfg.hlsArchiveHours);
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file() || entry.path().extension() != ".ts") continue;
+            const auto ft = entry.last_write_time(ec);
+            if (ec) { ec.clear(); continue; }
+            const auto st = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+            if (st < cutoff) std::filesystem::remove(entry.path(), ec);
+            ec.clear();
+        }
+    }
     return dir;
+}
+
+std::string hlsSegmentPattern(const StreamConfig& cfg, const std::string& dir) {
+    if (!cfg.hlsArchiveEnabled) return dir + "/segment%05d.ts";
+    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return dir + "/segment" + std::to_string(epoch) + "_" + std::to_string(::getpid()) + "_%05d.ts";
 }
 
 void appendHlsMux(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
@@ -96,8 +122,12 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     // generic mux helper. This keeps PID/service remapping deterministic for
     // every newly generated segment.
     appendHlsMux(args, cfg, spec);
-    appendTsSmoother(args, "transcode_hls_ts_smoother", 100000);
-    appendOutputQueueWithTime(args, "transcode_hls_output_queue", 8000000000ULL, false);
+    // 202.79: HLS is file segmentation, not a wall-clock network transport.
+    // Re-timestamping the already muxed TS with tsparse set-timestamps=true can
+    // slowly move PCR relative to AAC PTS and manifests as periodic audio gaps.
+    // Preserve mux timestamps and use tsparse only for packet alignment.
+    args.insert(args.end(), {"tsparse", "name=transcode_hls_ts_align", "set-timestamps=false", "alignment=7", "!"});
+    appendOutputQueueWithTime(args, "transcode_hls_output_queue", 12000000000ULL, false);
 
     // Remove an old playlist and stale .ts files before starting a new HLS
     // generation. Otherwise a client can briefly read segments from the
@@ -106,10 +136,10 @@ bool appendHlsSink(std::vector<std::string>& args, const StreamConfig& cfg, GstO
     args.insert(args.end(), {
         "hlssink",
         "playlist-location=" + dir + "/video.m3u8",
-        "location=" + dir + "/segment%05d.ts",
+        "location=" + hlsSegmentPattern(cfg, dir),
         "playlist-root=/" + hlsPublicPathName(cfg) + "/",
         "target-duration=2",
-        "max-files=9",
+        "max-files=" + std::to_string(cfg.hlsArchiveEnabled ? std::max<uint32_t>(9u, cfg.hlsArchiveHours * 1800u + 60u) : 9u),
         "playlist-length=7"
     });
 

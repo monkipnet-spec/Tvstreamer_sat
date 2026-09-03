@@ -36,23 +36,52 @@ bool factoryAvailable(const char* name) {
     return true;
 }
 
+std::string intelVideoEncoderFactory() {
+    // Prefer modern Intel Quick Sync / GstVA elements. GStreamer-VAAPI is kept
+    // as a compatibility fallback for Ubuntu systems with the older plugin.
+    for (const char* name : {"qsvh264enc", "vah264enc", "vaapih264enc"}) {
+        if (factoryAvailable(name)) return name;
+    }
+    return {};
+}
+
+bool isIntelVideoEncoder(const std::string& factory) {
+    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc";
+}
+
 std::string selectedVideoEncoderFactory(const StreamConfig& config) {
     const std::string requested = config.transcodeVideoEncoder;
     if (requested == "nvenc") return factoryAvailable("nvh264enc") ? "nvh264enc" : std::string();
+    if (requested == "intel") return intelVideoEncoderFactory();
     if (requested == "x264") return factoryAvailable("x264enc") ? "x264enc" : std::string();
-    // Auto mode prefers NVIDIA NVENC when the GStreamer nvcodec element is
-    // registered by a working NVIDIA driver, otherwise it falls back to CPU x264.
+    // Auto: discrete NVIDIA first, then Intel hardware, then CPU x264.
     if (factoryAvailable("nvh264enc")) return "nvh264enc";
+    if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
     if (factoryAvailable("x264enc")) return "x264enc";
     return {};
+}
+
+void setUIntIfPresent(GstElement* element, const char* property, guint value) {
+    if (element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), property)) {
+        g_object_set(element, property, value, nullptr);
+    }
+}
+
+void setBoolIfPresent(GstElement* element, const char* property, gboolean value) {
+    if (element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), property)) {
+        g_object_set(element, property, value, nullptr);
+    }
+}
+
+void setEnumIfPresent(GstElement* element, const char* property, const char* value) {
+    if (element && g_object_class_find_property(G_OBJECT_GET_CLASS(element), property)) {
+        gst_util_set_object_arg(G_OBJECT(element), property, value);
+    }
 }
 
 void configureVideoEncoder(GstElement* encoder, const std::string& factory, guint bitrateKbps) {
     if (!encoder) return;
     if (factory == "nvh264enc") {
-        // nvh264enc accepts system-memory NV12 and uploads it internally. Keep the
-        // same one-second GOP/header cadence used by the CPU path so SRT/UDP late
-        // joins still recover at the next IDR.
         g_object_set(encoder,
             "bitrate", bitrateKbps,
             "gop-size", 50,
@@ -63,8 +92,27 @@ void configureVideoEncoder(GstElement* encoder, const std::string& factory, guin
             "strict-gop", TRUE,
             "vbv-buffer-size", std::max<guint>(bitrateKbps, 500u),
             nullptr);
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "rc-mode")) {
-            gst_util_set_object_arg(G_OBJECT(encoder), "rc-mode", "cbr");
+        setEnumIfPresent(encoder, "rc-mode", "cbr");
+        return;
+    }
+    if (isIntelVideoEncoder(factory)) {
+        setUIntIfPresent(encoder, "bitrate", bitrateKbps);
+        setUIntIfPresent(encoder, "b-frames", 0);
+        setBoolIfPresent(encoder, "aud", TRUE);
+        if (factory == "qsvh264enc") {
+            setUIntIfPresent(encoder, "gop-size", 50);
+            setUIntIfPresent(encoder, "idr-interval", 0);
+            setEnumIfPresent(encoder, "rate-control", "cbr");
+        } else if (factory == "vah264enc") {
+            setUIntIfPresent(encoder, "key-int-max", 50);
+            setEnumIfPresent(encoder, "rate-control", "cbr");
+            setUIntIfPresent(encoder, "target-usage", 4);
+        } else {
+            // Legacy vaapih264enc names differ across GStreamer releases; only
+            // set properties when the installed element actually exposes them.
+            setUIntIfPresent(encoder, "keyframe-period", 50);
+            setUIntIfPresent(encoder, "key-int-max", 50);
+            setEnumIfPresent(encoder, "rate-control", "cbr");
         }
         return;
     }
@@ -314,7 +362,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* convert = gst_element_factory_make("videoconvert", nullptr);
         GstElement* deinterlace = gst_element_factory_make("deinterlace", nullptr);
         GstElement* scale = gst_element_factory_make("videoscale", nullptr);
-        GstElement* postScaleConvert = videoEncoderFactory == "nvh264enc"
+        GstElement* postScaleConvert = (videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory))
             ? gst_element_factory_make("videoconvert", nullptr)
             : nullptr;
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
@@ -324,7 +372,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* parser = gst_element_factory_make("h264parse", nullptr);
         GstElement* outQueue = gst_element_factory_make("queue", nullptr);
         if (!queue || !convert || !deinterlace || !scale ||
-            (videoEncoderFactory == "nvh264enc" && !postScaleConvert) ||
+            ((videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory)) && !postScaleConvert) ||
             !filter || !encoder || !parser || !outQueue) {
             std::cerr << "Transcoder: missing video elements" << std::endl;
             gst_caps_unref(caps);
@@ -332,7 +380,7 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
             return;
         }
 
-        const char* rawFormat = videoEncoderFactory == "nvh264enc" ? "NV12" : "I420";
+        const char* rawFormat = (videoEncoderFactory == "nvh264enc" || isIntelVideoEncoder(videoEncoderFactory)) ? "NV12" : "I420";
         GstCaps* rawCaps = gst_caps_new_simple("video/x-raw",
             "format", G_TYPE_STRING, rawFormat,
             "width", G_TYPE_INT, width,
@@ -392,6 +440,15 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         GstElement* filter = gst_element_factory_make("capsfilter", nullptr);
         const auto encoderSelection = makeAudioEncoder(codec);
         GstElement* encoder = encoderSelection.element;
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(resample), "quality")) {
+            g_object_set(resample, "quality", 6, nullptr);
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "skip-to-first")) {
+            g_object_set(rate, "skip-to-first", TRUE, nullptr);
+        }
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "tolerance")) {
+            g_object_set(rate, "tolerance", static_cast<guint64>(20 * GST_MSECOND), nullptr);
+        }
         GstElement* parser = gst_element_factory_make(codec == "mp3" ? "mpegaudioparse" : "aacparse", nullptr);
         // MP3 keeps an explicit caps filter. AAC must negotiate directly from aacparse
         // to mpegtsmux so codec_data (AudioSpecificConfig) is preserved unchanged.
@@ -424,12 +481,6 @@ void onDecodedPadAdded(GstElement*, GstPad* pad, gpointer userData) {
         g_object_set(filter, "caps", audioCaps, nullptr);
         gst_caps_unref(audioCaps);
         configureAudioBitrate(encoder, encoderSelection.factory, context->config.transcodeAudioBitrate);
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "skip-to-first")) {
-            g_object_set(rate, "skip-to-first", TRUE, nullptr);
-        }
-        if (g_object_class_find_property(G_OBJECT_GET_CLASS(rate), "tolerance")) {
-            g_object_set(rate, "tolerance", static_cast<guint64>(20 * GST_MSECOND), nullptr);
-        }
         if (g_object_class_find_property(G_OBJECT_GET_CLASS(parser), "disable-passthrough")) {
             g_object_set(parser, "disable-passthrough", TRUE, nullptr);
         }
@@ -712,9 +763,12 @@ TranscoderCapabilities TranscoderModule::inspectCapabilities() {
 
     result.x264Available = factoryAvailable("x264enc");
     result.nvencAvailable = factoryAvailable("nvh264enc");
+    result.intelEncoder = intelVideoEncoderFactory();
+    result.intelAvailable = !result.intelEncoder.empty();
     if (result.nvencAvailable) result.videoEncoder = "nvh264enc";
+    else if (result.intelAvailable) result.videoEncoder = result.intelEncoder;
     else if (result.x264Available) result.videoEncoder = "x264enc";
-    else result.missingElements.emplace_back("H.264 encoder: nvh264enc or x264enc");
+    else result.missingElements.emplace_back("H.264 encoder: nvh264enc, qsvh264enc/vah264enc/vaapih264enc or x264enc");
     GstElementFactory* aacParser = gst_element_factory_find("aacparse");
     if (aacParser) {
         gst_object_unref(aacParser);
@@ -795,6 +849,10 @@ GstElement* TranscoderModule::createBin(const StreamConfig& config, std::string&
         const std::string requestedEncoder = config.transcodeVideoEncoder;
         if (requestedEncoder == "nvenc" && !capabilities.nvencAvailable) {
             error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
+            return nullptr;
+        }
+        if (requestedEncoder == "intel" && !capabilities.intelAvailable) {
+            error = "Intel hardware H.264 was requested but qsvh264enc/vah264enc/vaapih264enc is not available";
             return nullptr;
         }
         if (requestedEncoder == "x264" && !capabilities.x264Available) {

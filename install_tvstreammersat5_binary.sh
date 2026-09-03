@@ -181,6 +181,9 @@ DEPENDENCIES=(
     gstreamer1.0-plugins-ugly
     gstreamer1.0-libav
     gstreamer1.0-rtsp
+    gstreamer1.0-vaapi
+    vainfo
+    intel-media-va-driver
 )
 
 printf 'Source directory : %s\n' "$SOURCE_DIR"

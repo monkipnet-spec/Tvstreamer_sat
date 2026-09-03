@@ -187,6 +187,16 @@ void configureHlsChildSource(GstElement* element, StreamConfig& cfg) {
     }
 
     configureHttpCredentials(element, cfg);
+    // 202.80: HLS HTTP fetches are segmented file transfers, not the media
+    // clock. hlsdemux/embedded MPEG-TS already owns the provider PCR/PTS
+    // timeline. Stamping every playlist/segment response with its wall-clock
+    // arrival time creates a second clock domain; after several segments that
+    // can make the bounded input queue repeatedly drain/refill and surface as
+    // short audio stalls even in pure passthrough (transcoding disabled).
+    // Keep arrival timestamps off on both the initial source and every internal
+    // hlsdemux child source.
+    setBooleanPropertyIfPresent(element, "is-live", FALSE);
+    setBooleanPropertyIfPresent(element, "do-timestamp", FALSE);
     // 202.44: HLS segment/playlist fetches are allowed to survive transient
     // HTTP failures instead of exhausting souphttpsrc's default three retries
     // and tearing down the complete channel. The stream-level watchdog still
@@ -379,8 +389,11 @@ GstElement* buildHls(
         tvs::protocols::inputs::hlsInputUri(cfg), cfg);
     g_object_set(src,
         "location", location.c_str(),
-        "is-live", TRUE,
-        "do-timestamp", TRUE,
+        // 202.80: never use HTTP segment arrival time as the HLS media clock.
+        // hlsdemux and the MPEG-TS PCR/PTS carried by the provider remain the
+        // only timing authority for passthrough HLS input.
+        "is-live", FALSE,
+        "do-timestamp", FALSE,
         nullptr);
     configureHttpCredentials(src, cfg);
     setBooleanPropertyIfPresent(src, "compress", TRUE);
@@ -438,8 +451,9 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.72: protocol=HLS source=souphttpsrc+hlsdemux"
-              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off do_timestamp=on"
+    std::cerr << "Network TS input 202.80: protocol=HLS source=souphttpsrc+hlsdemux"
+              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off"
+              << " http_is_live=off do_timestamp=off media_clock=provider-pcr-pts"
               << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
               << " http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;

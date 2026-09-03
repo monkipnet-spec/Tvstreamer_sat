@@ -50,6 +50,9 @@ echo "Installing TVStreammerSAT5 dependencies..."
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
     gstreamer1.0-rtsp \
+    gstreamer1.0-vaapi \
+    vainfo \
+    intel-media-va-driver \
     ca-certificates
 
 "${APT_GET[@]}" clean

@@ -394,10 +394,16 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     if (config.transcodeVideoCodec != "copy") config.transcodeVideoCodec = "h264";
     config.transcodeVideoEncoder = toLower(root.get("transcode_video_encoder", "auto").asString());
     if (config.transcodeVideoEncoder != "auto" && config.transcodeVideoEncoder != "x264" &&
-        config.transcodeVideoEncoder != "nvenc") {
+        config.transcodeVideoEncoder != "nvenc" && config.transcodeVideoEncoder != "intel") {
         config.transcodeVideoEncoder = "auto";
     }
     config.transcodeVideoBitrate = root.get("transcode_video_bitrate", Json::UInt64(6000000)).asUInt64();
+    config.hlsArchiveEnabled = root.get("hls_archive_enabled", false).asBool();
+    config.hlsArchiveHours = std::clamp(root.get("hls_archive_hours", 24).asUInt(), 1u, 168u);
+    config.hlsArchivePath = root.get("hls_archive_path", "/var/lib/tvstreammersat5/archive").asString();
+    if (config.hlsArchivePath.empty() || config.hlsArchivePath.front() != '/') {
+        config.hlsArchivePath = "/var/lib/tvstreammersat5/archive";
+    }
     config.transcodeAudioCodec = root.get("transcode_audio_codec", "aac").asString();
     if (config.transcodeAudioCodec != "aac" && config.transcodeAudioCodec != "mp3" &&
         config.transcodeAudioCodec != "copy") {
@@ -465,6 +471,9 @@ Json::Value StreamConfig::toJson() const {
     root["transcode_video_codec"] = transcodeVideoCodec;
     root["transcode_video_encoder"] = transcodeVideoEncoder;
     root["transcode_video_bitrate"] = Json::UInt64(transcodeVideoBitrate);
+    root["hls_archive_enabled"] = hlsArchiveEnabled;
+    root["hls_archive_hours"] = hlsArchiveHours;
+    root["hls_archive_path"] = hlsArchivePath;
     root["transcode_audio_codec"] = transcodeAudioCodec;
     root["transcode_audio_bitrate"] = Json::UInt64(transcodeAudioBitrate);
     root["audio_pid"] = audioPid;

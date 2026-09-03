@@ -3561,7 +3561,9 @@ bool isMpegTsFile(const std::string& input) {
 }
 
 std::string hlsDirectory(const StreamConfig& cfg) {
-    return "/tmp/tvstreammersat5-hls/" + cfg.id;
+    return cfg.hlsArchiveEnabled
+        ? (std::filesystem::path(cfg.hlsArchivePath) / cfg.id).string()
+        : (std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id).string();
 }
 
 std::string hlsPublicPathName(const StreamConfig& cfg) {
@@ -4092,29 +4094,52 @@ void configureHlsSink(GstElement* sink, const StreamConfig& cfg) {
     const std::filesystem::path directory(hlsDirectory(cfg));
     std::error_code ec;
     std::filesystem::create_directories(directory, ec);
-    // A restarted HLS stream must never expose the previous run's playlist or
-    // fragments while the new mux is waiting for its first keyframe.
+    // Live-only HLS clears old fragments. DVR mode preserves segments across
+    // stream restarts and prunes only files older than the configured retention.
     if (!ec) {
+        const auto cutoff = std::chrono::system_clock::now() - std::chrono::hours(cfg.hlsArchiveHours);
         for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
             if (ec) break;
             if (!entry.is_regular_file()) continue;
             const std::string name = entry.path().filename().string();
-            if (name == "video.m3u8" ||
-                (name.rfind("segment", 0) == 0 && entry.path().extension() == ".ts")) {
+            bool remove = false;
+            if (name == "video.m3u8") remove = true;
+            if (name.rfind("segment", 0) == 0 && entry.path().extension() == ".ts") {
+                if (!cfg.hlsArchiveEnabled) {
+                    remove = true;
+                } else {
+                    std::error_code timeEc;
+                    const auto ft = entry.last_write_time(timeEc);
+                    if (!timeEc) {
+                        const auto st = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                            ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+                        remove = st < cutoff;
+                    }
+                }
+            }
+            if (remove) {
                 std::error_code removeEc;
                 std::filesystem::remove(entry.path(), removeEc);
             }
         }
     }
     const std::string playlist = hlsDirectory(cfg) + "/video.m3u8";
-    const std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
+    std::string location = hlsDirectory(cfg) + "/segment%05d.ts";
+    if (cfg.hlsArchiveEnabled) {
+        const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        location = hlsDirectory(cfg) + "/segment" + std::to_string(epoch) + "_" +
+            std::to_string(::getpid()) + "_%05d.ts";
+    }
     const std::string playlistRoot = "/" + hlsPublicPathName(cfg) + "/";
     g_object_set(sink,
         "playlist-location", playlist.c_str(),
         "location", location.c_str(),
         "playlist-root", playlistRoot.c_str(),
         "target-duration", 2,
-        "max-files", 9,
+        "max-files", static_cast<guint>(cfg.hlsArchiveEnabled
+            ? std::max<uint32_t>(9u, cfg.hlsArchiveHours * 1800u + 60u)
+            : 9u),
         nullptr);
     setUIntPropertyIfPresent(sink, "playlist-length", 7);
     setBooleanPropertyIfPresent(sink, "send-keyframe-requests", TRUE);

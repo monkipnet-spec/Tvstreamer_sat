@@ -72,8 +72,13 @@ struct StreamConfig {
     bool transcodeEnabled = false;
     std::string transcodeResolution = "1920x1080";
     std::string transcodeVideoCodec = "h264"; // h264 | copy
-    std::string transcodeVideoEncoder = "auto"; // auto | x264 | nvenc
+    std::string transcodeVideoEncoder = "auto"; // auto | x264 | nvenc | intel
     uint64_t transcodeVideoBitrate = 6000000;
+    // HLS DVR archive. When enabled, live HLS segments are retained on disk and
+    // exposed through Flussonic-compatible archive/timeshift playlist URLs.
+    bool hlsArchiveEnabled = false;
+    uint32_t hlsArchiveHours = 24;
+    std::string hlsArchivePath = "/var/lib/tvstreammersat5/archive";
     std::string transcodeAudioCodec = "aac";
     uint64_t transcodeAudioBitrate = 192000;
     uint32_t audioPid = 0;

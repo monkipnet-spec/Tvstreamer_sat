@@ -186,16 +186,29 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
     return ss.str();
 }
 
+std::string intelVideoEncoderFactory() {
+    for (const char* name : {"qsvh264enc", "vah264enc", "vaapih264enc"}) {
+        if (hasFactory(name)) return name;
+    }
+    return {};
+}
+
+bool isIntelVideoEncoder(const std::string& factory) {
+    return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc";
+}
+
 std::string selectedVideoEncoderFactory(const StreamConfig& cfg) {
     if (cfg.transcodeVideoEncoder == "nvenc") return hasFactory("nvh264enc") ? "nvh264enc" : std::string();
+    if (cfg.transcodeVideoEncoder == "intel") return intelVideoEncoderFactory();
     if (cfg.transcodeVideoEncoder == "x264") return hasFactory("x264enc") ? "x264enc" : std::string();
     if (hasFactory("nvh264enc")) return "nvh264enc";
+    if (const std::string intel = intelVideoEncoderFactory(); !intel.empty()) return intel;
     if (hasFactory("x264enc")) return "x264enc";
     return {};
 }
 
 std::string scaledVideoCaps(int width, int height, const std::string& encoderFactory) {
-    const char* format = encoderFactory == "nvh264enc" ? "NV12" : "I420";
+    const char* format = (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) ? "NV12" : "I420";
     return "video/x-raw,format=" + std::string(format) + ",width=" + std::to_string(width) +
            ",height=" + std::to_string(height) +
            ",pixel-aspect-ratio=(fraction)1/1,interlace-mode=progressive";
@@ -207,10 +220,12 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
     if (encoderFactory.empty()) {
         if (cfg.transcodeVideoEncoder == "nvenc") {
             error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
+        } else if (cfg.transcodeVideoEncoder == "intel") {
+            error = "Intel hardware H.264 was requested but qsvh264enc/vah264enc/vaapih264enc is not available";
         } else if (cfg.transcodeVideoEncoder == "x264") {
             error = "CPU x264 was requested but GStreamer x264enc is not available";
         } else {
-            error = "no H.264 video encoder is available (need nvh264enc or x264enc)";
+            error = "no H.264 video encoder is available (need nvh264enc, Intel qsv/va or x264enc)";
         }
         return false;
     }
@@ -228,6 +243,30 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
             "repeat-sequence-header=true",
             "strict-gop=true",
             property("vbv-buffer-size", std::to_string(std::max<uint64_t>(bitrateKbps, 500)))
+        });
+    } else if (encoderFactory == "qsvh264enc") {
+        args.insert(args.end(), {
+            property("bitrate", std::to_string(bitrateKbps)),
+            property("gop-size", std::to_string(keyInt)),
+            "b-frames=0",
+            "rate-control=cbr",
+            "idr-interval=0"
+        });
+    } else if (encoderFactory == "vah264enc") {
+        args.insert(args.end(), {
+            property("bitrate", std::to_string(bitrateKbps)),
+            property("key-int-max", std::to_string(keyInt)),
+            "b-frames=0",
+            "rate-control=cbr",
+            "aud=true",
+            "target-usage=4"
+        });
+    } else if (encoderFactory == "vaapih264enc") {
+        // Legacy VAAPI fallback. Keep the argument set conservative because
+        // property names differ between Ubuntu/GStreamer generations.
+        args.insert(args.end(), {
+            property("bitrate", std::to_string(bitrateKbps)),
+            "rate-control=cbr"
         });
     } else {
         args.insert(args.end(), {
@@ -344,6 +383,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
     const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
     if (encoderFactory.empty()) {
         if (cfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
+        else if (cfg.transcodeVideoEncoder == "intel") error = "Intel qsvh264enc/vah264enc/vaapih264enc is not available";
         else if (cfg.transcodeVideoEncoder == "x264") error = "CPU x264enc is not available";
         else error = "no H.264 video encoder is available";
         return;
@@ -360,15 +400,15 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
         "!", "videoscale", "add-borders=false", "method=lanczos"
     });
-    if (encoderFactory == "nvh264enc") {
-        // nvh264enc does not accept I420. Convert after YADIF/scale so the
-        // deinterlacer can keep its proven CPU format and hand NV12 to NVENC.
+    if (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) {
+        // Hardware encoders use NV12 system-memory input. Convert after YADIF/scale so the
+        // deinterlacer can keep its proven CPU format and hand NV12 to the selected hardware encoder.
         args.insert(args.end(), {"!", "videoconvert"});
     }
     args.insert(args.end(), {"!", scaledVideoCaps(width, height, encoderFactory)});
     if (!appendVideoEncoder(args, cfg, flv, 50, error)) return;
     args.insert(args.end(), {
-        // Keep parameter sets on every IDR for both CPU and NVENC. nvh264enc
+        // Keep parameter sets on every IDR for CPU and hardware encoders. nvh264enc
         // also enables repeat-sequence-header; h264parse normalizes the output
         // for late SRT/UDP joins and FLV/TS stream-format requirements.
         "!", "h264parse", property("config-interval", "-1"),
@@ -411,8 +451,11 @@ void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         "!", "audio/x-raw",
         "!", "audioconvert",
-        "!", "audioresample",
-        "!", "audiorate",
+        "!", "audioresample", "quality=6",
+        // Keep long-running HLS audio locked to the 48 kHz clock. A small
+        // tolerance lets audiorate correct source jitter before it accumulates
+        // into audible gaps at segment boundaries.
+        "!", "audiorate", "skip-to-first=true", "tolerance=20000000",
         "!", rawAudioCaps,
         "!"
     });
@@ -470,9 +513,9 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
 
     const std::string testVideoEncoder = selectedVideoEncoderFactory(testCfg);
     if (testVideoEncoder.empty()) {
-        error = testCfg.transcodeVideoEncoder == "nvenc"
-            ? "NVIDIA NVENC nvh264enc is not available"
-            : "no H.264 video encoder is available";
+        if (testCfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
+        else if (testCfg.transcodeVideoEncoder == "intel") error = "Intel qsvh264enc/vah264enc/vaapih264enc is not available";
+        else error = "no H.264 video encoder is available";
         return;
     }
     args.insert(args.end(), {
@@ -482,7 +525,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     args.insert(args.end(), {
         "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate"
     });
-    if (testVideoEncoder == "nvh264enc") args.insert(args.end(), {"!", "videoconvert"});
+    if (testVideoEncoder == "nvh264enc" || isIntelVideoEncoder(testVideoEncoder)) args.insert(args.end(), {"!", "videoconvert"});
     args.insert(args.end(), {"!", scaledVideoCaps(width, height, testVideoEncoder)});
     if (!appendVideoEncoder(args, testCfg, spec.container == ContainerKind::Flv, 25, error)) return;
     args.insert(args.end(), {
@@ -530,8 +573,8 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 
     std::vector<std::string> missing;
     validateFactories(required, missing);
-    if (!hasFactory("nvh264enc") && !hasFactory("x264enc")) {
-        missing.emplace_back("H.264 encoder: nvh264enc or x264enc");
+    if (!hasFactory("nvh264enc") && intelVideoEncoderFactory().empty() && !hasFactory("x264enc")) {
+        missing.emplace_back("H.264 encoder: nvh264enc, Intel qsv/va or x264enc");
     }
     if (findAacEncoder().empty()) {
         missing.emplace_back("AAC encoder: fdkaacenc, voaacenc or avenc_aac");

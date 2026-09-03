@@ -26,6 +26,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <mutex>
 #include <sstream>
 #include <set>
@@ -171,6 +172,116 @@ std::string hlsPublicName(const StreamConfig& cfg) {
     }
     while (!result.empty() && result.back() == '_') result.pop_back();
     return result.empty() ? cleanPathToken(cfg.id) : result;
+}
+
+
+const StreamConfig* findStreamConfigById(const std::vector<StreamConfig>& streams, const std::string& id) {
+    for (const auto& cfg : streams) if (cfg.id == id) return &cfg;
+    return nullptr;
+}
+
+std::filesystem::path hlsStorageDirectory(const StreamConfig& cfg) {
+    if (cfg.hlsArchiveEnabled) return std::filesystem::path(cfg.hlsArchivePath) / cfg.id;
+    return std::filesystem::path("/tmp/tvstreammersat5-hls") / cfg.id;
+}
+
+struct HlsArchiveSegment {
+    std::string name;
+    int64_t timestamp = 0;
+};
+
+std::vector<HlsArchiveSegment> hlsArchiveSegments(const StreamConfig& cfg) {
+    std::vector<HlsArchiveSegment> result;
+    const auto directory = hlsStorageDirectory(cfg);
+    std::error_code ec;
+    if (!std::filesystem::exists(directory, ec)) return result;
+    const int64_t cutoff = unixNowSeconds() - static_cast<int64_t>(cfg.hlsArchiveHours) * 3600;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file() || entry.path().extension() != ".ts") continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("segment", 0) != 0) continue;
+        const auto ft = entry.last_write_time(ec);
+        if (ec) { ec.clear(); continue; }
+        const auto st = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            ft - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+        const int64_t stamp = std::chrono::duration_cast<std::chrono::seconds>(st.time_since_epoch()).count();
+        if (stamp < cutoff) {
+            std::filesystem::remove(entry.path(), ec);
+            ec.clear();
+            continue;
+        }
+        result.push_back({name, stamp});
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+        return a.name < b.name;
+    });
+    return result;
+}
+
+bool parseHlsArchivePlaylistRequest(const std::string& fileName, int64_t& from, int64_t& to, bool& event) {
+    from = 0; to = 0; event = false;
+    std::smatch match;
+    const int64_t now = unixNowSeconds();
+    if (std::regex_match(fileName, match, std::regex(R"(^archive-([0-9]+)-([0-9]+)\.m3u8$)"))) {
+        from = std::stoll(match[1].str());
+        to = from + std::stoll(match[2].str());
+        return true;
+    }
+    if (std::regex_match(fileName, match, std::regex(R"(^timeshift_rel-([0-9]+)\.m3u8$)")) ||
+        std::regex_match(fileName, match, std::regex(R"(^rewind-([0-9]+)\.m3u8$)"))) {
+        from = now - std::stoll(match[1].str());
+        to = now + 10;
+        event = true;
+        return true;
+    }
+    if (std::regex_match(fileName, match, std::regex(R"(^timeshift_abs-([0-9]+)\.m3u8$)"))) {
+        from = std::stoll(match[1].str());
+        to = now + 10;
+        event = true;
+        return true;
+    }
+    return false;
+}
+
+std::string buildHlsArchivePlaylist(const StreamConfig& cfg, const std::string& fileName) {
+    int64_t from = 0, to = 0;
+    bool event = false;
+    if (!cfg.hlsArchiveEnabled || !parseHlsArchivePlaylistRequest(fileName, from, to, event)) return {};
+    const auto segments = hlsArchiveSegments(cfg);
+    std::vector<HlsArchiveSegment> selected;
+    for (const auto& segment : segments) {
+        // file mtime is close to segment completion, so include one target
+        // duration of margin at the requested beginning.
+        if (segment.timestamp >= from - 2 && segment.timestamp <= to + 2) selected.push_back(segment);
+    }
+    if (selected.empty()) return {};
+
+    std::ostringstream out;
+    out << "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\n";
+    out << "#EXT-X-MEDIA-SEQUENCE:0\n";
+    if (event) out << "#EXT-X-PLAYLIST-TYPE:EVENT\n";
+    else out << "#EXT-X-PLAYLIST-TYPE:VOD\n";
+    for (size_t i = 0; i < selected.size(); ++i) {
+        double duration = 2.0;
+        if (i + 1 < selected.size()) {
+            duration = static_cast<double>(selected[i + 1].timestamp - selected[i].timestamp);
+            duration = std::clamp(duration, 1.0, 6.0);
+        } else if (i > 0) {
+            duration = static_cast<double>(selected[i].timestamp - selected[i - 1].timestamp);
+            duration = std::clamp(duration, 1.0, 6.0);
+        }
+        out << "#EXT-X-PROGRAM-DATE-TIME:";
+        const std::time_t t = static_cast<std::time_t>(selected[i].timestamp);
+        std::tm tm{};
+        gmtime_r(&t, &tm);
+        out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ") << "\n";
+        out << "#EXTINF:" << std::fixed << std::setprecision(3) << duration << ",\n";
+        out << selected[i].name << "\n";
+    }
+    if (!event) out << "#EXT-X-ENDLIST\n";
+    return out.str();
 }
 
 bool resolveHlsTarget(const std::vector<StreamConfig>& streams, const std::string& target,
@@ -588,9 +699,14 @@ void HttpServer::handleSession(tcp::socket socket) {
                     http::write(socket, res);
                     return;
                 }
-                const std::filesystem::path filePath =
-                    std::filesystem::path("/tmp/tvstreammersat5-hls") / hlsId / hlsFile;
-                if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+                const StreamConfig* hlsCfg = findStreamConfigById(configManager.config.streams, hlsId);
+                const std::filesystem::path filePath = hlsCfg
+                    ? hlsStorageDirectory(*hlsCfg) / hlsFile
+                    : std::filesystem::path();
+                int64_t archiveFrom = 0, archiveTo = 0; bool archiveEvent = false;
+                const bool dynamicArchive = hlsCfg && hlsCfg->hlsArchiveEnabled &&
+                    parseHlsArchivePlaylistRequest(hlsFile, archiveFrom, archiveTo, archiveEvent);
+                if (!dynamicArchive && (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath))) {
                     res.result(http::status::not_found);
                     res.set(http::field::content_type, "text/plain");
                     res.keep_alive(false);
@@ -1452,6 +1568,8 @@ std::string HttpServer::currentState() {
     transcoder["video_encoder"] = transcoderCapabilities.videoEncoder;
     transcoder["x264_available"] = transcoderCapabilities.x264Available;
     transcoder["nvenc_available"] = transcoderCapabilities.nvencAvailable;
+    transcoder["intel_available"] = transcoderCapabilities.intelAvailable;
+    transcoder["intel_encoder"] = transcoderCapabilities.intelEncoder;
     transcoder["audio_encoder"] = transcoderCapabilities.audioEncoder;
     transcoder["aac_encoder"] = transcoderCapabilities.aacEncoder;
     transcoder["mp3_encoder"] = transcoderCapabilities.mp3Encoder;
@@ -2053,19 +2171,24 @@ bool HttpServer::serveHlsFile(const tcp::socket& socket, const std::string& targ
         return false;
     }
 
-    const std::filesystem::path filePath =
-        std::filesystem::path("/tmp/tvstreammersat5-hls") / id / fileName;
-    if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
-        res.result(http::status::not_found);
-        res.set(http::field::content_type, "text/plain");
-        res.body() = "Not Found";
-        return true;
+    const StreamConfig* cfg = findStreamConfigById(configManager.config.streams, id);
+    if (!cfg) return false;
+    const std::filesystem::path filePath = hlsStorageDirectory(*cfg) / fileName;
+    const std::string archivePlaylist = buildHlsArchivePlaylist(*cfg, fileName);
+    if (!archivePlaylist.empty()) {
+        res.body() = archivePlaylist;
+    } else {
+        if (!std::filesystem::exists(filePath) || !std::filesystem::is_regular_file(filePath)) {
+            res.result(http::status::not_found);
+            res.set(http::field::content_type, "text/plain");
+            res.body() = "Not Found";
+            return true;
+        }
+        std::ifstream input(filePath, std::ios::binary);
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        res.body() = buffer.str();
     }
-
-    std::ifstream input(filePath, std::ios::binary);
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    res.body() = buffer.str();
     boost::system::error_code endpointError;
     const std::string clientIp = socket.remote_endpoint(endpointError).address().to_string();
     if (!endpointError && !clientIp.empty()) {
@@ -4973,7 +5096,7 @@ function openStreamModal() {
   openStreamForm({
     id: 'stream-' + Date.now(),
     name:'', input_uri:'', backup_input_uri:'', backup_input_type:'url', backup_file_loop:false, output_type:'udp-cbr', output_mode:'listener', output_host:'127.0.0.1', output_port:1234,
-    interface_address:'', input_interface_address:'', input_mode:'auto', hls_access_key_mode:'none', hls_access_key_name:'Authorization', hls_access_key_value:'', hls_user_agent:'Mozilla/5.0 TVStreammerSAT5', conditional_access_client:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_codec:'h264', transcode_video_encoder:'auto', transcode_video_bitrate:6000000, transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
+    interface_address:'', input_interface_address:'', input_mode:'auto', hls_access_key_mode:'none', hls_access_key_name:'Authorization', hls_access_key_value:'', hls_user_agent:'Mozilla/5.0 TVStreammerSAT5', conditional_access_client:'', test_pattern:false, auto_start:false, remap_enabled:false, cbr:true, target_bitrate:2000000, transcode_enabled:false, transcode_resolution:'1920x1080', transcode_video_codec:'h264', transcode_video_encoder:'auto', transcode_video_bitrate:6000000, hls_archive_enabled:false, hls_archive_hours:24, hls_archive_path:'/var/lib/tvstreammersat5/archive', transcode_audio_codec:'aac', transcode_audio_bitrate:192000,
     audio_pid:0, video_pid:0, input_service_id:0, service_id:1, service_name:'', service_provider:'', additional_outputs:[]
   });
 }
@@ -5197,7 +5320,7 @@ function openStreamForm(stream) {
     const transcoderMissing = Array.isArray(transcoderInfo.missing_elements) ? transcoderInfo.missing_elements.join(', ') : '';
     const camOptions = camClientOptions(stream.conditional_access_client || '');
     const transcoderStatus = transcoderAvailable
-      ? `Доступно: H.264 Auto=${transcoderInfo.video_encoder || 'нет'}, NVENC ${transcoderInfo.nvenc_available ? 'да' : 'нет'}, x264 ${transcoderInfo.x264_available ? 'да' : 'нет'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
+      ? `Доступно: H.264 Auto=${transcoderInfo.video_encoder || 'нет'}, NVENC ${transcoderInfo.nvenc_available ? 'да' : 'нет'}, Intel ${transcoderInfo.intel_available ? (transcoderInfo.intel_encoder || 'да') : 'нет'}, x264 ${transcoderInfo.x264_available ? 'да' : 'нет'}, AAC ${transcoderInfo.aac_encoder || 'нет'}, MP3 ${transcoderInfo.mp3_encoder || 'нет'}, deinterlace ${transcoderInfo.deinterlace ? 'да' : 'нет'}`
       : `Недоступно: ${transcoderMissing || transcoderInfo.message || 'не установлены необходимые GStreamer-плагины'}`;
     openModal(`
       <h2>${stream.name ? 'Редактирование трансляции' : 'Настройка трансляции'}</h2>
@@ -5217,7 +5340,8 @@ function openStreamForm(stream) {
         <div class="form-row full"><label>Имя Канала и Провайдер</label><div class="row-inline compact-row"><input class="compact" id="streamServiceName" value="${stream.service_name||''}" placeholder="Belarus 5" /><input class="compact" id="streamProvider" value="${stream.service_provider||''}" placeholder="BTRC" /></div></div>
         <div class="form-row full"><label>Target bitrate (кбит/с, для CBR)</label><input id="streamBitrate" type="number" value="${Math.round((stream.target_bitrate||2000000)/1000)}" placeholder="2000" /></div>
         <div class="form-row full"><label>Транскодирование</label><div class="checkbox-inline"><input id="streamTranscodeEnabled" type="checkbox" ${(stream.transcode_enabled && transcoderAvailable) ? 'checked' : ''} ${transcoderAvailable ? '' : 'disabled'} onchange="updateTranscodeControls()" /><span>Обрабатывать видео/аудио: транскодирование или независимый проброс оригинальных потоков</span></div><small style="color:${transcoderAvailable ? '#7ee2a8' : '#ff9f9f'}">${transcoderStatus}</small></div>
-        <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeVideoCodec" onchange="updateTranscodeVideoControls()"><option value="h264" ${(stream.transcode_video_codec||'h264')==='h264'?'selected':''}>Видео: H.264 транскодирование</option><option value="copy" ${stream.transcode_video_codec==='copy'?'selected':''}>Видео: проброс оригинального потока</option></select><select id="streamTranscodeVideoEncoder" onchange="updateTranscodeVideoControls()"><option value="auto" ${(!stream.transcode_video_encoder||stream.transcode_video_encoder==='auto')?'selected':''}>Кодировщик: Auto (NVENC → x264)</option><option value="nvenc" ${stream.transcode_video_encoder==='nvenc'?'selected':''} ${transcoderInfo.nvenc_available?'':'disabled'}>Кодировщик: NVIDIA NVENC${transcoderInfo.nvenc_available?'':' (недоступен)'}</option><option value="x264" ${stream.transcode_video_encoder==='x264'?'selected':''} ${transcoderInfo.x264_available?'':'disabled'}>Кодировщик: CPU x264${transcoderInfo.x264_available?'':' (недоступен)'}</option></select><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><div class="row-inline compact-row" style="margin-top:8px"><select id="streamTranscodeAudioCodec" onchange="updateTranscodeAudioControls()"><option value="copy" ${stream.transcode_audio_codec==='copy'?'selected':''}>Аудио: проброс оригинальной дорожки</option><option value="aac" ${(stream.transcode_audio_codec||'aac')==='aac'?'selected':''} ${transcoderInfo.aac_encoder?'':'disabled'}>Аудио: AAC-LC${transcoderInfo.aac_encoder?'':' (недоступен)'}</option><option value="mp3" ${stream.transcode_audio_codec==='mp3'?'selected':''} ${transcoderInfo.mp3_encoder?'':'disabled'}>Аудио: MP3${transcoderInfo.mp3_encoder?'':' (недоступен)'}</option></select><select id="streamTranscodeAudioBitrate" ${stream.transcode_audio_codec==='copy'?'disabled':''}><option value="96000" ${(stream.transcode_audio_bitrate||192000)===96000?'selected':''}>96 кбит/с</option><option value="128000" ${(stream.transcode_audio_bitrate||192000)===128000?'selected':''}>128 кбит/с</option><option value="160000" ${(stream.transcode_audio_bitrate||192000)===160000?'selected':''}>160 кбит/с</option><option value="192000" ${(stream.transcode_audio_bitrate||192000)===192000?'selected':''}>192 кбит/с</option><option value="256000" ${(stream.transcode_audio_bitrate||192000)===256000?'selected':''}>256 кбит/с</option><option value="320000" ${(stream.transcode_audio_bitrate||192000)===320000?'selected':''}>320 кбит/с</option></select><span>аудио</span></div><small>202.78: H.264 можно кодировать CPU x264 или NVIDIA NVENC; Auto выбирает NVENC при наличии nvh264enc и иначе использует x264. Интерлейс 576i/1080i деинтерлейсится YADIF по всем полям с сохранением 50 Гц движения; SPS/PPS повторяются на каждом IDR.</small></div>
+        <div class="form-row full"><label>HLS архив (DVR)</label><div class="row-inline compact-row"><label class="checkbox-inline"><input id="streamHlsArchiveEnabled" type="checkbox" ${stream.hls_archive_enabled?'checked':''} /><span>Записывать архив</span></label><input id="streamHlsArchiveHours" type="number" min="1" max="168" value="${stream.hls_archive_hours||24}" style="max-width:110px" /><span>часов</span><input id="streamHlsArchivePath" value="${stream.hls_archive_path||'/var/lib/tvstreammersat5/archive'}" placeholder="/var/lib/tvstreammersat5/archive" /></div><small>Архив сохраняет HLS TS-сегменты на диск. Совместимые URL: /КАНАЛ/archive-UTC-ДЛИТЕЛЬНОСТЬ.m3u8, /КАНАЛ/rewind-СЕКУНДЫ.m3u8, /КАНАЛ/timeshift_rel-СЕКУНДЫ.m3u8, /КАНАЛ/timeshift_abs-UTC.m3u8.</small></div>
+        <div class="form-row full" id="streamTranscodeControls" style="display:${(stream.transcode_enabled && transcoderAvailable)?'block':'none'}"><label>Параметры транскодирования</label><div class="row-inline compact-row"><select id="streamTranscodeVideoCodec" onchange="updateTranscodeVideoControls()"><option value="h264" ${(stream.transcode_video_codec||'h264')==='h264'?'selected':''}>Видео: H.264 транскодирование</option><option value="copy" ${stream.transcode_video_codec==='copy'?'selected':''}>Видео: проброс оригинального потока</option></select><select id="streamTranscodeVideoEncoder" onchange="updateTranscodeVideoControls()"><option value="auto" ${(!stream.transcode_video_encoder||stream.transcode_video_encoder==='auto')?'selected':''}>Кодировщик: Auto (NVENC → Intel → x264)</option><option value="nvenc" ${stream.transcode_video_encoder==='nvenc'?'selected':''} ${transcoderInfo.nvenc_available?'':'disabled'}>Кодировщик: NVIDIA NVENC${transcoderInfo.nvenc_available?'':' (недоступен)'}</option><option value="intel" ${stream.transcode_video_encoder==='intel'?'selected':''} ${transcoderInfo.intel_available?'':'disabled'}>Кодировщик: Intel Quick Sync / VA${transcoderInfo.intel_available ? ` (${transcoderInfo.intel_encoder})` : ' (недоступен)'}</option><option value="x264" ${stream.transcode_video_encoder==='x264'?'selected':''} ${transcoderInfo.x264_available?'':'disabled'}>Кодировщик: CPU x264${transcoderInfo.x264_available?'':' (недоступен)'}</option></select><select id="streamTranscodeResolution" onchange="applyRecommendedTranscodeBitrate()"><option value="3840x2160" ${stream.transcode_resolution==='3840x2160'?'selected':''}>3840×2160 (4K UHD)</option><option value="3200x1800" ${stream.transcode_resolution==='3200x1800'?'selected':''}>3200×1800 (3K)</option><option value="2560x1440" ${stream.transcode_resolution==='2560x1440'?'selected':''}>2560×1440 (2K QHD)</option><option value="1920x1080" ${(!stream.transcode_resolution||stream.transcode_resolution==='1920x1080')?'selected':''}>1920×1080 (Full HD)</option><option value="1280x720" ${stream.transcode_resolution==='1280x720'?'selected':''}>1280×720 (HD)</option><option value="720x576" ${stream.transcode_resolution==='720x576'?'selected':''}>720×576 (PAL SD)</option></select><input id="streamTranscodeBitrate" type="number" min="500" max="100000" step="100" value="${Math.round((stream.transcode_video_bitrate||6000000)/1000)}" placeholder="6000" /><span>кбит/с CBR</span></div><div class="row-inline compact-row" style="margin-top:8px"><select id="streamTranscodeAudioCodec" onchange="updateTranscodeAudioControls()"><option value="copy" ${stream.transcode_audio_codec==='copy'?'selected':''}>Аудио: проброс оригинальной дорожки</option><option value="aac" ${(stream.transcode_audio_codec||'aac')==='aac'?'selected':''} ${transcoderInfo.aac_encoder?'':'disabled'}>Аудио: AAC-LC${transcoderInfo.aac_encoder?'':' (недоступен)'}</option><option value="mp3" ${stream.transcode_audio_codec==='mp3'?'selected':''} ${transcoderInfo.mp3_encoder?'':'disabled'}>Аудио: MP3${transcoderInfo.mp3_encoder?'':' (недоступен)'}</option></select><select id="streamTranscodeAudioBitrate" ${stream.transcode_audio_codec==='copy'?'disabled':''}><option value="96000" ${(stream.transcode_audio_bitrate||192000)===96000?'selected':''}>96 кбит/с</option><option value="128000" ${(stream.transcode_audio_bitrate||192000)===128000?'selected':''}>128 кбит/с</option><option value="160000" ${(stream.transcode_audio_bitrate||192000)===160000?'selected':''}>160 кбит/с</option><option value="192000" ${(stream.transcode_audio_bitrate||192000)===192000?'selected':''}>192 кбит/с</option><option value="256000" ${(stream.transcode_audio_bitrate||192000)===256000?'selected':''}>256 кбит/с</option><option value="320000" ${(stream.transcode_audio_bitrate||192000)===320000?'selected':''}>320 кбит/с</option></select><span>аудио</span></div><small>202.79: H.264 поддерживает NVIDIA NVENC, Intel Quick Sync/VA и CPU x264. Auto: NVENC → Intel → x264. Интерлейс 576i/1080i деинтерлейсится YADIF по всем полям с сохранением 50 Гц движения; SPS/PPS повторяются на каждом IDR.</small></div>
         <div class="form-row full"><label>Автозапуск</label><div class="checkbox-inline"><input id="streamAutoStart" type="checkbox" ${stream.auto_start ? 'checked' : ''} /><span>Запускать после перезапуска программы</span></div></div>
         <div class="form-row full" id="streamCbrRow"><label>Включить CBR</label><div class="checkbox-inline"><input id="streamCbr" type="checkbox" ${stream.cbr ? 'checked' : ''} onchange="syncUdpCbrModeFromCheckbox()" /><span>CBR</span></div><small>CBR поддерживается для UDP, HTTP, HLS и SRT.</small></div>
         <div class="form-row full"><label>Включить Remap</label><div class="checkbox-inline"><input id="streamRemapEnabled" type="checkbox" ${stream.remap_enabled ? 'checked' : ''} /><span>Remap PID / Service</span></div><small>Для MPEG-TS: SID входа 0 = автоопределение программы из PAT; ненулевой SID выбирает конкретный входной канал. SID выхода всегда задаётся отдельно и используется для Remap в PAT/PMT/SDT. V-PID и A-PID задают выходные PID.</small></div>
@@ -5470,6 +5594,9 @@ function saveStream(id) {
     transcode_resolution: document.getElementById('streamTranscodeResolution').value,
     transcode_video_codec: document.getElementById('streamTranscodeVideoCodec').value,
     transcode_video_encoder: document.getElementById('streamTranscodeVideoEncoder').value,
+    hls_archive_enabled: document.getElementById('streamHlsArchiveEnabled')?.checked === true,
+    hls_archive_hours: Math.max(1, Math.min(168, Number(document.getElementById('streamHlsArchiveHours')?.value || 24))),
+    hls_archive_path: document.getElementById('streamHlsArchivePath')?.value.trim() || '/var/lib/tvstreammersat5/archive',
     transcode_video_bitrate: Number(document.getElementById('streamTranscodeBitrate').value) * 1000,
     transcode_audio_codec: document.getElementById('streamTranscodeAudioCodec').value,
     transcode_audio_bitrate: Number(document.getElementById('streamTranscodeAudioBitrate').value),
