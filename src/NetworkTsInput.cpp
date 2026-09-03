@@ -182,13 +182,12 @@ void configureHlsChildSource(GstElement* element, StreamConfig& cfg) {
         return;
     }
 
+    // 202.85: match TVStreamer5/main more closely. hlsdemux owns its internally
+    // created segment HTTP sources, so do not force is-live/do-timestamp on
+    // those children. Re-timestamping every segment source can create a second
+    // arrival-time clock domain at segment boundaries. Keep this hook only for
+    // credentials/User-Agent/access-key propagation.
     configureHttpCredentials(element, cfg);
-    // 202.83: match TVStreamer5/main HLS timing. The HTTP/HLS source is a live
-    // source and GStreamer timestamps the data before hlsdemux. Do not add a
-    // second SAT5-specific retry/backoff or segment-arrival timing policy here;
-    // StreamManager remains responsible for watchdog/error/EOS recovery.
-    setBooleanPropertyIfPresent(element, "is-live", TRUE);
-    setBooleanPropertyIfPresent(element, "do-timestamp", TRUE);
     if (cfg.hlsAccessKeyMode == "query" && hasProperty(element, "location")) {
         if (!g_object_get_data(G_OBJECT(element), "tvs-network-hls-location-watch")) {
             g_signal_connect(element, "notify::location",
@@ -385,6 +384,13 @@ GstElement* buildHls(
     setIntPropertyIfPresent(demux, "connection-speed",
         static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000ULL, 1ULL)));
     configureTsMux(mux, cfg);
+    // 202.85: this is the intermediate HLS input mux, not the final Stable UDP
+    // remap mux. TVStreamer5/main does not clamp or skip timestamps here. The
+    // final output remux still keeps the existing monotonic guards. Applying
+    // them at both muxes can turn legal segment-boundary timestamp adjustments
+    // into stream-specific drops/offsets and accumulate A/V skew.
+    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", FALSE);
+    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", FALSE);
 
     if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
         error = "HLS input: failed to link TVStreamer5 source/demux/mux queue";
@@ -399,8 +405,8 @@ GstElement* buildHls(
 
     // TVStreamer5 itself relies on hlsdemux's dynamic elementary pads. Keep the
     // SAT5 deep-element hook only to propagate User-Agent/access credentials to
-    // hlsdemux-created HTTP child sources; their live/timestamp mode is kept the
-    // same as TVStreamer5 as well.
+    // hlsdemux-created HTTP child sources. Child timing remains owned by
+    // hlsdemux, as in TVStreamer5/main.
     configureHlsChildSource(src, ctx->config);
     g_signal_connect(demux, "deep-element-added",
         G_CALLBACK(onHlsDeepElementAdded), ctx);
@@ -415,10 +421,12 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.84: protocol=HLS profile=TVStreamer5"
+    std::cerr << "Network TS input 202.85: protocol=HLS profile=TVStreamer5"
               << " source=souphttpsrc+hlsdemux+mpegtsmux"
               << " queue_ms=5000 queue_max_mb=40 leaky=off"
-              << " http_is_live=on do_timestamp=on"
+              << " manifest_http_is_live=on manifest_do_timestamp=on"
+              << " child_http_timestamps=hlsdemux-owned"
+              << " input_mux_timestamp_clamp=off"
               << " input_selector=off mpegts_pad_adapter=auto"
               << " http_retries=gstreamer-default watchdog_rebuild_ms=15000"
               << std::endl;

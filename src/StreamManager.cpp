@@ -3197,7 +3197,7 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
 
     std::cerr << "Stable UDP audio reservoir startup complete: "
               << "startup_reservoir_ms=1500 min_threshold_ms=0 "
-              << "steady_state=source-timestamps audio_clocksync=off" << std::endl;
+              << "steady_state=clocksync-only" << std::endl;
 }
 
 void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
@@ -9090,7 +9090,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                 tsdemux = gst_element_factory_make("tsdemux", "hls_tvstreamer5_compat_tsdemux");
                 if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
                     if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
-                    std::cerr << "HLS TVStreamer5 compatibility 202.84: failed to create tsdemux"
+                    std::cerr << "HLS TVStreamer5 compatibility 202.85: failed to create tsdemux"
                               << std::endl;
                     if (caps) gst_caps_unref(caps);
                     gst_object_unref(pipeline);
@@ -9101,7 +9101,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                     G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
                 ctx->hlsCompatTsDemux = tsdemux;
                 gst_element_sync_state_with_parent(tsdemux);
-                std::cerr << "HLS TVStreamer5 compatibility 202.84: input_pad=mpegts"
+                std::cerr << "HLS TVStreamer5 compatibility 202.85: input_pad=mpegts"
                           << " adapter=tsdemux elementary_path=parser+mpegtsmux"
                           << " decode=off transcode=off" << std::endl;
             }
@@ -9125,7 +9125,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                 }
             }
 
-            std::cerr << "HLS TVStreamer5 compatibility 202.84: MPEG-TS pad link failed caps="
+            std::cerr << "HLS TVStreamer5 compatibility 202.85: MPEG-TS pad link failed caps="
                       << capsString << std::endl;
             if (caps) gst_caps_unref(caps);
             gst_object_unref(pipeline);
