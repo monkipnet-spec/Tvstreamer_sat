@@ -3195,9 +3195,12 @@ void onStableUdpAudioReservoirRunning(GstElement* queue, gpointer userData) {
         G_OBJECT(queue), "tvs-audio-reservoir-started", GINT_TO_POINTER(1));
     setUInt64PropertyIfPresent(queue, "min-threshold-time", 0);
 
+    const bool sharedTsPacer =
+        g_object_get_data(G_OBJECT(queue), "tvs-audio-reservoir-shared-ts-pacer") != nullptr;
     std::cerr << "Stable UDP audio reservoir startup complete: "
               << "startup_reservoir_ms=1500 min_threshold_ms=0 "
-              << "steady_state=clocksync-only" << std::endl;
+              << "steady_state=" << (sharedTsPacer ? "shared-ts-pacer" : "clocksync-only")
+              << std::endl;
 }
 
 void onHlsInputPrebufferRunning(GstElement* queue, gpointer userData) {
@@ -9190,16 +9193,25 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http ||
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
+    // 202.88: after the 202.87 HLS CBR reservoir reduction removed the audible
+    // stutter, Detsky_mir exposed a persistent ~2-3 s audio lead over video.
+    // The final HLS remap still had an audio-only clocksync while video entered
+    // the same mpegtsmux without a matching clock stage. Do not create a second
+    // elementary-stream wall-clock domain for HLS: keep its one startup audio
+    // reservoir, then let mpegtsmux + StableUdpOutput pace audio and video as one
+    // TS timeline. SRT/HTTP retain their existing TVStreamer5 audio clocksync.
+    const bool hlsSharedTsAvClock =
+        stableUdpAudioReservoir &&
+        remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
     const bool tvStreamer5AudioClock =
-        stableUdpAudioReservoir && tvStreamer5NetworkRemap;
+        stableUdpAudioReservoir && tvStreamer5NetworkRemap && !hlsSharedTsAvClock;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    // SRT/HTTP and the final HLS Stable UDP remap use the TVStreamer5
-    // elementary-stream audio path: one 1500 ms startup reservoir followed by
-    // clocksync(sync-to-first). The intermediate HLS compatibility demux is
-    // deliberately excluded above so HLS is paced only once.
+    // SRT/HTTP keep the TVStreamer5 elementary audio clocksync. HLS keeps only
+    // the 1500 ms startup reservoir; steady-state A/V pacing is shared after
+    // mpegtsmux by StableUdpOutput.
     GstElement* audioClockSync = tvStreamer5AudioClock
         ? gst_element_factory_make("clocksync", nullptr)
         : nullptr;
@@ -9251,6 +9263,12 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         setUInt64PropertyIfPresent(
             audioReservoirQueue, "min-threshold-time", kStableUdpAudioReservoir);
         setIntPropertyIfPresent(audioReservoirQueue, "leaky", 0);
+        if (hlsSharedTsAvClock) {
+            g_object_set_data(
+                G_OBJECT(audioReservoirQueue),
+                "tvs-audio-reservoir-shared-ts-pacer",
+                GINT_TO_POINTER(1));
+        }
         g_signal_connect(
             audioReservoirQueue,
             "running",
@@ -9383,6 +9401,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                       : "")
                   << (hlsCompatibilityElementaryPad && isAudio
                       ? " hls_compat_audio_pacer=off"
+                      : "")
+                  << (hlsSharedTsAvClock && isAudio
+                      ? " hls_final_audio_clock=shared-ts-pacer av_sync=stableudp-common"
                       : "")
                   << std::endl;
         const gchar* padName = GST_PAD_NAME(muxSinkPad);

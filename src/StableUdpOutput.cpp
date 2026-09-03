@@ -2832,7 +2832,7 @@ GstElement* createSink(
         const char* tv5Source = isSegmentedHlsInput(config)
             ? "HLS"
             : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP");
-        std::cerr << "TVStreamer5 IP UDP shaper 202.87: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.88: source="
                   << tv5Source
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
@@ -2849,7 +2849,7 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.87: profile=TVStreamer5"
+        std::cerr << "HLS timing 202.88: profile=TVStreamer5"
                   << " pacing=reservoir-rate-controller"
                   << " startup_reservoir_ms=5000"
                   << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
