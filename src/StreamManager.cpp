@@ -8325,20 +8325,16 @@ bool StreamManager::buildOutputBranch(
     const bool sharedDvbSpts = state && state->sharedDvbInput &&
         !state->sharedDvbServiceRelayUri.empty() &&
         state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri;
-    const bool hlsTransportTs = state &&
-        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
-        state->runtimeConfig.inputServiceId == 0;
-    // 202.22: SRT commonly carries an already-finished SPTS.  If no explicit
-    // service selection was requested, keep that transport intact exactly like
-    // direct HTTP MPEG-TS and direct HLS MPEG-TS.  Re-demux/remux remains
-    // available when inputServiceId selects one program from an SRT MPTS or
-    // when explicit PID/SID remapping is enabled.
+    // 202.22: SRT commonly carries an already-finished SPTS. If no explicit
+    // service selection was requested, keep that transport intact like direct
+    // HTTP MPEG-TS. HLS is deliberately excluded in 202.83 because its Stable
+    // UDP path now follows TVStreamer5/main and always uses the normal remux.
     const bool srtTransportTs = state &&
         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt &&
         state->runtimeConfig.inputServiceId == 0;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
-        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs || srtTransportTs ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) || srtTransportTs ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
@@ -8346,10 +8342,9 @@ bool StreamManager::buildOutputBranch(
     // tsdemux/mpegtsmux cycle can drop valid/private streams and is not required
     // by StableUdpOutput/WISI shaping. Remux only for explicit PID/SID remapping
     // or a generic multi-program input.
-    // v202.3: the HLS input stage already ends in one complete MPEG-TS stream:
-    // either provider TS direct-passthrough or the compatibility mpegtsmux
-    // fallback.  Do not immediately demux/remux that TS again for Stable UDP.
-    // Explicit PID/SID remap still takes the normal remux path below.
+    // 202.83: HLS intentionally follows TVStreamer5/main rather than SAT5's
+    // direct-transport optimization. Stable UDP therefore rebuilds the HLS TS
+    // through the normal remap pipeline before the common TVStreamer5 shaper.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
     if (srtTransportTs && usesStableUdpShaper(outputConfig) && !outputConfig.remapEnabled) {
@@ -8363,13 +8358,11 @@ bool StreamManager::buildOutputBranch(
     // PID/SID remapping is disabled.  This does not touch UDP/WISI output.
     const bool strictTsNetworkOutput = (type == "http" || type == "srt") && !transcodedInput;
     const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
-    // 202.37: HLS SPTS is already smooth in direct transport mode. For UDP remap,
-    // do not destroy that timeline with tsdemux/parsers/mpegtsmux. Rewrite only
-    // PAT/PMT/SID and requested A/V PID headers packet-by-packet.
-    const bool hlsPacketRemap = state &&
-        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
-        state->runtimeConfig.inputServiceId == 0 &&
-        outputConfig.remapEnabled && usesStableUdpShaper(outputConfig);
+    // 202.83: disable the SAT5 HLS packet-level shortcut. TVStreamer5/main
+    // always sends Stable UDP passthrough through buildRemapPipeline(), which
+    // gives HLS the same tsdemux -> parser -> mpegtsmux transport treatment as
+    // its proven implementation.
+    const bool hlsPacketRemap = false;
     const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied && !hlsPacketRemap) ||
                              stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
     if (hlsPacketRemap) {
@@ -9074,75 +9067,23 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         }
     }
     const bool isMpegTs = capsString.find("video/mpegts") != std::string::npos ||
-        capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // 202.81: do not concatenate HLS MPEG-TS fragments byte-for-byte into a
-        // long-lived transport. EXT-X-DISCONTINUITY, per-fragment continuity
-        // counter resets and PCR/PTS steps are valid inside HLS, but those
-        // playlist semantics disappear after conversion to UDP/SRT/HTTP TS.
-        // Keep compressed payloads untouched while rebuilding only the TS
-        // container: hlsdemux -> tsdemux -> parser -> mpegtsmux. This regenerates
-        // PAT/PMT/PCR/continuity counters and gives downstream clients one
-        // continuous clock domain. No audio/video decoding is performed.
-        if (ctx->hlsInputSelector) {
-            GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
-            if (!pipeline) {
-                if (caps) gst_caps_unref(caps);
-                return;
-            }
-
-            GstElement* tsdemux = ctx->hlsTsDemux;
-            if (!tsdemux) {
-                tsdemux = gst_element_factory_make("tsdemux", "hls_input_ts_demux");
-                if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
-                    if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
-                    std::cerr << "HLS input 202.81: failed to create persistent tsdemux"
-                              << std::endl;
-                    if (caps) gst_caps_unref(caps);
-                    gst_object_unref(pipeline);
-                    return;
-                }
-                // tsdemux defaults to 700 ms. A little more demux latency gives
-                // burst-delivered HLS fragments room to cross segment boundaries
-                // without changing the encoded audio/video payload.
-                setIntPropertyIfPresent(tsdemux, "latency", 1200);
-                g_signal_connect(
-                    tsdemux, "pad-added",
-                    G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
-                ctx->hlsTsDemux = tsdemux;
-                gst_element_sync_state_with_parent(tsdemux);
-                std::cerr << "HLS input 202.81: transport=mpegts continuous_remux=on"
-                          << " decode=off transcode=off tsdemux_latency_ms=1200"
-                          << " regenerate_pat_pmt_pcr_cc=on" << std::endl;
-            }
-
-            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
-            if (sinkPad) {
-                GstPad* oldPeer = gst_pad_get_peer(sinkPad);
-                if (oldPeer) {
-                    if (oldPeer != pad) gst_pad_unlink(oldPeer, sinkPad);
-                    gst_object_unref(oldPeer);
-                }
-                const bool linked = gst_pad_is_linked(sinkPad) ||
-                    gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
-                gst_object_unref(sinkPad);
-                if (linked) {
-                    ctx->hlsDirectTsActive = false;
-                    if (caps) gst_caps_unref(caps);
-                    gst_object_unref(pipeline);
-                    return;
-                }
-            }
-
-            std::cerr << "HLS input 202.81: MPEG-TS fragment link to tsdemux failed"
-                      << std::endl;
+        // 202.83: TVStreamer5/main expects hlsdemux to expose elementary A/V
+        // pads and does not insert SAT5's 202.81 persistent nested tsdemux.
+        // Keep the old generic MPEG-TS compatibility fallback only for non-HLS
+        // dynamic sources. If an HLS provider/GStreamer combination exposes a
+        // transport pad here, report it explicitly rather than silently switching
+        // back to the old SAT5 HLS topology.
+        if (tvs::stream_protocols::inputKind(ctx->config) ==
+            tvs::stream_protocols::InputProtocolKind::Hls) {
+            std::cerr << "HLS TVStreamer5 input 202.83: unexpected MPEG-TS pad caps="
+                      << capsString << " action=drain" << std::endl;
             if (caps) gst_caps_unref(caps);
-            gst_object_unref(pipeline);
+            drainDynamicPad(ctx->mux, pad);
             return;
         }
 
-        // Generic non-HLS compatibility path for any other dynamic MPEG-TS pad.
         GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
         GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
         if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
@@ -9191,16 +9132,18 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     const auto remapInputKind = tvs::stream_protocols::inputKind(ctx->config);
     const bool tvStreamer5NetworkRemap =
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
-        remapInputKind == tvs::stream_protocols::InputProtocolKind::Http;
+        remapInputKind == tvs::stream_protocols::InputProtocolKind::Http ||
+        remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
     const bool tvStreamer5AudioClock =
         stableUdpAudioReservoir && tvStreamer5NetworkRemap;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    // 202.28: for SRT/HTTP remap restore the TVStreamer5 elementary-stream
-    // audio path exactly: 1500 ms startup reservoir followed by clocksync.
-    // DVB/HLS keep the SAT5 v201 startup-only queue and are not changed.
+    // 202.83: SRT/HTTP/HLS use the TVStreamer5 elementary-stream audio path
+    // exactly: 1500 ms startup reservoir followed by clocksync(sync-to-first).
+    // The HLS addition is intentional; it replaces the SAT5 startup-only HLS
+    // queue that could drift into repeated AAC stalls after several segments.
     GstElement* audioClockSync = tvStreamer5AudioClock
         ? gst_element_factory_make("clocksync", nullptr)
         : nullptr;
@@ -9268,24 +9211,15 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
-    const bool hlsVideoParser =
-        isVideo &&
-        tvs::stream_protocols::inputKind(ctx->config) ==
-            tvs::stream_protocols::InputProtocolKind::Hls &&
-        (parserFactory == "h264parse" || parserFactory == "h265parse");
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
             // TVStreamer5 remap: do not force every-IDR parameter-set injection
             // and do not disable parser passthrough.
             g_object_set(parser, "config-interval", 1, nullptr);
         } else {
-            // 202.82: the 202.81 HLS continuous-remux path can be joined by a
-            // downstream decoder at any point in the live stream. Force parser
-            // output and repeat SPS/PPS (or VPS/SPS/PPS) at every IDR so a join
-            // does not produce long runs of "non-existing PPS" errors.
-            const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser || hlsVideoParser;
+            const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser;
             g_object_set(parser, "config-interval", repeatHeadersEveryIdr ? -1 : 1, nullptr);
-            if (srtVideoParser || hlsVideoParser) {
+            if (srtVideoParser) {
                 setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
             }
         }

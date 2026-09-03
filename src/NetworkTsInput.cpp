@@ -20,7 +20,7 @@ namespace {
 // the stream-level recovery windows so buffering absorbs short jitter/outages
 // without hiding a genuinely dead source.
 constexpr guint64 kNetworkInputQueue = 6 * GST_SECOND;
-constexpr guint64 kHlsInputQueue = 10 * GST_SECOND;
+constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 // TVStreamer5/main uses 500 ms SRT latency for this path.
 constexpr gint kSrtLatencyMs = 500;
@@ -45,10 +45,6 @@ void setBooleanPropertyIfPresent(GstElement* element, const char* propertyName, 
 }
 
 void setIntPropertyIfPresent(GstElement* element, const char* propertyName, gint value) {
-    if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
-}
-
-void setDoublePropertyIfPresent(GstElement* element, const char* propertyName, gdouble value) {
     if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
 }
 
@@ -187,24 +183,12 @@ void configureHlsChildSource(GstElement* element, StreamConfig& cfg) {
     }
 
     configureHttpCredentials(element, cfg);
-    // 202.80: HLS HTTP fetches are segmented file transfers, not the media
-    // clock. hlsdemux/embedded MPEG-TS already owns the provider PCR/PTS
-    // timeline. Stamping every playlist/segment response with its wall-clock
-    // arrival time creates a second clock domain; after several segments that
-    // can make the bounded input queue repeatedly drain/refill and surface as
-    // short audio stalls even in pure passthrough (transcoding disabled).
-    // Keep arrival timestamps off on both the initial source and every internal
-    // hlsdemux child source.
-    setBooleanPropertyIfPresent(element, "is-live", FALSE);
-    setBooleanPropertyIfPresent(element, "do-timestamp", FALSE);
-    // 202.44: HLS segment/playlist fetches are allowed to survive transient
-    // HTTP failures instead of exhausting souphttpsrc's default three retries
-    // and tearing down the complete channel. The stream-level watchdog still
-    // rebuilds the HLS pipeline if no TS data arrives for 15 seconds, so an
-    // endlessly missing segment cannot leave the channel wedged forever.
-    setIntPropertyIfPresent(element, "retries", -1);
-    setDoublePropertyIfPresent(element, "retry-backoff-factor", 0.25);
-    setDoublePropertyIfPresent(element, "retry-backoff-max", 2.0);
+    // 202.83: match TVStreamer5/main HLS timing. The HTTP/HLS source is a live
+    // source and GStreamer timestamps the data before hlsdemux. Do not add a
+    // second SAT5-specific retry/backoff or segment-arrival timing policy here;
+    // StreamManager remains responsible for watchdog/error/EOS recovery.
+    setBooleanPropertyIfPresent(element, "is-live", TRUE);
+    setBooleanPropertyIfPresent(element, "do-timestamp", TRUE);
     if (cfg.hlsAccessKeyMode == "query" && hasProperty(element, "location")) {
         if (!g_object_get_data(G_OBJECT(element), "tvs-network-hls-location-watch")) {
             g_signal_connect(element, "notify::location",
@@ -355,9 +339,13 @@ GstElement* buildHls(
         error = "HLS input: missing stream state";
         return nullptr;
     }
+    // 202.83: use the proven TVStreamer5/main HLS topology verbatim at the
+    // media level: souphttpsrc -> hlsdemux -> elementary parsers -> mpegtsmux
+    // -> queue. SAT5 keeps only its access-key/User-Agent integration and
+    // watchdog around that topology.
     if (!hasElementFactory("souphttpsrc") || !hasElementFactory("hlsdemux") ||
-        !hasElementFactory("mpegtsmux") || !hasElementFactory("input-selector")) {
-        error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux/input-selector";
+        !hasElementFactory("mpegtsmux")) {
+        error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux";
         return nullptr;
     }
     if (!hlsPadAddedCallback || !configureTsMux) {
@@ -369,19 +357,16 @@ GstElement* buildHls(
     GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
     GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
-    GstElement* selector =
-        gst_element_factory_make("input-selector", "input_hls_transport_selector");
-    GstElement* queue = addQueue(pipeline, "input_queue", kHlsInputQueue, kHlsQueueHardMaxBytes);
-    if (!src || !demux || !mux || !selector || !queue ||
+    GstElement* queue = addQueue(
+        pipeline, "input_queue", kHlsInputQueue, kHlsQueueHardMaxBytes);
+    if (!src || !demux || !mux || !queue ||
         !addElementOrFail(pipeline, src) ||
         !addElementOrFail(pipeline, demux) ||
-        !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, selector)) {
+        !addElementOrFail(pipeline, mux)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
         if (demux && !GST_OBJECT_PARENT(demux)) gst_object_unref(demux);
         if (mux && !GST_OBJECT_PARENT(mux)) gst_object_unref(mux);
-        if (selector && !GST_OBJECT_PARENT(selector)) gst_object_unref(selector);
-        error = "HLS input: failed to create network transport chain";
+        error = "HLS input: failed to create TVStreamer5 transport chain";
         return nullptr;
     }
 
@@ -389,55 +374,33 @@ GstElement* buildHls(
         tvs::protocols::inputs::hlsInputUri(cfg), cfg);
     g_object_set(src,
         "location", location.c_str(),
-        // 202.80: never use HTTP segment arrival time as the HLS media clock.
-        // hlsdemux and the MPEG-TS PCR/PTS carried by the provider remain the
-        // only timing authority for passthrough HLS input.
-        "is-live", FALSE,
-        "do-timestamp", FALSE,
+        "is-live", TRUE,
+        "do-timestamp", TRUE,
         nullptr);
     configureHttpCredentials(src, cfg);
-    setBooleanPropertyIfPresent(src, "compress", TRUE);
 
-    // Match TVStreamer5: let hlsdemux know the configured service/output scale,
-    // but do not add a second application-side bitrate/pacing controller.
+    // TVStreamer5/main supplies the configured output/service scale to the
+    // adaptive demuxer. This does not force transcoding; it only guides variant
+    // selection when the URL is a master playlist.
     setIntPropertyIfPresent(demux, "connection-speed",
         static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000ULL, 1ULL)));
     configureTsMux(mux, cfg);
-    setBooleanPropertyIfPresent(selector, "sync-streams", FALSE);
-    setBooleanPropertyIfPresent(selector, "cache-buffers", FALSE);
 
-    if (!gst_element_link(src, demux) || !gst_element_link(selector, queue)) {
-        error = "HLS input: failed to link HTTP/demux/selector queue";
+    if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
+        error = "HLS input: failed to link TVStreamer5 source/demux/mux queue";
         return nullptr;
     }
 
     if (!state->sourceContext) state->sourceContext = std::make_unique<RemapContext>();
     auto* ctx = state->sourceContext.get();
     ctx->mux = mux;
-    ctx->hlsInputSelector = selector;
     ctx->config = cfg;
     ctx->flvMux = false;
 
-    // 202.81: the mux branch is the only output branch for HLS. If hlsdemux
-    // exposes complete MPEG-TS fragments, StreamManager routes them through a
-    // persistent tsdemux and then back into this mux. This keeps codec payloads
-    // untouched while regenerating one continuous TS timeline/CC domain.
-    GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src");
-    GstPad* muxSelectorPad = gst_element_request_pad_simple(selector, "sink_%u");
-    if (!muxSrcPad || !muxSelectorPad ||
-        gst_pad_link(muxSrcPad, muxSelectorPad) != GST_PAD_LINK_OK) {
-        if (muxSrcPad) gst_object_unref(muxSrcPad);
-        if (muxSelectorPad) {
-            gst_element_release_request_pad(selector, muxSelectorPad);
-            gst_object_unref(muxSelectorPad);
-        }
-        error = "HLS input: failed to connect fallback remux selector pad";
-        return nullptr;
-    }
-    gst_object_unref(muxSrcPad);
-    ctx->hlsMuxSelectorPad = muxSelectorPad;
-    g_object_set(selector, "active-pad", muxSelectorPad, nullptr);
-
+    // TVStreamer5 itself relies on hlsdemux's dynamic elementary pads. Keep the
+    // SAT5 deep-element hook only to propagate User-Agent/access credentials to
+    // hlsdemux-created HTTP child sources; their live/timestamp mode is kept the
+    // same as TVStreamer5 as well.
     configureHlsChildSource(src, ctx->config);
     g_signal_connect(demux, "deep-element-added",
         G_CALLBACK(onHlsDeepElementAdded), ctx);
@@ -452,11 +415,12 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.81: protocol=HLS source=souphttpsrc+hlsdemux"
-              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off"
-              << " http_is_live=off do_timestamp=off"
-              << " direct_mpegts=off continuous_remux=on decode=off transcode=off"
-              << " regenerate_pat_pmt_pcr_cc=on http_retries=infinite watchdog_rebuild_ms=15000"
+    std::cerr << "Network TS input 202.83: protocol=HLS profile=TVStreamer5"
+              << " source=souphttpsrc+hlsdemux+mpegtsmux"
+              << " queue_ms=5000 queue_max_mb=40 leaky=off"
+              << " http_is_live=on do_timestamp=on"
+              << " input_selector=off nested_tsdemux=off"
+              << " http_retries=gstreamer-default watchdog_rebuild_ms=15000"
               << std::endl;
     return src;
 }

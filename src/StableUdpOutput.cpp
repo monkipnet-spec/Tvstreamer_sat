@@ -186,11 +186,11 @@ bool isContinuousNetworkMpegTsInput(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
-// 202.36: restore the pre-202.30 HLS path. Plain SRT/HTTP MPEG-TS uses
-// the TVStreamer5 UDP timing profile; segmented HLS stays on the validated
-// SAT5 HLS PTS/slow-PLL path from 202.29 (v202.7 lineage).
+// 202.83: HLS now uses the same Stable UDP timing profile as TVStreamer5/main.
+// This removes SAT5's HLS-only PTS/slow-PLL clock and restores the proven
+// five-second reservoir + periodic-PCR transport used by TVStreamer5.
 bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
-    if (isSegmentedHlsInput(cfg)) return false;
+    if (isSegmentedHlsInput(cfg)) return true;
     if (tvs::protocols::inputs::isSrtInput(cfg)) return true;
     std::string uri = cfg.inputUri;
     std::transform(uri.begin(), uri.end(), uri.begin(), [](unsigned char c) {
@@ -721,10 +721,12 @@ public:
           caCleanStartEnabled(!useTvStreamer5IpShaperProfile(cfg)),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           hlsInput(isSegmentedHlsInput(cfg)),
-          segmentedHlsInput(isSegmentedHlsInput(cfg)),
-          // 202.57: the real TVStreamer5/main path does NOT use SAT5's later
-          // long-window network-arrival PLL.  It uses the original 500 ms EWMA +
-          // 100 ms reservoir controller below. HLS keeps its SAT5 PLL path.
+          // 202.83: HLS is deliberately folded into the TVStreamer5 IP profile,
+          // so the old SAT5 segmented-HLS PTS/slow-PLL controller is disabled.
+          segmentedHlsInput(
+              isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
+          // 202.57/202.83: the real TVStreamer5/main path uses the original
+          // reservoir controller rather than SAT5's later slow-PLL variants.
           continuousNetworkMpegTsInput(
               isContinuousNetworkMpegTsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
@@ -1816,12 +1818,7 @@ private:
                 ? kMaximumTransportBitrate - kVbrTransportHeadroomBitrate
                 : kMaximumTransportBitrate;
         }
-        // 202.82: HLS is already converted by the input path into one continuous
-        // mpegtsmux timeline before StableUdpOutput. Preserve that mux PCR and
-        // use the CBR shaper only to add NULL packets / pace the wire rate.
-        // No synthetic PCR-only slots are required, so the complete target rate
-        // remains available to useful TS packets.
-        if (segmentedHlsInput || srtRemapCbrSourcePcr ||
+        if (srtRemapCbrSourcePcr ||
             (continuousNetworkMpegTsInput && !forceSyntheticPcr)) {
             return currentTargetBitrate();
         }
@@ -1834,12 +1831,6 @@ private:
     bool sourcePcrPassthrough() const {
         if (srtRemapCbrSourcePcr) return true;
         if (tvStreamer5IpProfile) return false;
-        // 202.82: since 202.81 every HLS MPEG-TS input is demuxed/remuxed into
-        // one continuous transport before this sender. Replacing mpegtsmux PCR
-        // here while preserving its audio/video PTS/DTS creates a second clock
-        // domain and can accumulate into periodic audio stalls. Keep the mux PCR
-        // in both UDP-CBR and UDP-VBR; CBR adds only NULL stuffing.
-        if (segmentedHlsInput) return true;
         return mode == UdpShapingMode::Vbr || !forceSyntheticPcr;
     }
 
@@ -2173,11 +2164,9 @@ private:
             // including slots reserved for periodic PCR-only packets.
             realTokenAccumulator += pace;
 
-            // Continuous MPEG-TS keeps its PCR in both VBR and CBR. NULL
-            // stuffing changes the wire bitrate, not the media clock. Replacing
-            // PCR while preserving source PTS/DTS creates two clock domains.
-            // 202.82: HLS is continuous-remuxed by mpegtsmux upstream, so HLS now
-            // follows this same rule and preserves the remuxed PCR.
+            // Non-TVStreamer5 continuous MPEG-TS may preserve source PCR.
+            // TVStreamer5 IP inputs, including HLS since 202.83, use the proven
+            // periodic 20 ms PCR transport clock instead.
             if ((mode == UdpShapingMode::Cbr || tvStreamer5IpProfile) &&
                 !sourcePcrPassthrough() &&
                 periodicPcrInitialized && slotTime >= nextPeriodicPcrNanoseconds) {
@@ -2818,8 +2807,11 @@ GstElement* createSink(
           (tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
-        std::cerr << "TVStreamer5 IP UDP shaper 202.57: source="
-                  << (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP")
+        const char* tv5Source = isSegmentedHlsInput(config)
+            ? "HLS"
+            : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP");
+        std::cerr << "TVStreamer5 IP UDP shaper 202.83: source="
+                  << tv5Source
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
                   << " startup_pcr_min=5"
@@ -2833,10 +2825,11 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.82: continuous_remux=on"
-                  << " pacing=slow-playout-pll"
-                  << " cbr=null-stuffing-only"
-                  << " pcr=mpegtsmux-passthrough synthetic_pcr=off"
+        std::cerr << "HLS timing 202.83: profile=TVStreamer5"
+                  << " pacing=reservoir-rate-controller"
+                  << " startup_reservoir_ms=5000"
+                  << " pcr=periodic-20ms source_pcr=stripped-after-lock"
+                  << " cbr=null-stuffing+periodic-pcr"
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {

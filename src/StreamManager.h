@@ -37,16 +37,6 @@ struct RemapContext {
     bool flvMux = false;
     bool rtspPush = false;
     bool hlsSink2 = false;
-    // 202.81 HLS input: hlsdemux may expose complete MPEG-TS fragments, but a
-    // continuous UDP/SRT/HTTP transport cannot carry HLS playlist-level
-    // discontinuity semantics. Route TS fragments through one persistent
-    // tsdemux -> parsers -> mpegtsmux chain so CC/PCR/PSI are regenerated as a
-    // single continuous transport without decoding or transcoding payloads.
-    GstElement* hlsInputSelector = nullptr;
-    GstElement* hlsTsDemux = nullptr; // non-owning; parent pipeline owns it
-    GstPad* hlsMuxSelectorPad = nullptr;
-    GstPad* hlsDirectSelectorPad = nullptr;
-    bool hlsDirectTsActive = false;
     bool programMapApplied = false;
     GstPad* preallocatedVideoMuxPad = nullptr;
     GstPad* preallocatedAudioMuxPad = nullptr;
@@ -55,8 +45,6 @@ struct RemapContext {
 
     ~RemapContext() {
         destroyedCount.fetch_add(1, std::memory_order_relaxed);
-        if (hlsMuxSelectorPad) gst_object_unref(hlsMuxSelectorPad);
-        if (hlsDirectSelectorPad) gst_object_unref(hlsDirectSelectorPad);
         if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);
         if (preallocatedAudioMuxPad) gst_object_unref(preallocatedAudioMuxPad);
     }
