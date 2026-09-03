@@ -1176,6 +1176,16 @@ private:
     static constexpr uint64_t kControllerUpdateNanoseconds = 100ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kTargetReservoirNanoseconds = 2500ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kLowReservoirNanoseconds = 800ULL * 1000ULL * 1000ULL;
+    // 202.87 diagnostic A/B: HLS + UDP-CBR keeps the proven five-second cold-start
+    // reservoir, but reduces the steady media lead against the synthetic PCR clock.
+    // Detsky_mir measured ~2.64 s median audio PTS lead with the generic 2.5 s
+    // reservoir while AAC payload/PTS, CC, PCR cadence and UDP pacing were clean.
+    // Scope this experiment strictly to HLS CBR; SRT/HTTP/DVB and UDP-VBR retain
+    // their existing 2500/800 ms controller thresholds.
+    static constexpr uint64_t kHlsTv5CbrTargetReservoirNanoseconds =
+        800ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kHlsTv5CbrLowReservoirNanoseconds =
+        250ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
     // v202.7 HLS playout PLL: keep useful TS packet spacing almost fixed.
     // The HLS demuxer may deliver a VBR GOP with a slightly different byte/PTS
@@ -1912,12 +1922,20 @@ private:
 
         const uint64_t estimate = std::max<uint64_t>(1ULL, estimatedInputBitrate);
         const uint64_t bufferNow = bufferedBytes.load(std::memory_order_relaxed);
+        const bool hlsTv5CbrReservoirProfile =
+            hlsInput && tvStreamer5IpProfile && mode == UdpShapingMode::Cbr;
+        const uint64_t targetReservoirNanoseconds = hlsTv5CbrReservoirProfile
+            ? kHlsTv5CbrTargetReservoirNanoseconds
+            : kTargetReservoirNanoseconds;
+        const uint64_t lowReservoirNanoseconds = hlsTv5CbrReservoirProfile
+            ? kHlsTv5CbrLowReservoirNanoseconds
+            : kLowReservoirNanoseconds;
         const uint64_t targetBufferBytes = std::max<uint64_t>(
             kUdpPayloadSize * 32ULL,
-            bytesForDuration(estimate, kTargetReservoirNanoseconds));
+            bytesForDuration(estimate, targetReservoirNanoseconds));
         const uint64_t lowBufferBytes = std::max<uint64_t>(
             kUdpPayloadSize * 8ULL,
-            bytesForDuration(estimate, kLowReservoirNanoseconds));
+            bytesForDuration(estimate, lowReservoirNanoseconds));
 
         // 202.32: SRT + remap + CBR is already a complete target-rate CBR
         // transport from mpegtsmux, including NULL stuffing and a matching PCR
@@ -2799,6 +2817,10 @@ GstElement* createSink(
     gst_app_sink_set_callbacks(GST_APP_SINK(sink), &callbacks, sender, destroySender);
 
     const bool tv5IpProfile = useTvStreamer5IpShaperProfile(config);
+    const bool hlsTv5CbrReservoirProfile =
+        isSegmentedHlsInput(config) && tv5IpProfile && mode == UdpShapingMode::Cbr;
+    const uint64_t steadyTargetReservoirMs = hlsTv5CbrReservoirProfile ? 800ULL : 2500ULL;
+    const uint64_t steadyLowWatermarkMs = hlsTv5CbrReservoirProfile ? 250ULL : 800ULL;
     const bool srtRemapCbrSourcePcr = useSrtRemapCbrSourcePcr(config);
     const bool syntheticPcr = !srtRemapCbrSourcePcr &&
         (tv5IpProfile ||
@@ -2810,11 +2832,13 @@ GstElement* createSink(
         const char* tv5Source = isSegmentedHlsInput(config)
             ? "HLS"
             : (tvs::protocols::inputs::isSrtInput(config) ? "SRT" : "HTTP");
-        std::cerr << "TVStreamer5 IP UDP shaper 202.83: source="
+        std::cerr << "TVStreamer5 IP UDP shaper 202.87: source="
                   << tv5Source
                   << " profile=tvstreamer5-compatible"
                   << " startup_reservoir_ms=" << (kTvStreamer5StartupReservoirNanoseconds / 1000000ULL)
                   << " startup_pcr_min=5"
+                  << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
+                  << " steady_low_watermark_ms=" << steadyLowWatermarkMs
                   << " buffer_limit_mb=32"
                   << " timing=reservoir-rate-controller"
                   << " pcr_mode="
@@ -2825,9 +2849,11 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.83: profile=TVStreamer5"
+        std::cerr << "HLS timing 202.87: profile=TVStreamer5"
                   << " pacing=reservoir-rate-controller"
                   << " startup_reservoir_ms=5000"
+                  << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
+                  << " steady_low_watermark_ms=" << steadyLowWatermarkMs
                   << " pcr=periodic-20ms source_pcr=stripped-after-lock"
                   << " cbr=null-stuffing+periodic-pcr"
                   << std::endl;
@@ -2866,7 +2892,8 @@ GstElement* createSink(
               << (tv5IpProfile ? kTvStreamer5StartupMinimumPcrSamples : kStartupMinimumPcrSamples)
               << " startup_pcr_grace_ms="
               << (tv5IpProfile ? 0ULL : (kStartupPcrGraceNanoseconds / 1000000ULL))
-              << " target_reservoir_ms=2500 low_watermark_ms=800"
+              << " target_reservoir_ms=" << steadyTargetReservoirMs
+              << " low_watermark_ms=" << steadyLowWatermarkMs
               << " null_pid=0x1fff source_timing="
               << (tv5IpProfile
                     ? "reservoir-rate-controller"
