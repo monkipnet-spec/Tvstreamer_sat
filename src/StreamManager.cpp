@@ -9190,21 +9190,19 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Http ||
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
-    // 202.89 rollback of the 202.88 HLS shared-TS-pacer experiment. Restore the
-    // 202.87 behavior: SRT/HTTP and the final HLS Stable UDP remap use one
-    // 1500 ms startup reservoir followed by clocksync(sync-to-first). The
-    // intermediate HLS compatibility demux remains excluded above, so HLS is
-    // still paced only once and the 202.86 duplicate-pacer fix is preserved.
+    // HLS segment timestamps can legitimately jump at discontinuities. Keep its
+    // startup reservoir, but do not run a second wall-clock synchronizer over
+    // AAC after the HLS demux/remux path. SRT/HTTP retain the TVStreamer5 clock.
     const bool tvStreamer5AudioClock =
-        stableUdpAudioReservoir && tvStreamer5NetworkRemap;
+        stableUdpAudioReservoir && tvStreamer5NetworkRemap &&
+        remapInputKind != tvs::stream_protocols::InputProtocolKind::Hls;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    // SRT/HTTP and the final HLS Stable UDP remap use the TVStreamer5
-    // elementary-stream audio path: one 1500 ms startup reservoir followed by
-    // clocksync(sync-to-first). The intermediate HLS compatibility demux is
-    // deliberately excluded above so HLS is paced only once.
+    // SRT/HTTP use the TVStreamer5 elementary-stream audio path: one 1500 ms
+    // startup reservoir followed by clocksync(sync-to-first). HLS uses only
+    // the startup reservoir so segment timestamps are not paced twice.
     GstElement* audioClockSync = tvStreamer5AudioClock
         ? gst_element_factory_make("clocksync", nullptr)
         : nullptr;
