@@ -9751,6 +9751,16 @@ void StreamManager::maybeAutoRaiseUdpCbr(
     StreamState* state, std::chrono::steady_clock::time_point now) {
     if (!state) return;
 
+    // HLS variants are selected by hlsdemux. Its segmented delivery is bursty,
+    // so using the measured input rate to mutate the output CBR can cause a
+    // feedback loop that selects a heavier variant and destabilizes playback.
+    if (tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+        tvs::stream_protocols::InputProtocolKind::Hls) {
+        state->autoCbrExcessSamples = 0;
+        state->autoCbrPeakBitrate = 0;
+        return;
+    }
+
     const auto autoCbrOutputs = outputConfigs(state->config);
     const bool hasUdpCbr = std::any_of(
         autoCbrOutputs.begin(), autoCbrOutputs.end(),

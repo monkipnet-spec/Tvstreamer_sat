@@ -378,11 +378,9 @@ GstElement* buildHls(
         nullptr);
     configureHttpCredentials(src, cfg);
 
-    // TVStreamer5/main supplies the configured output/service scale to the
-    // adaptive demuxer. This does not force transcoding; it only guides variant
-    // selection when the URL is a master playlist.
-    setIntPropertyIfPresent(demux, "connection-speed",
-        static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000ULL, 1ULL)));
+    // Do not use the output UDP bitrate as HLS connection speed. For a
+    // multibitrate master playlist that value can select a variant unrelated
+    // to the configured input URL and create unnecessary bitrate spikes.
     configureTsMux(mux, cfg);
     // 202.85: this is the intermediate HLS input mux, not the final Stable UDP
     // remap mux. TVStreamer5/main does not clamp or skip timestamps here. The
