@@ -69,11 +69,14 @@ constexpr guint64 kStableUdpAudioReservoirMax = 3 * GST_SECOND;
 constexpr guint64 kHlsInputStartupBuffer = GST_SECOND;
 constexpr guint64 kHlsInputQueueMax = 12 * GST_SECOND;
 constexpr auto kInputFailoverDelay = std::chrono::seconds(6);
-// 202.54: six seconds remains the network-loss detector, but an 8-second
-// SRT/HTTP input queue must be allowed to bridge that gap. Rebuilding at 6 s
-// destroyed a still-buffered pipeline and caused synchronized recovery storms.
-// Wait 12 s of continuous silence before rebuilding SRT/HTTP MPEG-TS.
+// 202.54: six seconds remains the SRT loss detector, but an 8-second input
+// queue must be allowed to bridge that gap. Rebuilding at 6 s destroyed a
+// still-buffered pipeline and caused synchronized recovery storms.
 constexpr auto kNetworkNoInputRebuildDelay = std::chrono::seconds(12);
+// HTTP MPEG-TS origins can pause delivery while keeping the connection alive.
+// Give the existing pipeline time to recover instead of creating an avoidable
+// audio/video discontinuity during a short upstream stall.
+constexpr auto kHttpMpegTsNoInputRebuildDelay = std::chrono::seconds(30);
 constexpr auto kNetworkRecoveryJitterMax = std::chrono::milliseconds(2500);
 // 202.38: HLS is segmented delivery, so a several-second gap in emitted TS
 // buffers can be normal while hlsdemux waits for/reloads the next media
@@ -10102,7 +10105,7 @@ void StreamManager::monitorBus(const std::string& id) {
                   << " source_only_restart=disabled loss_action=wait-12s-then-rebuild"
                   << " latency_ms=500 queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Http) {
-        std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=6000 rebuild_ms=12000"
+        std::cerr << "HTTP MPEG-TS watchdog 202.57: loss_detect_ms=30000 rebuild_ms=30000"
                   << " source_retries=gstreamer-default error_recovery=on eos_recovery=on"
                   << " pipeline_retry_ms=5000 recovery=source-only-first recovery_jitter_ms=0..2500"
                   << " queue_ms=3000 queue_max_mb=32" << std::endl;
@@ -10573,27 +10576,27 @@ void StreamManager::monitorBus(const std::string& id) {
                           << std::endl;
             }
 
-            // 202.55 two-stage network watchdog. At 6 s restart only input_src.
-            // 202.62 keeps serialization/grace; the six-second loss detector
-            // and 12-second full-rebuild fallback thresholds are unchanged.
+            // 202.55 two-stage network watchdog. HTTP MPEG-TS deliberately waits
+            // longer because a live origin may pause without closing its socket.
             const bool networkLossDetected =
                 recoverableNetworkInput && !waitingForFirstSrtMedia &&
                 !networkRecoveryGraceActive && !sourceReconnectInFlight &&
-                now - state->lastInputActivity >= kInputFailoverDelay;
+                now - state->lastInputActivity >=
+                            (httpMpegTsInput ? kHttpMpegTsNoInputRebuildDelay : kInputFailoverDelay);
             if (networkLossDetected && !networkLossWarningActive && !networkRecoveryPending) {
                 networkLossWarningActive = true;
                 const char* protocolName = srtInput ? "SRT" : "HTTP-MPEGTS";
-                // 202.70: both SRT and HTTP only report the six-second gap here.
-                // The 12-second watchdog below owns the actual full-pipeline rebuild.
-                // This avoids carrying a half-restarted souphttpsrc session forward.
                 state->statusMessage = std::string(protocolName) +
-                    " input gap - waiting full rebuild threshold";
+                            " input gap - waiting full rebuild threshold";
                 std::cerr << "NETWORK RECOVERY 202.70: stream=" << id
                           << " protocol=" << protocolName
-                          << " reason=no-input-6s"
+                          << " reason=no-input-"
+                          << std::chrono::duration_cast<std::chrono::seconds>(
+                                 httpMpegTsInput ? kHttpMpegTsNoInputRebuildDelay : kInputFailoverDelay).count()
+                          << "s"
                           << " action=wait-full-rebuild-threshold full_rebuild_after_ms="
                           << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 kNetworkNoInputRebuildDelay).count()
+                                 httpMpegTsInput ? kHttpMpegTsNoInputRebuildDelay : kNetworkNoInputRebuildDelay).count()
                           << std::endl;
             }
 
@@ -10602,7 +10605,9 @@ void StreamManager::monitorBus(const std::string& id) {
                 : (waitingForFirstSrtMedia
                     ? kSrtStartupFailoverDelay
                     : (recoverableNetworkInput
-                        ? kNetworkNoInputRebuildDelay
+                        ? (httpMpegTsInput
+                            ? kHttpMpegTsNoInputRebuildDelay
+                            : kNetworkNoInputRebuildDelay)
                         : kInputFailoverDelay));
             const bool inputTimedOut =
                 !networkRecoveryGraceActive && !sourceReconnectInFlight &&
