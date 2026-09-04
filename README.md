@@ -25,6 +25,34 @@ TVStreammerSAT5 - сервер маршрутизации, мониторинг�
 - встроенный тестовый источник и библиотека файлов замены;
 - Basic Authentication и шифрование пароля панели в конфигурации.
 
+## Архитектура
+
+Обычные потоки обрабатываются внутри процесса без обязательного транскодирования.
+Для каждого канала сначала выбирается входной протокол, затем создаётся passthrough
+или remap-путь и один основной либо несколько дополнительных выходов.
+
+```text
+Входной протокол
+      |
+      +-- passthrough/remap ----------------------> выходной протокол
+      |
+      +-- опциональный GStreamer transcoder
+              |
+              +-- decode
+              +-- deinterlace / scale / frame rate
+              +-- H.264 + AAC/MP3
+              +-- выходной модуль
+```
+
+Код протоколов разделён по каталогам:
+
+```text
+src/protocols/inputs/          URI-модули входов транскодера
+src/protocols/outputs/         URI-модули выходов транскодера
+src/protocols/stream/inputs/   входы обычного поточного пути
+src/protocols/stream/outputs/  выходы обычного поточного пути
+```
+
 ## Поддерживаемые протоколы
 
 ### Входы
@@ -183,6 +211,42 @@ cd ~/tvstreammersat5-data
 sudo cmake --install build
 ```
 
+## Запуск как systemd-сервис
+
+Установите бинарник и создайте отдельный рабочий каталог для конфигурации:
+
+```bash
+sudo mkdir -p /opt/tvstreammersat5
+sudo install -m 755 build/TVStreammerSAT5 /opt/tvstreammersat5/TVStreammerSAT5
+```
+
+Пример `/etc/systemd/system/tvstreammersat5.service`:
+
+```ini
+[Unit]
+Description=TVStreammerSAT5
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tvstreammersat5
+ExecStart=/opt/tvstreammersat5/TVStreammerSAT5
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Активируйте сервис:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tvstreammersat5
+sudo systemctl status tvstreammersat5 --no-pager --full
+```
+
 ## Конфигурационные файлы
 
 Все изменяемые данные находятся в рабочем каталоге процесса:
@@ -196,7 +260,7 @@ backup-files/                     загруженные файлы замены
 
 Перед обновлением сохраняйте эти файлы. Не публикуйте конфигурацию: она может содержать сетевые адреса, Telegram token и параметры CA-клиентов.
 
-## Docker
+## Параметры UDP и PCR
 
 Для обычного UDP-выхода программа накапливает 1500 мс данных и начинает передачу
 с ближайшего независимо декодируемого видеокадра. Если конкретному приёмнику нужен
@@ -217,6 +281,11 @@ PCR можно принудительно включить переменной:
 ```bash
 TVS_UDP_FORCE_SYNTHETIC_PCR=1
 ```
+
+## Docker
+
+Сборка и запуск в Docker используют host networking, чтобы корректно работали
+multicast, RTP, SRT listener и привязка к сетевым интерфейсам.
 
 ### Сборка образа
 
