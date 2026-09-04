@@ -8,7 +8,10 @@
 #include "utils.h"
 
 #include <algorithm>
+#include <curl/curl.h>
 #include <iostream>
+#include <regex>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -120,6 +123,103 @@ std::string appendAccessQuery(const std::string& uri, const StreamConfig& cfg) {
     g_free(escapedName);
     g_free(escapedValue);
     return result;
+}
+
+size_t collectHlsManifest(char* data, size_t size, size_t count, void* userData) {
+    auto* body = static_cast<std::string*>(userData);
+    const size_t bytes = size * count;
+    if (!body || !data) return 0;
+    constexpr size_t kManifestLimit = 512 * 1024;
+    if (body->size() >= kManifestLimit) return 0;
+    body->append(data, std::min(bytes, kManifestLimit - body->size()));
+    return bytes;
+}
+
+std::string selectFixedHlsVariant(const StreamConfig& cfg, const std::string& uri) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return {};
+
+    std::string body;
+    struct curl_slist* headers = nullptr;
+    if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() &&
+        !cfg.hlsAccessKeyValue.empty()) {
+        headers = curl_slist_append(
+            headers, (cfg.hlsAccessKeyName + ": " + cfg.hlsAccessKeyValue).c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    }
+    const std::string requestUri = appendAccessQuery(uri, cfg);
+    curl_easy_setopt(curl, CURLOPT_URL, requestUri.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2500L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collectHlsManifest);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT,
+        cfg.hlsUserAgent.empty() ? "Mozilla/5.0 TVStreammerSAT5" : cfg.hlsUserAgent.c_str());
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    const CURLcode result = curl_easy_perform(curl);
+
+    char* effectiveUri = nullptr;
+    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effectiveUri);
+    const std::string baseUri = effectiveUri ? effectiveUri : requestUri;
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (result != CURLE_OK) return {};
+
+    struct Variant {
+        int width = 0;
+        int height = 0;
+        uint64_t bandwidth = 0;
+        std::string uri;
+    };
+    std::vector<Variant> variants;
+    std::string pendingAttributes;
+    std::istringstream lines(body);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("#EXT-X-STREAM-INF:", 0) == 0) {
+            pendingAttributes = line.substr(18);
+            continue;
+        }
+        if (pendingAttributes.empty() || line.empty() || line[0] == '#') continue;
+
+        static const std::regex resolutionPattern(R"(RESOLUTION=(\d+)x(\d+))");
+        static const std::regex bandwidthPattern(R"(BANDWIDTH=(\d+))");
+        std::smatch resolutionMatch;
+        std::smatch bandwidthMatch;
+        if (std::regex_search(pendingAttributes, resolutionMatch, resolutionPattern)) {
+            Variant variant;
+            variant.width = std::stoi(resolutionMatch[1].str());
+            variant.height = std::stoi(resolutionMatch[2].str());
+            if (std::regex_search(pendingAttributes, bandwidthMatch, bandwidthPattern)) {
+                variant.bandwidth = std::stoull(bandwidthMatch[1].str());
+            }
+            gchar* resolved = g_uri_resolve_relative(
+                baseUri.c_str(), line.c_str(), G_URI_FLAGS_NONE, nullptr);
+            if (resolved) {
+                variant.uri = appendAccessQuery(resolved, cfg);
+                g_free(resolved);
+                variants.push_back(std::move(variant));
+            }
+        }
+        pendingAttributes.clear();
+    }
+    if (variants.empty()) return {};
+
+    const auto selected = std::max_element(variants.begin(), variants.end(),
+        [](const Variant& left, const Variant& right) {
+            const bool leftIsTarget = left.width == 1920 && left.height == 1080;
+            const bool rightIsTarget = right.width == 1920 && right.height == 1080;
+            if (leftIsTarget != rightIsTarget) return !leftIsTarget;
+            const int64_t leftPixels = static_cast<int64_t>(left.width) * left.height;
+            const int64_t rightPixels = static_cast<int64_t>(right.width) * right.height;
+            if (leftPixels != rightPixels) return leftPixels < rightPixels;
+            return left.bandwidth < right.bandwidth;
+        });
+    return selected->uri;
 }
 
 void configureHttpCredentials(GstElement* element, const StreamConfig& cfg) {
@@ -369,8 +469,10 @@ GstElement* buildHls(
         return nullptr;
     }
 
-    std::string location = appendAccessQuery(
+    const std::string manifestUri = appendAccessQuery(
         tvs::protocols::inputs::hlsInputUri(cfg), cfg);
+    const std::string fixedVariantUri = selectFixedHlsVariant(cfg, manifestUri);
+    const std::string location = fixedVariantUri.empty() ? manifestUri : fixedVariantUri;
     g_object_set(src,
         "location", location.c_str(),
         "is-live", TRUE,
@@ -421,6 +523,8 @@ GstElement* buildHls(
     terminalElement = queue;
     std::cerr << "Network TS input 202.85: protocol=HLS profile=TVStreamer5"
               << " source=souphttpsrc+hlsdemux+mpegtsmux"
+              << " variant_selection=" << (fixedVariantUri.empty()
+                  ? "adaptive-fallback" : "fixed-1080p-or-max")
               << " queue_ms=5000 queue_max_mb=40 leaky=off"
               << " manifest_http_is_live=on manifest_do_timestamp=on"
               << " child_http_timestamps=hlsdemux-owned"
