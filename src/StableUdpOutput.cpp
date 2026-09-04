@@ -2251,9 +2251,14 @@ private:
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
-        const uint64_t playoutSourceRate = segmentedHlsInput
-            ? hlsSourceRate
-            : networkLongTermArrivalBitrate;
+        // CBR output already has an authoritative transport clock: the
+        // configured target bitrate. Do not derive its video pacing from
+        // bursty VBR HLS segment byte/PTS density, which can make video late
+        // while audio continues.
+        const uint64_t playoutSourceRate =
+            segmentedHlsInput && mode == UdpShapingMode::Cbr
+                ? currentTargetBitrate()
+                : (segmentedHlsInput ? hlsSourceRate : networkLongTermArrivalBitrate);
         if ((segmentedHlsInput || networkArrivalLocked) && playoutSourceRate > 0) {
             // Do not chase HTTP/SRT delivery bursts or every HLS GOP estimate.
             // Lock a long-lived media-clock pace and let a slow reservoir PLL
