@@ -1670,8 +1670,10 @@ private:
     }
 
     bool hlsOutputPhaseCalibrationProfile() const {
-        return hlsInput && mode == UdpShapingMode::Cbr &&
-            tvStreamer5IpProfile && !sourcePcrPassthrough();
+        // HLS segment boundaries can make a short startup PTS-PCR sample
+        // transient. Do not advance PCR based on that sample: it can make
+        // video PES packets appear late while audio continues.
+        return false;
     }
 
     void observeHlsFinalCalibrationDatagram(const guint8* data) {
