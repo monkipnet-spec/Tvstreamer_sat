@@ -8664,6 +8664,8 @@ bool StreamManager::buildRemapPipeline(
         (state && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty() &&
          state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri) ||
         (state && isDirectHttpMpegTsConfig(state->runtimeConfig)) ||
+        (state && tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+            tvs::stream_protocols::InputProtocolKind::Hls) ||
         (state && tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(state->runtimeConfig)) &&
          state->runtimeConfig.inputServiceId > 0);
     const uint32_t selectedInputServiceId = sourceAlreadySingleProgramForDemux ? 0U : cfg.inputServiceId;
@@ -8685,7 +8687,9 @@ bool StreamManager::buildRemapPipeline(
         // Other multi-program inputs (UDP/SRT/File/etc.) still use inputServiceId.
         const bool sourceAlreadySingleProgram =
             cfg.testPattern ||
-            tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(cfg));
+            tvs::stream_protocols::isDvbInput(tvs::stream_protocols::inputKind(cfg)) ||
+            tvs::stream_protocols::inputKind(cfg) ==
+                tvs::stream_protocols::InputProtocolKind::Hls;
         const uint32_t inputServiceId = sourceAlreadySingleProgram ? 0U : cfg.inputServiceId;
         if (inputServiceId > 0) {
             setIntPropertyIfPresent(demux, "program-number", static_cast<gint>(inputServiceId));
