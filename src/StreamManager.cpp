@@ -9278,16 +9278,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
-        const bool hlsNetworkRemap =
-            remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
-        if (hlsNetworkRemap) {
-            // HLS segment restarts can begin on an IDR without carrying the
-            // previous SPS/PPS in the new segment. Force h264parse to process
-            // the stream and repeat parameter sets with every IDR so a receiver
-            // can recover without waiting for a full pipeline rebuild.
-            g_object_set(parser, "config-interval", -1, nullptr);
-            setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
-        } else if (tvStreamer5NetworkRemap) {
+        if (tvStreamer5NetworkRemap) {
             g_object_set(parser, "config-interval", 1, nullptr);
         } else {
             const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser;

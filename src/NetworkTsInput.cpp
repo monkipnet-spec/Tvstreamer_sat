@@ -484,12 +484,11 @@ GstElement* buildHls(
     // multibitrate master playlist that value can select a variant unrelated
     // to the configured input URL and create unnecessary bitrate spikes.
     configureTsMux(mux, cfg);
-    // HLS segments may restart or overlap their timestamps at a discontinuity.
-    // Do not pass those backwards DTS/PTS values into the next TS mux: that
-    // produces malformed PES at the segment boundary and makes downstream
-    // receivers lose the video service.
-    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
-    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
+    // This is the intermediate HLS input mux, not the final Stable UDP remux.
+    // Preserve hlsdemux timestamps across segment boundaries; the final output
+    // remux owns monotonic timestamp handling.
+    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", FALSE);
+    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", FALSE);
 
     if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
         error = "HLS input: failed to link TVStreamer5 source/demux/mux queue";
