@@ -2115,10 +2115,6 @@ private:
 
     bool sourcePcrPassthrough() const {
         if (srtRemapCbrSourcePcr) return true;
-        // HLS input mux already carries the source transport PCR. Preserve it
-        // for compatibility testing instead of replacing it with the
-        // TVStreamer5 synthetic 20 ms PCR clock.
-        if (hlsInput) return true;
         if (tvStreamer5IpProfile) return false;
         return mode == UdpShapingMode::Vbr || !forceSyntheticPcr;
     }
@@ -3153,13 +3149,11 @@ GstElement* createSink(
     const uint64_t steadyLowWatermarkMs = hlsTv5CbrReservoirProfile ? 250ULL : 800ULL;
     const bool srtRemapCbrSourcePcr = useSrtRemapCbrSourcePcr(config);
     const bool syntheticPcr = !srtRemapCbrSourcePcr &&
-        !isSegmentedHlsInput(config) &&
         (tv5IpProfile ||
          (mode == UdpShapingMode::Cbr &&
           !isSegmentedHlsInput(config) &&
           (tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
-    const bool sourcePcr = !syntheticPcr;
     if (tv5IpProfile) {
         const char* tv5Source = isSegmentedHlsInput(config)
             ? "HLS"
@@ -3195,9 +3189,8 @@ GstElement* createSink(
                   << " startup_reservoir_ms=5000"
                   << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
                   << " steady_low_watermark_ms=" << steadyLowWatermarkMs
-                  << " pcr=" << (sourcePcr ? "source-passthrough" : "periodic-20ms")
-                  << " source_pcr=" << (sourcePcr ? "preserved" : "stripped-after-lock")
-                  << " cbr=null-stuffing+source-timing"
+                  << " pcr=periodic-20ms source_pcr=stripped-after-lock"
+                  << " cbr=null-stuffing+periodic-pcr"
                   << " pcr_phase=pre-send-final-ts-measured-per-hls-channel"
                   << " target_pts_pcr_lead_ms="
                   << (hlsTv5CbrReservoirProfile
