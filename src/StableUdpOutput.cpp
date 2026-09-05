@@ -2251,14 +2251,16 @@ private:
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
-        // CBR output already has an authoritative transport clock: the
-        // configured target bitrate. Do not derive its video pacing from
-        // bursty VBR HLS segment byte/PTS density, which can make video late
-        // while audio continues.
-        const uint64_t playoutSourceRate =
-            segmentedHlsInput && mode == UdpShapingMode::Cbr
-                ? currentTargetBitrate()
-                : (segmentedHlsInput ? hlsSourceRate : networkLongTermArrivalBitrate);
+        // 203.03: the configured CBR target is the output transport rate, not
+        // the rate at which real HLS packets must be consumed. Pacing real HLS
+        // packets at the target CBR rate drains the media reservoir in bursts,
+        // leaving multi-second NULL/PCR-only intervals in which WISI receivers
+        // lose PAT/PMT/audio/video. Keep the configured transport CBR via NULL
+        // stuffing, but pace real HLS packets from their media timeline-derived
+        // source rate.
+        const uint64_t playoutSourceRate = segmentedHlsInput
+            ? hlsSourceRate
+            : networkLongTermArrivalBitrate;
         if ((segmentedHlsInput || networkArrivalLocked) && playoutSourceRate > 0) {
             // Do not chase HTTP/SRT delivery bursts or every HLS GOP estimate.
             // Lock a long-lived media-clock pace and let a slow reservoir PLL
