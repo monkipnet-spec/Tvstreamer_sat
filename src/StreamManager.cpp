@@ -9277,12 +9277,23 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
+    const bool hlsFullRemux =
+        !ctx->flvMux &&
+        tvs::stream_protocols::inputKind(ctx->config) ==
+            tvs::stream_protocols::InputProtocolKind::Hls;
+    if (hlsFullRemux) {
+        // Do not pass through HLS access-unit buffers.  Re-parsing each
+        // elementary stream lets mpegtsmux receive complete PES units instead
+        // of segment-fragmented payloads.
+        setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
+    }
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
-            g_object_set(parser, "config-interval", 1, nullptr);
+            g_object_set(parser, "config-interval", hlsFullRemux ? -1 : 1, nullptr);
         } else {
             const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser;
-            g_object_set(parser, "config-interval", repeatHeadersEveryIdr ? -1 : 1, nullptr);
+            g_object_set(parser, "config-interval",
+                hlsFullRemux || repeatHeadersEveryIdr ? -1 : 1, nullptr);
             if (srtVideoParser) {
                 setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
             }
@@ -9388,6 +9399,9 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                       : "")
                   << (tvStreamer5NetworkRemap
                       ? " remap_profile=TVStreamer5"
+                      : "")
+                  << (hlsFullRemux
+                      ? " hls_full_remux=parser-rebuild+monotonic-pes"
                       : "")
                   << (hlsCompatibilityElementaryPad && isAudio
                       ? " hls_compat_audio_pacer=off"

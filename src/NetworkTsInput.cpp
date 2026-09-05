@@ -484,11 +484,10 @@ GstElement* buildHls(
     // multibitrate master playlist that value can select a variant unrelated
     // to the configured input URL and create unnecessary bitrate spikes.
     configureTsMux(mux, cfg);
-    // This is the intermediate HLS input mux, not the final Stable UDP remux.
-    // Preserve hlsdemux timestamps across segment boundaries; the final output
-    // remux owns monotonic timestamp handling.
-    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", FALSE);
-    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", FALSE);
+    // HLS segment boundaries are not MPEG-TS PES boundaries.  Rebuild a single
+    // monotonic transport timeline here before the final UDP shaper sees it.
+    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
+    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
 
     if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
         error = "HLS input: failed to link TVStreamer5 source/demux/mux queue";
@@ -526,7 +525,7 @@ GstElement* buildHls(
               << " queue_ms=5000 queue_max_mb=40 leaky=off"
               << " manifest_http_is_live=on manifest_do_timestamp=on"
               << " child_http_timestamps=hlsdemux-owned"
-              << " input_mux_timestamp_clamp=off"
+              << " input_mux_timestamp_rebuild=monotonic"
               << " input_selector=off mpegts_pad_adapter=auto"
               << " http_retries=gstreamer-default watchdog_rebuild_ms=15000"
               << std::endl;
