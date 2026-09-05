@@ -2251,13 +2251,112 @@ private:
         const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
-        // 203.03: the configured CBR target is the output transport rate, not
-        // the rate at which real HLS packets must be consumed. Pacing real HLS
-        // packets at the target CBR rate drains the media reservoir in bursts,
-        // leaving multi-second NULL/PCR-only intervals in which WISI receivers
-        // lose PAT/PMT/audio/video. Keep the configured transport CBR via NULL
-        // stuffing, but pace real HLS packets from their media timeline-derived
-        // source rate.
+
+        // 203.04: HLS arrives one segment at a time, so neither HTTP arrival
+        // speed nor the configured UDP CBR rate is a valid useful-packet pace.
+        // Use the HLS media clock as the token-bucket base, but do not make the
+        // old slow PLL chase the natural 0..one-segment reservoir sawtooth.
+        // A bounded low/high guard only corrects genuine long-term drift. This
+        // keeps PAT/PMT/audio/video present between HLS downloads without the
+        // video-late/freeze behaviour seen when 203.03 tried to converge on an
+        // eight-second reservoir. The outer transport remains strict CBR and
+        // unused slots remain NULL packets; PCR scheduling is unchanged.
+        const bool hlsCbrMediaBucket =
+            segmentedHlsInput && mode == UdpShapingMode::Cbr && tvStreamer5IpProfile;
+        if (hlsCbrMediaBucket && hlsSourceRate > 0) {
+            constexpr uint64_t kBucketUpdateNanoseconds =
+                1000ULL * 1000ULL * 1000ULL;
+            constexpr uint64_t kBucketLowGuardNanoseconds =
+                1000ULL * 1000ULL * 1000ULL;
+            constexpr uint64_t kBucketHighGuardNanoseconds =
+                8000ULL * 1000ULL * 1000ULL;
+            constexpr uint64_t kBucketFollowDivisor = 4ULL;
+            constexpr uint64_t kBucketStepPermille = 20ULL;      // 2% / second
+            constexpr uint64_t kBucketLowGuardPermille = 100ULL; // -10%
+            constexpr uint64_t kBucketHighGuardPermille = 150ULL;// +15%
+
+            const uint64_t ceiling = maxRealPaceBitrate();
+            const uint64_t sourceLimited = std::min<uint64_t>(hlsSourceRate, ceiling);
+            if (hlsPllBaseBitrate == 0) {
+                hlsPllBaseBitrate = sourceLimited;
+                currentRealPaceBitrate = sourceLimited;
+                hlsPllLastUpdateNanoseconds = nowNanoseconds;
+            }
+
+            const uint64_t bufferMs = hlsPllBaseBitrate > 0
+                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, hlsPllBaseBitrate)
+                : 0ULL;
+
+            if (nowNanoseconds >= hlsPllLastUpdateNanoseconds &&
+                nowNanoseconds - hlsPllLastUpdateNanoseconds >= kBucketUpdateNanoseconds) {
+                hlsPllLastUpdateNanoseconds = nowNanoseconds;
+
+                // hlsTimestampDerivedInputBitrate is already a six-second media
+                // window plus EWMA. Follow it on a one-second cadence, but only
+                // by one quarter of the remaining error per update.
+                hlsPllBaseBitrate =
+                    (hlsPllBaseBitrate * (kBucketFollowDivisor - 1ULL) + sourceLimited) /
+                    kBucketFollowDivisor;
+
+                uint64_t desired = hlsPllBaseBitrate;
+                const uint64_t lowGuardBytes = std::max<uint64_t>(
+                    kUdpPayloadSize * 8ULL,
+                    bytesForDuration(hlsPllBaseBitrate, kBucketLowGuardNanoseconds));
+                const uint64_t highGuardBytes = std::max<uint64_t>(
+                    kUdpPayloadSize * 32ULL,
+                    bytesForDuration(hlsPllBaseBitrate, kBucketHighGuardNanoseconds));
+
+                if (bufferNow < lowGuardBytes) {
+                    desired = hlsPllBaseBitrate *
+                        (1000ULL - kBucketLowGuardPermille) / 1000ULL;
+                    ++lowWatermarkEvents;
+                } else if (bufferNow > highGuardBytes) {
+                    desired = std::min<uint64_t>(
+                        ceiling,
+                        hlsPllBaseBitrate *
+                            (1000ULL + kBucketHighGuardPermille) / 1000ULL);
+                }
+
+                const uint64_t maximumStep = std::max<uint64_t>(
+                    1000ULL,
+                    std::max<uint64_t>(1ULL, currentRealPaceBitrate) *
+                        kBucketStepPermille / 1000ULL);
+                const uint64_t lower = currentRealPaceBitrate > maximumStep
+                    ? currentRealPaceBitrate - maximumStep
+                    : 0ULL;
+                const uint64_t upper = std::min<uint64_t>(
+                    ceiling, currentRealPaceBitrate + maximumStep);
+                currentRealPaceBitrate = std::clamp<uint64_t>(desired, lower, upper);
+                hlsPllCorrectionBitrate =
+                    static_cast<int64_t>(currentRealPaceBitrate) -
+                    static_cast<int64_t>(hlsPllBaseBitrate);
+            }
+
+            realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
+            updateTransportBitrate();
+            targetReservoirBytes.store(
+                bytesForDuration(hlsPllBaseBitrate, kBucketHighGuardNanoseconds),
+                std::memory_order_relaxed);
+            reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
+
+            if (!hlsExactPacingAnnounced) {
+                std::cerr << "HLS UDP pacing 203.04: mode=segment-media-token-bucket"
+                          << " source_rate_bitrate=" << hlsSourceRate
+                          << " base_bitrate=" << hlsPllBaseBitrate
+                          << " real_pace_bitrate=" << currentRealPaceBitrate
+                          << " low_guard_ms="
+                          << (kBucketLowGuardNanoseconds / 1000000ULL)
+                          << " high_guard_ms="
+                          << (kBucketHighGuardNanoseconds / 1000000ULL)
+                          << " max_step_permille=" << kBucketStepPermille
+                          << " transport_cbr=" << currentTargetBitrate()
+                          << " PCR=continuous-20ms-clock"
+                          << std::endl;
+                hlsExactPacingAnnounced = true;
+            }
+            return;
+        }
+
         const uint64_t playoutSourceRate = segmentedHlsInput
             ? hlsSourceRate
             : networkLongTermArrivalBitrate;
