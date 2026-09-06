@@ -198,11 +198,11 @@ bool isContinuousNetworkMpegTsInput(const StreamConfig& cfg) {
     return uri.rfind("http://", 0) == 0 || uri.rfind("https://", 0) == 0;
 }
 
-// 202.83: HLS now uses the same Stable UDP timing profile as TVStreamer5/main.
-// This removes SAT5's HLS-only PTS/slow-PLL clock and restores the proven
-// five-second reservoir + periodic-PCR transport used by TVStreamer5.
+// 203.05: restore the HLS UDP-CBR profile used by 202.74. Segmented HLS stays
+// on SAT5's HLS PTS/slow-PLL path; only continuous SRT/HTTP use the TVStreamer5
+// network timing profile. This is the WISI-stable transport behaviour from 202.74.
 bool useTvStreamer5IpShaperProfile(const StreamConfig& cfg) {
-    if (isSegmentedHlsInput(cfg)) return true;
+    if (isSegmentedHlsInput(cfg)) return false;
     if (tvs::protocols::inputs::isSrtInput(cfg)) return true;
     std::string uri = cfg.inputUri;
     std::transform(uri.begin(), uri.end(), uri.begin(), [](unsigned char c) {
@@ -789,12 +789,11 @@ public:
           caCleanStartEnabled(!useTvStreamer5IpShaperProfile(cfg)),
           conditionalAccessInput(!cfg.conditionalAccessClient.empty()),
           hlsInput(isSegmentedHlsInput(cfg)),
-          // 202.83: HLS is deliberately folded into the TVStreamer5 IP profile,
-          // so the old SAT5 segmented-HLS PTS/slow-PLL controller is disabled.
+          // 203.05/202.74: segmented HLS owns its media-timeline slow PLL;
+          // continuous SRT/HTTP retain the TVStreamer5 network profile.
           segmentedHlsInput(
               isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
-          // 202.57/202.83: the real TVStreamer5/main path uses the original
-          // reservoir controller rather than SAT5's later slow-PLL variants.
+          // Continuous network MPEG-TS keeps its existing network controller.
           continuousNetworkMpegTsInput(
               isContinuousNetworkMpegTsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
           // 202.28: SRT/HTTP use the exact TVStreamer5 periodic-PCR profile.
@@ -2116,7 +2115,11 @@ private:
     bool sourcePcrPassthrough() const {
         if (srtRemapCbrSourcePcr) return true;
         if (tvStreamer5IpProfile) return false;
-        return mode == UdpShapingMode::Vbr || !forceSyntheticPcr;
+        // 203.05/202.74: segmented HLS CBR always owns one continuous 20 ms
+        // PCR domain across HLS segment boundaries. Non-HLS keeps the existing
+        // source-PCR/forced-PCR policy.
+        return mode == UdpShapingMode::Vbr ||
+               (!segmentedHlsInput && !forceSyntheticPcr);
     }
 
     void updateTransportBitrate() {
@@ -2252,111 +2255,9 @@ private:
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
 
-        // 203.04: HLS arrives one segment at a time, so neither HTTP arrival
-        // speed nor the configured UDP CBR rate is a valid useful-packet pace.
-        // Use the HLS media clock as the token-bucket base, but do not make the
-        // old slow PLL chase the natural 0..one-segment reservoir sawtooth.
-        // A bounded low/high guard only corrects genuine long-term drift. This
-        // keeps PAT/PMT/audio/video present between HLS downloads without the
-        // video-late/freeze behaviour seen when 203.03 tried to converge on an
-        // eight-second reservoir. The outer transport remains strict CBR and
-        // unused slots remain NULL packets; PCR scheduling is unchanged.
-        const bool hlsCbrMediaBucket =
-            segmentedHlsInput && mode == UdpShapingMode::Cbr && tvStreamer5IpProfile;
-        if (hlsCbrMediaBucket && hlsSourceRate > 0) {
-            constexpr uint64_t kBucketUpdateNanoseconds =
-                1000ULL * 1000ULL * 1000ULL;
-            constexpr uint64_t kBucketLowGuardNanoseconds =
-                1000ULL * 1000ULL * 1000ULL;
-            constexpr uint64_t kBucketHighGuardNanoseconds =
-                8000ULL * 1000ULL * 1000ULL;
-            constexpr uint64_t kBucketFollowDivisor = 4ULL;
-            constexpr uint64_t kBucketStepPermille = 20ULL;      // 2% / second
-            constexpr uint64_t kBucketLowGuardPermille = 100ULL; // -10%
-            constexpr uint64_t kBucketHighGuardPermille = 150ULL;// +15%
-
-            const uint64_t ceiling = maxRealPaceBitrate();
-            const uint64_t sourceLimited = std::min<uint64_t>(hlsSourceRate, ceiling);
-            if (hlsPllBaseBitrate == 0) {
-                hlsPllBaseBitrate = sourceLimited;
-                currentRealPaceBitrate = sourceLimited;
-                hlsPllLastUpdateNanoseconds = nowNanoseconds;
-            }
-
-            const uint64_t bufferMs = hlsPllBaseBitrate > 0
-                ? multiplyDivide(bufferNow * 8ULL, 1000ULL, hlsPllBaseBitrate)
-                : 0ULL;
-
-            if (nowNanoseconds >= hlsPllLastUpdateNanoseconds &&
-                nowNanoseconds - hlsPllLastUpdateNanoseconds >= kBucketUpdateNanoseconds) {
-                hlsPllLastUpdateNanoseconds = nowNanoseconds;
-
-                // hlsTimestampDerivedInputBitrate is already a six-second media
-                // window plus EWMA. Follow it on a one-second cadence, but only
-                // by one quarter of the remaining error per update.
-                hlsPllBaseBitrate =
-                    (hlsPllBaseBitrate * (kBucketFollowDivisor - 1ULL) + sourceLimited) /
-                    kBucketFollowDivisor;
-
-                uint64_t desired = hlsPllBaseBitrate;
-                const uint64_t lowGuardBytes = std::max<uint64_t>(
-                    kUdpPayloadSize * 8ULL,
-                    bytesForDuration(hlsPllBaseBitrate, kBucketLowGuardNanoseconds));
-                const uint64_t highGuardBytes = std::max<uint64_t>(
-                    kUdpPayloadSize * 32ULL,
-                    bytesForDuration(hlsPllBaseBitrate, kBucketHighGuardNanoseconds));
-
-                if (bufferNow < lowGuardBytes) {
-                    desired = hlsPllBaseBitrate *
-                        (1000ULL - kBucketLowGuardPermille) / 1000ULL;
-                    ++lowWatermarkEvents;
-                } else if (bufferNow > highGuardBytes) {
-                    desired = std::min<uint64_t>(
-                        ceiling,
-                        hlsPllBaseBitrate *
-                            (1000ULL + kBucketHighGuardPermille) / 1000ULL);
-                }
-
-                const uint64_t maximumStep = std::max<uint64_t>(
-                    1000ULL,
-                    std::max<uint64_t>(1ULL, currentRealPaceBitrate) *
-                        kBucketStepPermille / 1000ULL);
-                const uint64_t lower = currentRealPaceBitrate > maximumStep
-                    ? currentRealPaceBitrate - maximumStep
-                    : 0ULL;
-                const uint64_t upper = std::min<uint64_t>(
-                    ceiling, currentRealPaceBitrate + maximumStep);
-                currentRealPaceBitrate = std::clamp<uint64_t>(desired, lower, upper);
-                hlsPllCorrectionBitrate =
-                    static_cast<int64_t>(currentRealPaceBitrate) -
-                    static_cast<int64_t>(hlsPllBaseBitrate);
-            }
-
-            realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
-            updateTransportBitrate();
-            targetReservoirBytes.store(
-                bytesForDuration(hlsPllBaseBitrate, kBucketHighGuardNanoseconds),
-                std::memory_order_relaxed);
-            reservoirMilliseconds.store(bufferMs, std::memory_order_relaxed);
-
-            if (!hlsExactPacingAnnounced) {
-                std::cerr << "HLS UDP pacing 203.04: mode=segment-media-token-bucket"
-                          << " source_rate_bitrate=" << hlsSourceRate
-                          << " base_bitrate=" << hlsPllBaseBitrate
-                          << " real_pace_bitrate=" << currentRealPaceBitrate
-                          << " low_guard_ms="
-                          << (kBucketLowGuardNanoseconds / 1000000ULL)
-                          << " high_guard_ms="
-                          << (kBucketHighGuardNanoseconds / 1000000ULL)
-                          << " max_step_permille=" << kBucketStepPermille
-                          << " transport_cbr=" << currentTargetBitrate()
-                          << " PCR=continuous-20ms-clock"
-                          << std::endl;
-                hlsExactPacingAnnounced = true;
-            }
-            return;
-        }
-
+        // 203.05: the 203.04 segment token-bucket experiment is removed.
+        // Segmented HLS now continues directly into the proven 202.74 slow
+        // media-timeline PLL below.
         const uint64_t playoutSourceRate = segmentedHlsInput
             ? hlsSourceRate
             : networkLongTermArrivalBitrate;
@@ -3252,8 +3153,8 @@ GstElement* createSink(
     const bool syntheticPcr = !srtRemapCbrSourcePcr &&
         (tv5IpProfile ||
          (mode == UdpShapingMode::Cbr &&
-          !isSegmentedHlsInput(config) &&
-          (tvs::protocols::inputs::isSrtInput(config) ||
+          (isSegmentedHlsInput(config) ||
+           tvs::protocols::inputs::isSrtInput(config) ||
            forceSyntheticCbrPcr())));
     if (tv5IpProfile) {
         const char* tv5Source = isSegmentedHlsInput(config)
@@ -3285,22 +3186,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 202.93: profile=TVStreamer5"
-                  << " pacing=reservoir-rate-controller"
-                  << " startup_reservoir_ms=5000"
-                  << " steady_target_reservoir_ms=" << steadyTargetReservoirMs
-                  << " steady_low_watermark_ms=" << steadyLowWatermarkMs
-                  << " pcr=periodic-20ms source_pcr=stripped-after-lock"
-                  << " cbr=null-stuffing+periodic-pcr"
-                  << " pcr_phase=pre-send-final-ts-measured-per-hls-channel"
-                  << " target_pts_pcr_lead_ms="
-                  << (hlsTv5CbrReservoirProfile
-                          ? (kHlsCbrTargetPtsPcrLeadNanoseconds / 1000000ULL)
-                          : 0ULL)
-                  << " max_pcr_phase_advance_ms="
-                  << (hlsTv5CbrReservoirProfile
-                          ? (kHlsCbrMaxPcrPhaseAdvanceNanoseconds / 1000000ULL)
-                          : 0ULL)
+        std::cerr << "HLS timing 203.06: compatibility=202.74"
+                  << " profile=sat5-restored"
+                  << " direct_mpegts=preferred remux=fallback-only"
+                  << " pacing=slow-playout-pll periodic_pcr=20ms"
                   << std::endl;
     }
     if (srtRemapCbrSourcePcr) {

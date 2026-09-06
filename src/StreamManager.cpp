@@ -4318,13 +4318,10 @@ void configureTsMux(GstElement* mux, const StreamConfig& cfg) {
         "pmt-interval", 9000U,
         "si-interval", 9000U,
         nullptr);
-    const auto muxInputKind = tvs::stream_protocols::inputKind(cfg);
-    if (muxInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
-        muxInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
-        // 202.81: HLS segment boundaries may legally carry discontinuities or
-        // timestamp steps that are meaningful only together with the playlist.
-        // Once HLS is restreamed as one continuous TS, keep mux input timing
-        // monotonic when the installed GStreamer version exposes these guards.
+    // 203.05/202.74: timestamp clamping belongs to SRT only. HLS fallback
+    // remux must preserve hlsdemux's segment timeline and discontinuities.
+    if (tvs::stream_protocols::inputKind(cfg) ==
+        tvs::stream_protocols::InputProtocolKind::Srt) {
         setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
         setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
     }
@@ -7396,6 +7393,17 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     GstElement* oldPipeline = state->pipeline;
     GstBus* oldBus = state->bus;
+    const bool strictHlsGenerationTeardown =
+        tvs::stream_protocols::inputKind(state->runtimeConfig) ==
+            tvs::stream_protocols::InputProtocolKind::Hls;
+
+    // HLS owns several dynamic-pad/souphttpsrc/hlsdemux objects. Detach the
+    // appsink callback before NULL so the old StableUdpSender is destroyed even
+    // if a network child is slow to tear down. Other protocol recovery keeps its
+    // existing restart/fallback semantics.
+    if (strictHlsGenerationTeardown && oldPipeline) {
+        detachAppSinkCallbacksForTeardown(oldPipeline);
+    }
 
     // 202.70: a public HTTP relay is tied to the tcpserversink generation that
     // lives inside this pipeline. Never carry that detached relay thread across
@@ -7441,6 +7449,41 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         return false;
     }
 
+    if (strictHlsGenerationTeardown) {
+        // Mirror normal stream teardown before constructing the next HLS
+        // generation. Request-pad references in RemapContext and signal user-data
+        // can otherwise keep the old pipeline (and its HTTP/HLS objects) alive
+        // after a recovery rebuild.
+        if (oldPipeline) {
+            if (state->sourceContext) {
+                disconnectSignalHandlersByData(oldPipeline, state->sourceContext.get());
+            }
+            for (const auto& context : state->outputContexts) {
+                if (context) disconnectSignalHandlersByData(oldPipeline, context.get());
+            }
+        }
+        state->outputContexts.clear();
+        state->sourceContext.reset();
+
+        if (oldBus) {
+            gst_bus_set_flushing(oldBus, TRUE);
+            gst_object_unref(oldBus);
+            oldBus = nullptr;
+            state->bus = nullptr;
+        }
+        state->pipeline = nullptr;
+        if (oldPipeline && !releasePipelineAndWaitForFinalize(
+                oldPipeline, state->config.id, std::chrono::seconds(10))) {
+            state->statusMessage =
+                "error: HLS recovery pipeline did not finalize; service restart scheduled";
+            state->active = false;
+            scheduleAutomaticServiceRestart(
+                state->config.id, "hls-recovery-pipeline-finalize-timeout");
+            return false;
+        }
+        trimReleasedPipelineMemory();
+    }
+
     state->runtimeConfig = state->config;
     state->runtimeConfig.testPattern = false;
     if (!useBackup && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty()) {
@@ -7461,12 +7504,25 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
 
     GstElement* newPipeline = createPipeline(state);
     if (!newPipeline) {
-        state->pipeline = oldPipeline;
-        state->bus = oldBus;
-        state->statusMessage = "error: restart failed";
-        if (oldPipeline) {
-            gst_element_set_state(oldPipeline, GST_STATE_PLAYING);
+        if (strictHlsGenerationTeardown) {
+            // createPipeline() can fail after dynamic request pads/contexts were
+            // created. Drop those references immediately so the failed pipeline
+            // generation can be reclaimed instead of surviving until the next
+            // retry or process restart.
+            state->outputContexts.clear();
+            state->sourceContext.reset();
+            state->pipeline = nullptr;
+            state->bus = nullptr;
+            state->active = false;
+            trimReleasedPipelineMemory();
+        } else {
+            state->pipeline = oldPipeline;
+            state->bus = oldBus;
+            if (oldPipeline) {
+                gst_element_set_state(oldPipeline, GST_STATE_PLAYING);
+            }
         }
+        state->statusMessage = "error: restart failed";
         return false;
     }
 
@@ -7536,16 +7592,45 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
         // replacement to NULL before dropping it; the previous pipeline was
         // already stopped above, so leave the stream offline for the normal
         // monitor/restart path instead of retaining a half-started pipeline.
+        if (strictHlsGenerationTeardown) {
+            detachAppSinkCallbacksForTeardown(newPipeline);
+        }
         gst_element_set_state(newPipeline, GST_STATE_NULL);
         gst_element_get_state(newPipeline, nullptr, nullptr, GST_SECOND);
-        if (newBus) gst_object_unref(newBus);
-        gst_object_unref(newPipeline);
+
+        if (strictHlsGenerationTeardown) {
+            if (state->sourceContext) {
+                disconnectSignalHandlersByData(newPipeline, state->sourceContext.get());
+            }
+            for (const auto& context : state->outputContexts) {
+                if (context) disconnectSignalHandlersByData(newPipeline, context.get());
+            }
+            state->outputContexts.clear();
+            state->sourceContext.reset();
+        }
+
+        if (newBus) {
+            gst_bus_set_flushing(newBus, TRUE);
+            gst_object_unref(newBus);
+            newBus = nullptr;
+        }
         state->pipeline = nullptr;
         state->bus = nullptr;
+
+        if (strictHlsGenerationTeardown) {
+            if (!releasePipelineAndWaitForFinalize(
+                    newPipeline, state->config.id, std::chrono::seconds(10))) {
+                scheduleAutomaticServiceRestart(
+                    state->config.id, "hls-failed-replacement-finalize-timeout");
+            }
+        } else {
+            gst_object_unref(newPipeline);
+        }
         state->statusMessage = "error: restart playback failed";
         state->active = false;
         if (oldBus) gst_object_unref(oldBus);
         if (oldPipeline) gst_object_unref(oldPipeline);
+        trimReleasedPipelineMemory();
         return false;
     }
 
@@ -8328,16 +8413,18 @@ bool StreamManager::buildOutputBranch(
     const bool sharedDvbSpts = state && state->sharedDvbInput &&
         !state->sharedDvbServiceRelayUri.empty() &&
         state->runtimeConfig.inputUri == state->sharedDvbServiceRelayUri;
+    const bool hlsTransportTs = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
+        state->runtimeConfig.inputServiceId == 0;
     // 202.22: SRT commonly carries an already-finished SPTS. If no explicit
     // service selection was requested, keep that transport intact like direct
-    // HTTP MPEG-TS. HLS is deliberately excluded in 202.83 because its Stable
-    // UDP path now follows TVStreamer5/main and always uses the normal remux.
+    // HTTP MPEG-TS and the restored 202.74 HLS direct transport.
     const bool srtTransportTs = state &&
         sourceProtocol == tvs::stream_protocols::InputProtocolKind::Srt &&
         state->runtimeConfig.inputServiceId == 0;
     const bool sourceAlreadySingleProgramTs = state && (
         state->runtimeConfig.testPattern || sharedDvbSpts ||
-        isDirectHttpMpegTsConfig(state->runtimeConfig) || srtTransportTs ||
+        isDirectHttpMpegTsConfig(state->runtimeConfig) || hlsTransportTs || srtTransportTs ||
         (tvs::stream_protocols::isDvbInput(sourceProtocol) && state->runtimeConfig.inputServiceId > 0));
     // DVB service selection is done by dvbsrc PID filters resolved from the
     // selected service PMT (PAT/PMT/PCR + all elementary PIDs). Test bars are
@@ -8345,9 +8432,8 @@ bool StreamManager::buildOutputBranch(
     // tsdemux/mpegtsmux cycle can drop valid/private streams and is not required
     // by StableUdpOutput/WISI shaping. Remux only for explicit PID/SID remapping
     // or a generic multi-program input.
-    // 202.83: HLS intentionally follows TVStreamer5/main rather than SAT5's
-    // direct-transport optimization. Stable UDP therefore rebuilds the HLS TS
-    // through the normal remap pipeline before the common TVStreamer5 shaper.
+    // 203.05/202.74: an HLS SPTS is already a complete transport. Stable UDP
+    // must not force another tsdemux/parser/mpegtsmux cycle around it.
     const bool stableUdpRemux = usesStableUdpShaper(outputConfig) &&
         !transcodedInput && !sourceAlreadySingleProgramTs;
     if (srtTransportTs && usesStableUdpShaper(outputConfig) && !outputConfig.remapEnabled) {
@@ -8361,11 +8447,13 @@ bool StreamManager::buildOutputBranch(
     // PID/SID remapping is disabled.  This does not touch UDP/WISI output.
     const bool strictTsNetworkOutput = (type == "http" || type == "srt") && !transcodedInput;
     const bool remapAlreadyApplied = state && state->dvbTsRemapApplied && sharedDvbSpts;
-    // 202.83: disable the SAT5 HLS packet-level shortcut. TVStreamer5/main
-    // always sends Stable UDP passthrough through buildRemapPipeline(), which
-    // gives HLS the same tsdemux -> parser -> mpegtsmux transport treatment as
-    // its proven implementation.
-    const bool hlsPacketRemap = false;
+    // 203.05/202.74: when remap is requested, rewrite only PAT/PMT/SID and
+    // requested A/V PID headers. Preserve provider PCR/PTS/DTS and transport
+    // continuity instead of rebuilding elementary streams.
+    const bool hlsPacketRemap = state &&
+        sourceProtocol == tvs::stream_protocols::InputProtocolKind::Hls &&
+        state->runtimeConfig.inputServiceId == 0 &&
+        outputConfig.remapEnabled && usesStableUdpShaper(outputConfig);
     const bool needsRemux = ((outputConfig.remapEnabled && !remapAlreadyApplied && !hlsPacketRemap) ||
                              stableUdpRemux || strictTsNetworkOutput) && !transcodedInput;
     if (hlsPacketRemap) {
@@ -9055,6 +9143,7 @@ GstElement* StreamManager::createOutputSink(StreamState* state, const StreamConf
 }
 
 void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer user_data) {
+    (void)demux;
     auto* ctx = static_cast<RemapContext*>(user_data);
     if (!ctx || !ctx->mux) {
         return;
@@ -9075,84 +9164,88 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     const bool isMpegTs = capsString.find("video/mpegts") != std::string::npos ||
         capsString.find("application/x-mpegts") != std::string::npos;
     if (isMpegTs) {
-        // 202.84: TVStreamer5/main usually gets elementary A/V pads directly
-        // from hlsdemux. The production GStreamer build used by SAT5 instead
-        // exposes a video/mpegts pad for these MPEG-TS HLS providers. Draining
-        // that pad in 202.83 discarded the complete HLS transport and caused
-        // every HLS watchdog to fire after 15 seconds. Adapt only this pad shape
-        // through one persistent tsdemux, then continue through the exact same
-        // parser -> mpegtsmux path used by TVStreamer5. No decode/transcode and
-        // no SAT5 HLS PLL/input-selector is reintroduced.
-        if (tvs::stream_protocols::inputKind(ctx->config) ==
-            tvs::stream_protocols::InputProtocolKind::Hls) {
-            GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
-            if (!pipeline) {
-                if (caps) gst_caps_unref(caps);
-                return;
+        // 203.05: restore the 202.74 HLS fast path. Legacy hlsdemux commonly
+        // exposes complete MPEG-TS fragments. They already carry a coherent
+        // provider PAT/PMT/PCR/PTS timeline, so select that transport directly.
+        if (ctx->hlsInputSelector) {
+            if (!ctx->hlsDirectSelectorPad) {
+                ctx->hlsDirectSelectorPad =
+                    gst_element_request_pad_simple(ctx->hlsInputSelector, "sink_%u");
             }
-
-            GstElement* tsdemux = ctx->hlsCompatTsDemux;
-            if (!tsdemux) {
-                tsdemux = gst_element_factory_make("tsdemux", "hls_tvstreamer5_compat_tsdemux");
-                if (!tsdemux || !gst_bin_add(GST_BIN(pipeline), tsdemux)) {
-                    if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
-                    std::cerr << "HLS TVStreamer5 compatibility 202.86: failed to create tsdemux"
-                              << std::endl;
-                    if (caps) gst_caps_unref(caps);
-                    gst_object_unref(pipeline);
-                    return;
-                }
-                g_signal_connect(
-                    tsdemux, "pad-added",
-                    G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
-                ctx->hlsCompatTsDemux = tsdemux;
-                gst_element_sync_state_with_parent(tsdemux);
-                std::cerr << "HLS TVStreamer5 compatibility 202.86: input_pad=mpegts"
-                          << " adapter=tsdemux elementary_path=parser+mpegtsmux"
-                          << " decode=off transcode=off" << std::endl;
-            }
-
-            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
-            if (sinkPad) {
-                GstPad* oldPeer = gst_pad_get_peer(sinkPad);
+            GstPad* directSinkPad = ctx->hlsDirectSelectorPad;
+            if (directSinkPad) {
+                GstPad* oldPeer = gst_pad_get_peer(directSinkPad);
                 if (oldPeer) {
                     if (oldPeer != pad) {
-                        gst_pad_unlink(oldPeer, sinkPad);
+                        gst_pad_unlink(oldPeer, directSinkPad);
                     }
                     gst_object_unref(oldPeer);
                 }
-                const bool linked = gst_pad_is_linked(sinkPad) ||
-                    gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK;
-                gst_object_unref(sinkPad);
-                if (linked) {
+                if (gst_pad_is_linked(directSinkPad) ||
+                    gst_pad_link(pad, directSinkPad) == GST_PAD_LINK_OK) {
+                    g_object_set(ctx->hlsInputSelector, "active-pad", directSinkPad, nullptr);
+                    if (!ctx->hlsDirectTsActive) {
+                        ctx->hlsDirectTsActive = true;
+                        std::cerr << "HLS input 203.06: compatibility=202.74"
+                                  << " transport=mpegts direct_passthrough=on"
+                                  << " remux=off preserve_pcr_pts=on preserve_cc=on"
+                                  << std::endl;
+                    }
+                    if (caps) gst_caps_unref(caps);
+                    return;
+                }
+            }
+            std::cerr << "HLS input 203.06: direct MPEG-TS link failed, falling back to remux"
+                      << std::endl;
+        }
+
+        // 203.06 memory hardening for the 202.74 compatibility fallback:
+        // reuse one tsdemux for the lifetime of this HLS pipeline. hlsdemux can
+        // replace its transport pad at segment/variant transitions; creating a
+        // new child tsdemux for every replacement leaves parented elements alive
+        // until the whole pipeline is destroyed.
+        GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
+        bool createdCompatDemux = false;
+        if (pipeline && !ctx->hlsCompatTsDemux) {
+            GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
+            if (tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
+                ctx->hlsCompatTsDemux = tsdemux;
+                createdCompatDemux = true;
+                g_signal_connect(
+                    tsdemux, "pad-added",
+                    G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
+                gst_element_sync_state_with_parent(tsdemux);
+            } else if (tsdemux) {
+                gst_object_unref(tsdemux);
+            }
+        }
+        if (pipeline && ctx->hlsCompatTsDemux) {
+            GstPad* sinkPad = gst_element_get_static_pad(ctx->hlsCompatTsDemux, "sink");
+            if (sinkPad) {
+                GstPad* oldPeer = gst_pad_get_peer(sinkPad);
+                if (oldPeer) {
+                    if (oldPeer != pad) gst_pad_unlink(oldPeer, sinkPad);
+                    gst_object_unref(oldPeer);
+                }
+                if (gst_pad_is_linked(sinkPad) ||
+                    gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
+                    gst_object_unref(sinkPad);
                     if (caps) gst_caps_unref(caps);
                     gst_object_unref(pipeline);
                     return;
                 }
-            }
-
-            std::cerr << "HLS TVStreamer5 compatibility 202.86: MPEG-TS pad link failed caps="
-                      << capsString << std::endl;
-            if (caps) gst_caps_unref(caps);
-            gst_object_unref(pipeline);
-            return;
-        }
-
-        GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
-        GstElement* tsdemux = gst_element_factory_make("tsdemux", nullptr);
-        if (pipeline && tsdemux && gst_bin_add(GST_BIN(pipeline), tsdemux)) {
-            gst_element_sync_state_with_parent(tsdemux);
-            GstPad* sinkPad = gst_element_get_static_pad(tsdemux, "sink");
-            if (sinkPad && gst_pad_link(pad, sinkPad) == GST_PAD_LINK_OK) {
-                g_signal_connect(tsdemux, "pad-added", G_CALLBACK(StreamManager::onDemuxPadAdded), ctx);
                 gst_object_unref(sinkPad);
-                if (caps) gst_caps_unref(caps);
-                gst_object_unref(pipeline);
-                return;
             }
-            if (sinkPad) gst_object_unref(sinkPad);
+            // A just-created fallback that cannot accept the transport pad is
+            // useless. Remove it immediately instead of retaining an orphan in
+            // the pipeline. Existing reusable fallback is kept for the next pad.
+            if (createdCompatDemux) {
+                g_signal_handlers_disconnect_by_data(ctx->hlsCompatTsDemux, ctx);
+                gst_element_set_state(ctx->hlsCompatTsDemux, GST_STATE_NULL);
+                gst_bin_remove(GST_BIN(pipeline), ctx->hlsCompatTsDemux);
+                ctx->hlsCompatTsDemux = nullptr;
+            }
         }
-        if (tsdemux && !GST_OBJECT_PARENT(tsdemux)) gst_object_unref(tsdemux);
         if (pipeline) gst_object_unref(pipeline);
     }
     bool isAudio = capsString.find("audio/") != std::string::npos;
@@ -9179,37 +9272,22 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
     GstElement* parser = parserFactory.empty() ? nullptr : gst_element_factory_make(parserFactory.c_str(), nullptr);
     GstElement* capsfilter = capsFilterForMux(ctx->flvMux, isVideo, isAudio, capsString, parserFactory);
 
-    // 202.86: the MPEG-TS pad exposed by hlsdemux on GStreamer 1.20 is first
-    // adapted through hlsCompatTsDemux into elementary A/V and remuxed back to
-    // transport. That intermediate adapter must remain parser -> mpegtsmux only.
-    // The final Stable UDP remap owns the single 1500 ms audio startup reservoir
-    // and clocksync. Applying both stages here created two independent audio
-    // pacing points on HLS, matching the duplicate reservoir-complete logs.
-    const bool hlsCompatibilityElementaryPad =
-        ctx->hlsCompatTsDemux && demux == ctx->hlsCompatTsDemux;
     const bool stableUdpAudioReservoir =
         isAudio && !ctx->flvMux &&
-        !hlsCompatibilityElementaryPad &&
         usesStableUdpShaper(ctx->config) &&
         udpCbrOutputEnabled(ctx->config);
     const auto remapInputKind = tvs::stream_protocols::inputKind(ctx->config);
     const bool tvStreamer5NetworkRemap =
         remapInputKind == tvs::stream_protocols::InputProtocolKind::Srt ||
-        remapInputKind == tvs::stream_protocols::InputProtocolKind::Http ||
-        remapInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
-    // HLS segment timestamps can legitimately jump at discontinuities. Keep its
-    // startup reservoir, but do not run a second wall-clock synchronizer over
-    // AAC after the HLS demux/remux path. SRT/HTTP retain the TVStreamer5 clock.
+        remapInputKind == tvs::stream_protocols::InputProtocolKind::Http;
     const bool tvStreamer5AudioClock =
-        stableUdpAudioReservoir && tvStreamer5NetworkRemap &&
-        remapInputKind != tvs::stream_protocols::InputProtocolKind::Hls;
+        stableUdpAudioReservoir && tvStreamer5NetworkRemap;
 
     GstElement* audioReservoirQueue = stableUdpAudioReservoir
         ? gst_element_factory_make("queue", nullptr)
         : nullptr;
-    // SRT/HTTP use the TVStreamer5 elementary-stream audio path: one 1500 ms
-    // startup reservoir followed by clocksync(sync-to-first). HLS uses only
-    // the startup reservoir so segment timestamps are not paced twice.
+    // 203.05/202.74: SRT/HTTP use clocksync; HLS fallback keeps only the
+    // startup-only audio reservoir and follows the provider media timeline.
     GstElement* audioClockSync = tvStreamer5AudioClock
         ? gst_element_factory_make("clocksync", nullptr)
         : nullptr;
@@ -9232,20 +9310,34 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     GstElement* pipeline = GST_ELEMENT(gst_element_get_parent(ctx->mux));
     if (!pipeline) {
-        gst_object_unref(queue);
+        for (GstElement* element : {queue, parser, capsfilter, audioReservoirQueue, audioClockSync}) {
+            if (element) gst_object_unref(element);
+        }
         return;
     }
+
+    // Dynamic pads can disappear while a branch is being assembled. Any
+    // element already added to the bin must be removed on every failure path;
+    // merely dropping the local pointer leaves the pipeline owning it forever.
+    const auto cleanupDynamicBranch = [&]() {
+        for (GstElement* element :
+             {audioClockSync, audioReservoirQueue, capsfilter, parser, queue}) {
+            if (!element) continue;
+            if (GST_OBJECT_PARENT(element) == GST_OBJECT(pipeline)) {
+                gst_element_set_state(element, GST_STATE_NULL);
+                gst_bin_remove(GST_BIN(pipeline), element);
+            } else if (!GST_OBJECT_PARENT(element)) {
+                gst_object_unref(element);
+            }
+        }
+    };
 
     if (!gst_bin_add(GST_BIN(pipeline), queue) ||
         !gst_bin_add(GST_BIN(pipeline), parser) ||
         (capsfilter && !gst_bin_add(GST_BIN(pipeline), capsfilter)) ||
         (audioReservoirQueue && !gst_bin_add(GST_BIN(pipeline), audioReservoirQueue)) ||
         (audioClockSync && !gst_bin_add(GST_BIN(pipeline), audioClockSync))) {
-        if (queue && !GST_OBJECT_PARENT(queue)) gst_object_unref(queue);
-        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
-        if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
-        if (audioReservoirQueue && !GST_OBJECT_PARENT(audioReservoirQueue)) gst_object_unref(audioReservoirQueue);
-        if (audioClockSync && !GST_OBJECT_PARENT(audioClockSync)) gst_object_unref(audioClockSync);
+        cleanupDynamicBranch();
         gst_object_unref(pipeline);
         return;
     }
@@ -9277,23 +9369,14 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         tvs::stream_protocols::inputKind(ctx->config) ==
             tvs::stream_protocols::InputProtocolKind::Srt &&
         (parserFactory == "h264parse" || parserFactory == "h265parse");
-    const bool hlsFullRemux =
-        !ctx->flvMux &&
-        tvs::stream_protocols::inputKind(ctx->config) ==
-            tvs::stream_protocols::InputProtocolKind::Hls;
-    if (hlsFullRemux) {
-        // Do not pass through HLS access-unit buffers.  Re-parsing each
-        // elementary stream lets mpegtsmux receive complete PES units instead
-        // of segment-fragmented payloads.
-        setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
-    }
+    const bool hlsCompatibilityElementaryPad =
+        ctx->hlsCompatTsDemux && demux == ctx->hlsCompatTsDemux;
     if (parserFactory == "h264parse" || parserFactory == "h265parse") {
         if (tvStreamer5NetworkRemap) {
-            g_object_set(parser, "config-interval", hlsFullRemux ? -1 : 1, nullptr);
+            g_object_set(parser, "config-interval", 1, nullptr);
         } else {
             const bool repeatHeadersEveryIdr = ctx->hlsSink2 || srtVideoParser;
-            g_object_set(parser, "config-interval",
-                hlsFullRemux || repeatHeadersEveryIdr ? -1 : 1, nullptr);
+            g_object_set(parser, "config-interval", repeatHeadersEveryIdr ? -1 : 1, nullptr);
             if (srtVideoParser) {
                 setBooleanPropertyIfPresent(parser, "disable-passthrough", TRUE);
             }
@@ -9315,6 +9398,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
         ? gst_element_link_many(queue, parser, capsfilter, nullptr)
         : gst_element_link(queue, parser);
     if (!parserLinked) {
+        cleanupDynamicBranch();
         gst_object_unref(pipeline);
         drainDynamicPad(ctx->mux, pad);
         return;
@@ -9327,6 +9411,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             : gst_element_link(parserTail, audioReservoirQueue);
         if (!linked) {
             std::cerr << "Stable UDP audio reservoir link failed" << std::endl;
+            cleanupDynamicBranch();
             gst_object_unref(pipeline);
             drainDynamicPad(ctx->mux, pad);
             return;
@@ -9335,12 +9420,14 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
 
     GstPad* queueSinkPad = gst_element_get_static_pad(queue, "sink");
     if (!queueSinkPad) {
+        cleanupDynamicBranch();
         gst_object_unref(pipeline);
         return;
     }
 
     if (gst_pad_link(pad, queueSinkPad) != GST_PAD_LINK_OK) {
         gst_object_unref(queueSinkPad);
+        cleanupDynamicBranch();
         gst_object_unref(pipeline);
         drainDynamicPad(ctx->mux, pad);
         return;
@@ -9379,6 +9466,7 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             if (!stableUdpPreMapped) gst_element_release_request_pad(ctx->mux, muxSinkPad);
             gst_object_unref(muxSinkPad);
         }
+        cleanupDynamicBranch();
         gst_object_unref(pipeline);
         return;
     }
@@ -9400,9 +9488,6 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
                   << (tvStreamer5NetworkRemap
                       ? " remap_profile=TVStreamer5"
                       : "")
-                  << (hlsFullRemux
-                      ? " hls_full_remux=parser-rebuild+monotonic-pes"
-                      : "")
                   << (hlsCompatibilityElementaryPad && isAudio
                       ? " hls_compat_audio_pacer=off"
                       : "")
@@ -9417,12 +9502,15 @@ void StreamManager::onDemuxPadAdded(GstElement* demux, GstPad* pad, gpointer use
             ctx->audioPadName = padName ? padName : "";
         }
         if (!ctx->rtspPush && !ctx->hlsSink2) updateMuxProgramMap(ctx);
-    } else if (!stableUdpPreMapped) {
-        // Request pads are owned by the mux until explicitly released. Merely
-        // dropping our GstPad reference leaves a failed dynamic pad attached
-        // to a long-lived pipeline and accumulates resources on repeated pad
-        // add/link failures.
-        gst_element_release_request_pad(ctx->mux, muxSinkPad);
+    } else {
+        if (!stableUdpPreMapped) {
+            // Request pads are owned by the mux until explicitly released. Merely
+            // dropping our GstPad reference leaves a failed dynamic pad attached
+            // to a long-lived pipeline and accumulates resources on repeated pad
+            // add/link failures.
+            gst_element_release_request_pad(ctx->mux, muxSinkPad);
+        }
+        cleanupDynamicBranch();
     }
 
     gst_object_unref(parserSrcPad);

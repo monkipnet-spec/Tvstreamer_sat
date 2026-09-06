@@ -8,10 +8,7 @@
 #include "utils.h"
 
 #include <algorithm>
-#include <curl/curl.h>
 #include <iostream>
-#include <regex>
-#include <sstream>
 #include <string>
 
 namespace {
@@ -23,7 +20,7 @@ namespace {
 // the stream-level recovery windows so buffering absorbs short jitter/outages
 // without hiding a genuinely dead source.
 constexpr guint64 kNetworkInputQueue = 6 * GST_SECOND;
-constexpr guint64 kHlsInputQueue = 5 * GST_SECOND;
+constexpr guint64 kHlsInputQueue = 10 * GST_SECOND;
 constexpr gint kNetworkSourceTimeoutSeconds = 15;
 // TVStreamer5/main uses 500 ms SRT latency for this path.
 constexpr gint kSrtLatencyMs = 500;
@@ -48,6 +45,10 @@ void setBooleanPropertyIfPresent(GstElement* element, const char* propertyName, 
 }
 
 void setIntPropertyIfPresent(GstElement* element, const char* propertyName, gint value) {
+    if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
+}
+
+void setDoublePropertyIfPresent(GstElement* element, const char* propertyName, gdouble value) {
     if (hasProperty(element, propertyName)) g_object_set(element, propertyName, value, nullptr);
 }
 
@@ -125,103 +126,6 @@ std::string appendAccessQuery(const std::string& uri, const StreamConfig& cfg) {
     return result;
 }
 
-size_t collectHlsManifest(char* data, size_t size, size_t count, void* userData) {
-    auto* body = static_cast<std::string*>(userData);
-    const size_t bytes = size * count;
-    if (!body || !data) return 0;
-    constexpr size_t kManifestLimit = 512 * 1024;
-    if (body->size() >= kManifestLimit) return 0;
-    body->append(data, std::min(bytes, kManifestLimit - body->size()));
-    return bytes;
-}
-
-std::string selectFixedHlsVariant(const StreamConfig& cfg, const std::string& uri) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return {};
-
-    std::string body;
-    struct curl_slist* headers = nullptr;
-    if (cfg.hlsAccessKeyMode == "header" && !cfg.hlsAccessKeyName.empty() &&
-        !cfg.hlsAccessKeyValue.empty()) {
-        headers = curl_slist_append(
-            headers, (cfg.hlsAccessKeyName + ": " + cfg.hlsAccessKeyValue).c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
-    const std::string requestUri = appendAccessQuery(uri, cfg);
-    curl_easy_setopt(curl, CURLOPT_URL, requestUri.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2500L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, collectHlsManifest);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT,
-        cfg.hlsUserAgent.empty() ? "Mozilla/5.0 TVStreammerSAT5" : cfg.hlsUserAgent.c_str());
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    const CURLcode result = curl_easy_perform(curl);
-
-    char* effectiveUri = nullptr;
-    curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &effectiveUri);
-    const std::string baseUri = effectiveUri ? effectiveUri : requestUri;
-    if (headers) curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (result != CURLE_OK) return {};
-
-    struct Variant {
-        int width = 0;
-        int height = 0;
-        uint64_t bandwidth = 0;
-        std::string uri;
-    };
-    std::vector<Variant> variants;
-    std::string pendingAttributes;
-    std::istringstream lines(body);
-    std::string line;
-    while (std::getline(lines, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.rfind("#EXT-X-STREAM-INF:", 0) == 0) {
-            pendingAttributes = line.substr(18);
-            continue;
-        }
-        if (pendingAttributes.empty() || line.empty() || line[0] == '#') continue;
-
-        static const std::regex resolutionPattern(R"(RESOLUTION=(\d+)x(\d+))");
-        static const std::regex bandwidthPattern(R"(BANDWIDTH=(\d+))");
-        std::smatch resolutionMatch;
-        std::smatch bandwidthMatch;
-        if (std::regex_search(pendingAttributes, resolutionMatch, resolutionPattern)) {
-            Variant variant;
-            variant.width = std::stoi(resolutionMatch[1].str());
-            variant.height = std::stoi(resolutionMatch[2].str());
-            if (std::regex_search(pendingAttributes, bandwidthMatch, bandwidthPattern)) {
-                variant.bandwidth = std::stoull(bandwidthMatch[1].str());
-            }
-            gchar* resolved = g_uri_resolve_relative(
-                baseUri.c_str(), line.c_str(), G_URI_FLAGS_NONE, nullptr);
-            if (resolved) {
-                variant.uri = appendAccessQuery(resolved, cfg);
-                g_free(resolved);
-                variants.push_back(std::move(variant));
-            }
-        }
-        pendingAttributes.clear();
-    }
-    if (variants.empty()) return {};
-
-    const auto selected = std::max_element(variants.begin(), variants.end(),
-        [](const Variant& left, const Variant& right) {
-            const bool leftIsTarget = left.width == 1920 && left.height == 1080;
-            const bool rightIsTarget = right.width == 1920 && right.height == 1080;
-            if (leftIsTarget != rightIsTarget) return !leftIsTarget;
-            const int64_t leftPixels = static_cast<int64_t>(left.width) * left.height;
-            const int64_t rightPixels = static_cast<int64_t>(right.width) * right.height;
-            if (leftPixels != rightPixels) return leftPixels < rightPixels;
-            return left.bandwidth < right.bandwidth;
-        });
-    return selected->uri;
-}
-
 void configureHttpCredentials(GstElement* element, const StreamConfig& cfg) {
     if (!element) return;
     GstElementFactory* factory = gst_element_get_factory(element);
@@ -282,12 +186,13 @@ void configureHlsChildSource(GstElement* element, StreamConfig& cfg) {
         return;
     }
 
-    // 202.85: match TVStreamer5/main more closely. hlsdemux owns its internally
-    // created segment HTTP sources, so do not force is-live/do-timestamp on
-    // those children. Re-timestamping every segment source can create a second
-    // arrival-time clock domain at segment boundaries. Keep this hook only for
-    // credentials/User-Agent/access-key propagation.
+    // 203.05: restore the 202.74 HLS child-source policy. Segment/playlist
+    // fetches retry through transient HTTP failures; the stream-level watchdog
+    // remains the final recovery owner if TS delivery really stops.
     configureHttpCredentials(element, cfg);
+    setIntPropertyIfPresent(element, "retries", -1);
+    setDoublePropertyIfPresent(element, "retry-backoff-factor", 0.25);
+    setDoublePropertyIfPresent(element, "retry-backoff-max", 2.0);
     if (cfg.hlsAccessKeyMode == "query" && hasProperty(element, "location")) {
         if (!g_object_get_data(G_OBJECT(element), "tvs-network-hls-location-watch")) {
             g_signal_connect(element, "notify::location",
@@ -438,13 +343,13 @@ GstElement* buildHls(
         error = "HLS input: missing stream state";
         return nullptr;
     }
-    // 202.84: use TVStreamer5/main HLS source timing and media topology. On
-    // GStreamer builds where hlsdemux outputs a complete MPEG-TS pad instead of
-    // elementary pads, StreamManager inserts only a tsdemux compatibility
-    // adapter before the same TVStreamer5 parser -> mpegtsmux path.
+    // 203.05: restore the proven 202.74 HLS topology. Prefer the complete
+    // MPEG-TS pad from hlsdemux and preserve the provider transport byte-for-byte.
+    // Keep tsdemux/parser/mpegtsmux only as a compatibility fallback for HLS
+    // variants that expose elementary A/V pads.
     if (!hasElementFactory("souphttpsrc") || !hasElementFactory("hlsdemux") ||
-        !hasElementFactory("mpegtsmux")) {
-        error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux";
+        !hasElementFactory("mpegtsmux") || !hasElementFactory("input-selector")) {
+        error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux/input-selector";
         return nullptr;
     }
     if (!hlsPadAddedCallback || !configureTsMux) {
@@ -456,54 +361,71 @@ GstElement* buildHls(
     GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
     GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
     GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
+    GstElement* selector =
+        gst_element_factory_make("input-selector", "input_hls_transport_selector");
     GstElement* queue = addQueue(
         pipeline, "input_queue", kHlsInputQueue, kHlsQueueHardMaxBytes);
-    if (!src || !demux || !mux || !queue ||
+    if (!src || !demux || !mux || !selector || !queue ||
         !addElementOrFail(pipeline, src) ||
         !addElementOrFail(pipeline, demux) ||
-        !addElementOrFail(pipeline, mux)) {
+        !addElementOrFail(pipeline, mux) ||
+        !addElementOrFail(pipeline, selector)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
         if (demux && !GST_OBJECT_PARENT(demux)) gst_object_unref(demux);
         if (mux && !GST_OBJECT_PARENT(mux)) gst_object_unref(mux);
-        error = "HLS input: failed to create TVStreamer5 transport chain";
+        if (selector && !GST_OBJECT_PARENT(selector)) gst_object_unref(selector);
+        error = "HLS input: failed to create 202.74 transport chain";
         return nullptr;
     }
 
-    const std::string manifestUri = appendAccessQuery(
+    std::string location = appendAccessQuery(
         tvs::protocols::inputs::hlsInputUri(cfg), cfg);
-    const std::string fixedVariantUri = selectFixedHlsVariant(cfg, manifestUri);
-    const std::string location = fixedVariantUri.empty() ? manifestUri : fixedVariantUri;
     g_object_set(src,
         "location", location.c_str(),
         "is-live", TRUE,
         "do-timestamp", TRUE,
         nullptr);
     configureHttpCredentials(src, cfg);
+    setBooleanPropertyIfPresent(src, "compress", TRUE);
 
-    // Do not use the output UDP bitrate as HLS connection speed. For a
-    // multibitrate master playlist that value can select a variant unrelated
-    // to the configured input URL and create unnecessary bitrate spikes.
+    // 202.74 behaviour: hlsdemux gets the configured service/output scale, but
+    // there is no application-side variant prefetch or extra HLS pacing stage.
+    setIntPropertyIfPresent(demux, "connection-speed",
+        static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000ULL, 1ULL)));
     configureTsMux(mux, cfg);
-    // HLS segment boundaries are not MPEG-TS PES boundaries.  Rebuild a single
-    // monotonic transport timeline here before the final UDP shaper sees it.
-    setBooleanPropertyIfPresent(mux, "enforce-increasing-timestamps", TRUE);
-    setBooleanPropertyIfPresent(mux, "skip-backwards-streams", TRUE);
+    setBooleanPropertyIfPresent(selector, "sync-streams", FALSE);
+    setBooleanPropertyIfPresent(selector, "cache-buffers", FALSE);
 
-    if (!gst_element_link(src, demux) || !gst_element_link(mux, queue)) {
-        error = "HLS input: failed to link TVStreamer5 source/demux/mux queue";
+    if (!gst_element_link(src, demux) || !gst_element_link(selector, queue)) {
+        error = "HLS input: failed to link HTTP/demux/selector queue";
         return nullptr;
     }
 
     if (!state->sourceContext) state->sourceContext = std::make_unique<RemapContext>();
     auto* ctx = state->sourceContext.get();
     ctx->mux = mux;
+    ctx->hlsInputSelector = selector;
     ctx->config = cfg;
     ctx->flvMux = false;
 
-    // TVStreamer5 itself relies on hlsdemux's dynamic elementary pads. Keep the
-    // SAT5 deep-element hook only to propagate User-Agent/access credentials to
-    // hlsdemux-created HTTP child sources. Child timing remains owned by
-    // hlsdemux, as in TVStreamer5/main.
+    // Start with the elementary remux fallback. As soon as hlsdemux exposes a
+    // complete MPEG-TS pad, onDemuxPadAdded() switches the selector to direct TS.
+    GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src");
+    GstPad* muxSelectorPad = gst_element_request_pad_simple(selector, "sink_%u");
+    if (!muxSrcPad || !muxSelectorPad ||
+        gst_pad_link(muxSrcPad, muxSelectorPad) != GST_PAD_LINK_OK) {
+        if (muxSrcPad) gst_object_unref(muxSrcPad);
+        if (muxSelectorPad) {
+            gst_element_release_request_pad(selector, muxSelectorPad);
+            gst_object_unref(muxSelectorPad);
+        }
+        error = "HLS input: failed to connect fallback remux selector pad";
+        return nullptr;
+    }
+    gst_object_unref(muxSrcPad);
+    ctx->hlsMuxSelectorPad = muxSelectorPad;
+    g_object_set(selector, "active-pad", muxSelectorPad, nullptr);
+
     configureHlsChildSource(src, ctx->config);
     g_signal_connect(demux, "deep-element-added",
         G_CALLBACK(onHlsDeepElementAdded), ctx);
@@ -518,16 +440,11 @@ GstElement* buildHls(
     }
 
     terminalElement = queue;
-    std::cerr << "Network TS input 202.85: protocol=HLS profile=TVStreamer5"
-              << " source=souphttpsrc+hlsdemux+mpegtsmux"
-              << " variant_selection=" << (fixedVariantUri.empty()
-                  ? "adaptive-fallback" : "fixed-1080p-or-max")
-              << " queue_ms=5000 queue_max_mb=40 leaky=off"
-              << " manifest_http_is_live=on manifest_do_timestamp=on"
-              << " child_http_timestamps=hlsdemux-owned"
-              << " input_mux_timestamp_rebuild=monotonic"
-              << " input_selector=off mpegts_pad_adapter=auto"
-              << " http_retries=gstreamer-default watchdog_rebuild_ms=15000"
+    std::cerr << "Network TS input 203.06: protocol=HLS compatibility=202.74"
+              << " source=souphttpsrc+hlsdemux"
+              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off do_timestamp=on"
+              << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
+              << " http_retries=infinite watchdog_rebuild_ms=15000"
               << std::endl;
     return src;
 }

@@ -37,12 +37,17 @@ struct RemapContext {
     bool flvMux = false;
     bool rtspPush = false;
     bool hlsSink2 = false;
-    // 202.84: TVStreamer5/main normally receives elementary pads directly from
-    // hlsdemux. On the GStreamer build used by SAT5 production, hlsdemux emits
-    // a video/mpegts transport pad instead. Keep one pipeline-owned tsdemux as
-    // a compatibility adapter only for that pad shape; timing/source settings
-    // remain the TVStreamer5 HLS profile.
-    GstElement* hlsCompatTsDemux = nullptr; // non-owning; parent pipeline owns it
+    // 203.05: restore the proven 202.74 HLS transport path. If hlsdemux
+    // exposes complete MPEG-TS fragments, route them byte-for-byte through an
+    // input-selector. Keep the elementary remux branch only as a fallback.
+    GstElement* hlsInputSelector = nullptr;
+    GstPad* hlsMuxSelectorPad = nullptr;
+    GstPad* hlsDirectSelectorPad = nullptr;
+    // 203.06: keep at most one compatibility tsdemux per HLS pipeline.
+    // Pipeline owns the element; this is a non-owning pointer used to avoid
+    // allocating another tsdemux on every transient HLS pad replacement.
+    GstElement* hlsCompatTsDemux = nullptr;
+    bool hlsDirectTsActive = false;
     bool programMapApplied = false;
     GstPad* preallocatedVideoMuxPad = nullptr;
     GstPad* preallocatedAudioMuxPad = nullptr;
@@ -51,6 +56,8 @@ struct RemapContext {
 
     ~RemapContext() {
         destroyedCount.fetch_add(1, std::memory_order_relaxed);
+        if (hlsMuxSelectorPad) gst_object_unref(hlsMuxSelectorPad);
+        if (hlsDirectSelectorPad) gst_object_unref(hlsDirectSelectorPad);
         if (preallocatedVideoMuxPad) gst_object_unref(preallocatedVideoMuxPad);
         if (preallocatedAudioMuxPad) gst_object_unref(preallocatedAudioMuxPad);
     }
