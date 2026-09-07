@@ -6746,10 +6746,12 @@ std::map<std::string, StreamState*> StreamManager::snapshot() {
     std::lock_guard<std::mutex> lock(managerMutex);
     std::map<std::string, StreamState*> result;
     for (auto& [id, statePtr] : streams) {
-        if (statePtr->gstTranscoder && !statePtr->gstTranscoder->isRunning()) {
-            statePtr->running = false;
-            statePtr->active = false;
-            statePtr->statusMessage = "gstreamer transcoder exited";
+        if (statePtr->gstTranscoder && statePtr->running.load() &&
+            !statePtr->gstTranscoder->isRunning()) {
+            // 203.11: monitorBus owns transcoder recovery.  A UI/state snapshot
+            // must not turn a recoverable child-process exit into a permanent
+            // stream stop before the monitor thread gets a chance to restart it.
+            statePtr->statusMessage = "recovering gstreamer transcoder";
         }
         if (statePtr->pipeline) {
             updateBitrateEstimates(statePtr.get());
@@ -10099,12 +10101,24 @@ void StreamManager::monitorBus(const std::string& id) {
 
     if (state->gstTranscoder && !state->pipeline) {
         auto lastSyntheticSample = std::chrono::steady_clock::now();
+        unsigned transcoderAutoRestartFailures = 0;
+        auto transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
 
         while (state->running.load()) {
             const auto now = std::chrono::steady_clock::now();
             maybeAutoRaiseUdpCbr(state, now);
 
             if (!state->gstTranscoder->isRunning()) {
+                // 203.11: a watchdog/encoder gst-launch exit is recoverable. Keep
+                // the configured stream enabled and restart the transcoder instead
+                // of converting a child-process failure into a permanent STOP.
+                if (now < transcoderAutoRestartDue) {
+                    state->active = true;
+                    state->statusMessage = "recovering gstreamer transcoder";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    continue;
+                }
+
                 if (!state->usingBackup && !state->config.backupInputUri.empty()) {
                     notifyStreamState(
                         state->config,
@@ -10115,6 +10129,10 @@ void StreamManager::monitorBus(const std::string& id) {
                             "\nBackup: " + state->config.backupInputUri);
 
                     if (restartTranscodedInput(state, state->config.backupInputUri, true)) {
+                        std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                                  << " result=running source=backup" << std::endl;
+                        transcoderAutoRestartFailures = 0;
+                        transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
                         notifyStreamState(
                             state->config,
                             "🟠",
@@ -10131,22 +10149,56 @@ void StreamManager::monitorBus(const std::string& id) {
                     isBackupFileInput(state->config, state->activeInputUri)) {
                     const std::string loopFile = state->activeInputUri;
                     if (restartTranscodedInput(state, loopFile, true)) {
+                        std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                                  << " result=running source=backup-file-loop" << std::endl;
+                        transcoderAutoRestartFailures = 0;
+                        transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
                         state->statusMessage = "running on backup file loop";
                         lastSyntheticSample = std::chrono::steady_clock::now();
                         continue;
                     }
                 }
 
-                state->statusMessage = "error: gstreamer transcoder exited";
-                state->active = false;
-                state->running = false;
-                notifyStreamState(
-                    state->config,
-                    "🔴",
-                    telegramText(configManager, "Ошибка GStreamer-транскодера", "GStreamer transcoder error"),
-                    telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
-                return;
+                const bool restartUsesBackup = state->usingBackup;
+                std::string restartUri = state->activeInputUri;
+                if (restartUri.empty()) {
+                    restartUri = restartUsesBackup
+                        ? state->config.backupInputUri
+                        : state->primaryInputUri;
+                }
+
+                std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                          << " event=exited attempt=" << (transcoderAutoRestartFailures + 1)
+                          << " source=" << restartUri
+                          << " backup=" << (restartUsesBackup ? "yes" : "no")
+                          << std::endl;
+
+                if (!restartUri.empty() &&
+                    restartTranscodedInput(state, restartUri, restartUsesBackup)) {
+                    std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                              << " result=running source=" << restartUri << std::endl;
+                    transcoderAutoRestartFailures = 0;
+                    transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
+                    state->active = true;
+                    lastSyntheticSample = std::chrono::steady_clock::now();
+                    continue;
+                }
+
+                ++transcoderAutoRestartFailures;
+                const unsigned shift = std::min<unsigned>(transcoderAutoRestartFailures - 1, 4);
+                const unsigned retrySeconds = std::min<unsigned>(2U << shift, 30U);
+                transcoderAutoRestartDue = now + std::chrono::seconds(retrySeconds);
+                state->active = true;
+                state->statusMessage = "recovering gstreamer transcoder; retry in " +
+                    std::to_string(retrySeconds) + "s";
+                std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                          << " result=failed retry_in_s=" << retrySeconds << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
             }
+
+            transcoderAutoRestartFailures = 0;
+            transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
 
             if (state->usingBackup &&
                 now - state->lastPrimaryRetry >=
@@ -10227,6 +10279,8 @@ void StreamManager::monitorBus(const std::string& id) {
     bool networkGraceSuppressionLogged = false;
     unsigned networkRecoveryAttempts = 0;
     auto networkRecoveryDue = std::chrono::steady_clock::time_point::min();
+    unsigned transcoderAutoRestartFailures = 0;
+    auto transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -10544,10 +10598,24 @@ void StreamManager::monitorBus(const std::string& id) {
 
         if (state->gstTranscoder) {
             if (!state->gstTranscoder->isRunning()) {
+                // Stable-UDP/FIFO transcoder paths have a GStreamer relay
+                // pipeline as well. Apply the same 203.11 child-process recovery
+                // policy here rather than permanently stopping the stream.
+                if (now < transcoderAutoRestartDue) {
+                    state->active = true;
+                    state->statusMessage = "recovering gstreamer transcoder";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    continue;
+                }
+
                 if (!state->usingBackup &&
                     !state->config.backupInputUri.empty() &&
                     restartTranscodedInput(state, state->config.backupInputUri, true)) {
                     bus = state->bus;
+                    transcoderAutoRestartFailures = 0;
+                    transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
+                    std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                              << " result=running source=backup" << std::endl;
                     notifyStreamState(
                         state->config,
                         "🟠",
@@ -10562,20 +10630,53 @@ void StreamManager::monitorBus(const std::string& id) {
                     isBackupFileInput(state->config, state->activeInputUri) &&
                     restartTranscodedInput(state, state->activeInputUri, true)) {
                     bus = state->bus;
+                    transcoderAutoRestartFailures = 0;
+                    transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
+                    std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                              << " result=running source=backup-file-loop" << std::endl;
                     state->statusMessage = "running on backup file loop";
                     continue;
                 }
 
-                state->statusMessage = "error: gstreamer transcoder exited";
-                state->active = false;
-                state->running = false;
-                notifyStreamState(
-                    state->config,
-                    "🔴",
-                    telegramText(configManager, "Ошибка GStreamer-транскодера", "GStreamer transcoder error"),
-                    telegramText(configManager, "Процесс gst-launch завершился", "gst-launch process exited"));
-                return;
+                const bool restartUsesBackup = state->usingBackup;
+                std::string restartUri = state->activeInputUri;
+                if (restartUri.empty()) {
+                    restartUri = restartUsesBackup
+                        ? state->config.backupInputUri
+                        : state->primaryInputUri;
+                }
+
+                std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                          << " event=exited attempt=" << (transcoderAutoRestartFailures + 1)
+                          << " source=" << restartUri
+                          << " backup=" << (restartUsesBackup ? "yes" : "no")
+                          << std::endl;
+
+                if (!restartUri.empty() &&
+                    restartTranscodedInput(state, restartUri, restartUsesBackup)) {
+                    bus = state->bus;
+                    transcoderAutoRestartFailures = 0;
+                    transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
+                    state->active = true;
+                    std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                              << " result=running source=" << restartUri << std::endl;
+                    continue;
+                }
+
+                ++transcoderAutoRestartFailures;
+                const unsigned shift = std::min<unsigned>(transcoderAutoRestartFailures - 1, 4);
+                const unsigned retrySeconds = std::min<unsigned>(2U << shift, 30U);
+                transcoderAutoRestartDue = now + std::chrono::seconds(retrySeconds);
+                state->active = true;
+                state->statusMessage = "recovering gstreamer transcoder; retry in " +
+                    std::to_string(retrySeconds) + "s";
+                std::cerr << "Transcoder auto-restart 203.11: stream=" << id
+                          << " result=failed retry_in_s=" << retrySeconds << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                continue;
             }
+            transcoderAutoRestartFailures = 0;
+            transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
             // A live gst-launch process is not proof of media activity.
             // SRT/UDP may remain connected with zero media. The external
             // watchdog is the real 5-second no-buffer detector.
