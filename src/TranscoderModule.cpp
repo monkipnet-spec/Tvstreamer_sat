@@ -1,13 +1,21 @@
 #include "TranscoderModule.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <iostream>
 #include <filesystem>
 #include <cstdlib>
 #include <sstream>
+#include <thread>
 #include <unistd.h>
 #include <memory>
 #include <mutex>
+
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 
 namespace {
 
@@ -36,13 +44,79 @@ bool factoryAvailable(const char* name) {
     return true;
 }
 
-std::string intelVideoEncoderFactory() {
-    // Prefer modern Intel Quick Sync / GstVA elements. GStreamer-VAAPI is kept
-    // as a compatibility fallback for Ubuntu systems with the older plugin.
-    for (const char* name : {"qsvh264enc", "vah264enc", "vaapih264enc"}) {
-        if (factoryAvailable(name)) return name;
+struct EncoderProbeResult {
+    bool ok = false;
+    bool timedOut = false;
+    int exitCode = -1;
+    int signal = 0;
+};
+
+EncoderProbeResult probeVideoEncoderFactory(const std::string& factory) {
+    EncoderProbeResult result;
+    if (!factoryAvailable(factory.c_str())) return result;
+
+    std::string gstLaunch;
+    if (!executableInPath("gst-launch-1.0", &gstLaunch)) return result;
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        std::cerr << "Intel encoder probe 203.08: factory=" << factory
+                  << " result=fork-failed errno=" << errno << std::endl;
+        return result;
     }
-    return {};
+
+    if (pid == 0) {
+        // A broken qsvh264enc on older Intel generations can abort in libmfx.
+        // Probe it in an isolated child and suppress core dumps so the main
+        // TVStreammerSAT5 process is never affected by the driver assertion.
+        struct rlimit coreLimit {};
+        coreLimit.rlim_cur = 0;
+        coreLimit.rlim_max = 0;
+        ::setrlimit(RLIMIT_CORE, &coreLimit);
+
+        const int nullFd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (nullFd >= 0) {
+            ::dup2(nullFd, STDOUT_FILENO);
+            ::dup2(nullFd, STDERR_FILENO);
+            if (nullFd > STDERR_FILENO) ::close(nullFd);
+        }
+
+        ::execl(gstLaunch.c_str(), gstLaunch.c_str(),
+                "-q",
+                "videotestsrc", "num-buffers=24", "!",
+                "video/x-raw,format=NV12,width=320,height=240,framerate=25/1", "!",
+                factory.c_str(), "bitrate=1000", "!",
+                "fakesink", "sync=false",
+                static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
+        int status = 0;
+        const pid_t done = ::waitpid(pid, &status, WNOHANG);
+        if (done == pid) {
+            if (WIFEXITED(status)) {
+                result.exitCode = WEXITSTATUS(status);
+                result.ok = result.exitCode == 0;
+            } else if (WIFSIGNALED(status)) {
+                result.signal = WTERMSIG(status);
+            }
+            return result;
+        }
+        if (done < 0 && errno != EINTR) return result;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            result.timedOut = true;
+            ::kill(pid, SIGKILL);
+            while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+std::string intelVideoEncoderFactory() {
+    return TranscoderModule::workingIntelVideoEncoderFactory();
 }
 
 bool isIntelVideoEncoder(const std::string& factory) {
@@ -740,6 +814,36 @@ void onDemuxPadAdded(GstElement*, GstPad* pad, gpointer userData) {
 }
 
 } // namespace
+
+std::string TranscoderModule::workingIntelVideoEncoderFactory() {
+    static std::once_flag probeOnce;
+    static std::string selected;
+
+    std::call_once(probeOnce, []() {
+        // Preserve the preferred order on modern Intel systems, but only keep
+        // an encoder after it has encoded real NV12 frames in a child process.
+        for (const char* name : {"qsvh264enc", "vah264enc", "vaapih264enc"}) {
+            if (!factoryAvailable(name)) continue;
+            const EncoderProbeResult probe = probeVideoEncoderFactory(name);
+            std::cerr << "Intel encoder probe 203.08: factory=" << name
+                      << " result=" << (probe.ok ? "ok" : "failed");
+            if (probe.timedOut) std::cerr << " reason=timeout";
+            else if (probe.signal != 0) std::cerr << " signal=" << probe.signal;
+            else if (probe.exitCode >= 0) std::cerr << " exit=" << probe.exitCode;
+            std::cerr << std::endl;
+            if (probe.ok) {
+                selected = name;
+                break;
+            }
+        }
+
+        std::cerr << "Intel encoder selection 203.08: selected="
+                  << (selected.empty() ? "none" : selected)
+                  << " policy=runtime-probe qsv->va->legacy-vaapi" << std::endl;
+    });
+
+    return selected;
+}
 
 TranscoderCapabilities TranscoderModule::inspectCapabilities() {
     TranscoderCapabilities result;

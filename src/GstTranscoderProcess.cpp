@@ -187,10 +187,10 @@ std::string commandLineForLog(const std::vector<std::string>& args) {
 }
 
 std::string intelVideoEncoderFactory() {
-    for (const char* name : {"qsvh264enc", "vah264enc", "vaapih264enc"}) {
-        if (hasFactory(name)) return name;
-    }
-    return {};
+    // 203.08: factory registration is not proof that the Intel backend works.
+    // TranscoderModule probes qsv/VA in an isolated child process and caches
+    // the first encoder that actually produces H.264 without aborting.
+    return TranscoderModule::workingIntelVideoEncoderFactory();
 }
 
 bool isIntelVideoEncoder(const std::string& factory) {
@@ -221,7 +221,7 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
         if (cfg.transcodeVideoEncoder == "nvenc") {
             error = "NVIDIA NVENC was requested but GStreamer nvh264enc is not available";
         } else if (cfg.transcodeVideoEncoder == "intel") {
-            error = "Intel hardware H.264 was requested but qsvh264enc/vah264enc/vaapih264enc is not available";
+            error = "Intel hardware H.264 was requested but no qsv/VA H.264 encoder passed the runtime probe";
         } else if (cfg.transcodeVideoEncoder == "x264") {
             error = "CPU x264 was requested but GStreamer x264enc is not available";
         } else {
@@ -253,13 +253,15 @@ bool appendVideoEncoder(std::vector<std::string>& args, const StreamConfig& cfg,
             "idr-interval=0"
         });
     } else if (encoderFactory == "vah264enc") {
+        // Keep the GstVA command line on the conservative property set that is
+        // known to work on older Intel generations (including Ivy Bridge).
+        // h264parse downstream repeats codec headers, so encoder-specific AUD /
+        // target-usage knobs are intentionally not required here.
         args.insert(args.end(), {
             property("bitrate", std::to_string(bitrateKbps)),
             property("key-int-max", std::to_string(keyInt)),
             "b-frames=0",
-            "rate-control=cbr",
-            "aud=true",
-            "target-usage=4"
+            "rate-control=cbr"
         });
     } else if (encoderFactory == "vaapih264enc") {
         // Legacy VAAPI fallback. Keep the argument set conservative because
@@ -383,7 +385,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
     const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
     if (encoderFactory.empty()) {
         if (cfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
-        else if (cfg.transcodeVideoEncoder == "intel") error = "Intel qsvh264enc/vah264enc/vaapih264enc is not available";
+        else if (cfg.transcodeVideoEncoder == "intel") error = "Intel qsv/VA H.264 encoder did not pass the runtime probe";
         else if (cfg.transcodeVideoEncoder == "x264") error = "CPU x264enc is not available";
         else error = "no H.264 video encoder is available";
         return;
@@ -514,7 +516,7 @@ void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, con
     const std::string testVideoEncoder = selectedVideoEncoderFactory(testCfg);
     if (testVideoEncoder.empty()) {
         if (testCfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
-        else if (testCfg.transcodeVideoEncoder == "intel") error = "Intel qsvh264enc/vah264enc/vaapih264enc is not available";
+        else if (testCfg.transcodeVideoEncoder == "intel") error = "Intel qsv/VA H.264 encoder did not pass the runtime probe";
         else error = "no H.264 video encoder is available";
         return;
     }

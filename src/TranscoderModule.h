@@ -24,6 +24,11 @@ class TranscoderModule {
 public:
     static TranscoderCapabilities inspectCapabilities();
 
+    // Returns the first Intel H.264 encoder that survives a real out-of-process
+    // encode probe. Factory presence alone is not enough: on older Intel GPUs
+    // qsvh264enc can be registered but abort inside Media SDK/VAAPI at runtime.
+    static std::string workingIntelVideoEncoderFactory();
+
     // Creates a completely isolated GstBin with one generic input ghost pad and one
     // MPEG-TS source ghost pad. The bin owns parsing, decoding, scaling, encoding,
     // optional original-audio passthrough, remuxing and ignored-pad draining.
