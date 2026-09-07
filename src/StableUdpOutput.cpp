@@ -1188,14 +1188,13 @@ private:
     static constexpr uint64_t kHlsTv5CbrLowReservoirNanoseconds =
         250ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
-    // v202.7 HLS playout PLL: keep useful TS packet spacing almost fixed.
-    // The HLS demuxer may deliver a VBR GOP with a slightly different byte/PTS
-    // density every few seconds; following that estimate directly makes video
-    // packets alternately late/early against the continuous 20 ms PCR clock.
+    // 203.12 HLS media-timeline lock. The provider PTS/DTS stays untouched while
+    // StableUdpOutput owns a synthetic continuous PCR clock. Therefore reservoir
+    // occupancy must never speed up or slow down HLS media: doing so makes the
+    // preserved PTS drift against PCR. Follow only genuine long-term PTS-derived
+    // bitrate changes; keep the 8 s reservoir as burst absorption/diagnostics.
     static constexpr uint64_t kHlsPllUpdateNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
-    static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
-    static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
     // 202.22 continuous SRT/HTTP: delivery callbacks can be bursty, while
     // short PCR byte-density varies with VBR GOP structure.  Neither is a good
     // instantaneous playout-rate control signal.  Measure bytes over a long
@@ -2003,10 +2002,9 @@ private:
             const uint64_t pllUpdateNanoseconds = segmentedHlsInput
                 ? kHlsPllUpdateNanoseconds : kNetworkArrivalPllUpdateNanoseconds;
             const uint64_t pllCorrectionPermille = segmentedHlsInput
-                ? kHlsPllMaximumCorrectionPermille
-                : kNetworkArrivalPllMaximumCorrectionPermille;
+                ? 0ULL : kNetworkArrivalPllMaximumCorrectionPermille;
             const uint64_t pllStepPermille = segmentedHlsInput
-                ? kHlsPllMaximumStepPermille : kNetworkArrivalPllMaximumStepPermille;
+                ? 0ULL : kNetworkArrivalPllMaximumStepPermille;
             const uint64_t pllFollowDivisor = segmentedHlsInput ? 32ULL : 64ULL;
             if (hlsPllBaseBitrate == 0) {
                 const uint64_t startupPace = segmentedHlsInput
@@ -2038,56 +2036,64 @@ private:
                     (hlsPllBaseBitrate * (pllFollowDivisor - 1ULL) + sourceLimited) /
                     pllFollowDivisor;
 
-                // Reservoir correction: 1% pace change per 100% occupancy error,
-                // hard-limited to +/-1.5%. The actual five-second pace step is
-                // further limited to 0.2%, so no GOP-sized speed jump reaches UDP.
-                const uint64_t targetBytes = std::max<uint64_t>(
-                    kUdpPayloadSize * 32ULL,
-                    bytesForDuration(hlsPllBaseBitrate, pllTargetReservoirNanoseconds));
-                int64_t error = 0;
-                if (bufferNow >= targetBytes) {
-                    error = static_cast<int64_t>(std::min<uint64_t>(
-                        bufferNow - targetBytes,
-                        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+                if (segmentedHlsInput) {
+                    // 203.12: preserve the source media clock. Reservoir occupancy
+                    // is intentionally NOT a frequency-control input for segmented
+                    // HLS because source PTS/DTS is preserved while PCR is synthetic.
+                    // A reservoir-derived +/- pace correction accumulates directly
+                    // as PTS-PCR phase error (observed as AAC stutter after runtime).
+                    currentRealPaceBitrate = hlsPllBaseBitrate;
+                    hlsPllCorrectionBitrate = 0;
                 } else {
-                    const uint64_t diff = targetBytes - bufferNow;
-                    error = -static_cast<int64_t>(std::min<uint64_t>(
-                        diff, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
-                }
+                    // Continuous SRT/HTTP keeps the established slow reservoir PLL.
+                    const uint64_t targetBytes = std::max<uint64_t>(
+                        kUdpPayloadSize * 32ULL,
+                        bytesForDuration(hlsPllBaseBitrate, pllTargetReservoirNanoseconds));
+                    int64_t error = 0;
+                    if (bufferNow >= targetBytes) {
+                        error = static_cast<int64_t>(std::min<uint64_t>(
+                            bufferNow - targetBytes,
+                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+                    } else {
+                        const uint64_t diff = targetBytes - bufferNow;
+                        error = -static_cast<int64_t>(std::min<uint64_t>(
+                            diff, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+                    }
 
-                int64_t correction = 0;
-                if (targetBytes > 0) {
+                    int64_t correction = 0;
+                    if (targetBytes > 0) {
 #if defined(__SIZEOF_INT128__)
-                    correction = static_cast<int64_t>(
-                        (static_cast<__int128>(hlsPllBaseBitrate) * error) /
-                        (static_cast<__int128>(targetBytes) * 100));
+                        correction = static_cast<int64_t>(
+                            (static_cast<__int128>(hlsPllBaseBitrate) * error) /
+                            (static_cast<__int128>(targetBytes) * 100));
 #else
-                    correction = static_cast<int64_t>(
-                        (static_cast<long double>(hlsPllBaseBitrate) *
-                         static_cast<long double>(error)) /
-                        (static_cast<long double>(targetBytes) * 100.0L));
+                        correction = static_cast<int64_t>(
+                            (static_cast<long double>(hlsPllBaseBitrate) *
+                             static_cast<long double>(error)) /
+                            (static_cast<long double>(targetBytes) * 100.0L));
 #endif
+                    }
+                    const int64_t maximumCorrection = static_cast<int64_t>(
+                        hlsPllBaseBitrate * pllCorrectionPermille / 1000ULL);
+                    correction = std::clamp<int64_t>(
+                        correction, -maximumCorrection, maximumCorrection);
+
+                    int64_t desired = static_cast<int64_t>(hlsPllBaseBitrate) + correction;
+                    desired = std::clamp<int64_t>(
+                        desired, 0, static_cast<int64_t>(hlsPaceCeiling));
+
+                    const uint64_t maximumStep = std::max<uint64_t>(1000ULL,
+                        hlsPllBaseBitrate * pllStepPermille / 1000ULL);
+                    const int64_t current = static_cast<int64_t>(currentRealPaceBitrate);
+                    const int64_t lower = current > static_cast<int64_t>(maximumStep)
+                        ? current - static_cast<int64_t>(maximumStep) : 0;
+                    const int64_t upper = std::min<int64_t>(
+                        static_cast<int64_t>(hlsPaceCeiling),
+                        current + static_cast<int64_t>(maximumStep));
+                    currentRealPaceBitrate = static_cast<uint64_t>(
+                        std::clamp<int64_t>(desired, lower, upper));
+                    hlsPllCorrectionBitrate = correction;
                 }
-                const int64_t maximumCorrection = static_cast<int64_t>(
-                    hlsPllBaseBitrate * pllCorrectionPermille / 1000ULL);
-                correction = std::clamp<int64_t>(
-                    correction, -maximumCorrection, maximumCorrection);
-
-                int64_t desired = static_cast<int64_t>(hlsPllBaseBitrate) + correction;
-                desired = std::clamp<int64_t>(
-                    desired, 0, static_cast<int64_t>(hlsPaceCeiling));
-
-                const uint64_t maximumStep = std::max<uint64_t>(1000ULL,
-                    hlsPllBaseBitrate * pllStepPermille / 1000ULL);
-                const int64_t current = static_cast<int64_t>(currentRealPaceBitrate);
-                const int64_t lower = current > static_cast<int64_t>(maximumStep)
-                    ? current - static_cast<int64_t>(maximumStep) : 0;
-                const int64_t upper = std::min<int64_t>(
-                    static_cast<int64_t>(hlsPaceCeiling),
-                    current + static_cast<int64_t>(maximumStep));
-                currentRealPaceBitrate = static_cast<uint64_t>(
-                    std::clamp<int64_t>(desired, lower, upper));
-                hlsPllCorrectionBitrate = correction;
             }
 
             realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
@@ -2097,7 +2103,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing: mode=slow-playout-pll"
+                                  ? "HLS UDP pacing 203.12: mode=media-timeline-lock"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2106,6 +2112,8 @@ private:
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
                           << " pll_correction_permille=" << pllCorrectionPermille
                           << " pll_step_permille=" << pllStepPermille
+                          << " reservoir_frequency_control="
+                          << (segmentedHlsInput ? "off" : "on")
                           << " PCR="
                           << (segmentedHlsInput
                                   ? "continuous-20ms-clock"
@@ -2517,7 +2525,7 @@ private:
                   << " pcr_program=" << declaredPcrProgram
                   << " timing="
                   << (segmentedHlsInput
-                          ? "hls_slow_playout_pll_periodic_pcr"
+                          ? "hls_media_timeline_lock_periodic_pcr"
                           : (continuousNetworkMpegTsInput
                                 ? "network_arrival_playout_pll_source_pcr"
                                 : (sourcePcrPassthrough()
@@ -2866,10 +2874,11 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.07: compatibility=202.74"
+        std::cerr << "HLS timing 203.12: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=slow-playout-pll periodic_pcr=20ms"
+                  << " pacing=media-timeline-lock reservoir_frequency_control=off"
+                  << " periodic_pcr=20ms"
                   << " pcr_phase=fixed-zero-no-pre-send-calibration"
                   << std::endl;
     }
