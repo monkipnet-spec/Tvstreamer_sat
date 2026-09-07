@@ -38,12 +38,16 @@ private:
     static std::vector<std::string> buildCommand(
         const StreamConfig& baseConfig,
         const StreamConfig& outputConfig,
+        int& inheritedInputFd,
+        bool& forceSoftwareH264Decode,
         std::string& description,
         std::string& error);
 
     static bool spawnProcess(
         const std::vector<std::string>& args,
         const std::string& description,
+        int inheritedInputFd,
+        bool forceSoftwareH264Decode,
         ChildProcess& child,
         std::string& error);
 };
