@@ -7,7 +7,6 @@
 #include "utils.h"
 
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -17,16 +16,12 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
-#include <net/if.h>
-#include <netinet/in.h>
 #include <sstream>
 #include <thread>
-#include <unordered_set>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <gst/gst.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -34,222 +29,6 @@ using tvs::protocols::ContainerKind;
 using tvs::protocols::GstOutputSpec;
 
 namespace {
-
-#if defined(__linux__) && !defined(IP_MULTICAST_ALL)
-#define IP_MULTICAST_ALL 49
-#endif
-
-constexpr int kTranscoderUdpReceiveBufferBytes = 16 * 1024 * 1024;
-constexpr int kTranscoderTransportWatchdogMs = 5000;
-constexpr int kTranscoderDecodedVideoWatchdogMs = 15000;
-
-struct ProtectedUdpInput {
-    int fd = -1;
-    std::string group;
-    int port = 0;
-    std::vector<std::string> joinedInterfaces;
-    std::string boundDevice;
-    int effectiveReceiveBuffer = 0;
-};
-
-bool parseIpv4MulticastUdpUri(const StreamConfig& cfg, std::string& group, int& port) {
-    std::string uri = normalizeInputUri(tvs::protocols::inputUriForGstreamer(cfg));
-    const std::string lower = toLower(uri);
-    if (lower.rfind("udp://", 0) != 0) return false;
-
-    std::string endpoint = uri.substr(6);
-    if (!endpoint.empty() && endpoint.front() == '@') endpoint.erase(endpoint.begin());
-    const size_t query = endpoint.find_first_of("/?");
-    if (query != std::string::npos) endpoint.resize(query);
-    const size_t colon = endpoint.rfind(':');
-    if (colon == std::string::npos || colon == 0 || colon + 1 >= endpoint.size()) return false;
-
-    group = endpoint.substr(0, colon);
-    char* end = nullptr;
-    errno = 0;
-    const long parsedPort = std::strtol(endpoint.c_str() + colon + 1, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || parsedPort <= 0 || parsedPort > 65535) return false;
-    port = static_cast<int>(parsedPort);
-
-    in_addr address {};
-    if (::inet_pton(AF_INET, group.c_str(), &address) != 1) return false;
-    const uint32_t hostOrder = ntohl(address.s_addr);
-    return (hostOrder & 0xF0000000U) == 0xE0000000U;
-}
-
-std::string effectiveTranscoderInputInterface(const StreamConfig& cfg) {
-    if (cfg.inputInterfaceAddressConfigured) return cfg.inputInterfaceAddress;
-    return cfg.interfaceAddress;
-}
-
-std::vector<NetworkInterface> transcoderMulticastInterfaces(
-    const StreamConfig& cfg,
-    std::string& error) {
-    const std::string configured = effectiveTranscoderInputInterface(cfg);
-    std::vector<NetworkInterface> result;
-    std::unordered_set<std::string> added;
-    for (const auto& iface : enumerateNetworkInterfaces(true)) {
-        const bool loopback = iface.name == "lo" || iface.address.rfind("127.", 0) == 0;
-        if (!configured.empty() && iface.name != configured && iface.address != configured) continue;
-        if (iface.name.empty() || iface.address.empty() || !iface.isUp ||
-            (!iface.supportsMulticast && !loopback)) {
-            continue;
-        }
-        if (added.insert(iface.name).second) result.push_back(iface);
-    }
-    if (!configured.empty() && result.empty()) {
-        error = "selected transcoder multicast input interface was not found/up: " + configured;
-    }
-    return result;
-}
-
-bool bindSocketToDevice(int fd, const std::string& interfaceName, std::string& error) {
-#if defined(__linux__) && defined(SO_BINDTODEVICE)
-    if (interfaceName.empty()) return true;
-    if (::setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
-                     interfaceName.c_str(), static_cast<socklen_t>(interfaceName.size() + 1)) != 0) {
-        error = "SO_BINDTODEVICE(" + interfaceName + ") failed: " + std::strerror(errno);
-        return false;
-    }
-    return true;
-#else
-    (void)fd;
-    (void)interfaceName;
-    return true;
-#endif
-}
-
-bool createProtectedUdpInput(const StreamConfig& cfg, ProtectedUdpInput& input, std::string& error) {
-    if (!parseIpv4MulticastUdpUri(cfg, input.group, input.port)) return false;
-
-    std::string interfaceError;
-    const auto interfaces = transcoderMulticastInterfaces(cfg, interfaceError);
-    if (!interfaceError.empty()) {
-        error = interfaceError;
-        return false;
-    }
-    if (interfaces.empty()) {
-        error = "no active IPv4 multicast interface is available for protected transcoder UDP input";
-        return false;
-    }
-
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) {
-        error = std::string("protected transcoder UDP socket failed: ") + std::strerror(errno);
-        return false;
-    }
-
-    auto fail = [&](const std::string& message) {
-        ::close(fd);
-        error = message;
-        return false;
-    };
-
-    const int reuse = 1;
-    if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
-        return fail(std::string("protected transcoder UDP SO_REUSEADDR failed: ") + std::strerror(errno));
-    }
-
-    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-                     &kTranscoderUdpReceiveBufferBytes, sizeof(kTranscoderUdpReceiveBufferBytes)) != 0) {
-        std::cerr << "Protected transcoder UDP 203.09: warning SO_RCVBUF request="
-                  << kTranscoderUdpReceiveBufferBytes << " failed: " << std::strerror(errno) << std::endl;
-    }
-
-#if defined(__linux__) && defined(IP_MULTICAST_ALL)
-    const int multicastAll = 0;
-    if (::setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &multicastAll, sizeof(multicastAll)) != 0) {
-        return fail(std::string("protected transcoder UDP IP_MULTICAST_ALL=0 failed: ") +
-                    std::strerror(errno));
-    }
-#endif
-
-    sockaddr_in bindAddress {};
-    bindAddress.sin_family = AF_INET;
-    bindAddress.sin_addr.s_addr = htonl(INADDR_ANY);
-    bindAddress.sin_port = htons(static_cast<uint16_t>(input.port));
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&bindAddress), sizeof(bindAddress)) != 0) {
-        return fail("protected transcoder UDP bind 0.0.0.0:" + std::to_string(input.port) +
-                    " failed: " + std::strerror(errno));
-    }
-
-    const std::string configured = effectiveTranscoderInputInterface(cfg);
-    if (!configured.empty()) {
-        std::string bindError;
-        if (!bindSocketToDevice(fd, interfaces.front().name, bindError)) {
-            return fail("protected transcoder UDP strict interface failed: " + bindError);
-        }
-        input.boundDevice = interfaces.front().name;
-    }
-
-    in_addr groupAddress {};
-    if (::inet_pton(AF_INET, input.group.c_str(), &groupAddress) != 1) {
-        return fail("invalid protected transcoder multicast group: " + input.group);
-    }
-
-    for (const auto& iface : interfaces) {
-        in_addr localAddress {};
-        if (::inet_pton(AF_INET, iface.address.c_str(), &localAddress) != 1) continue;
-        ip_mreq membership {};
-        membership.imr_multiaddr = groupAddress;
-        membership.imr_interface = localAddress;
-        if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership, sizeof(membership)) == 0) {
-            input.joinedInterfaces.push_back(iface.name);
-            continue;
-        }
-        const std::string joinError = "join " + input.group + " on " + iface.name +
-            " failed: " + std::strerror(errno);
-        if (!configured.empty()) return fail("protected transcoder UDP " + joinError);
-        std::cerr << "Protected transcoder UDP 203.09: warning " << joinError << std::endl;
-    }
-    if (input.joinedInterfaces.empty()) {
-        return fail("protected transcoder UDP failed to join " + input.group + " on any interface");
-    }
-
-    socklen_t receiveBufferLength = sizeof(input.effectiveReceiveBuffer);
-    if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-                     &input.effectiveReceiveBuffer, &receiveBufferLength) != 0) {
-        input.effectiveReceiveBuffer = 0;
-    }
-
-    input.fd = fd;
-    return true;
-}
-
-std::string joinedNames(const std::vector<std::string>& names) {
-    std::ostringstream ss;
-    for (size_t i = 0; i < names.size(); ++i) {
-        if (i > 0) ss << ',';
-        ss << names[i];
-    }
-    return ss.str();
-}
-
-bool factoryLongNameContains(const char* factoryName, const std::string& needle) {
-    GstElementFactory* factory = gst_element_factory_find(factoryName);
-    if (!factory) return false;
-    const gchar* longName = gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_LONGNAME);
-    const bool matched = longName && toLower(longName).find(toLower(needle)) != std::string::npos;
-    gst_object_unref(factory);
-    return matched;
-}
-
-bool forceSoftwareH264DecodeForPlatform() {
-    // Ivy Bridge VA decode recovered poorly from damaged live MPEG-TS in field
-    // tests, while avdec_h264 recovered repeatedly without stopping the pipeline.
-    // Keep hardware *encoding* enabled; only decode is forced to software on
-    // this old Intel generation.
-    return factoryLongNameContains("vah264enc", "ivybridge") ||
-           factoryLongNameContains("vah264dec", "ivybridge");
-}
-
-std::string softwareH264FeatureRankOverride() {
-    const char* existing = std::getenv("GST_PLUGIN_FEATURE_RANK");
-    std::string value = existing ? existing : "";
-    if (!value.empty() && value.back() != ',') value += ',';
-    value += "vah264dec:NONE,vaapih264dec:NONE,qsvh264dec:NONE";
-    return value;
-}
 
 void markOpenDescriptorsCloseOnExec() {
     DIR* directory = ::opendir("/proc/self/fd");
@@ -418,6 +197,31 @@ bool isIntelVideoEncoder(const std::string& factory) {
     return factory == "qsvh264enc" || factory == "vah264enc" || factory == "vaapih264enc";
 }
 
+bool factoryLongNameContains(const char* factoryName, const std::string& needle) {
+    GstElementFactory* factory = gst_element_factory_find(factoryName);
+    if (!factory) return false;
+    const gchar* longName = gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_LONGNAME);
+    const bool matched = longName && toLower(longName).find(toLower(needle)) != std::string::npos;
+    gst_object_unref(factory);
+    return matched;
+}
+
+bool forceSoftwareH264DecodeForPlatform() {
+    // 203.10: Ivy Bridge VA H.264 decode can stop producing raw frames after
+    // damaged/discontinuous live MPEG-TS. Field A/B testing showed avdec_h264
+    // keeps recovering while Intel VA H.264 encoding remains stable.
+    return factoryLongNameContains("vah264enc", "ivybridge") ||
+           factoryLongNameContains("vah264dec", "ivybridge");
+}
+
+std::string softwareH264FeatureRankOverride() {
+    const char* existing = std::getenv("GST_PLUGIN_FEATURE_RANK");
+    std::string value = existing ? existing : "";
+    if (!value.empty() && value.back() != ',') value += ',';
+    value += "vah264dec:NONE,vaapih264dec:NONE,qsvh264dec:NONE";
+    return value;
+}
+
 std::string selectedVideoEncoderFactory(const StreamConfig& cfg) {
     if (cfg.transcodeVideoEncoder == "nvenc") return hasFactory("nvh264enc") ? "nvh264enc" : std::string();
     if (cfg.transcodeVideoEncoder == "intel") return intelVideoEncoderFactory();
@@ -546,104 +350,9 @@ bool isSidAwareMpegTsInput(const StreamConfig& cfg) {
 bool appendTranscoderDecodeInput(
     std::vector<std::string>& args,
     const StreamConfig& cfg,
-    int& inheritedInputFd,
-    bool& forceSoftwareH264Decode,
     std::string& error) {
-    inheritedInputFd = -1;
-    forceSoftwareH264Decode = forceSoftwareH264DecodeForPlatform();
-    if (forceSoftwareH264Decode && !hasFactory("avdec_h264")) {
-        error = "Intel Ivy Bridge transcoder recovery requires GStreamer avdec_h264";
-        return false;
-    }
-
-    std::string multicastGroup;
-    int multicastPort = 0;
-    if (parseIpv4MulticastUdpUri(cfg, multicastGroup, multicastPort)) {
-        std::vector<std::string> missing;
-        validateFactories({"fdsrc", "tee", "queue", "watchdog", "fakesink",
-                           "tsparse", "tsdemux", "decodebin3"}, missing);
-        if (!missing.empty()) {
-            std::ostringstream ss;
-            ss << "missing protected UDP transcoder input elements";
-            for (size_t i = 0; i < missing.size(); ++i) {
-                ss << (i == 0 ? ": " : ", ") << missing[i];
-            }
-            error = ss.str();
-            return false;
-        }
-
-        ProtectedUdpInput input;
-        if (!createProtectedUdpInput(cfg, input, error)) return false;
-        inheritedInputFd = input.fd;
-
-        const uint32_t inputSid = effectiveInputServiceId(cfg);
-        args.insert(args.end(), {
-            "fdsrc",
-            "name=transcode_udp_fdsrc",
-            "fd=" + std::to_string(inheritedInputFd),
-            "blocksize=65536",
-            "do-timestamp=true",
-            "!", "tee", "name=transcode_ts_input_tee",
-
-            // Independent heartbeat branch: source loss is now detected on raw
-            // UDP/TS buffers, not after the decoder.  Its leaky queue prevents
-            // encoder/decode backpressure from masquerading as multicast loss.
-            "transcode_ts_input_tee.", "!", "queue",
-            "name=transcode_ts_watchdog_queue",
-            "max-size-buffers=0",
-            "max-size-bytes=2097152",
-            "max-size-time=1000000000",
-            "leaky=downstream",
-            "!", "watchdog",
-            "name=transcode_ts_input_watchdog",
-            "timeout=" + std::to_string(kTranscoderTransportWatchdogMs),
-            "!", "fakesink", "sync=false", "async=false",
-
-            // Decode branch has enough headroom that the 15 s decoded-video
-            // watchdog fires before this queue can backpressure the source tee.
-            "transcode_ts_input_tee.", "!", "queue",
-            "name=transcode_ts_decode_queue",
-            "max-size-buffers=0",
-            "max-size-bytes=33554432",
-            "max-size-time=20000000000",
-            "leaky=0",
-            "!", "tsparse",
-            "!", "tsdemux",
-            "name=transcode_udp_demux",
-            "latency=700"
-        });
-        if (inputSid != 0) {
-            args.push_back("program-number=" + std::to_string(inputSid));
-        }
-        args.insert(args.end(), {
-            "transcode_udp_demux.", ":", "decodebin3", "name=dec"
-        });
-
-        std::cerr << "Protected transcoder UDP 203.09: group=" << input.group
-                  << " port=" << input.port
-                  << " rcvbuf_bytes=" << input.effectiveReceiveBuffer
-                  << " multicast_all=off"
-                  << " interfaces=" << joinedNames(input.joinedInterfaces)
-                  << " strict_device=" << (input.boundDevice.empty() ? "auto" : input.boundDevice)
-                  << " input_watchdog_ms=" << kTranscoderTransportWatchdogMs
-                  << " decoded_video_watchdog_ms=" << kTranscoderDecodedVideoWatchdogMs
-                  << " input_sid=" << inputSid
-                  << std::endl;
-        if (forceSoftwareH264Decode) {
-            std::cerr << "Transcoder H264 decode 203.09: platform=Intel-IvyBridge"
-                      << " policy=software-recovery decoder=avdec_h264"
-                      << " hardware_encode=preserved" << std::endl;
-        }
-        return true;
-    }
-
     if (!isSidAwareMpegTsInput(cfg)) {
         tvs::protocols::appendDecodeInput(args, cfg);
-        if (forceSoftwareH264Decode) {
-            std::cerr << "Transcoder H264 decode 203.09: platform=Intel-IvyBridge"
-                      << " policy=software-recovery decoder=avdec_h264"
-                      << " hardware_encode=preserved" << std::endl;
-        }
         return true;
     }
 
@@ -689,11 +398,6 @@ bool appendTranscoderDecodeInput(
     std::cerr << "GStreamer transcoder input selector: input_sid=" << inputSid
               << " method=tsdemux-program-number decode=decodebin3"
               << " uri=" << uri << std::endl;
-    if (forceSoftwareH264Decode) {
-        std::cerr << "Transcoder H264 decode 203.09: platform=Intel-IvyBridge"
-                  << " policy=software-recovery decoder=avdec_h264"
-                  << " hardware_encode=preserved" << std::endl;
-    }
     return true;
 }
 
@@ -717,7 +421,7 @@ void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
     args.insert(args.end(), {
         "!", "watchdog",
         "name=transcode_decoded_video_watchdog",
-        "timeout=" + std::to_string(kTranscoderDecodedVideoWatchdogMs),
+        "timeout=15000",
         "!", "video/x-raw",
         "!", "videoconvert",
         "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
@@ -918,29 +622,29 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 bool GstTranscoderProcess::spawnProcess(
     const std::vector<std::string>& args,
     const std::string& description,
-    int inheritedInputFd,
-    bool forceSoftwareH264Decode,
     ChildProcess& child,
     std::string& error) {
     if (args.empty()) {
-        if (inheritedInputFd >= 0) ::close(inheritedInputFd);
         error = "empty gst-launch command";
         return false;
+    }
+
+    const bool forceSoftwareH264Decode = forceSoftwareH264DecodeForPlatform();
+    if (forceSoftwareH264Decode && !hasFactory("avdec_h264")) {
+        error = "Intel Ivy Bridge transcoder recovery requires GStreamer avdec_h264";
+        return false;
+    }
+    if (forceSoftwareH264Decode) {
+        std::cerr << "Transcoder H264 decode 203.10: platform=Intel-IvyBridge"
+                  << " policy=software-recovery decoder=avdec_h264"
+                  << " hardware_encode=preserved input_transport=original-uri"
+                  << std::endl;
     }
 
     // gst-launch does not need any TVStreammerSAT5 sockets. Mark every currently open
     // non-standard descriptor close-on-exec before forking so HTTP/metrics/listener
     // sockets cannot remain alive in the external transcoder process.
     markOpenDescriptorsCloseOnExec();
-    if (inheritedInputFd >= 0) {
-        const int flags = ::fcntl(inheritedInputFd, F_GETFD);
-        if (flags < 0 || ::fcntl(inheritedInputFd, F_SETFD, flags & ~FD_CLOEXEC) != 0) {
-            const std::string fdError = std::strerror(errno);
-            ::close(inheritedInputFd);
-            error = "failed to preserve protected transcoder UDP fd across exec: " + fdError;
-            return false;
-        }
-    }
 
     int stderrPipe[2] = {-1, -1};
     const bool captureStderr = ::pipe(stderrPipe) == 0;
@@ -955,7 +659,6 @@ bool GstTranscoderProcess::spawnProcess(
 
     pid_t pid = ::fork();
     if (pid < 0) {
-        if (inheritedInputFd >= 0) ::close(inheritedInputFd);
         if (captureStderr) {
             ::close(stderrPipe[0]);
             ::close(stderrPipe[1]);
@@ -993,7 +696,6 @@ bool GstTranscoderProcess::spawnProcess(
         std::_Exit(127);
     }
 
-    if (inheritedInputFd >= 0) ::close(inheritedInputFd);
     if (captureStderr) ::close(stderrPipe[1]);
     child.pid = pid;
     child.description = description;
@@ -1057,12 +759,8 @@ bool GstTranscoderProcess::spawnProcess(
 std::vector<std::string> GstTranscoderProcess::buildCommand(
     const StreamConfig& baseConfig,
     const StreamConfig& outputConfig,
-    int& inheritedInputFd,
-    bool& forceSoftwareH264Decode,
     std::string& description,
     std::string& error) {
-    inheritedInputFd = -1;
-    forceSoftwareH264Decode = false;
     if (!validateOutputAvailability(outputConfig, error)) {
         return {};
     }
@@ -1087,43 +785,23 @@ std::vector<std::string> GstTranscoderProcess::buildCommand(
     if (baseConfig.testPattern) {
         addTestSources(args, baseConfig, outputSpec, error);
     } else {
-        std::cerr << "Transcoder watchdog 203.09: transport_timeout_ms="
-                  << kTranscoderTransportWatchdogMs
-                  << " decoded_video_timeout_ms=" << kTranscoderDecodedVideoWatchdogMs
+        std::cerr << "Transcoder decoded-video watchdog 203.10: timeout_ms=15000"
                   << " source=" << tvs::protocols::inputUriForGstreamer(baseConfig)
-                  << " transport_scope=raw-udp-ts-when-protected"
-                  << " video_scope=decoded-video-recovery"
+                  << " scope=post-decode action=exit-for-parent-failover"
                   << std::endl;
-        if (!appendTranscoderDecodeInput(
-                args, baseConfig, inheritedInputFd, forceSoftwareH264Decode, error)) {
-            if (inheritedInputFd >= 0) {
-                ::close(inheritedInputFd);
-                inheritedInputFd = -1;
-            }
+        if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
             return {};
         }
-        std::cerr << "GStreamer transcoder 203.09: video=h264"
+        std::cerr << "GStreamer transcoder 203.10: video=h264"
                   << " encoder_request=" << baseConfig.transcodeVideoEncoder
                   << " deinterlace=yadif-all-fields"
                   << " cadence=preserve-progressive/double-interlaced-fields"
                   << " output=" << baseConfig.transcodeResolution << std::endl;
         addVideoBranch(args, baseConfig, outputSpec, error);
-        if (!error.empty()) {
-            if (inheritedInputFd >= 0) {
-                ::close(inheritedInputFd);
-                inheritedInputFd = -1;
-            }
-            return {};
-        }
+        if (!error.empty()) return {};
         addAudioBranch(args, baseConfig, outputSpec, error);
     }
-    if (!error.empty()) {
-        if (inheritedInputFd >= 0) {
-            ::close(inheritedInputFd);
-            inheritedInputFd = -1;
-        }
-        return {};
-    }
+    if (!error.empty()) return {};
 
     description = outputSpec.description;
     return args;
@@ -1149,13 +827,8 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
     for (const auto& output : outputs) {
         std::string description;
         std::string commandError;
-        int inheritedInputFd = -1;
-        bool forceSoftwareH264Decode = false;
-        std::vector<std::string> args = buildCommand(
-            config, output, inheritedInputFd, forceSoftwareH264Decode,
-            description, commandError);
+        std::vector<std::string> args = buildCommand(config, output, description, commandError);
         if (!commandError.empty()) {
-            if (inheritedInputFd >= 0) ::close(inheritedInputFd);
             error = commandError;
             for (auto& startedChild : started) {
                 if (startedChild.pid > 0) {
@@ -1169,9 +842,7 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         std::cerr << "GStreamer transcoder command: " << commandLineForLog(args) << std::endl;
 
         ChildProcess child;
-        if (!spawnProcess(
-                args, description, inheritedInputFd, forceSoftwareH264Decode,
-                child, error)) {
+        if (!spawnProcess(args, description, child, error)) {
             for (auto& startedChild : started) {
                 if (startedChild.pid > 0) {
                     ::kill(startedChild.pid, SIGTERM);
