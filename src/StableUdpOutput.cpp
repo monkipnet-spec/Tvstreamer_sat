@@ -1188,13 +1188,22 @@ private:
     static constexpr uint64_t kHlsTv5CbrLowReservoirNanoseconds =
         250ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kCorrectionHorizonNanoseconds = 6ULL * 1000ULL * 1000ULL * 1000ULL;
-    // 203.12 HLS media-timeline lock. The provider PTS/DTS stays untouched while
-    // StableUdpOutput owns a synthetic continuous PCR clock. Therefore reservoir
-    // occupancy must never speed up or slow down HLS media: doing so makes the
-    // preserved PTS drift against PCR. Follow only genuine long-term PTS-derived
-    // bitrate changes; keep the 8 s reservoir as burst absorption/diagnostics.
+    // v202.7 HLS playout PLL: keep useful TS packet spacing almost fixed.
+    // The HLS demuxer may deliver a VBR GOP with a slightly different byte/PTS
+    // density every few seconds; following that estimate directly makes video
+    // packets alternately late/early against the continuous 20 ms PCR clock.
     static constexpr uint64_t kHlsPllUpdateNanoseconds = 5ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
+    static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
+    static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
+    // 203.13: HLS segments arrive as bursts of small TS GstBuffers. Parsing an
+    // entire downloaded segment inside the real-time UDP sender thread can hold
+    // that thread long enough to bunch AAC PES packets even though the final UDP
+    // bitrate/PCR/CC remain valid. Convert only a bounded number of HLS chunks on
+    // each sender tick and, when we already have packet headroom, do that work
+    // after the current UDP datagram has been sent.
+    static constexpr std::size_t kHlsIngestChunksPerSenderTick = 16;
+    static constexpr std::size_t kHlsPreSendPacketLowWater = 64;
     // 202.22 continuous SRT/HTTP: delivery callbacks can be bursty, while
     // short PCR byte-density varies with VBR GOP structure.  Neither is a good
     // instantaneous playout-rate control signal.  Measure bytes over a long
@@ -1244,7 +1253,12 @@ private:
             }
 
             const uint64_t now = monotonicNanoseconds();
-            moveAvailableChunks();
+            // 203.13: protect the sender deadline from HLS segment-download bursts.
+            // Normal HLS operation parses queued TS after sending this datagram.
+            // Only refill before send when the packet ring is genuinely shallow.
+            if (!segmentedHlsInput || realPackets.size() < kHlsPreSendPacketLowWater) {
+                moveAvailableChunks();
+            }
             updateRateController(now);
 
             uint64_t activeBitrate = transportBitrate.load(std::memory_order_relaxed);
@@ -1299,6 +1313,13 @@ private:
                 std::memory_order_relaxed);
             if (filled.real > 0) {
                 queueSpace.notify_all();
+            }
+
+            // HLS-only: once the time-critical datagram is already on the wire,
+            // convert one bounded batch of newly downloaded TS into the packet ring.
+            // This keeps segment parsing from creating recurring sender stalls.
+            if (segmentedHlsInput) {
+                moveAvailableChunks();
             }
 
             // Never perform synchronous journal I/O in the production sender
@@ -1428,31 +1449,44 @@ private:
     }
 
     void moveAvailableChunks() {
-        // 202.62: heaptrack showed millions of _Deque_base::_M_initialize_map
-        // allocations from constructing a temporary std::deque on every sender
-        // tick. Keep a second deque for the lifetime of the sender and swap the
-        // producer queue into it in O(1). This preserves packet ordering and all
-        // pacing/PCR behaviour while removing the hot-path deque constructor.
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            queuedChunks.swap(processingChunks);
+        // 203.13: keep HLS segment parsing out of the sender's critical path.
+        // processingChunks persists across ticks, so packet order is unchanged;
+        // newly-arrived chunks wait in queuedChunks until the older batch drains.
+        // Non-HLS inputs retain the previous all-at-once behaviour.
+        if (processingChunks.empty()) {
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                if (!queuedChunks.empty()) {
+                    queuedChunks.swap(processingChunks);
+                }
+            }
+
+            // Diagnostics are maintained incrementally while this batch drains.
+            // Scan the deque only once when a fresh batch is acquired; scanning
+            // thousands of HLS chunks on every UDP tick would recreate the same
+            // sender-thread latency this change is intended to remove.
+            uint64_t processingPayload = 0;
+            uint64_t processingCapacity = 0;
+            uint64_t processingMaxCapacity = 0;
+            for (const auto& chunk : processingChunks) {
+                processingPayload += static_cast<uint64_t>(chunk.bytes.size());
+                processingCapacity += static_cast<uint64_t>(chunk.bytes.capacity());
+                processingMaxCapacity = std::max<uint64_t>(
+                    processingMaxCapacity, static_cast<uint64_t>(chunk.bytes.capacity()));
+            }
+            processingChunkPayloadBytes.store(processingPayload, std::memory_order_relaxed);
+            processingChunkCapacityBytes.store(processingCapacity, std::memory_order_relaxed);
+            processingChunkCount.store(
+                static_cast<uint64_t>(processingChunks.size()), std::memory_order_relaxed);
+            processingChunkMaxCapacityBytes.store(
+                processingMaxCapacity, std::memory_order_relaxed);
         }
 
-        uint64_t processingPayload = 0;
-        uint64_t processingCapacity = 0;
-        uint64_t processingMaxCapacity = 0;
-        for (const auto& chunk : processingChunks) {
-            processingPayload += static_cast<uint64_t>(chunk.bytes.size());
-            processingCapacity += static_cast<uint64_t>(chunk.bytes.capacity());
-            processingMaxCapacity = std::max<uint64_t>(
-                processingMaxCapacity, static_cast<uint64_t>(chunk.bytes.capacity()));
-        }
-        processingChunkPayloadBytes.store(processingPayload, std::memory_order_relaxed);
-        processingChunkCapacityBytes.store(processingCapacity, std::memory_order_relaxed);
-        processingChunkCount.store(static_cast<uint64_t>(processingChunks.size()), std::memory_order_relaxed);
-        processingChunkMaxCapacityBytes.store(processingMaxCapacity, std::memory_order_relaxed);
-
-        while (!processingChunks.empty()) {
+        const std::size_t chunkBudget = segmentedHlsInput
+            ? kHlsIngestChunksPerSenderTick
+            : std::numeric_limits<std::size_t>::max();
+        std::size_t processedChunks = 0;
+        while (!processingChunks.empty() && processedChunks < chunkBudget) {
             const uint64_t payload = static_cast<uint64_t>(processingChunks.front().bytes.size());
             const uint64_t capacity = static_cast<uint64_t>(processingChunks.front().bytes.capacity());
             queueChunk(std::move(processingChunks.front()));
@@ -1460,8 +1494,15 @@ private:
             processingChunkPayloadBytes.fetch_sub(payload, std::memory_order_relaxed);
             processingChunkCapacityBytes.fetch_sub(capacity, std::memory_order_relaxed);
             processingChunkCount.fetch_sub(1, std::memory_order_relaxed);
+            ++processedChunks;
         }
-        processingChunkMaxCapacityBytes.store(0, std::memory_order_relaxed);
+
+        if (processingChunks.empty()) {
+            processingChunkPayloadBytes.store(0, std::memory_order_relaxed);
+            processingChunkCapacityBytes.store(0, std::memory_order_relaxed);
+            processingChunkCount.store(0, std::memory_order_relaxed);
+            processingChunkMaxCapacityBytes.store(0, std::memory_order_relaxed);
+        }
     }
 
     void ensureRealPacketCapacity(std::size_t additionalPackets = 1) {
@@ -2002,9 +2043,10 @@ private:
             const uint64_t pllUpdateNanoseconds = segmentedHlsInput
                 ? kHlsPllUpdateNanoseconds : kNetworkArrivalPllUpdateNanoseconds;
             const uint64_t pllCorrectionPermille = segmentedHlsInput
-                ? 0ULL : kNetworkArrivalPllMaximumCorrectionPermille;
+                ? kHlsPllMaximumCorrectionPermille
+                : kNetworkArrivalPllMaximumCorrectionPermille;
             const uint64_t pllStepPermille = segmentedHlsInput
-                ? 0ULL : kNetworkArrivalPllMaximumStepPermille;
+                ? kHlsPllMaximumStepPermille : kNetworkArrivalPllMaximumStepPermille;
             const uint64_t pllFollowDivisor = segmentedHlsInput ? 32ULL : 64ULL;
             if (hlsPllBaseBitrate == 0) {
                 const uint64_t startupPace = segmentedHlsInput
@@ -2036,64 +2078,56 @@ private:
                     (hlsPllBaseBitrate * (pllFollowDivisor - 1ULL) + sourceLimited) /
                     pllFollowDivisor;
 
-                if (segmentedHlsInput) {
-                    // 203.12: preserve the source media clock. Reservoir occupancy
-                    // is intentionally NOT a frequency-control input for segmented
-                    // HLS because source PTS/DTS is preserved while PCR is synthetic.
-                    // A reservoir-derived +/- pace correction accumulates directly
-                    // as PTS-PCR phase error (observed as AAC stutter after runtime).
-                    currentRealPaceBitrate = hlsPllBaseBitrate;
-                    hlsPllCorrectionBitrate = 0;
+                // Reservoir correction: 1% pace change per 100% occupancy error,
+                // hard-limited to +/-1.5%. The actual five-second pace step is
+                // further limited to 0.2%, so no GOP-sized speed jump reaches UDP.
+                const uint64_t targetBytes = std::max<uint64_t>(
+                    kUdpPayloadSize * 32ULL,
+                    bytesForDuration(hlsPllBaseBitrate, pllTargetReservoirNanoseconds));
+                int64_t error = 0;
+                if (bufferNow >= targetBytes) {
+                    error = static_cast<int64_t>(std::min<uint64_t>(
+                        bufferNow - targetBytes,
+                        static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
                 } else {
-                    // Continuous SRT/HTTP keeps the established slow reservoir PLL.
-                    const uint64_t targetBytes = std::max<uint64_t>(
-                        kUdpPayloadSize * 32ULL,
-                        bytesForDuration(hlsPllBaseBitrate, pllTargetReservoirNanoseconds));
-                    int64_t error = 0;
-                    if (bufferNow >= targetBytes) {
-                        error = static_cast<int64_t>(std::min<uint64_t>(
-                            bufferNow - targetBytes,
-                            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
-                    } else {
-                        const uint64_t diff = targetBytes - bufferNow;
-                        error = -static_cast<int64_t>(std::min<uint64_t>(
-                            diff, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
-                    }
-
-                    int64_t correction = 0;
-                    if (targetBytes > 0) {
-#if defined(__SIZEOF_INT128__)
-                        correction = static_cast<int64_t>(
-                            (static_cast<__int128>(hlsPllBaseBitrate) * error) /
-                            (static_cast<__int128>(targetBytes) * 100));
-#else
-                        correction = static_cast<int64_t>(
-                            (static_cast<long double>(hlsPllBaseBitrate) *
-                             static_cast<long double>(error)) /
-                            (static_cast<long double>(targetBytes) * 100.0L));
-#endif
-                    }
-                    const int64_t maximumCorrection = static_cast<int64_t>(
-                        hlsPllBaseBitrate * pllCorrectionPermille / 1000ULL);
-                    correction = std::clamp<int64_t>(
-                        correction, -maximumCorrection, maximumCorrection);
-
-                    int64_t desired = static_cast<int64_t>(hlsPllBaseBitrate) + correction;
-                    desired = std::clamp<int64_t>(
-                        desired, 0, static_cast<int64_t>(hlsPaceCeiling));
-
-                    const uint64_t maximumStep = std::max<uint64_t>(1000ULL,
-                        hlsPllBaseBitrate * pllStepPermille / 1000ULL);
-                    const int64_t current = static_cast<int64_t>(currentRealPaceBitrate);
-                    const int64_t lower = current > static_cast<int64_t>(maximumStep)
-                        ? current - static_cast<int64_t>(maximumStep) : 0;
-                    const int64_t upper = std::min<int64_t>(
-                        static_cast<int64_t>(hlsPaceCeiling),
-                        current + static_cast<int64_t>(maximumStep));
-                    currentRealPaceBitrate = static_cast<uint64_t>(
-                        std::clamp<int64_t>(desired, lower, upper));
-                    hlsPllCorrectionBitrate = correction;
+                    const uint64_t diff = targetBytes - bufferNow;
+                    error = -static_cast<int64_t>(std::min<uint64_t>(
+                        diff, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
                 }
+
+                int64_t correction = 0;
+                if (targetBytes > 0) {
+#if defined(__SIZEOF_INT128__)
+                    correction = static_cast<int64_t>(
+                        (static_cast<__int128>(hlsPllBaseBitrate) * error) /
+                        (static_cast<__int128>(targetBytes) * 100));
+#else
+                    correction = static_cast<int64_t>(
+                        (static_cast<long double>(hlsPllBaseBitrate) *
+                         static_cast<long double>(error)) /
+                        (static_cast<long double>(targetBytes) * 100.0L));
+#endif
+                }
+                const int64_t maximumCorrection = static_cast<int64_t>(
+                    hlsPllBaseBitrate * pllCorrectionPermille / 1000ULL);
+                correction = std::clamp<int64_t>(
+                    correction, -maximumCorrection, maximumCorrection);
+
+                int64_t desired = static_cast<int64_t>(hlsPllBaseBitrate) + correction;
+                desired = std::clamp<int64_t>(
+                    desired, 0, static_cast<int64_t>(hlsPaceCeiling));
+
+                const uint64_t maximumStep = std::max<uint64_t>(1000ULL,
+                    hlsPllBaseBitrate * pllStepPermille / 1000ULL);
+                const int64_t current = static_cast<int64_t>(currentRealPaceBitrate);
+                const int64_t lower = current > static_cast<int64_t>(maximumStep)
+                    ? current - static_cast<int64_t>(maximumStep) : 0;
+                const int64_t upper = std::min<int64_t>(
+                    static_cast<int64_t>(hlsPaceCeiling),
+                    current + static_cast<int64_t>(maximumStep));
+                currentRealPaceBitrate = static_cast<uint64_t>(
+                    std::clamp<int64_t>(desired, lower, upper));
+                hlsPllCorrectionBitrate = correction;
             }
 
             realPaceBitrate.store(currentRealPaceBitrate, std::memory_order_relaxed);
@@ -2103,7 +2137,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.12: mode=media-timeline-lock"
+                                  ? "HLS UDP pacing 203.13: mode=slow-playout-pll sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2112,8 +2146,6 @@ private:
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
                           << " pll_correction_permille=" << pllCorrectionPermille
                           << " pll_step_permille=" << pllStepPermille
-                          << " reservoir_frequency_control="
-                          << (segmentedHlsInput ? "off" : "on")
                           << " PCR="
                           << (segmentedHlsInput
                                   ? "continuous-20ms-clock"
@@ -2525,7 +2557,7 @@ private:
                   << " pcr_program=" << declaredPcrProgram
                   << " timing="
                   << (segmentedHlsInput
-                          ? "hls_media_timeline_lock_periodic_pcr"
+                          ? "hls_slow_playout_pll_periodic_pcr"
                           : (continuousNetworkMpegTsInput
                                 ? "network_arrival_playout_pll_source_pcr"
                                 : (sourcePcrPassthrough()
@@ -2874,11 +2906,13 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.12: compatibility=202.74"
+        std::cerr << "HLS timing 203.13: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=media-timeline-lock reservoir_frequency_control=off"
-                  << " periodic_pcr=20ms"
+                  << " pacing=slow-playout-pll periodic_pcr=20ms"
+                  << " sender_ingest=post-send-bounded"
+                  << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
+                  << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
                   << " pcr_phase=fixed-zero-no-pre-send-calibration"
                   << std::endl;
     }
