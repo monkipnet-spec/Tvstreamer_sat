@@ -77,6 +77,11 @@ constexpr uint64_t kTimestampForwardJumpNanoseconds = 5ULL * 1000ULL * 1000ULL *
 constexpr uint64_t kVbrTransportHeadroomBitrate = 120000ULL;
 constexpr uint64_t kMinimumVbrTransportBitrate = 500000ULL;
 constexpr uint64_t kMaximumTransportBitrate = 200000000ULL;
+// 203.14: these 203.13 HLS sender-ingest tuning constants are also logged
+// from createSink(), so keep them at translation-unit scope rather than as
+// private StableUdpSender members. Functional values are unchanged.
+constexpr std::size_t kHlsIngestChunksPerSenderTick = 16;
+constexpr std::size_t kHlsPreSendPacketLowWater = 64;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
@@ -1202,8 +1207,6 @@ private:
     // bitrate/PCR/CC remain valid. Convert only a bounded number of HLS chunks on
     // each sender tick and, when we already have packet headroom, do that work
     // after the current UDP datagram has been sent.
-    static constexpr std::size_t kHlsIngestChunksPerSenderTick = 16;
-    static constexpr std::size_t kHlsPreSendPacketLowWater = 64;
     // 202.22 continuous SRT/HTTP: delivery callbacks can be bursty, while
     // short PCR byte-density varies with VBR GOP structure.  Neither is a good
     // instantaneous playout-rate control signal.  Measure bytes over a long
