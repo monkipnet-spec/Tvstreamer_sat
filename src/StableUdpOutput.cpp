@@ -1203,6 +1203,12 @@ private:
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
     static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
+    // 203.24: EXTINF/segment bytes stays authoritative, but when the provider
+    // PCR byte-density clock is only slightly faster (<=2%) it is a useful
+    // lower-bound for deadline-safe playout. This prevents small under-pacing
+    // on services such as Detsky_mir while still rejecting the grossly wrong
+    // PCR estimates that caused the old media-burst/null-gap cycle.
+    static constexpr uint64_t kHlsNearPcrAssistTolerancePermille = 20ULL; // +2.0% max
     // 203.13: HLS segments arrive as bursts of small TS GstBuffers. Parsing an
     // entire downloaded segment inside the real-time UDP sender thread can hold
     // that thread long enough to bunch AAC PES packets even though the final UDP
@@ -2069,26 +2075,58 @@ private:
 
             const uint64_t durationRateLimited = segmentedHlsInput && hlsDurationRate > 0
                 ? std::min<uint64_t>(hlsDurationRate, hlsPaceCeiling) : 0;
+
+            uint64_t nearPcrAssistRate = 0;
             if (durationRateLimited > 0 &&
-                durationRateLimited != hlsLastDurationMediaBitrate) {
-                // 203.23: the rolling scheduler rate is already media-time
-                // averaged. Rebase immediately when a newly completed segment
-                // changes that rate; do not spend minutes walking down from a
-                // bogus PCR-density fallback at 0.2% per five seconds.
-                const bool firstDurationLock = hlsLastDurationMediaBitrate == 0;
-                hlsLastDurationMediaBitrate = durationRateLimited;
-                hlsPllBaseBitrate = durationRateLimited;
-                currentRealPaceBitrate = durationRateLimited;
+                pcrDerivedInputBitrate > durationRateLimited) {
+                const uint64_t nearPcrUpperBound = multiplyDivide(
+                    durationRateLimited,
+                    1000ULL + kHlsNearPcrAssistTolerancePermille,
+                    1000ULL);
+                if (pcrDerivedInputBitrate <= nearPcrUpperBound) {
+                    nearPcrAssistRate = std::min<uint64_t>(
+                        pcrDerivedInputBitrate, hlsPaceCeiling);
+                }
+            }
+
+            // 203.24: never pace below a trustworthy nearby provider PCR clock.
+            // EXTINF/bytes remains authoritative for large disagreements; PCR is
+            // allowed only as a +0..2% deadline-safety floor.
+            const uint64_t mediaClockRateLimited = std::max<uint64_t>(
+                durationRateLimited, nearPcrAssistRate);
+
+            if (mediaClockRateLimited > 0 &&
+                mediaClockRateLimited != hlsLastMediaClockBitrate) {
+                // First duration lock must escape a potentially bogus startup
+                // fallback immediately. Later rolling-rate updates preserve the
+                // token phase so segment boundaries cannot introduce a pacing
+                // phase discontinuity.
+                const bool firstDurationLock = hlsLastMediaClockBitrate == 0;
+                hlsLastMediaClockBitrate = mediaClockRateLimited;
+                hlsPllBaseBitrate = mediaClockRateLimited;
+                currentRealPaceBitrate = mediaClockRateLimited;
                 hlsPllCorrectionBitrate = 0;
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
-                realTokenAccumulator = 0;
                 if (firstDurationLock) {
-                    std::cerr << "HLS UDP pacing 203.23: source_rate=segment-bytes/EXTINF"
+                    realTokenAccumulator = 0;
+                    std::cerr << "HLS UDP pacing 203.24: source_rate=segment-bytes/EXTINF"
                               << " duration_rate_bitrate=" << durationRateLimited
-                              << " pcr_fallback_bitrate=" << pcrDerivedInputBitrate
+                              << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
+                              << " effective_media_clock_bitrate=" << mediaClockRateLimited
+                              << " pcr_assist=" << (nearPcrAssistRate > 0 ? "on" : "off")
+                              << " pcr_assist_limit_permille=" << kHlsNearPcrAssistTolerancePermille
                               << " transport_bitrate=" << currentTargetBitrate()
                               << " action=lock-duration-media-clock"
                               << std::endl;
+                } else if (nearPcrAssistRate > 0 && !hlsNearPcrAssistAnnounced) {
+                    std::cerr << "HLS UDP pacing 203.24: source_rate=duration+near-PCR"
+                              << " duration_rate_bitrate=" << durationRateLimited
+                              << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
+                              << " effective_media_clock_bitrate=" << mediaClockRateLimited
+                              << " token_phase=preserved"
+                              << " action=enable-near-pcr-assist"
+                              << std::endl;
+                    hlsNearPcrAssistAnnounced = true;
                 }
             } else if (hlsPllBaseBitrate == 0) {
                 const uint64_t startupPace = segmentedHlsInput
@@ -2112,8 +2150,9 @@ private:
                 nowNanoseconds - hlsPllLastUpdateNanoseconds >= pllUpdateNanoseconds) {
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
 
-                const uint64_t sourceLimited =
-                    std::min<uint64_t>(playoutSourceRate, hlsPaceCeiling);
+                const uint64_t sourceLimited = segmentedHlsInput && mediaClockRateLimited > 0
+                    ? mediaClockRateLimited
+                    : std::min<uint64_t>(playoutSourceRate, hlsPaceCeiling);
                 if (!(segmentedHlsInput && hlsDurationRate > 0)) {
                     // Legacy HLS fallback and continuous-network inputs still
                     // follow their noisier estimates very slowly. Duration-rate
@@ -2183,11 +2222,16 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.23: mode=duration-segment-media-clock+slow-reservoir-pll sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.24: mode=duration-segment-media-clock+near-pcr-assist+slow-reservoir-pll sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
                           << " duration_rate_bitrate=" << (segmentedHlsInput ? hlsDurationRate : 0)
+                          << " pcr_rate_bitrate=" << (segmentedHlsInput ? pcrDerivedInputBitrate : 0)
+                          << " effective_media_clock_bitrate="
+                          << (segmentedHlsInput ? mediaClockRateLimited : playoutSourceRate)
+                          << " pcr_assist="
+                          << (segmentedHlsInput && nearPcrAssistRate > 0 ? "on" : "off")
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " target_reservoir_ms="
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
@@ -2681,6 +2725,7 @@ private:
     const uint64_t startupReservoirDurationNanoseconds = 0;
     const std::size_t bufferLimitBytes = kMaxBufferedBytes;
     bool hlsExactPacingAnnounced = false;
+    bool hlsNearPcrAssistAnnounced = false;
     bool srtPrePaddedCbrAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
@@ -2754,7 +2799,7 @@ private:
     uint64_t hlsTimestampDerivedInputBitrate = 0;
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
-    uint64_t hlsLastDurationMediaBitrate = 0;
+    uint64_t hlsLastMediaClockBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
@@ -2956,10 +3001,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.23: compatibility=202.74"
+        std::cerr << "HLS timing 203.24: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+slow-reservoir-pll periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+near-pcr-assist+slow-reservoir-pll periodic_pcr=20ms"
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
