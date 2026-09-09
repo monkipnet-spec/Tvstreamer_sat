@@ -67,7 +67,7 @@ void stopDurationHlsSchedulerForTeardown(
     delete scheduler;
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - started);
-    std::cerr << "HLS TEARDOWN 203.20: stream=" << streamId
+    std::cerr << "HLS TEARDOWN 203.21: stream=" << streamId
               << " scheduler_stop_ms=" << elapsed.count()
               << " action=stop-before-gstreamer-null" << std::endl;
 }
@@ -10309,6 +10309,7 @@ void StreamManager::monitorBus(const std::string& id) {
     auto networkRecoveryDue = std::chrono::steady_clock::time_point::min();
     unsigned transcoderAutoRestartFailures = 0;
     auto transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
+    int lastHlsSourceUnavailableStatus = 0;
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -10324,6 +10325,33 @@ void StreamManager::monitorBus(const std::string& id) {
         const bool hlsInput =
             !state->usingBackup &&
             activeInputKind == tvs::stream_protocols::InputProtocolKind::Hls;
+        const int hlsSourceUnavailableStatus = hlsInput
+            ? tvs::hls_scheduler::sourceUnavailableHttpStatus(state->pipeline) : 0;
+        const bool hlsSourceUnavailable =
+            hlsSourceUnavailableStatus == 404 || hlsSourceUnavailableStatus == 410;
+        if (hlsSourceUnavailable) {
+            state->hlsRecoveryPending = false;
+            state->hlsRecoveryAttempts = 0;
+            state->hlsRecoveryDue = std::chrono::steady_clock::time_point::min();
+            state->hlsRecoveryGraceUntil = std::chrono::steady_clock::time_point::min();
+            state->active = true;
+            state->statusMessage = "HLS source unavailable (HTTP " +
+                std::to_string(hlsSourceUnavailableStatus) + ") - probing every 30s";
+            if (lastHlsSourceUnavailableStatus != hlsSourceUnavailableStatus) {
+                std::cerr << "HLS SOURCE 203.21: stream=" << id
+                          << " state=unavailable http_status="
+                          << hlsSourceUnavailableStatus
+                          << " action=suppress-pipeline-rebuild probe_ms=30000"
+                          << std::endl;
+                lastHlsSourceUnavailableStatus = hlsSourceUnavailableStatus;
+            }
+        } else if (lastHlsSourceUnavailableStatus != 0) {
+            std::cerr << "HLS SOURCE 203.21: stream=" << id
+                      << " state=available previous_http_status="
+                      << lastHlsSourceUnavailableStatus
+                      << " action=normal-watchdog-resumed" << std::endl;
+            lastHlsSourceUnavailableStatus = 0;
+        }
         bool sourceReconnectInFlight =
             state->networkSourceReconnectInFlight.load(std::memory_order_acquire);
         const bool startupGraceActive = recoverableNetworkInput &&
@@ -10478,7 +10506,7 @@ void StreamManager::monitorBus(const std::string& id) {
         // returns, retry with 15/30/60-second bounded backoff.
         const bool hlsRecoveryGraceActive = hlsInput &&
             now < state->hlsRecoveryGraceUntil;
-        if (hlsInput && state->hlsRecoveryPending &&
+        if (hlsInput && !hlsSourceUnavailable && state->hlsRecoveryPending &&
             !hlsRecoveryGraceActive && now >= state->hlsRecoveryDue) {
             const std::string recoveryUri = !state->primaryInputUri.empty()
                 ? state->primaryInputUri : state->activeInputUri;
@@ -10955,10 +10983,28 @@ void StreamManager::monitorBus(const std::string& id) {
                     state->inputLossNotified = false;
                 }
             } else if (inputTimedOut && hlsInput && state->config.backupInputUri.empty()) {
+                // 203.21: a confirmed HTTP 404/410 is a provider-side absence,
+                // not a stuck GStreamer pipeline. The scheduler owns quiet 30 s
+                // probes, so rebuilding the same pipeline cannot help.
+                if (hlsSourceUnavailable) {
+                    if (!state->inputLossNotified) {
+                        state->inputLossNotified = true;
+                        state->statusMessage = "HLS source unavailable (HTTP " +
+                            std::to_string(hlsSourceUnavailableStatus) + ")";
+                        notifyStreamState(
+                            state->config,
+                            "🟡",
+                            telegramText(configManager, "HLS источник недоступен", "HLS source unavailable"),
+                            "HTTP " + std::to_string(hlsSourceUnavailableStatus) +
+                                "; " + telegramText(configManager,
+                                    "проверяю источник каждые 30 секунд без перезапуска канала",
+                                    "probing every 30 seconds without rebuilding the channel") +
+                                "\nURL: " + state->activeInputUri);
+                    }
                 // 202.66: if a freshly rebuilt HLS pipeline is still inside its
                 // startup grace, count the no-input event but do not rebuild it
                 // again. Once grace expires, schedule one serialized retry.
-                if (now < state->hlsRecoveryGraceUntil) {
+                } else if (now < state->hlsRecoveryGraceUntil) {
                     if (!state->inputLossNotified) {
                         ++state->hlsRecoverySuppressed;
                         hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
@@ -11105,6 +11151,17 @@ void StreamManager::monitorBus(const std::string& id) {
                 if (hlsInput) {
                     gchar* sourcePath = GST_MESSAGE_SRC(msg)
                         ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
+                    if (hlsSourceUnavailable) {
+                        ++state->hlsRecoverySuppressed;
+                        hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
+                        std::cerr << "HLS SOURCE 203.21: stream=" << id
+                                  << " reason=gstreamer-error http_status="
+                                  << hlsSourceUnavailableStatus
+                                  << " action=suppress-pipeline-rebuild" << std::endl;
+                        if (sourcePath) g_free(sourcePath);
+                        gst_message_unref(msg);
+                        continue;
+                    }
                     if (now < state->hlsRecoveryGraceUntil) {
                         ++state->hlsRecoverySuppressed;
                         hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
@@ -11184,6 +11241,16 @@ void StreamManager::monitorBus(const std::string& id) {
                     continue;
                 }
                 if (hlsInput) {
+                    if (hlsSourceUnavailable) {
+                        ++state->hlsRecoverySuppressed;
+                        hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);
+                        std::cerr << "HLS SOURCE 203.21: stream=" << id
+                                  << " reason=EOS http_status="
+                                  << hlsSourceUnavailableStatus
+                                  << " action=suppress-pipeline-rebuild" << std::endl;
+                        gst_message_unref(msg);
+                        continue;
+                    }
                     if (now < state->hlsRecoveryGraceUntil) {
                         ++state->hlsRecoverySuppressed;
                         hlsRecoverySuppressedCount.fetch_add(1, std::memory_order_relaxed);

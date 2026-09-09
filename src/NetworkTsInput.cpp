@@ -394,7 +394,7 @@ GstElement* buildHls(
         return nullptr;
     }
 
-    auto* scheduler = new tvs::hls_scheduler::Scheduler(src, queue, cfg);
+    auto* scheduler = new tvs::hls_scheduler::Scheduler(pipeline, src, queue, cfg);
     if (!scheduler->start(error)) {
         delete scheduler;
         return nullptr;
@@ -406,7 +406,7 @@ GstElement* buildHls(
         });
 
     terminalElement = queue;
-    std::cerr << "Network TS input 203.20: protocol=HLS"
+    std::cerr << "Network TS input 203.21: protocol=HLS"
               << " source=duration-controlled-segment-scheduler+appsrc"
               << " low_ahead_ms=6000 target_ahead_ms=8000 high_ahead_ms=12000"
               << " min_start_segments=2 segment_fetch=full-speed-on-demand"

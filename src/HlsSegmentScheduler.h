@@ -10,6 +10,10 @@
 namespace tvs::hls_scheduler {
 
 inline constexpr const char* kPipelineDataKey = "tvs-duration-hls-scheduler";
+// 203.21: nonzero GINT_TO_POINTER(HTTP status) while the scheduler has
+// confirmed that the HLS control resource is persistently unavailable.
+inline constexpr const char* kPipelineSourceUnavailableKey =
+    "tvs-duration-hls-source-unavailable";
 
 // Own HLS segment downloader used instead of hlsdemux prefetching.  Segments are
 // downloaded quickly, but only when the duration already admitted downstream
@@ -18,7 +22,7 @@ inline constexpr const char* kPipelineDataKey = "tvs-duration-hls-scheduler";
 // only media clock. Consumption is tracked in a private byte/duration ledger.
 class Scheduler {
 public:
-    Scheduler(GstElement* appsrc, GstElement* terminalQueue, StreamConfig config);
+    Scheduler(GstElement* pipeline, GstElement* appsrc, GstElement* terminalQueue, StreamConfig config);
     ~Scheduler();
 
     Scheduler(const Scheduler&) = delete;
@@ -31,5 +35,9 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// Returns 404/410 while the scheduler deliberately keeps the pipeline alive
+// and probes the source in the background. Zero means normal recovery policy.
+int sourceUnavailableHttpStatus(GstElement* pipeline);
 
 } // namespace tvs::hls_scheduler

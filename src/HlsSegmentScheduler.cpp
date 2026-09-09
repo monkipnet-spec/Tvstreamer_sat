@@ -41,6 +41,11 @@ constexpr long kHttpTransferTimeoutMs = 12000;
 constexpr long kPlaylistHttpTransferTimeoutMs = 2500;
 constexpr uint64_t kPlaylistPollMinNs = 500ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPlaylistPollMaxNs = 2ULL * kNsPerSecond;
+// 203.21: three definitive 404/410 responses mean the resource is not merely
+// slow. Keep the current pipeline alive and probe quietly instead of letting
+// the stream watchdog rebuild an identical pipeline every 15/30/60 seconds.
+constexpr unsigned kSourceUnavailableConfirmations = 3;
+constexpr uint64_t kSourceUnavailableProbeMs = 30000;
 
 std::once_flag gCurlInitOnce;
 
@@ -340,8 +345,8 @@ namespace tvs::hls_scheduler {
 
 class Scheduler::Impl {
 public:
-    Impl(GstElement* appsrc, GstElement* terminalQueue, StreamConfig config)
-        : appsrc_(appsrc), terminalQueue_(terminalQueue), config_(std::move(config)) {
+    Impl(GstElement* pipeline, GstElement* appsrc, GstElement* terminalQueue, StreamConfig config)
+        : pipeline_(pipeline), appsrc_(appsrc), terminalQueue_(terminalQueue), config_(std::move(config)) {
         if (appsrc_) gst_object_ref(appsrc_);
         if (terminalQueue_) gst_object_ref(terminalQueue_);
     }
@@ -480,30 +485,108 @@ private:
         return "unnamed";
     }
 
+    static bool isUnavailableHttpStatus(long status) {
+        return status == 404 || status == 410;
+    }
+
+    void noteControlRequestSuccess() {
+        consecutiveUnavailableResponses_ = 0;
+        const bool wasUnavailable =
+            controlUnavailable_.exchange(false, std::memory_order_acq_rel);
+        const int status = sourceUnavailableStatus_.load(std::memory_order_acquire);
+        if (wasUnavailable && status != 0) {
+            // Keep the pipeline marker until the first segment is actually
+            // pushed. Otherwise StreamManager could resume its 15 s watchdog
+            // in the small window between playlist recovery and media recovery.
+            std::cerr << "HLS SOURCE 203.21: stream=" << streamLabel()
+                      << " state=control-available previous_http_status=" << status
+                      << " action=wait-for-media" << std::endl;
+        }
+    }
+
+    void noteMediaRestored() {
+        const int previous =
+            sourceUnavailableStatus_.exchange(0, std::memory_order_acq_rel);
+        controlUnavailable_.store(false, std::memory_order_release);
+        consecutiveUnavailableResponses_ = 0;
+        if (pipeline_) {
+            g_object_set_data(
+                G_OBJECT(pipeline_), kPipelineSourceUnavailableKey, nullptr);
+        }
+        if (previous != 0) {
+            std::cerr << "HLS SOURCE 203.21: stream=" << streamLabel()
+                      << " state=available previous_http_status=" << previous
+                      << " action=media-restored" << std::endl;
+        }
+    }
+
+    bool noteControlRequestFailure(long status) {
+        if (!isUnavailableHttpStatus(status)) {
+            if (!controlUnavailable_.load(std::memory_order_acquire)) {
+                consecutiveUnavailableResponses_ = 0;
+            }
+            return false;
+        }
+        ++consecutiveUnavailableResponses_;
+        if (consecutiveUnavailableResponses_ < kSourceUnavailableConfirmations) {
+            return false;
+        }
+        const int newStatus = static_cast<int>(status);
+        controlUnavailable_.store(true, std::memory_order_release);
+        const int previous = sourceUnavailableStatus_.exchange(
+            newStatus, std::memory_order_acq_rel);
+        if (pipeline_) {
+            g_object_set_data(
+                G_OBJECT(pipeline_), kPipelineSourceUnavailableKey,
+                GINT_TO_POINTER(newStatus));
+        }
+        if (previous != newStatus) {
+            std::cerr << "HLS SOURCE 203.21: stream=" << streamLabel()
+                      << " state=unavailable http_status=" << newStatus
+                      << " confirmations=" << consecutiveUnavailableResponses_
+                      << " probe_ms=" << kSourceUnavailableProbeMs
+                      << " action=hold-pipeline" << std::endl;
+        }
+        return true;
+    }
+
+    bool sourceUnavailable() const {
+        return controlUnavailable_.load(std::memory_order_acquire);
+    }
+
     bool fetchBytesWithRetry(const std::string& url,
                              std::vector<uint8_t>& body,
                              std::string& effectiveUrl,
                              const char* what,
                              long transferTimeoutMs,
-                             unsigned maxAttempts = 0) {
+                             unsigned maxAttempts = 0,
+                             bool controlRequest = false) {
         unsigned attempt = 0;
         while (!stopping_.load(std::memory_order_relaxed)) {
             long status = 0;
             std::string error;
             if (httpGet(url, config_, stopping_, body, status, effectiveUrl, error,
-                        transferTimeoutMs)) return true;
+                        transferTimeoutMs)) {
+                if (controlRequest) noteControlRequestSuccess();
+                return true;
+            }
             if (stopping_.load(std::memory_order_relaxed)) return false;
             ++attempt;
+            const bool unavailableConfirmed =
+                controlRequest && noteControlRequestFailure(status);
             const bool defer = maxAttempts != 0 && attempt >= maxAttempts;
-            const uint64_t backoffMs = defer ? 0 :
-                std::min<uint64_t>(2000, 250ULL << std::min<unsigned>(attempt - 1, 3));
-            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " " << what
+            const uint64_t backoffMs = unavailableConfirmed
+                ? kSourceUnavailableProbeMs
+                : (defer ? 0 : std::min<uint64_t>(
+                    2000, 250ULL << std::min<unsigned>(attempt - 1, 3)));
+            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " " << what
                       << " fetch failed attempt=" << attempt
                       << " url=" << url
                       << " error=" << error
                       << " timeout_ms=" << transferTimeoutMs
                       << " retry_ms=" << backoffMs
-                      << (defer ? " action=defer-refresh" : "")
+                      << (unavailableConfirmed ? " action=source-unavailable"
+                          : (defer ? " action=defer-refresh" : ""))
                       << std::endl;
             if (defer) return false;
             std::unique_lock<std::mutex> lock(wakeMutex_);
@@ -519,18 +602,18 @@ private:
         std::string effective;
         const unsigned playlistAttempts = runtimeRefresh ? 1U : 0U;
         if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "playlist",
-                                 kPlaylistHttpTransferTimeoutMs, playlistAttempts)) return false;
+                                 kPlaylistHttpTransferTimeoutMs, playlistAttempts, true)) return false;
         const std::string text(bytes.begin(), bytes.end());
         const std::string base = effective.empty() ? activePlaylistUrl_ : effective;
         playlist = parsePlaylist(text, base);
         if (playlist.master) {
             const auto variant = chooseVariant(playlist.variants, config_.targetBitrate);
             if (!variant) {
-                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
+                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
                 return false;
             }
             if (variant->url != activePlaylistUrl_) {
-                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
+                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
                           << " target=" << config_.targetBitrate
                           << " url=" << variant->url << std::endl;
                 activePlaylistUrl_ = variant->url;
@@ -538,7 +621,7 @@ private:
             bytes.clear();
             effective.clear();
             if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "media-playlist",
-                                     kPlaylistHttpTransferTimeoutMs, playlistAttempts)) return false;
+                                     kPlaylistHttpTransferTimeoutMs, playlistAttempts, true)) return false;
             const std::string mediaText(bytes.begin(), bytes.end());
             playlist = parsePlaylist(mediaText, effective.empty() ? activePlaylistUrl_ : effective);
         }
@@ -571,7 +654,7 @@ private:
     bool decryptSegmentIfNeeded(const Segment& segment, std::vector<uint8_t>& bytes) {
         if (segment.keyUri.empty()) return true;
         if (segment.keyUri.rfind("unsupported:", 0) == 0) {
-            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " unsupported encryption method="
+            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " unsupported encryption method="
                       << segment.keyUri.substr(12) << " sequence=" << segment.sequence << std::endl;
             return false;
         }
@@ -582,7 +665,7 @@ private:
             if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key",
                                      kHttpTransferTimeoutMs)) return false;
             if (keyBody.size() < 16) {
-                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
+                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
                 return false;
             }
             cachedKey_.assign(keyBody.begin(), keyBody.begin() + 16);
@@ -617,7 +700,7 @@ private:
                   EVP_DecryptFinal_ex(ctx, plain.data() + out1, &out2) == 1;
         EVP_CIPHER_CTX_free(ctx);
         if (!ok) {
-            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
+            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
             return false;
         }
         plain.resize(static_cast<std::size_t>(out1 + out2));
@@ -634,7 +717,7 @@ private:
         while (start < bytes.size() && bytes[start] != 0x47) ++start;
         if (start >= bytes.size()) return true;
         if (start != 0) {
-            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " segment resync discarded=" << start
+            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " segment resync discarded=" << start
                       << " sequence=" << segment.sequence << std::endl;
         }
         const std::size_t usable = ((bytes.size() - start) / kTsPacketSize) * kTsPacketSize;
@@ -671,7 +754,7 @@ private:
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
             if (flow != GST_FLOW_OK) {
                 if (!stopping_.load(std::memory_order_relaxed)) {
-                    std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
+                    std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
                               << " appsrc push stopped flow=" << flow
                               << " sequence=" << segment.sequence << std::endl;
                 }
@@ -694,8 +777,9 @@ private:
         if (!decryptSegmentIfNeeded(segment, bytes)) return false;
         if (!pushSegment(segment, bytes)) return false;
         ++segmentsDownloaded_;
+        noteMediaRestored();
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
                   << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
@@ -708,9 +792,10 @@ private:
     }
 
     void run() {
-        activePlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
+        rootPlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
+        activePlaylistUrl_ = rootPlaylistUrl_;
         if (activePlaylistUrl_.empty()) return;
-        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
                   << " mode=duration-controlled"
                   << " low_ms=" << kLowAheadNs / 1000000ULL
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
@@ -729,6 +814,35 @@ private:
         uint64_t lastPlaylistLoadNs = monotonicNanoseconds();
 
         while (!stopping_.load(std::memory_order_relaxed)) {
+            if (sourceUnavailable()) {
+                // If a previously selected edge/media playlist vanished, probe
+                // the configured root/master again. This lets CDN edge changes
+                // recover without rebuilding the GStreamer pipeline.
+                if (!rootPlaylistUrl_.empty() && activePlaylistUrl_ != rootPlaylistUrl_) {
+                    std::cerr << "HLS SOURCE 203.21: stream=" << streamLabel()
+                              << " action=re-resolve-root-playlist url="
+                              << rootPlaylistUrl_ << std::endl;
+                    activePlaylistUrl_ = rootPlaylistUrl_;
+                }
+                std::unique_lock<std::mutex> lock(wakeMutex_);
+                wake_.wait_for(
+                    lock, std::chrono::milliseconds(kSourceUnavailableProbeMs), [&] {
+                        return stopping_.load(std::memory_order_relaxed);
+                    });
+                if (stopping_.load(std::memory_order_relaxed)) break;
+                lock.unlock();
+
+                MediaPlaylist recovered;
+                if (loadPlaylist(recovered, true)) {
+                    playlist = std::move(recovered);
+                    lastPlaylistLoadNs = monotonicNanoseconds();
+                    if (findSegmentIndex(playlist, nextSequence_) == std::nullopt) {
+                        nextSequence_ = chooseStartupSequence(playlist);
+                    }
+                }
+                continue;
+            }
+
             uint64_t ahead = aheadNs();
             if (!startup && ahead > kLowAheadNs) {
                 const uint64_t pollNs = playlistPollIntervalNs(playlist);
@@ -772,7 +886,7 @@ private:
                     if (nextSequence_ < first) {
                         const uint64_t old = nextSequence_;
                         nextSequence_ = chooseStartupSequence(playlist);
-                        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
+                        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
                                   << " fell behind live window old_sequence=" << old
                                   << " new_sequence=" << nextSequence_
                                   << " action=jump-near-live-edge" << std::endl;
@@ -806,12 +920,16 @@ private:
         }
     }
 
+    GstElement* pipeline_ = nullptr; // non-owning; scheduler lifetime is pipeline-owned
     GstElement* appsrc_ = nullptr;
     GstElement* terminalQueue_ = nullptr;
     StreamConfig config_;
     GstPad* terminalProbePad_ = nullptr;
     gulong terminalProbeId_ = 0;
     std::atomic<bool> stopping_{false};
+    std::atomic<int> sourceUnavailableStatus_{0};
+    std::atomic<bool> controlUnavailable_{false};
+    unsigned consecutiveUnavailableResponses_ = 0;
     std::atomic<uint64_t> consumedDurationNs_{0};
     uint64_t pushedDurationNs_ = 0;
     std::mutex consumptionMutex_;
@@ -823,15 +941,22 @@ private:
     std::thread worker_;
     std::mutex wakeMutex_;
     std::condition_variable wake_;
+    std::string rootPlaylistUrl_;
     std::string activePlaylistUrl_;
     std::string cachedKeyUri_;
     std::vector<uint8_t> cachedKey_;
 };
 
-Scheduler::Scheduler(GstElement* appsrc, GstElement* terminalQueue, StreamConfig config)
-    : impl_(std::make_unique<Impl>(appsrc, terminalQueue, std::move(config))) {}
+Scheduler::Scheduler(GstElement* pipeline, GstElement* appsrc, GstElement* terminalQueue, StreamConfig config)
+    : impl_(std::make_unique<Impl>(pipeline, appsrc, terminalQueue, std::move(config))) {}
 Scheduler::~Scheduler() = default;
 bool Scheduler::start(std::string& error) { return impl_->start(error); }
 void Scheduler::stop(bool sendEos) { impl_->stop(sendEos); }
+
+int sourceUnavailableHttpStatus(GstElement* pipeline) {
+    if (!pipeline) return 0;
+    return GPOINTER_TO_INT(g_object_get_data(
+        G_OBJECT(pipeline), kPipelineSourceUnavailableKey));
+}
 
 } // namespace tvs::hls_scheduler
