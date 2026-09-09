@@ -3079,6 +3079,11 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
 .quality-refresh{display:flex;align-items:center;gap:6px;color:#9aa3b1;font-size:.72rem;white-space:nowrap}
 .quality-refresh select{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:#121825;color:#d7deec;border-radius:8px;font-size:.72rem}
+.quality-charts{display:grid;gap:14px}
+.quality-output-chart{display:grid;gap:6px}
+.quality-output-chart-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 4px;color:#cfd8ea;font-size:.82rem}
+.quality-output-chart-head strong{color:#eef4ff;font-size:.88rem}
+.quality-output-chart-head span{color:#8f9bad;overflow-wrap:anywhere;text-align:right}
 .quality-board{position:relative;border:1px solid rgba(255,255,255,.1);background:#0f1622;border-radius:10px;padding:10px 10px 8px}
 .quality-board canvas{display:block;width:100%;height:320px;cursor:copy}
 .quality-legend{display:grid;grid-template-columns:1fr auto auto auto auto;gap:8px 18px;align-items:center;margin:10px 0 0;color:#cfd8ea;font-size:.78rem}
@@ -5704,7 +5709,7 @@ function storedQualityRefreshMs() {
   const value = stored === null ? 2000 : Number(stored);
   return qualityRefreshOptions.some(option => option.ms === value) ? value : 2000;
 }
-let qualityChart = {streamId:'', period:3600, samples:[], points:[], refreshMs:storedQualityRefreshMs(), timer:null};
+let qualityChart = {streamId:'', period:3600, samples:[], points:[], outputs:[], refreshMs:storedQualityRefreshMs(), timer:null};
 function stopQualityAutoRefresh() {
   clearInterval(qualityChart.timer);
   qualityChart.timer = null;
@@ -5739,6 +5744,7 @@ function openQualityModal(id, periodSeconds=3600) {
   stopQualityAutoRefresh();
   qualityChart.streamId = id;
   qualityChart.period = periodSeconds;
+  qualityChart.outputs = outputs;
   document.getElementById('modalContent').className = 'modal-content quality-modal';
   const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
   const refreshOptions = qualityRefreshOptions.map(option => `<option value="${option.ms}" ${option.ms===qualityChart.refreshMs?'selected':''}>${option.label}</option>`).join('');
@@ -5753,15 +5759,13 @@ function openQualityModal(id, periodSeconds=3600) {
         <label class="quality-refresh"><span>Автообновление</span><select onchange="setQualityAutoRefresh(Number(this.value))">${refreshOptions}</select></label>
       </div>
     </div>
-    <div class="quality-board">
-      <canvas id="qualityCanvas" width="1160" height="320"></canvas>
-    </div>
+    <div id="qualityCharts" class="quality-charts"></div>
     <div class="quality-decode">
       <strong>Расшифровка</strong>
       <span><i class="quality-line quality-input"></i> Зеленый — входной bitrate по левой шкале Mbit/s.</span>
-      <span><i class="quality-line quality-output"></i> Синий — выходной bitrate по левой шкале Mbit/s.</span>
+      <span><i class="quality-line quality-output"></i> Синий — bitrate конкретного выхода по левой шкале Mbit/s; каждый выход рисуется на отдельном графике.</span>
       <span><i class="quality-line quality-input-cc"></i> Оранжевый — CC-errors входного MPEG-TS по правой шкале.</span>
-      <span><i class="quality-line quality-output-cc"></i> Розовый — CC-errors выходного MPEG-TS по правой шкале.</span>
+      <span><i class="quality-line quality-output-cc"></i> Розовый — CC-errors общего выходного MPEG-TS до разветвления по правой шкале.</span>
       <span>Всплески CC-errors обычно означают потерю, дублирование или перестановку TS-пакетов.</span>
       <span>Клик по графику копирует картинку графика.</span>
     </div>
@@ -5792,11 +5796,59 @@ function renderQualityTabs(periodSeconds) {
     button.classList.toggle('active', qualityPeriods[index]?.seconds === periodSeconds);
   });
 }
+function qualityOutputLabel(output, index) {
+  const type = normalizedOutputType(output).toUpperCase();
+  const host = String(output?.output_host || '');
+  const port = Number(output?.output_port || 0);
+  const endpoint = host && port ? `${host}:${port}` : (host || (port ? String(port) : ''));
+  return `Выход ${index + 1}: ${type}${endpoint ? ` ${endpoint}` : ''}`;
+}
+function qualityOutputKbps(sample, output) {
+  const type = normalizedOutputType(output);
+  const cbrOutput = type === 'udp-cbr' ||
+    ((type === 'http' || type === 'hls' || type === 'srt') && !!output?.cbr);
+  const target = Number(sample?.target_kbps || 0);
+  if (cbrOutput && target > 0) return target;
+  return Number(sample?.output_kbps || 0);
+}
+function ensureQualityChartBoards(outputs) {
+  const host = document.getElementById('qualityCharts');
+  if (!host) return [];
+  const normalized = outputs.length ? outputs : [{output_type:'udp', output_host:'', output_port:0, cbr:false}];
+  const signature = JSON.stringify(normalized.map((output, index) => ({
+    index,
+    type: normalizedOutputType(output),
+    mode: output.output_mode || '',
+    host: output.output_host || '',
+    port: Number(output.output_port || 0),
+    iface: output.interface_address || ''
+  })));
+  if (host.dataset.signature !== signature) {
+    host.dataset.signature = signature;
+    host.innerHTML = normalized.map((output, index) => `
+      <div class="quality-output-chart">
+        <div class="quality-output-chart-head">
+          <strong>${escapeHtmlValue(qualityOutputLabel(output, index))}</strong>
+          <span>${index === 0 ? 'Основной выход' : 'Дополнительный выход'}</span>
+        </div>
+        <div class="quality-board">
+          <canvas id="qualityCanvas_${index}" width="1160" height="320" data-quality-output-index="${index}"></canvas>
+        </div>
+      </div>
+    `).join('');
+  }
+  return normalized.map((output, index) => ({output, index, canvas:document.getElementById(`qualityCanvas_${index}`)}));
+}
 function drawQualityChart(data) {
-  const canvas = document.getElementById('qualityCanvas');
   const details = document.getElementById('qualityDetails');
   const errors = document.getElementById('qualityErrors');
-  if (!canvas || !details || !errors) return;
+  if (!details || !errors) return;
+  const samples = data.samples || [];
+  const stream = (state.streams || []).find(item => item.id === qualityChart.streamId) || {};
+  const outputs = qualityChart.outputs?.length ? qualityChart.outputs : outputConfigsForStream(stream);
+  const charts = ensureQualityChartBoards(outputs);
+  if (!charts.length) return;
+
   const setupCanvas = (target, height) => {
     const targetRect = target.getBoundingClientRect();
     const targetRatio = window.devicePixelRatio || 1;
@@ -5806,19 +5858,7 @@ function drawQualityChart(data) {
     targetContext.setTransform(targetRatio, 0, 0, targetRatio, 0, 0);
     return {ctx: targetContext, width: target.width / targetRatio, height};
   };
-  const chart = setupCanvas(canvas, 320);
-  const ctx = chart.ctx;
-  const width = chart.width;
-  const height = chart.height;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = '#0f1622';
-  ctx.fillRect(0, 0, width, height);
-
-  const samples = data.samples || [];
-  const stream = (state.streams || []).find(item => item.id === qualityChart.streamId) || {};
   const streamName = stream.name || data.id || 'Поток';
-  const streamLinkText = (stream.vlc_links && stream.vlc_links[0]?.url) || stream.vlc_link || stream.input_uri || '';
-  const title = `${state.server_name || 'TVStreammerSAT5'}: Поток: ${streamName}${streamLinkText ? ` (${streamLinkText})` : ''}`;
   const edgeTime = ts => {
     const date = new Date(ts * 1000);
     const day = String(date.getDate()).padStart(2, '0');
@@ -5854,169 +5894,191 @@ function drawQualityChart(data) {
     <div class="value">${formatter(stats.max)}</div>
   `;
 
-  if (!samples.length) {
+  qualityChart.points = [];
+  const inputBitrateValues = samples.map(s => Number(s.input_kbps || 0));
+  const inputCcValues = samples.map(s => Number(s.input_cc_errors ?? s.cc_errors ?? 0));
+  const outputCcValues = samples.map(s => Number(s.output_cc_errors || 0));
+  const outputSeries = charts.map(({output, index}) => ({
+    output,
+    index,
+    values:samples.map(sample => qualityOutputKbps(sample, output))
+  }));
+
+  charts.forEach(({output, index, canvas}) => {
+    if (!canvas) return;
+    const chart = setupCanvas(canvas, 320);
+    const ctx = chart.ctx;
+    const width = chart.width;
+    const height = chart.height;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#0f1622';
+    ctx.fillRect(0, 0, width, height);
+
+    if (!samples.length) {
+      ctx.fillStyle = '#cfd8ea';
+      ctx.font = '700 13px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
+      canvas.onclick = () => copyQualityChartImage(canvas);
+      return;
+    }
+
+    const outputBitrateValues = outputSeries[index]?.values || samples.map(s => Number(s.output_kbps || 0));
+    const left = 74, right = 64, top = 36, bottom = 70;
+    const plotW = width - left - right;
+    const plotH = height - top - bottom;
+    const plotRight = left + plotW;
+    const plotBottom = top + plotH;
+    const endTs = data.generated_at || Math.floor(Date.now()/1000);
+    const startTs = endTs - (data.period_seconds || qualityChart.period);
+    const bitrateValues = [...inputBitrateValues, ...outputBitrateValues];
+    const ccValues = [...inputCcValues, ...outputCcValues];
+    const maxBitrateMbit = Math.max(1, ...bitrateValues.map(value => value / 1000));
+    const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
+    const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
+    const maxCcErrors = Math.max(1, ...ccValues);
+    const niceAxis = (maxValue, targetTicks) => {
+      const rawMax = Math.max(1, Number(maxValue || 0));
+      const roughStep = rawMax / Math.max(1, targetTicks);
+      const exponent = Math.floor(Math.log10(roughStep));
+      const base = Math.pow(10, exponent);
+      const fraction = roughStep / base;
+      const niceFraction = fraction <= 1 ? 1 : (fraction <= 2 ? 2 : (fraction <= 5 ? 5 : 10));
+      const step = niceFraction * base;
+      return {max: Math.ceil(rawMax / step) * step, step};
+    };
+    const rightTickCount = Math.max(4, Math.min(8, Math.floor(plotH / 38)));
+    const rightAxis = niceAxis(Math.max(5, maxCcErrors * 1.25), rightTickCount);
+    const rightMax = Math.max(5, rightAxis.max);
+    const rightStep = Math.max(1, rightAxis.step);
+
     ctx.fillStyle = '#cfd8ea';
     ctx.font = '700 13px Arial';
     ctx.textAlign = 'center';
-    ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
+    let titleText = `${state.server_name || 'TVStreammerSAT5'}: ${streamName} — ${qualityOutputLabel(output, index)}`;
+    while (ctx.measureText(titleText).width > plotW && titleText.length > 24) {
+      titleText = titleText.slice(0, -4) + '...';
+    }
+    ctx.fillText(titleText, width / 2, 18);
+
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,.24)';
+    ctx.beginPath();
+    ctx.moveTo(left, top - 8);
+    ctx.lineTo(left, plotBottom);
+    ctx.lineTo(plotRight, plotBottom);
+    ctx.moveTo(plotRight, top - 8);
+    ctx.lineTo(plotRight, plotBottom);
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(255,255,255,.13)';
+    ctx.setLineDash([2, 2]);
+    ctx.fillStyle = '#c8d0dc';
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'right';
+    for (let value=0; value<=leftMaxMbit; value+=bitrateStep) {
+      const y = plotBottom - (value / leftMaxMbit) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(left, y);
+      ctx.lineTo(plotRight, y);
+      ctx.stroke();
+      ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
+    }
+    ctx.textAlign = 'right';
+    for (let value=0; value<=rightMax + rightStep * .5; value+=rightStep) {
+      const y = plotBottom - (value / rightMax) * plotH;
+      ctx.fillText(String(Math.round(value)), width - 8, y + 4);
+    }
+
+    ctx.textAlign = 'center';
+    const tickCount = Math.max(4, Math.min(20, Math.floor(plotW / 64)));
+    for (let i=0;i<=tickCount;i++) {
+      const correctedX = left + plotW * i / tickCount;
+      const ts = startTs + (endTs - startTs) * i / tickCount;
+      ctx.beginPath();
+      ctx.moveTo(correctedX, top);
+      ctx.lineTo(correctedX, plotBottom);
+      ctx.stroke();
+      const edge = i === 0 || i === tickCount;
+      ctx.save();
+      ctx.translate(correctedX, height - 10);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillStyle = edge ? '#ff7f7f' : '#c8d0dc';
+      ctx.textAlign = 'left';
+      ctx.fillText(edge ? edgeTime(ts) : formatTime(ts, data.period_seconds), 0, 4);
+      ctx.restore();
+    }
+    ctx.setLineDash([]);
+
+    const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
+    const bitrateYFor = kbps => plotBottom - Math.min(kbps / 1000, leftMaxMbit) / leftMaxMbit * plotH;
+    const ccYFor = value => plotBottom - Math.min(value, rightMax) / rightMax * plotH;
+    const drawSeries = (values, color, yFor, widthPx=2) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = widthPx;
+      ctx.beginPath();
+      let started = false;
+      samples.forEach((sample, sampleIndex) => {
+        const value = values[sampleIndex] || 0;
+        const x = xFor(sample.ts);
+        const y = yFor(value);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+      });
+      ctx.stroke();
+    };
+    const drawCcBars = (values, color, offset) => {
+      ctx.fillStyle = color;
+      samples.forEach((sample, sampleIndex) => {
+        const value = values[sampleIndex] || 0;
+        if (!value) return;
+        const x = xFor(sample.ts) + offset;
+        const y = ccYFor(value);
+        ctx.fillRect(x - 1.5, y, 3, plotBottom - y);
+      });
+    };
+    drawCcBars(inputCcValues, 'rgba(255,159,26,.30)', -2);
+    drawCcBars(outputCcValues, 'rgba(255,79,154,.30)', 2);
+    drawSeries(inputCcValues, '#ff9f1a', ccYFor, 1.8);
+    drawSeries(outputCcValues, '#ff4f9a', ccYFor, 1.8);
+    drawSeries(inputBitrateValues, '#26ef46', bitrateYFor, 2.5);
+    drawSeries(outputBitrateValues, '#36a3ff', bitrateYFor, 2.5);
+
+    samples.forEach((sample, sampleIndex) => {
+      const x = xFor(sample.ts);
+      const inputY = bitrateYFor(inputBitrateValues[sampleIndex] || 0);
+      const outputY = bitrateYFor(outputBitrateValues[sampleIndex] || 0);
+      ctx.fillStyle = '#26ef46';
+      ctx.beginPath();
+      ctx.arc(x, inputY, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#36a3ff';
+      ctx.beginPath();
+      ctx.arc(x, outputY, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      qualityChart.points.push({outputIndex:index, x, y:(inputY + outputY) / 2, sample});
+    });
+    canvas.onclick = () => copyQualityChartImage(canvas);
+  });
+
+  if (!samples.length) {
     details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
     errors.innerHTML = '';
-    qualityChart.points = [];
-    canvas.onclick = () => copyQualityChartImage(canvas);
     return;
   }
 
-  const left = 74, right = 64, top = 36, bottom = 70;
-  const plotW = width - left - right;
-  const plotH = height - top - bottom;
-  const plotRight = left + plotW;
-  const plotBottom = top + plotH;
-  const endTs = data.generated_at || Math.floor(Date.now()/1000);
-  const startTs = endTs - (data.period_seconds || qualityChart.period);
-  const inputBitrateValues = samples.map(s => s.input_kbps || 0);
-  const outputBitrateValues = samples.map(s => s.output_kbps || 0);
-  const inputCcValues = samples.map(s => s.input_cc_errors ?? s.cc_errors ?? 0);
-  const outputCcValues = samples.map(s => s.output_cc_errors || 0);
-  const bitrateValues = [...inputBitrateValues, ...outputBitrateValues];
-  const ccValues = [...inputCcValues, ...outputCcValues];
-  const maxBitrateMbit = Math.max(1, ...bitrateValues.map(value => value / 1000));
-  const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
-  const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
-  const maxCcErrors = Math.max(1, ...ccValues);
-  const niceAxis = (maxValue, targetTicks) => {
-    const rawMax = Math.max(1, Number(maxValue || 0));
-    const roughStep = rawMax / Math.max(1, targetTicks);
-    const exponent = Math.floor(Math.log10(roughStep));
-    const base = Math.pow(10, exponent);
-    const fraction = roughStep / base;
-    const niceFraction = fraction <= 1 ? 1 : (fraction <= 2 ? 2 : (fraction <= 5 ? 5 : 10));
-    const step = niceFraction * base;
-    return {max: Math.ceil(rawMax / step) * step, step};
-  };
-  const rightTickCount = Math.max(4, Math.min(8, Math.floor(plotH / 38)));
-  const rightAxis = niceAxis(Math.max(5, maxCcErrors * 1.25), rightTickCount);
-  const rightMax = Math.max(5, rightAxis.max);
-  const rightStep = Math.max(1, rightAxis.step);
-
-  ctx.fillStyle = '#cfd8ea';
-  ctx.font = '700 13px Arial';
-  ctx.textAlign = 'center';
-  let titleText = title;
-  while (ctx.measureText(titleText).width > plotW && titleText.length > 24) {
-    titleText = titleText.slice(0, -4) + '...';
-  }
-  ctx.fillText(titleText, width / 2, 18);
-
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = 'rgba(255,255,255,.24)';
-  ctx.beginPath();
-  ctx.moveTo(left, top - 8);
-  ctx.lineTo(left, plotBottom);
-  ctx.lineTo(plotRight, plotBottom);
-  ctx.moveTo(plotRight, top - 8);
-  ctx.lineTo(plotRight, plotBottom);
-  ctx.stroke();
-
-  ctx.strokeStyle = 'rgba(255,255,255,.13)';
-  ctx.setLineDash([2, 2]);
-  ctx.fillStyle = '#c8d0dc';
-  ctx.font = '11px Arial';
-  ctx.textAlign = 'right';
-  for (let value=0; value<=leftMaxMbit; value+=bitrateStep) {
-    const y = plotBottom - (value / leftMaxMbit) * plotH;
-    ctx.beginPath();
-    ctx.moveTo(left, y);
-    ctx.lineTo(plotRight, y);
-    ctx.stroke();
-    ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
-  }
-  ctx.textAlign = 'right';
-  for (let value=0; value<=rightMax + rightStep * .5; value+=rightStep) {
-    const y = plotBottom - (value / rightMax) * plotH;
-    ctx.fillText(String(Math.round(value)), width - 8, y + 4);
-  }
-
-  ctx.textAlign = 'center';
-  const tickCount = Math.max(4, Math.min(20, Math.floor(plotW / 64)));
-  for (let i=0;i<=tickCount;i++) {
-    const correctedX = left + plotW * i / tickCount;
-    const ts = startTs + (endTs - startTs) * i / tickCount;
-    ctx.beginPath();
-    ctx.moveTo(correctedX, top);
-    ctx.lineTo(correctedX, plotBottom);
-    ctx.stroke();
-    const edge = i === 0 || i === tickCount;
-    ctx.save();
-    ctx.translate(correctedX, height - 10);
-    ctx.rotate(-Math.PI / 2);
-    ctx.fillStyle = edge ? '#ff7f7f' : '#c8d0dc';
-    ctx.textAlign = 'left';
-    ctx.fillText(edge ? edgeTime(ts) : formatTime(ts, data.period_seconds), 0, 4);
-    ctx.restore();
-  }
-  ctx.setLineDash([]);
-
-  const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
-  const bitrateYFor = kbps => plotBottom - Math.min(kbps / 1000, leftMaxMbit) / leftMaxMbit * plotH;
-  const ccYFor = value => plotBottom - Math.min(value, rightMax) / rightMax * plotH;
-  const drawSeries = (values, color, yFor, widthPx=2) => {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = widthPx;
-    ctx.beginPath();
-    let started = false;
-    samples.forEach((s, index) => {
-      const value = values[index] || 0;
-      const x = xFor(s.ts);
-      const y = yFor(value);
-      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
-    });
-    ctx.stroke();
-  };
-
-  const drawCcBars = (values, color, offset) => {
-    ctx.fillStyle = color;
-    samples.forEach((s, index) => {
-      const value = values[index] || 0;
-      if (!value) return;
-      const x = xFor(s.ts) + offset;
-      const y = ccYFor(value);
-      ctx.fillRect(x - 1.5, y, 3, plotBottom - y);
-    });
-  };
-  drawCcBars(inputCcValues, 'rgba(255,159,26,.30)', -2);
-  drawCcBars(outputCcValues, 'rgba(255,79,154,.30)', 2);
-  drawSeries(inputCcValues, '#ff9f1a', ccYFor, 1.8);
-  drawSeries(outputCcValues, '#ff4f9a', ccYFor, 1.8);
-  drawSeries(inputBitrateValues, '#26ef46', bitrateYFor, 2.5);
-  drawSeries(outputBitrateValues, '#36a3ff', bitrateYFor, 2.5);
-
-  qualityChart.points = [];
-  samples.forEach(s => {
-    const x = xFor(s.ts);
-    const inputY = bitrateYFor(s.input_kbps || 0);
-    const outputY = bitrateYFor(s.output_kbps || 0);
-    ctx.fillStyle = '#26ef46';
-    ctx.beginPath();
-    ctx.arc(x, inputY, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#36a3ff';
-    ctx.beginPath();
-    ctx.arc(x, outputY, 2.5, 0, Math.PI * 2);
-    ctx.fill();
-    qualityChart.points.push({x, y:(inputY + outputY) / 2, sample:s});
-  });
-
   const inputBitrateStats = statsFor(inputBitrateValues);
-  const outputBitrateStats = statsFor(outputBitrateValues);
   const inputCcStats = statsFor(inputCcValues);
   const outputCcStats = statsFor(outputCcValues);
+  const outputRows = outputSeries.map(({output, index, values}) =>
+    statsRow('quality-output', `${streamName} — ${qualityOutputLabel(output, index)}`, `[out ${index + 1}]`, statsFor(values), formatMbitValue)
+  ).join('');
   details.innerHTML = `
     <div class="quality-stats">
       <div></div><div></div><div class="head">посл</div><div class="head">мин</div><div class="head">сред</div><div class="head">макс</div>
       ${statsRow('quality-input', `${streamName} — входной bitrate`, '[input]', inputBitrateStats, formatMbitValue)}
-      ${statsRow('quality-output', `${streamName} — выходной bitrate`, '[output]', outputBitrateStats, formatMbitValue)}
+      ${outputRows}
       ${statsRow('quality-input-cc', `${streamName} — входные CC-errors`, '[input]', inputCcStats, value => formatMetricNumber(value))}
-      ${statsRow('quality-output-cc', `${streamName} — выходные CC-errors`, '[output]', outputCcStats, value => formatMetricNumber(value))}
+      ${statsRow('quality-output-cc', `${streamName} — выходные CC-errors (общий TS до разветвления)`, '[output]', outputCcStats, value => formatMetricNumber(value))}
     </div>
   `;
   const bad = samples.filter(s => s.level !== 'ok' || (s.input_cc_errors ?? s.cc_errors ?? 0) > 0 || (s.output_cc_errors || 0) > 0).slice(-30).reverse();
@@ -6028,7 +6090,6 @@ function drawQualityChart(data) {
         return `<div><span style="color:${markerColor}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC input: ${inputCc} · CC output: ${outputCc}</span></div>`;
       }).join('')
     : '<div><span style="color:#17c261">●</span><span>За выбранный период входных и выходных CC-errors и других ошибок нет</span></div>';
-  canvas.onclick = () => copyQualityChartImage(canvas);
 }
 function copyQualityChartImage(canvas) {
   const notice = document.getElementById('qualityCopyNotice');
