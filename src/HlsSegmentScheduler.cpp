@@ -645,7 +645,7 @@ private:
                 ? kSourceUnavailableProbeMs
                 : (defer ? 0 : std::min<uint64_t>(
                     2000, 250ULL << std::min<unsigned>(attempt - 1, 3)));
-            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " " << what
+            std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " " << what
                       << " fetch failed attempt=" << attempt
                       << " url=" << url
                       << " error=" << error
@@ -675,11 +675,11 @@ private:
         if (playlist.master) {
             const auto variant = chooseVariant(playlist.variants, config_.targetBitrate);
             if (!variant) {
-                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
+                std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
                 return false;
             }
             if (variant->url != activePlaylistUrl_) {
-                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
+                std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
                           << " target=" << config_.targetBitrate
                           << " url=" << variant->url << std::endl;
                 activePlaylistUrl_ = variant->url;
@@ -720,7 +720,7 @@ private:
     bool decryptSegmentIfNeeded(const Segment& segment, std::vector<uint8_t>& bytes) {
         if (segment.keyUri.empty()) return true;
         if (segment.keyUri.rfind("unsupported:", 0) == 0) {
-            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " unsupported encryption method="
+            std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " unsupported encryption method="
                       << segment.keyUri.substr(12) << " sequence=" << segment.sequence << std::endl;
             return false;
         }
@@ -731,7 +731,7 @@ private:
             if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key",
                                      kHttpTransferTimeoutMs)) return false;
             if (keyBody.size() < 16) {
-                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
+                std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
                 return false;
             }
             cachedKey_.assign(keyBody.begin(), keyBody.begin() + 16);
@@ -766,7 +766,7 @@ private:
                   EVP_DecryptFinal_ex(ctx, plain.data() + out1, &out2) == 1;
         EVP_CIPHER_CTX_free(ctx);
         if (!ok) {
-            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
+            std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
             return false;
         }
         plain.resize(static_cast<std::size_t>(out1 + out2));
@@ -783,7 +783,7 @@ private:
         while (start < bytes.size() && bytes[start] != 0x47) ++start;
         if (start >= bytes.size()) return true;
         if (start != 0) {
-            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " segment resync discarded=" << start
+            std::cerr << "HLS scheduler 203.25: stream=" << streamLabel() << " segment resync discarded=" << start
                       << " sequence=" << segment.sequence << std::endl;
         }
         const std::size_t usable = ((bytes.size() - start) / kTsPacketSize) * kTsPacketSize;
@@ -820,7 +820,7 @@ private:
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
             if (flow != GST_FLOW_OK) {
                 if (!stopping_.load(std::memory_order_relaxed)) {
-                    std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
+                    std::cerr << "HLS scheduler 203.25: stream=" << streamLabel()
                               << " appsrc push stopped flow=" << flow
                               << " sequence=" << segment.sequence << std::endl;
                 }
@@ -864,7 +864,7 @@ private:
         ++segmentsDownloaded_;
         noteMediaRestored();
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.25: stream=" << streamLabel()
                   << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
@@ -881,7 +881,7 @@ private:
         rootPlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
         activePlaylistUrl_ = rootPlaylistUrl_;
         if (activePlaylistUrl_.empty()) return;
-        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.25: stream=" << streamLabel()
                   << " mode=duration-controlled"
                   << " low_ms=" << kLowAheadNs / 1000000ULL
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
@@ -972,7 +972,7 @@ private:
                     if (nextSequence_ < first) {
                         const uint64_t old = nextSequence_;
                         nextSequence_ = chooseStartupSequence(playlist);
-                        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
+                        std::cerr << "HLS scheduler 203.25: stream=" << streamLabel()
                                   << " fell behind live window old_sequence=" << old
                                   << " new_sequence=" << nextSequence_
                                   << " action=jump-near-live-edge" << std::endl;
@@ -983,7 +983,31 @@ private:
                     const Segment& segment = playlist.segments[*index];
                     const uint64_t durationNs = std::max<uint64_t>(
                         1ULL, static_cast<uint64_t>(segment.durationSeconds * static_cast<double>(kNsPerSecond)));
-                    if (!startup && ahead > 0 && ahead + durationNs > kHighAheadNs) break;
+                    // 203.25: LOW is the urgent refill threshold.  For long HLS
+                    // segments (for example 10-11 s), LOW(6 s) + segment duration
+                    // can exceed the historical HIGH(12 s).  Refusing that segment
+                    // here delays the refill until ~1-2 s remain and can drain the
+                    // pipeline before the next media segment is pushed.
+                    //
+                    // HIGH remains a soft cap: while above LOW we do not enter this
+                    // download loop at all, and after one long segment is pushed the
+                    // TARGET check at the top of the loop stops further prefetch.
+                    // Therefore, when we are already at/below LOW, allow one segment
+                    // even if its projected ahead crosses HIGH.
+                    const bool urgentLowWaterRefill = !startup && ahead <= kLowAheadNs;
+                    const bool projectedAboveHigh =
+                        !startup && ahead > 0 && ahead + durationNs > kHighAheadNs;
+                    if (projectedAboveHigh && !urgentLowWaterRefill) break;
+                    if (projectedAboveHigh && urgentLowWaterRefill) {
+                        std::cerr << "HLS REFILL 203.25: stream=" << streamLabel()
+                                  << " ahead_ms=" << ahead / 1000000ULL
+                                  << " segment_duration_ms=" << durationNs / 1000000ULL
+                                  << " projected_ahead_ms=" << (ahead + durationNs) / 1000000ULL
+                                  << " low_ms=" << kLowAheadNs / 1000000ULL
+                                  << " high_ms=" << kHighAheadNs / 1000000ULL
+                                  << " action=allow-one-segment-at-low-water"
+                                  << std::endl;
+                    }
                     if (!downloadAndPush(segment)) return;
                     nextSequence_ = segment.sequence + 1;
                     madeProgress = true;

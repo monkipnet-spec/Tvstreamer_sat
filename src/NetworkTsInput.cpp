@@ -406,7 +406,7 @@ GstElement* buildHls(
         });
 
     terminalElement = queue;
-    std::cerr << "Network TS input 203.24: protocol=HLS"
+    std::cerr << "Network TS input 203.25: protocol=HLS"
               << " source=duration-controlled-segment-scheduler+appsrc"
               << " low_ahead_ms=6000 target_ahead_ms=8000 high_ahead_ms=12000"
               << " min_start_segments=2 segment_fetch=full-speed-on-demand"
