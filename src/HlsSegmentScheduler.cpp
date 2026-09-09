@@ -46,6 +46,13 @@ constexpr uint64_t kPlaylistPollMaxNs = 2ULL * kNsPerSecond;
 // the stream watchdog rebuild an identical pipeline every 15/30/60 seconds.
 constexpr unsigned kSourceUnavailableConfirmations = 3;
 constexpr uint64_t kSourceUnavailableProbeMs = 30000;
+// 203.23: smooth segment byte/EXTINF density over a media-time window. This
+// removes per-GOP VBR noise while still adapting within a few segments if the
+// provider changes variant/rate.
+constexpr uint64_t kMediaRateWindowTargetNs = 30ULL * kNsPerSecond;
+constexpr std::size_t kMediaRateWindowMaxSegments = 12;
+constexpr uint64_t kMinimumPublishedMediaBitrate = 100000ULL;
+constexpr uint64_t kMaximumPublishedMediaBitrate = 200000000ULL;
 
 std::once_flag gCurlInitOnce;
 
@@ -386,10 +393,11 @@ public:
 
     void stop(bool sendEos = true) {
         const bool wasStopping = stopping_.exchange(true, std::memory_order_relaxed);
-        // 203.22: teardown/recovery must never inherit a stale buffered-ahead
-        // guard from the retiring scheduler generation.
+        // 203.22/203.23: teardown/recovery must never inherit stale scheduler
+        // state from the retiring pipeline generation.
         if (pipeline_) {
             g_object_set_data(G_OBJECT(pipeline_), kPipelineBufferedUntilSecKey, nullptr);
+            g_object_set_data(G_OBJECT(pipeline_), kPipelineMediaBitrateKey, nullptr);
         }
         wake_.notify_all();
         if (sendEos && !wasStopping && appsrc_ && GST_IS_APP_SRC(appsrc_)) {
@@ -406,6 +414,11 @@ private:
     struct ConsumptionSpan {
         std::size_t remainingBytes = 0;
         uint64_t remainingDurationNs = 0;
+    };
+
+    struct MediaRateSpan {
+        uint64_t bytes = 0;
+        uint64_t durationNs = 0;
     };
 
     GstPadProbeReturn onTerminalBuffer(GstPadProbeInfo* info) {
@@ -473,6 +486,54 @@ private:
     uint64_t aheadNs() const {
         const uint64_t consumed = effectiveConsumedNs();
         return pushedDurationNs_ > consumed ? pushedDurationNs_ - consumed : 0;
+    }
+
+    uint64_t publishDurationMediaRate(
+        uint64_t bytes, uint64_t durationNs, bool discontinuity) {
+        if (bytes == 0 || durationNs == 0) return 0;
+
+        if (discontinuity) {
+            mediaRateWindow_.clear();
+            mediaRateWindowBytes_ = 0;
+            mediaRateWindowDurationNs_ = 0;
+        }
+
+        mediaRateWindow_.push_back({bytes, durationNs});
+        mediaRateWindowBytes_ += bytes;
+        mediaRateWindowDurationNs_ += durationNs;
+
+        while (mediaRateWindow_.size() > 1 &&
+               (mediaRateWindow_.size() > kMediaRateWindowMaxSegments ||
+                mediaRateWindowDurationNs_ > kMediaRateWindowTargetNs)) {
+            const auto oldest = mediaRateWindow_.front();
+            mediaRateWindow_.pop_front();
+            mediaRateWindowBytes_ -= oldest.bytes;
+            mediaRateWindowDurationNs_ -= oldest.durationNs;
+        }
+
+        if (mediaRateWindowBytes_ == 0 || mediaRateWindowDurationNs_ == 0) return 0;
+#if defined(__SIZEOF_INT128__)
+        const uint64_t bitrate = static_cast<uint64_t>(
+            (static_cast<__uint128_t>(mediaRateWindowBytes_) * 8ULL * kNsPerSecond) /
+            mediaRateWindowDurationNs_);
+#else
+        const long double bitrateWide =
+            static_cast<long double>(mediaRateWindowBytes_) * 8.0L *
+            static_cast<long double>(kNsPerSecond) /
+            static_cast<long double>(mediaRateWindowDurationNs_);
+        const uint64_t bitrate = static_cast<uint64_t>(bitrateWide);
+#endif
+        if (bitrate < kMinimumPublishedMediaBitrate ||
+            bitrate > kMaximumPublishedMediaBitrate) {
+            return 0;
+        }
+
+        if (pipeline_) {
+            g_object_set_data(
+                G_OBJECT(pipeline_), kPipelineMediaBitrateKey,
+                GUINT_TO_POINTER(static_cast<guint>(bitrate)));
+        }
+        return bitrate;
     }
 
     bool waitForRefillNeed(uint64_t maxWaitNs) {
@@ -584,7 +645,7 @@ private:
                 ? kSourceUnavailableProbeMs
                 : (defer ? 0 : std::min<uint64_t>(
                     2000, 250ULL << std::min<unsigned>(attempt - 1, 3)));
-            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " " << what
+            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " " << what
                       << " fetch failed attempt=" << attempt
                       << " url=" << url
                       << " error=" << error
@@ -614,11 +675,11 @@ private:
         if (playlist.master) {
             const auto variant = chooseVariant(playlist.variants, config_.targetBitrate);
             if (!variant) {
-                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
+                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
                 return false;
             }
             if (variant->url != activePlaylistUrl_) {
-                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
+                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
                           << " target=" << config_.targetBitrate
                           << " url=" << variant->url << std::endl;
                 activePlaylistUrl_ = variant->url;
@@ -659,7 +720,7 @@ private:
     bool decryptSegmentIfNeeded(const Segment& segment, std::vector<uint8_t>& bytes) {
         if (segment.keyUri.empty()) return true;
         if (segment.keyUri.rfind("unsupported:", 0) == 0) {
-            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " unsupported encryption method="
+            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " unsupported encryption method="
                       << segment.keyUri.substr(12) << " sequence=" << segment.sequence << std::endl;
             return false;
         }
@@ -670,7 +731,7 @@ private:
             if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key",
                                      kHttpTransferTimeoutMs)) return false;
             if (keyBody.size() < 16) {
-                std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
+                std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
                 return false;
             }
             cachedKey_.assign(keyBody.begin(), keyBody.begin() + 16);
@@ -705,7 +766,7 @@ private:
                   EVP_DecryptFinal_ex(ctx, plain.data() + out1, &out2) == 1;
         EVP_CIPHER_CTX_free(ctx);
         if (!ok) {
-            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
+            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
             return false;
         }
         plain.resize(static_cast<std::size_t>(out1 + out2));
@@ -722,7 +783,7 @@ private:
         while (start < bytes.size() && bytes[start] != 0x47) ++start;
         if (start >= bytes.size()) return true;
         if (start != 0) {
-            std::cerr << "HLS scheduler 203.21: stream=" << streamLabel() << " segment resync discarded=" << start
+            std::cerr << "HLS scheduler 203.23: stream=" << streamLabel() << " segment resync discarded=" << start
                       << " sequence=" << segment.sequence << std::endl;
         }
         const std::size_t usable = ((bytes.size() - start) / kTsPacketSize) * kTsPacketSize;
@@ -759,7 +820,7 @@ private:
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
             if (flow != GST_FLOW_OK) {
                 if (!stopping_.load(std::memory_order_relaxed)) {
-                    std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
+                    std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
                               << " appsrc push stopped flow=" << flow
                               << " sequence=" << segment.sequence << std::endl;
                 }
@@ -770,6 +831,8 @@ private:
         }
         if (stopping_.load(std::memory_order_relaxed)) return false;
         pushedDurationNs_ += segmentDurationNs;
+        publishDurationMediaRate(
+            static_cast<uint64_t>(usable), segmentDurationNs, segment.discontinuity);
         // 203.22: publish a conservative wall-clock reservoir deadline.
         // Capture the scheduler's exact ahead immediately after the push. The
         // whole-second value is rounded DOWN, so the monitor never claims more
@@ -801,10 +864,11 @@ private:
         ++segmentsDownloaded_;
         noteMediaRestored();
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
                   << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
+                  << " media_rate_bps=" << durationBasedMediaBitrate(pipeline_)
                   << " ahead_ms=" << ahead / 1000000ULL
                   << " downloaded=" << segmentsDownloaded_
                   << " consumed_effective_ms=" << effectiveConsumedNs() / 1000000ULL
@@ -817,7 +881,7 @@ private:
         rootPlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
         activePlaylistUrl_ = rootPlaylistUrl_;
         if (activePlaylistUrl_.empty()) return;
-        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
                   << " mode=duration-controlled"
                   << " low_ms=" << kLowAheadNs / 1000000ULL
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
@@ -908,7 +972,7 @@ private:
                     if (nextSequence_ < first) {
                         const uint64_t old = nextSequence_;
                         nextSequence_ = chooseStartupSequence(playlist);
-                        std::cerr << "HLS scheduler 203.21: stream=" << streamLabel()
+                        std::cerr << "HLS scheduler 203.23: stream=" << streamLabel()
                                   << " fell behind live window old_sequence=" << old
                                   << " new_sequence=" << nextSequence_
                                   << " action=jump-near-live-edge" << std::endl;
@@ -956,6 +1020,9 @@ private:
     uint64_t pushedDurationNs_ = 0;
     std::mutex consumptionMutex_;
     std::deque<ConsumptionSpan> consumptionSpans_;
+    std::deque<MediaRateSpan> mediaRateWindow_;
+    uint64_t mediaRateWindowBytes_ = 0;
+    uint64_t mediaRateWindowDurationNs_ = 0;
     uint64_t firstPushMonotonicNs_ = 0;
     uint64_t nextSequence_ = 0;
     uint64_t segmentsDownloaded_ = 0;
@@ -990,6 +1057,12 @@ uint64_t guaranteedBufferedAheadMilliseconds(GstElement* pipeline) {
     return bufferedUntilSec > nowSec
         ? (bufferedUntilSec - nowSec) * 1000ULL
         : 0;
+}
+
+uint64_t durationBasedMediaBitrate(GstElement* pipeline) {
+    if (!pipeline) return 0;
+    return static_cast<uint64_t>(GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), kPipelineMediaBitrateKey)));
 }
 
 } // namespace tvs::hls_scheduler

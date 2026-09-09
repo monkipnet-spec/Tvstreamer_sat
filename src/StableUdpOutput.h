@@ -31,7 +31,8 @@ MemoryStats memoryStats();
 // sender instances; the caller persists the stream-level target separately.
 std::size_t raiseCbrTargetBitrate(const std::string& streamId, uint64_t bitrate);
 // Highest current media-rate estimate among StableUDP senders for this stream.
-// Unlike socket arrival bitrate, HLS uses its PTS/PCR-derived media clock here.
+// Unlike socket arrival bitrate, HLS 203.23 uses scheduler segment bytes/EXTINF
+// duration as its primary media clock, with legacy PTS/PCR only as startup fallback.
 uint64_t maxInputBitrateEstimate(const std::string& streamId);
 
 GstElement* createSink(

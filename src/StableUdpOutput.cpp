@@ -1,4 +1,5 @@
 #include "StableUdpOutput.h"
+#include "HlsSegmentScheduler.h"
 #include "TsCcStageTrace.h"
 #include "protocols/inputs/GstSrtInputProtocol.h"
 
@@ -717,8 +718,9 @@ std::size_t findPatOffset(const guint8* data, std::size_t size, std::size_t mini
 
 class StableUdpSender {
 public:
-    StableUdpSender(const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
+    StableUdpSender(GstElement* pipeline, const StreamConfig& cfg, std::string& error, std::atomic<uint64_t>* networkBytesCounter)
         : streamId(cfg.id),
+          ownerPipeline(pipeline),
           srtInput(tvs::protocols::inputs::isSrtInput(cfg)),
           tvStreamer5IpProfile(useTvStreamer5IpShaperProfile(cfg)),
           srtRemapCbrSourcePcr(useSrtRemapCbrSourcePcr(cfg)),
@@ -1933,16 +1935,23 @@ private:
                 observeNetworkArrivalRate(nowNanoseconds, bytesNow);
             }
 
+            const uint64_t hlsDurationRate = segmentedHlsInput
+                ? tvs::hls_scheduler::durationBasedMediaBitrate(ownerPipeline) : 0;
             const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
-            if (segmentedHlsInput && hlsPtsRate > 0) {
-                // v202.6: hlsdemux's PTS/DTS running-time is the playout clock.
-                // A multi-second media-time window gives the useful TS rate even
-                // when HTTP downloads a whole segment in one burst and even when
-                // the service itself is VBR between adjacent PCR packets.
+            if (segmentedHlsInput && hlsDurationRate > 0) {
+                // 203.23: appsrc PTS/DTS are intentionally unset since 203.18,
+                // so the scheduler's complete-segment bytes/EXTINF duration is
+                // the authoritative transport-media rate for HLS playout.
+                estimatedInputBitrate = hlsDurationRate;
+                inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
+            } else if (segmentedHlsInput && hlsPtsRate > 0) {
+                // Legacy compatibility only; duration rate supersedes this as
+                // soon as the first complete scheduler segment is admitted.
                 estimatedInputBitrate = hlsPtsRate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (segmentedHlsInput && pcrDerivedInputBitrate > 0) {
-                // HLS startup fallback only until enough timestamp history exists.
+                // Startup fallback only until the first complete HLS segment
+                // publishes its bytes/EXTINF media rate.
                 estimatedInputBitrate = pcrDerivedInputBitrate;
                 inputBitrateEstimate.store(estimatedInputBitrate, std::memory_order_relaxed);
             } else if (continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0) {
@@ -2024,14 +2033,20 @@ private:
             return;
         }
 
+        const uint64_t hlsDurationRate = segmentedHlsInput
+            ? tvs::hls_scheduler::durationBasedMediaBitrate(ownerPipeline) : 0;
         const uint64_t hlsPtsRate = hlsTimestampDerivedInputBitrate;
-        const uint64_t hlsSourceRate = hlsPtsRate > 0 ? hlsPtsRate : pcrDerivedInputBitrate;
+        const uint64_t hlsFallbackRate = hlsPtsRate > 0
+            ? hlsPtsRate : pcrDerivedInputBitrate;
+        const uint64_t hlsSourceRate = hlsDurationRate > 0
+            ? hlsDurationRate : hlsFallbackRate;
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
 
-        // 203.05: the 203.04 segment token-bucket experiment is removed.
-        // Segmented HLS now continues directly into the proven 202.74 slow
-        // media-timeline PLL below.
+        // 203.23: scheduler segment bytes/EXTINF duration is the primary HLS
+        // media clock. PCR byte-density remains a startup fallback/diagnostic
+        // only. This spreads useful TS packets across the segment's real media
+        // duration while the remaining CBR transport slots become NULL/PCR.
         const uint64_t playoutSourceRate = segmentedHlsInput
             ? hlsSourceRate
             : networkLongTermArrivalBitrate;
@@ -2051,7 +2066,31 @@ private:
             const uint64_t pllStepPermille = segmentedHlsInput
                 ? kHlsPllMaximumStepPermille : kNetworkArrivalPllMaximumStepPermille;
             const uint64_t pllFollowDivisor = segmentedHlsInput ? 32ULL : 64ULL;
-            if (hlsPllBaseBitrate == 0) {
+
+            const uint64_t durationRateLimited = segmentedHlsInput && hlsDurationRate > 0
+                ? std::min<uint64_t>(hlsDurationRate, hlsPaceCeiling) : 0;
+            if (durationRateLimited > 0 &&
+                durationRateLimited != hlsLastDurationMediaBitrate) {
+                // 203.23: the rolling scheduler rate is already media-time
+                // averaged. Rebase immediately when a newly completed segment
+                // changes that rate; do not spend minutes walking down from a
+                // bogus PCR-density fallback at 0.2% per five seconds.
+                const bool firstDurationLock = hlsLastDurationMediaBitrate == 0;
+                hlsLastDurationMediaBitrate = durationRateLimited;
+                hlsPllBaseBitrate = durationRateLimited;
+                currentRealPaceBitrate = durationRateLimited;
+                hlsPllCorrectionBitrate = 0;
+                hlsPllLastUpdateNanoseconds = nowNanoseconds;
+                realTokenAccumulator = 0;
+                if (firstDurationLock) {
+                    std::cerr << "HLS UDP pacing 203.23: source_rate=segment-bytes/EXTINF"
+                              << " duration_rate_bitrate=" << durationRateLimited
+                              << " pcr_fallback_bitrate=" << pcrDerivedInputBitrate
+                              << " transport_bitrate=" << currentTargetBitrate()
+                              << " action=lock-duration-media-clock"
+                              << std::endl;
+                }
+            } else if (hlsPllBaseBitrate == 0) {
                 const uint64_t startupPace = segmentedHlsInput
                     ? (currentRealPaceBitrate > 0
                           ? currentRealPaceBitrate
@@ -2073,13 +2112,17 @@ private:
                 nowNanoseconds - hlsPllLastUpdateNanoseconds >= pllUpdateNanoseconds) {
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
 
-                // Follow genuine long-term variant/service rate changes extremely
-                // slowly: 1/32 of the PTS estimate every five seconds.
                 const uint64_t sourceLimited =
                     std::min<uint64_t>(playoutSourceRate, hlsPaceCeiling);
-                hlsPllBaseBitrate =
-                    (hlsPllBaseBitrate * (pllFollowDivisor - 1ULL) + sourceLimited) /
-                    pllFollowDivisor;
+                if (!(segmentedHlsInput && hlsDurationRate > 0)) {
+                    // Legacy HLS fallback and continuous-network inputs still
+                    // follow their noisier estimates very slowly. Duration-rate
+                    // HLS was already averaged by complete EXTINF segments and
+                    // is rebased directly above when the rolling rate changes.
+                    hlsPllBaseBitrate =
+                        (hlsPllBaseBitrate * (pllFollowDivisor - 1ULL) + sourceLimited) /
+                        pllFollowDivisor;
+                }
 
                 // Reservoir correction: 1% pace change per 100% occupancy error,
                 // hard-limited to +/-1.5%. The actual five-second pace step is
@@ -2140,10 +2183,11 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.13: mode=slow-playout-pll sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.23: mode=duration-segment-media-clock+slow-reservoir-pll sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
+                          << " duration_rate_bitrate=" << (segmentedHlsInput ? hlsDurationRate : 0)
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " target_reservoir_ms="
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
@@ -2580,6 +2624,7 @@ private:
                   << " underflow_slots=" << realUnderflowSlots.load(std::memory_order_relaxed)
                   << " ts_valid=" << validTimestampChunks.load(std::memory_order_relaxed)
                   << " ts_missing=" << missingTimestampChunks.load(std::memory_order_relaxed)
+                  << " hls_duration_rate=" << (segmentedHlsInput ? tvs::hls_scheduler::durationBasedMediaBitrate(ownerPipeline) : 0)
                   << " hls_pts_rate=" << (segmentedHlsInput ? hlsTimestampDerivedInputBitrate : 0)
                   << " hls_pts_samples=" << hlsTimestampBitrateSamples.load(std::memory_order_relaxed)
                   << " hls_pts_resets=" << hlsTimestampRateResets.load(std::memory_order_relaxed)
@@ -2619,6 +2664,7 @@ private:
     }
 
     std::string streamId;
+    GstElement* ownerPipeline = nullptr; // non-owning; appsink/sender is pipeline-owned
     std::string outputEndpoint;
     const bool srtInput = false;
     const bool tvStreamer5IpProfile = false;
@@ -2708,6 +2754,7 @@ private:
     uint64_t hlsTimestampDerivedInputBitrate = 0;
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
+    uint64_t hlsLastDurationMediaBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
@@ -2850,7 +2897,7 @@ GstElement* createSink(
         return nullptr;
     }
 
-    auto* sender = new StableUdpSender(config, error, networkBytes);
+    auto* sender = new StableUdpSender(pipeline, config, error, networkBytes);
     if (!sender->isReady()) {
         delete sender;
         gst_bin_remove(GST_BIN(pipeline), sink);
@@ -2909,10 +2956,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.13: compatibility=202.74"
+        std::cerr << "HLS timing 203.23: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=slow-playout-pll periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+slow-reservoir-pll periodic_pcr=20ms"
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
@@ -2959,7 +3006,7 @@ GstElement* createSink(
               << (tv5IpProfile
                     ? "reservoir-rate-controller"
                     : (isSegmentedHlsInput(config)
-                        ? "hls-pts-window-controller"
+                        ? "hls-duration-segment-clock"
                         : (isContinuousNetworkMpegTsInput(config)
                             ? "network-arrival-slow-pll"
                             : "reservoir-rate-controller")))

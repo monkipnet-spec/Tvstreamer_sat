@@ -20,6 +20,11 @@ inline constexpr const char* kPipelineSourceUnavailableKey =
 // while already-buffered HLS media is still guaranteed to cover playback.
 inline constexpr const char* kPipelineBufferedUntilSecKey =
     "tvs-duration-hls-buffered-until-sec";
+// 203.23: rolling transport-media bitrate derived from actual segment bytes
+// divided by EXTINF duration. StableUdpOutput uses this as the HLS media clock
+// instead of PCR byte-density, which can be badly biased on VBR services.
+inline constexpr const char* kPipelineMediaBitrateKey =
+    "tvs-duration-hls-media-bitrate-bps";
 
 // Own HLS segment downloader used instead of hlsdemux prefetching.  Segments are
 // downloaded quickly, but only when the duration already admitted downstream
@@ -50,5 +55,10 @@ int sourceUnavailableHttpStatus(GstElement* pipeline);
 // It reaches zero automatically as real time advances even when no new segment
 // is downloaded, so a dead source cannot be hidden indefinitely.
 uint64_t guaranteedBufferedAheadMilliseconds(GstElement* pipeline);
+
+// Rolling HLS transport-media bitrate in bits/s, calculated only from complete
+// segment bytes and EXTINF duration. Zero means no complete segment has been
+// admitted yet, so legacy fallback rate detection may be used temporarily.
+uint64_t durationBasedMediaBitrate(GstElement* pipeline);
 
 } // namespace tvs::hls_scheduler
