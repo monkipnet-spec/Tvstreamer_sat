@@ -2,11 +2,14 @@
 
 #include <curl/curl.h>
 #include <chrono>
+#include <exception>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace {
 constexpr auto kRepeatedStreamEventWindow = std::chrono::minutes(30);
+constexpr std::size_t kTelegramQueueMax = 64;
 
 size_t discardTelegramResponse(char*, size_t size, size_t nmemb, void*) {
     return size * nmemb;
@@ -34,9 +37,71 @@ std::string eventTitleFromTelegramMessage(const std::string& text) {
 
 TelegramNotifier::TelegramNotifier(ConfigManager& cfg)
     : manager(cfg) {
+    try {
+        worker = std::thread(&TelegramNotifier::workerLoop, this);
+    } catch (const std::exception& ex) {
+        std::cerr << "Telegram async worker unavailable: " << ex.what()
+                  << " action=notifications-disabled" << std::endl;
+    }
+}
+
+TelegramNotifier::~TelegramNotifier() {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stopping = true;
+        pendingMessages.clear();
+    }
+    queueCondition.notify_all();
+    if (worker.joinable()) {
+        worker.join();
+    }
 }
 
 void TelegramNotifier::sendMessage(const std::string& text) {
+    const auto& config = manager.config;
+    if (config.telegramToken.empty() || config.telegramChatId.empty() ||
+        !worker.joinable()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        if (stopping) return;
+        if (pendingMessages.size() >= kTelegramQueueMax) {
+            pendingMessages.pop_front();
+            std::cerr << "Telegram async queue full: limit=" << kTelegramQueueMax
+                      << " action=drop-oldest" << std::endl;
+        }
+        pendingMessages.push_back(text);
+    }
+    queueCondition.notify_one();
+}
+
+void TelegramNotifier::workerLoop() {
+    for (;;) {
+        std::string text;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCondition.wait(lock, [this] {
+                return stopping || !pendingMessages.empty();
+            });
+            if (stopping) return;
+            text = std::move(pendingMessages.front());
+            pendingMessages.pop_front();
+        }
+
+        try {
+            sendMessageBlocking(text);
+        } catch (const std::exception& ex) {
+            std::cerr << "Telegram async worker exception: " << ex.what()
+                      << std::endl;
+        } catch (...) {
+            std::cerr << "Telegram async worker unknown exception" << std::endl;
+        }
+    }
+}
+
+void TelegramNotifier::sendMessageBlocking(const std::string& text) {
     const auto& config = manager.config;
     if (config.telegramToken.empty() || config.telegramChatId.empty()) {
         return;
@@ -122,10 +187,8 @@ void TelegramNotifier::sendMessage(const std::string& text) {
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-    // 202.54: libcurl writes the Telegram JSON response to stdout when no
-    // write callback is installed. During a recovery storm that flooded
-    // journald with large JSON bodies and added synchronous I/O to monitor
-    // threads. Discard successful bodies and bound a failed API request.
+    // 203.19: this request still has a strict timeout, but it executes only on
+    // the notifier worker and therefore cannot serialize stream startup.
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discardTelegramResponse);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 4000L);
