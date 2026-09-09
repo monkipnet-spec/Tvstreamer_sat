@@ -2220,21 +2220,68 @@ std::string HttpServer::qualityHistory(const std::string& target) {
     }
     periodSeconds = std::clamp<uint64_t>(periodSeconds, 60, 30ULL * 24ULL * 60ULL * 60ULL);
 
+    // 203.16: the quality modal is allowed to keep history alive by itself.
+    // Previously the history was recorded only while /api/state happened to be
+    // polled. If that polling was throttled/stalled by the browser, the chart
+    // ended tens of minutes before the right edge even though the stream was
+    // still running. Sample the requested live stream here as well; the normal
+    // 30-second recorder guard keeps memory/CPU bounded.
+    Json::Value liveState;
+    const StreamConfig* liveConfig = nullptr;
+    for (const auto& cfg : configManager.config.streams) {
+        if (cfg.id == id) {
+            liveConfig = &cfg;
+            break;
+        }
+    }
+    if (liveConfig) {
+        const auto snap = streamManager.snapshot();
+        const auto it = snap.find(id);
+        if (it != snap.end() && it->second) {
+            auto* streamState = it->second;
+            liveState["active"] = streamState->active.load();
+            liveState["status"] = streamState->statusMessage;
+            liveState["bitrate_in_kbps"] = Json::UInt64(streamState->inputBitrate.load() / 1000);
+            liveState["bitrate_out_kbps"] = Json::UInt64(streamState->outputBitrate.load() / 1000);
+            liveState["input_cc_errors"] = Json::UInt64(streamState->inputCcErrorsDelta.load());
+            liveState["output_cc_errors"] = Json::UInt64(streamState->outputCcErrorsDelta.load());
+            liveState["input_cc_errors_total"] = Json::UInt64(streamState->inputCcErrors.load());
+            liveState["output_cc_errors_total"] = Json::UInt64(streamState->outputCcErrors.load());
+        } else {
+            liveState["active"] = false;
+            liveState["status"] = "stopped";
+            liveState["bitrate_in_kbps"] = Json::UInt64(0);
+            liveState["bitrate_out_kbps"] = Json::UInt64(0);
+            liveState["input_cc_errors"] = Json::UInt64(0);
+            liveState["output_cc_errors"] = Json::UInt64(0);
+            liveState["input_cc_errors_total"] = Json::UInt64(0);
+            liveState["output_cc_errors_total"] = Json::UInt64(0);
+        }
+        recordQualitySample(*liveConfig, liveState);
+    }
+
+    const int64_t generatedAt = unixNowSeconds();
     Json::Value root;
     root["id"] = id;
     root["period_seconds"] = Json::UInt64(periodSeconds);
-    root["generated_at"] = Json::Int64(unixNowSeconds());
+    root["generated_at"] = Json::Int64(generatedAt);
     Json::Value samples(Json::arrayValue);
 
-    const int64_t cutoff = unixNowSeconds() - static_cast<int64_t>(periodSeconds);
+    const int64_t cutoff = generatedAt - static_cast<int64_t>(periodSeconds);
     std::map<std::string, unsigned int> totals = {
         {"ok", 0}, {"warn", 0}, {"error", 0}, {"offline", 0}
     };
+    QualitySample newestStored;
+    bool haveNewestStored = false;
 
     {
         std::lock_guard<std::mutex> lock(qualityMutex);
         auto found = qualitySamples.find(id);
         if (found != qualitySamples.end()) {
+            if (!found->second.empty()) {
+                newestStored = found->second.back();
+                haveNewestStored = true;
+            }
             for (const auto& sample : found->second) {
                 if (sample.timestamp < cutoff) {
                     continue;
@@ -2247,6 +2294,8 @@ std::string HttpServer::qualityHistory(const std::string& target) {
                 item["target_kbps"] = Json::UInt64(sample.targetKbps);
                 item["input_cc_errors"] = Json::UInt64(sample.inputCcErrors);
                 item["output_cc_errors"] = Json::UInt64(sample.outputCcErrors);
+                item["input_cc_errors_total"] = Json::UInt64(sample.inputCcErrorsTotal);
+                item["output_cc_errors_total"] = Json::UInt64(sample.outputCcErrorsTotal);
                 item["cc_errors"] = Json::UInt64(sample.inputCcErrors);
                 item["status"] = sample.status;
                 item["level"] = sample.level;
@@ -2255,6 +2304,68 @@ std::string HttpServer::qualityHistory(const std::string& target) {
                 totals[sample.level]++;
             }
         }
+    }
+
+    // Add a non-persistent live point at the exact right edge. This keeps the
+    // graph visually continuous even with the intentionally sparse 30-second
+    // retained history, without increasing the history allocation rate.
+    if (liveConfig && !liveState.isNull()) {
+        Json::Value live;
+        live["ts"] = Json::Int64(generatedAt);
+        const bool active = liveState.get("active", false).asBool();
+        const uint64_t inputKbps = liveState.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
+        const uint64_t outputKbps = liveState.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
+        const uint64_t targetKbps = (liveConfig->transcodeEnabled
+            ? tvs::protocols::muxBitrate(*liveConfig)
+            : liveConfig->targetBitrate) / 1000;
+        const uint64_t inputTotal = liveState.get("input_cc_errors_total", Json::UInt64(0)).asUInt64();
+        const uint64_t outputTotal = liveState.get("output_cc_errors_total", Json::UInt64(0)).asUInt64();
+        const auto counterDelta = [](uint64_t current, uint64_t previous) {
+            return current >= previous ? current - previous : current;
+        };
+        uint64_t inputCc = liveState.get("input_cc_errors", Json::UInt64(0)).asUInt64();
+        uint64_t outputCc = liveState.get("output_cc_errors", Json::UInt64(0)).asUInt64();
+        if (haveNewestStored && newestStored.timestamp < generatedAt) {
+            inputCc = counterDelta(inputTotal, newestStored.inputCcErrorsTotal);
+            outputCc = counterDelta(outputTotal, newestStored.outputCcErrorsTotal);
+        } else if (haveNewestStored && newestStored.timestamp == generatedAt) {
+            inputCc = newestStored.inputCcErrors;
+            outputCc = newestStored.outputCcErrors;
+        }
+
+        live["active"] = active;
+        live["input_kbps"] = Json::UInt64(inputKbps);
+        live["output_kbps"] = Json::UInt64(outputKbps);
+        live["target_kbps"] = Json::UInt64(targetKbps);
+        live["input_cc_errors"] = Json::UInt64(inputCc);
+        live["output_cc_errors"] = Json::UInt64(outputCc);
+        live["input_cc_errors_total"] = Json::UInt64(inputTotal);
+        live["output_cc_errors_total"] = Json::UInt64(outputTotal);
+        live["cc_errors"] = Json::UInt64(inputCc);
+        const std::string status = liveState.get("status", "").asString();
+        live["status"] = status;
+        const std::string statusLower = toLower(status);
+        std::string level = "ok";
+        std::string message = "Качество в норме";
+        if (!active) {
+            level = "offline";
+            message = status == "stopped" ? "Поток остановлен" : "Поток не активен: " + status;
+        } else if (statusLower.find("error") != std::string::npos ||
+                   statusLower.find("failed") != std::string::npos ||
+                   statusLower.find("ended") != std::string::npos) {
+            level = "error";
+            message = "Ошибка GStreamer: " + status;
+        } else if (inputKbps == 0) {
+            level = "warn";
+            message = "Нет входного битрейта при активном потоке";
+        } else if (inputCc > 0 || outputCc > 0) {
+            level = "error";
+            message = "CC-errors MPEG-TS: вход=" + std::to_string(inputCc) +
+                ", выход=" + std::to_string(outputCc);
+        }
+        live["level"] = level;
+        live["message"] = message;
+        root["live_sample"] = live;
     }
 
     root["samples"] = samples;
@@ -2284,12 +2395,19 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     // 202.50: do not allocate/copy status/message strings for every /api/state
     // poll.  The quality chart does not need 2-second resolution, and this early
     // check also avoids allocator churn on the skipped polls.
+    uint64_t previousInputCcTotal = 0;
+    uint64_t previousOutputCcTotal = 0;
+    bool havePreviousCcTotals = false;
     {
         std::lock_guard<std::mutex> lock(qualityMutex);
         const auto found = qualitySamples.find(cfg.id);
-        if (found != qualitySamples.end() && !found->second.empty() &&
-            now - found->second.back().timestamp < kQualityRecordIntervalSeconds) {
-            return;
+        if (found != qualitySamples.end() && !found->second.empty()) {
+            if (now - found->second.back().timestamp < kQualityRecordIntervalSeconds) {
+                return;
+            }
+            previousInputCcTotal = found->second.back().inputCcErrorsTotal;
+            previousOutputCcTotal = found->second.back().outputCcErrorsTotal;
+            havePreviousCcTotals = true;
         }
     }
 
@@ -2299,8 +2417,24 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
     sample.inputKbps = state.get("bitrate_in_kbps", Json::UInt64(0)).asUInt64();
     sample.outputKbps = state.get("bitrate_out_kbps", Json::UInt64(0)).asUInt64();
     sample.targetKbps = (cfg.transcodeEnabled ? tvs::protocols::muxBitrate(cfg) : cfg.targetBitrate) / 1000;
-    sample.inputCcErrors = state.get("input_cc_errors", state.get("cc_errors", Json::UInt64(0))).asUInt64();
-    sample.outputCcErrors = state.get("output_cc_errors", Json::UInt64(0)).asUInt64();
+    const uint64_t fallbackInputCc = state.get("input_cc_errors", state.get("cc_errors", Json::UInt64(0))).asUInt64();
+    const uint64_t fallbackOutputCc = state.get("output_cc_errors", Json::UInt64(0)).asUInt64();
+    sample.inputCcErrorsTotal = state.get("input_cc_errors_total", Json::UInt64(fallbackInputCc)).asUInt64();
+    sample.outputCcErrorsTotal = state.get("output_cc_errors_total", Json::UInt64(fallbackOutputCc)).asUInt64();
+    if (havePreviousCcTotals) {
+        sample.inputCcErrors = sample.inputCcErrorsTotal >= previousInputCcTotal
+            ? sample.inputCcErrorsTotal - previousInputCcTotal
+            : sample.inputCcErrorsTotal;
+        sample.outputCcErrors = sample.outputCcErrorsTotal >= previousOutputCcTotal
+            ? sample.outputCcErrorsTotal - previousOutputCcTotal
+            : sample.outputCcErrorsTotal;
+    } else {
+        // First retained point has no previous 30-second baseline. Keep only the
+        // current StreamManager delta rather than treating lifetime totals as one
+        // enormous CC-error spike.
+        sample.inputCcErrors = fallbackInputCc;
+        sample.outputCcErrors = fallbackOutputCc;
+    }
     sample.status = state.get("status", "").asString();
 
     const std::string statusLower = toLower(sample.status);
@@ -2367,9 +2501,20 @@ void HttpServer::recordQualitySample(const StreamConfig& cfg, const Json::Value&
                     : kQualityMonthResolutionSeconds);
             const int64_t bucket = existing.timestamp / step;
             if (!compacted.empty() && step == previousStep && bucket == previousBucket) {
-                // Preserve the newest state in each old-data bucket. This also
-                // keeps the latest CC/status transition visible on the chart.
+                // 203.16: bitrate/status use the newest sample in a compacted
+                // bucket, but CC errors are interval counters and must be summed.
+                // Replacing the whole sample used to erase continuity errors that
+                // happened earlier in the same 1-minute/5-minute history bucket.
+                const uint64_t inputCcInBucket = compacted.back().inputCcErrors + existing.inputCcErrors;
+                const uint64_t outputCcInBucket = compacted.back().outputCcErrors + existing.outputCcErrors;
                 compacted.back() = existing;
+                compacted.back().inputCcErrors = inputCcInBucket;
+                compacted.back().outputCcErrors = outputCcInBucket;
+                if ((inputCcInBucket > 0 || outputCcInBucket > 0) && compacted.back().level == "ok") {
+                    compacted.back().level = "error";
+                    compacted.back().message = "CC-errors MPEG-TS за интервал: вход=" +
+                        std::to_string(inputCcInBucket) + ", выход=" + std::to_string(outputCcInBucket);
+                }
             } else {
                 compacted.push_back(existing);
                 previousStep = step;
@@ -3077,8 +3222,9 @@ header{position:fixed;top:0;left:0;right:0;z-index:100000;overflow:visible;displ
 .period-tabs{display:flex;gap:6px;flex-wrap:wrap}
 .period-tabs button{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.05);color:#d7deec;border-radius:8px;cursor:pointer;font-size:.72rem}
 .period-tabs button.active{background:#1f8bff;color:#fff;border-color:#1f8bff}
-.quality-refresh{display:flex;align-items:center;gap:6px;color:#9aa3b1;font-size:.72rem;white-space:nowrap}
-.quality-refresh select{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:#121825;color:#d7deec;border-radius:8px;font-size:.72rem}
+.quality-refresh,.quality-output-select{display:flex;align-items:center;gap:6px;color:#9aa3b1;font-size:.72rem;white-space:nowrap}
+.quality-refresh select,.quality-output-select select{padding:6px 8px;border:1px solid rgba(255,255,255,.1);background:#121825;color:#d7deec;border-radius:8px;font-size:.72rem}
+.quality-output-select select{min-width:260px;max-width:min(420px,70vw)}
 .quality-charts{display:grid;gap:14px}
 .quality-output-chart{display:grid;gap:6px}
 .quality-output-chart-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 4px;color:#cfd8ea;font-size:.82rem}
@@ -5709,7 +5855,11 @@ function storedQualityRefreshMs() {
   const value = stored === null ? 2000 : Number(stored);
   return qualityRefreshOptions.some(option => option.ms === value) ? value : 2000;
 }
-let qualityChart = {streamId:'', period:3600, samples:[], points:[], outputs:[], refreshMs:storedQualityRefreshMs(), timer:null};
+let qualityChart = {
+  streamId:'', period:3600, samples:[], points:[], outputs:[],
+  selectedOutputIndex:0, lastData:null,
+  refreshMs:storedQualityRefreshMs(), timer:null
+};
 function stopQualityAutoRefresh() {
   clearInterval(qualityChart.timer);
   qualityChart.timer = null;
@@ -5737,65 +5887,6 @@ function formatTime(ts, period) {
   }
   return date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second: period <= 600 ? '2-digit' : undefined});
 }
-function openQualityModal(id, periodSeconds=3600) {
-  const stream = state.streams.find(s=>s.id===id);
-  if (!stream) return;
-  const outputs = outputConfigsForStream(stream);
-  stopQualityAutoRefresh();
-  qualityChart.streamId = id;
-  qualityChart.period = periodSeconds;
-  qualityChart.outputs = outputs;
-  document.getElementById('modalContent').className = 'modal-content quality-modal';
-  const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
-  const refreshOptions = qualityRefreshOptions.map(option => `<option value="${option.ms}" ${option.ms===qualityChart.refreshMs?'selected':''}>${option.label}</option>`).join('');
-  document.getElementById('modalContent').innerHTML = modalCloseButton() + `
-    <div class="quality-head">
-      <div class="quality-title">
-        <h2>Качество потока</h2>
-        <small>${stream.name || stream.id} · ${outputs.map(output => `${normalizedOutputType(output).toUpperCase()} ${output.output_host}:${output.output_port}`).join(' · ')}</small>
-      </div>
-      <div class="quality-toolbar">
-        <div class="period-tabs">${tabs}</div>
-        <label class="quality-refresh"><span>Автообновление</span><select onchange="setQualityAutoRefresh(Number(this.value))">${refreshOptions}</select></label>
-      </div>
-    </div>
-    <div id="qualityCharts" class="quality-charts"></div>
-    <div class="quality-decode">
-      <strong>Расшифровка</strong>
-      <span><i class="quality-line quality-input"></i> Зеленый — входной bitrate по левой шкале Mbit/s.</span>
-      <span><i class="quality-line quality-output"></i> Синий — bitrate конкретного выхода по левой шкале Mbit/s; каждый выход рисуется на отдельном графике.</span>
-      <span><i class="quality-line quality-input-cc"></i> Оранжевый — CC-errors входного MPEG-TS по правой шкале.</span>
-      <span><i class="quality-line quality-output-cc"></i> Розовый — CC-errors общего выходного MPEG-TS до разветвления по правой шкале.</span>
-      <span>Всплески CC-errors обычно означают потерю, дублирование или перестановку TS-пакетов.</span>
-      <span>Клик по графику копирует картинку графика.</span>
-    </div>
-    <div id="qualityCopyNotice" class="quality-copy"></div>
-    <div id="qualityDetails" class="quality-details"></div>
-    <div id="qualityErrors" class="quality-errors"></div>
-    <div class="modal-actions">
-      <button class="button-secondary" onclick="closeModal()">Закрыть</button>
-    </div>
-  `;
-  updateHeaderHeight();
-  document.getElementById('modal').classList.add('active', 'quality-open');
-  loadQualityHistory(id, periodSeconds);
-  restartQualityAutoRefresh();
-}
-function loadQualityHistory(id, periodSeconds) {
-  qualityChart.period = periodSeconds;
-  fetch(`/api/quality-history?id=${encodeURIComponent(id)}&period=${periodSeconds}`)
-    .then(r=>r.json())
-    .then(data=>{
-      qualityChart.samples = data.samples || [];
-      renderQualityTabs(periodSeconds);
-      drawQualityChart(data);
-    });
-}
-function renderQualityTabs(periodSeconds) {
-  document.querySelectorAll('.period-tabs button').forEach((button, index) => {
-    button.classList.toggle('active', qualityPeriods[index]?.seconds === periodSeconds);
-  });
-}
 function qualityOutputLabel(output, index) {
   const type = normalizedOutputType(output).toUpperCase();
   const host = String(output?.output_host || '');
@@ -5811,53 +5902,154 @@ function qualityOutputKbps(sample, output) {
   if (cbrOutput && target > 0) return target;
   return Number(sample?.output_kbps || 0);
 }
-function ensureQualityChartBoards(outputs) {
+function storedQualityOutputIndex(id, count) {
+  const value = Number(localStorage.getItem(`tvstreammersat5-quality-output-${id}`));
+  return Number.isInteger(value) && value >= 0 && value < count ? value : 0;
+}
+function setQualityOutputIndex(index) {
+  const count = Math.max(1, qualityChart.outputs?.length || 0);
+  const selected = Math.max(0, Math.min(count - 1, Number.isFinite(index) ? Math.trunc(index) : 0));
+  qualityChart.selectedOutputIndex = selected;
+  if (qualityChart.streamId) {
+    localStorage.setItem(`tvstreammersat5-quality-output-${qualityChart.streamId}`, String(selected));
+  }
+  const select = document.getElementById('qualityOutputSelect');
+  if (select && Number(select.value) !== selected) select.value = String(selected);
+  if (qualityChart.lastData) drawQualityChart(qualityChart.lastData);
+}
+function openQualityModal(id, periodSeconds=3600) {
+  const stream = state.streams.find(s=>s.id===id);
+  if (!stream) return;
+  const outputs = outputConfigsForStream(stream);
+  stopQualityAutoRefresh();
+  qualityChart.streamId = id;
+  qualityChart.period = periodSeconds;
+  qualityChart.outputs = outputs;
+  qualityChart.selectedOutputIndex = storedQualityOutputIndex(id, Math.max(1, outputs.length));
+  qualityChart.lastData = null;
+  document.getElementById('modalContent').className = 'modal-content quality-modal';
+  const tabs = qualityPeriods.map(p=>`<button class="${p.seconds===periodSeconds?'active':''}" onclick="loadQualityHistory('${id}', ${p.seconds})">${p.label}</button>`).join('');
+  const refreshOptions = qualityRefreshOptions.map(option => `<option value="${option.ms}" ${option.ms===qualityChart.refreshMs?'selected':''}>${option.label}</option>`).join('');
+  const outputOptions = (outputs.length ? outputs : [{output_type:'udp', output_host:'', output_port:0, cbr:false}])
+    .map((output, index) => `<option value="${index}" ${index===qualityChart.selectedOutputIndex?'selected':''}>${escapeHtmlValue(qualityOutputLabel(output, index))}</option>`).join('');
+  document.getElementById('modalContent').innerHTML = modalCloseButton() + `
+    <div class="quality-head">
+      <div class="quality-title">
+        <h2>Качество потока</h2>
+        <small>${escapeHtmlValue(stream.name || stream.id)}</small>
+      </div>
+      <div class="quality-toolbar">
+        <label class="quality-output-select"><span>Исходящий поток</span><select id="qualityOutputSelect" onchange="setQualityOutputIndex(Number(this.value))">${outputOptions}</select></label>
+        <div class="period-tabs">${tabs}</div>
+        <label class="quality-refresh"><span>Автообновление</span><select onchange="setQualityAutoRefresh(Number(this.value))">${refreshOptions}</select></label>
+      </div>
+    </div>
+    <div id="qualityCharts" class="quality-charts"></div>
+    <div class="quality-decode">
+      <strong>Расшифровка</strong>
+      <span><i class="quality-line quality-input"></i> Зеленый — входной bitrate по левой шкале Mbit/s.</span>
+      <span><i class="quality-line quality-output"></i> Синий — bitrate выбранного исходящего потока по левой шкале Mbit/s.</span>
+      <span><i class="quality-line quality-input-cc"></i> Оранжевые столбцы — количество входных CC-errors за интервал истории по правой шкале.</span>
+      <span><i class="quality-line quality-output-cc"></i> Розовые столбцы — CC-errors общего выходного MPEG-TS до разветвления за интервал истории.</span>
+      <span>CC-errors считаются по накопительным счетчикам между соседними точками истории; ошибки внутри 30-секундного интервала больше не теряются.</span>
+      <span>Клик по графику копирует картинку графика.</span>
+    </div>
+    <div id="qualityCopyNotice" class="quality-copy"></div>
+    <div id="qualityDetails" class="quality-details"></div>
+    <div id="qualityErrors" class="quality-errors"></div>
+    <div class="modal-actions">
+      <button class="button-secondary" onclick="closeModal()">Закрыть</button>
+    </div>
+  `;
+  updateHeaderHeight();
+  document.getElementById('modal').classList.add('active', 'quality-open');
+  loadQualityHistory(id, periodSeconds);
+  restartQualityAutoRefresh();
+}
+function normalizedQualitySamples(data) {
+  const byTimestamp = new Map();
+  (Array.isArray(data?.samples) ? data.samples : []).forEach(sample => {
+    const ts = Number(sample?.ts || 0);
+    if (ts > 0) byTimestamp.set(ts, sample);
+  });
+  const live = data?.live_sample;
+  if (live && Number(live.ts || 0) > 0) {
+    // The live point intentionally replaces a retained point from the same
+    // second. Otherwise it extends the graph exactly to generated_at.
+    byTimestamp.set(Number(live.ts), live);
+  }
+  return [...byTimestamp.values()].sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+}
+function loadQualityHistory(id, periodSeconds) {
+  qualityChart.period = periodSeconds;
+  fetch(`/api/quality-history?id=${encodeURIComponent(id)}&period=${periodSeconds}`, {cache:'no-store'})
+    .then(r=>r.json())
+    .then(data=>{
+      data.samples = normalizedQualitySamples(data);
+      qualityChart.samples = data.samples;
+      qualityChart.lastData = data;
+      renderQualityTabs(periodSeconds);
+      drawQualityChart(data);
+    })
+    .catch(error => console.warn('TVStreammerSAT5 quality history refresh failed:', error));
+}
+function renderQualityTabs(periodSeconds) {
+  document.querySelectorAll('.period-tabs button').forEach((button, index) => {
+    button.classList.toggle('active', qualityPeriods[index]?.seconds === periodSeconds);
+  });
+}
+function ensureQualityChartBoard(output, index) {
   const host = document.getElementById('qualityCharts');
-  if (!host) return [];
-  const normalized = outputs.length ? outputs : [{output_type:'udp', output_host:'', output_port:0, cbr:false}];
-  const signature = JSON.stringify(normalized.map((output, index) => ({
+  if (!host) return null;
+  const signature = JSON.stringify({
     index,
     type: normalizedOutputType(output),
-    mode: output.output_mode || '',
-    host: output.output_host || '',
-    port: Number(output.output_port || 0),
-    iface: output.interface_address || ''
-  })));
+    mode: output?.output_mode || '',
+    host: output?.output_host || '',
+    port: Number(output?.output_port || 0),
+    iface: output?.interface_address || ''
+  });
   if (host.dataset.signature !== signature) {
     host.dataset.signature = signature;
-    host.innerHTML = normalized.map((output, index) => `
+    host.innerHTML = `
       <div class="quality-output-chart">
         <div class="quality-output-chart-head">
           <strong>${escapeHtmlValue(qualityOutputLabel(output, index))}</strong>
           <span>${index === 0 ? 'Основной выход' : 'Дополнительный выход'}</span>
         </div>
         <div class="quality-board">
-          <canvas id="qualityCanvas_${index}" width="1160" height="320" data-quality-output-index="${index}"></canvas>
+          <canvas id="qualityCanvas" width="1160" height="320" data-quality-output-index="${index}"></canvas>
         </div>
-      </div>
-    `).join('');
+      </div>`;
   }
-  return normalized.map((output, index) => ({output, index, canvas:document.getElementById(`qualityCanvas_${index}`)}));
+  return document.getElementById('qualityCanvas');
 }
 function drawQualityChart(data) {
   const details = document.getElementById('qualityDetails');
   const errors = document.getElementById('qualityErrors');
   if (!details || !errors) return;
-  const samples = data.samples || [];
+  const samples = Array.isArray(data.samples) ? data.samples : [];
   const stream = (state.streams || []).find(item => item.id === qualityChart.streamId) || {};
   const outputs = qualityChart.outputs?.length ? qualityChart.outputs : outputConfigsForStream(stream);
-  const charts = ensureQualityChartBoards(outputs);
-  if (!charts.length) return;
+  const normalizedOutputs = outputs.length ? outputs : [{output_type:'udp', output_host:'', output_port:0, cbr:false}];
+  const selectedIndex = Math.max(0, Math.min(normalizedOutputs.length - 1, qualityChart.selectedOutputIndex || 0));
+  qualityChart.selectedOutputIndex = selectedIndex;
+  const output = normalizedOutputs[selectedIndex];
+  const canvas = ensureQualityChartBoard(output, selectedIndex);
+  if (!canvas) return;
 
-  const setupCanvas = (target, height) => {
-    const targetRect = target.getBoundingClientRect();
-    const targetRatio = window.devicePixelRatio || 1;
-    target.width = Math.max(640, Math.floor(targetRect.width * targetRatio));
-    target.height = Math.floor(height * targetRatio);
-    const targetContext = target.getContext('2d');
-    targetContext.setTransform(targetRatio, 0, 0, targetRatio, 0, 0);
-    return {ctx: targetContext, width: target.width / targetRatio, height};
-  };
+  const targetRect = canvas.getBoundingClientRect();
+  const targetRatio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(640, Math.floor(targetRect.width * targetRatio));
+  canvas.height = Math.floor(320 * targetRatio);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(targetRatio, 0, 0, targetRatio, 0, 0);
+  const width = canvas.width / targetRatio;
+  const height = 320;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#0f1622';
+  ctx.fillRect(0, 0, width, height);
+
   const streamName = stream.name || data.id || 'Поток';
   const edgeTime = ts => {
     const date = new Date(ts * 1000);
@@ -5894,203 +6086,183 @@ function drawQualityChart(data) {
     <div class="value">${formatter(stats.max)}</div>
   `;
 
-  qualityChart.points = [];
-  const inputBitrateValues = samples.map(s => Number(s.input_kbps || 0));
-  const inputCcValues = samples.map(s => Number(s.input_cc_errors ?? s.cc_errors ?? 0));
-  const outputCcValues = samples.map(s => Number(s.output_cc_errors || 0));
-  const outputSeries = charts.map(({output, index}) => ({
-    output,
-    index,
-    values:samples.map(sample => qualityOutputKbps(sample, output))
-  }));
-
-  charts.forEach(({output, index, canvas}) => {
-    if (!canvas) return;
-    const chart = setupCanvas(canvas, 320);
-    const ctx = chart.ctx;
-    const width = chart.width;
-    const height = chart.height;
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = '#0f1622';
-    ctx.fillRect(0, 0, width, height);
-
-    if (!samples.length) {
-      ctx.fillStyle = '#cfd8ea';
-      ctx.font = '700 13px Arial';
-      ctx.textAlign = 'center';
-      ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
-      canvas.onclick = () => copyQualityChartImage(canvas);
-      return;
-    }
-
-    const outputBitrateValues = outputSeries[index]?.values || samples.map(s => Number(s.output_kbps || 0));
-    const left = 74, right = 64, top = 36, bottom = 70;
-    const plotW = width - left - right;
-    const plotH = height - top - bottom;
-    const plotRight = left + plotW;
-    const plotBottom = top + plotH;
-    const endTs = data.generated_at || Math.floor(Date.now()/1000);
-    const startTs = endTs - (data.period_seconds || qualityChart.period);
-    const bitrateValues = [...inputBitrateValues, ...outputBitrateValues];
-    const ccValues = [...inputCcValues, ...outputCcValues];
-    const maxBitrateMbit = Math.max(1, ...bitrateValues.map(value => value / 1000));
-    const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
-    const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
-    const maxCcErrors = Math.max(1, ...ccValues);
-    const niceAxis = (maxValue, targetTicks) => {
-      const rawMax = Math.max(1, Number(maxValue || 0));
-      const roughStep = rawMax / Math.max(1, targetTicks);
-      const exponent = Math.floor(Math.log10(roughStep));
-      const base = Math.pow(10, exponent);
-      const fraction = roughStep / base;
-      const niceFraction = fraction <= 1 ? 1 : (fraction <= 2 ? 2 : (fraction <= 5 ? 5 : 10));
-      const step = niceFraction * base;
-      return {max: Math.ceil(rawMax / step) * step, step};
-    };
-    const rightTickCount = Math.max(4, Math.min(8, Math.floor(plotH / 38)));
-    const rightAxis = niceAxis(Math.max(5, maxCcErrors * 1.25), rightTickCount);
-    const rightMax = Math.max(5, rightAxis.max);
-    const rightStep = Math.max(1, rightAxis.step);
-
+  if (!samples.length) {
     ctx.fillStyle = '#cfd8ea';
     ctx.font = '700 13px Arial';
     ctx.textAlign = 'center';
-    let titleText = `${state.server_name || 'TVStreammerSAT5'}: ${streamName} — ${qualityOutputLabel(output, index)}`;
-    while (ctx.measureText(titleText).width > plotW && titleText.length > 24) {
-      titleText = titleText.slice(0, -4) + '...';
-    }
-    ctx.fillText(titleText, width / 2, 18);
-
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = 'rgba(255,255,255,.24)';
-    ctx.beginPath();
-    ctx.moveTo(left, top - 8);
-    ctx.lineTo(left, plotBottom);
-    ctx.lineTo(plotRight, plotBottom);
-    ctx.moveTo(plotRight, top - 8);
-    ctx.lineTo(plotRight, plotBottom);
-    ctx.stroke();
-
-    ctx.strokeStyle = 'rgba(255,255,255,.13)';
-    ctx.setLineDash([2, 2]);
-    ctx.fillStyle = '#c8d0dc';
-    ctx.font = '11px Arial';
-    ctx.textAlign = 'right';
-    for (let value=0; value<=leftMaxMbit; value+=bitrateStep) {
-      const y = plotBottom - (value / leftMaxMbit) * plotH;
-      ctx.beginPath();
-      ctx.moveTo(left, y);
-      ctx.lineTo(plotRight, y);
-      ctx.stroke();
-      ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
-    }
-    ctx.textAlign = 'right';
-    for (let value=0; value<=rightMax + rightStep * .5; value+=rightStep) {
-      const y = plotBottom - (value / rightMax) * plotH;
-      ctx.fillText(String(Math.round(value)), width - 8, y + 4);
-    }
-
-    ctx.textAlign = 'center';
-    const tickCount = Math.max(4, Math.min(20, Math.floor(plotW / 64)));
-    for (let i=0;i<=tickCount;i++) {
-      const correctedX = left + plotW * i / tickCount;
-      const ts = startTs + (endTs - startTs) * i / tickCount;
-      ctx.beginPath();
-      ctx.moveTo(correctedX, top);
-      ctx.lineTo(correctedX, plotBottom);
-      ctx.stroke();
-      const edge = i === 0 || i === tickCount;
-      ctx.save();
-      ctx.translate(correctedX, height - 10);
-      ctx.rotate(-Math.PI / 2);
-      ctx.fillStyle = edge ? '#ff7f7f' : '#c8d0dc';
-      ctx.textAlign = 'left';
-      ctx.fillText(edge ? edgeTime(ts) : formatTime(ts, data.period_seconds), 0, 4);
-      ctx.restore();
-    }
-    ctx.setLineDash([]);
-
-    const xFor = ts => left + ((ts - startTs) / Math.max(1, endTs - startTs)) * plotW;
-    const bitrateYFor = kbps => plotBottom - Math.min(kbps / 1000, leftMaxMbit) / leftMaxMbit * plotH;
-    const ccYFor = value => plotBottom - Math.min(value, rightMax) / rightMax * plotH;
-    const drawSeries = (values, color, yFor, widthPx=2) => {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = widthPx;
-      ctx.beginPath();
-      let started = false;
-      samples.forEach((sample, sampleIndex) => {
-        const value = values[sampleIndex] || 0;
-        const x = xFor(sample.ts);
-        const y = yFor(value);
-        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
-      });
-      ctx.stroke();
-    };
-    const drawCcBars = (values, color, offset) => {
-      ctx.fillStyle = color;
-      samples.forEach((sample, sampleIndex) => {
-        const value = values[sampleIndex] || 0;
-        if (!value) return;
-        const x = xFor(sample.ts) + offset;
-        const y = ccYFor(value);
-        ctx.fillRect(x - 1.5, y, 3, plotBottom - y);
-      });
-    };
-    drawCcBars(inputCcValues, 'rgba(255,159,26,.30)', -2);
-    drawCcBars(outputCcValues, 'rgba(255,79,154,.30)', 2);
-    drawSeries(inputCcValues, '#ff9f1a', ccYFor, 1.8);
-    drawSeries(outputCcValues, '#ff4f9a', ccYFor, 1.8);
-    drawSeries(inputBitrateValues, '#26ef46', bitrateYFor, 2.5);
-    drawSeries(outputBitrateValues, '#36a3ff', bitrateYFor, 2.5);
-
-    samples.forEach((sample, sampleIndex) => {
-      const x = xFor(sample.ts);
-      const inputY = bitrateYFor(inputBitrateValues[sampleIndex] || 0);
-      const outputY = bitrateYFor(outputBitrateValues[sampleIndex] || 0);
-      ctx.fillStyle = '#26ef46';
-      ctx.beginPath();
-      ctx.arc(x, inputY, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#36a3ff';
-      ctx.beginPath();
-      ctx.arc(x, outputY, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      qualityChart.points.push({outputIndex:index, x, y:(inputY + outputY) / 2, sample});
-    });
+    ctx.fillText('История пока пустая. Данные появятся после нескольких обновлений состояния.', width / 2, height / 2);
     canvas.onclick = () => copyQualityChartImage(canvas);
-  });
-
-  if (!samples.length) {
     details.innerHTML = '<div class="quality-card"><strong>Нет данных</strong>История собирается в памяти во время работы приложения.</div>';
     errors.innerHTML = '';
     return;
   }
 
+  qualityChart.points = [];
+  const inputBitrateValues = samples.map(s => Number(s.input_kbps || 0));
+  const outputBitrateValues = samples.map(sample => qualityOutputKbps(sample, output));
+  const inputCcValues = samples.map(s => Number(s.input_cc_errors ?? s.cc_errors ?? 0));
+  const outputCcValues = samples.map(s => Number(s.output_cc_errors || 0));
+
+  const left = 74, right = 64, top = 36, bottom = 70;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const plotRight = left + plotW;
+  const plotBottom = top + plotH;
+  const endTs = Number(data.generated_at || Math.floor(Date.now()/1000));
+  const startTs = endTs - Number(data.period_seconds || qualityChart.period);
+  const bitrateValues = [...inputBitrateValues, ...outputBitrateValues];
+  const ccValues = [...inputCcValues, ...outputCcValues];
+  const maxBitrateMbit = Math.max(1, ...bitrateValues.map(value => value / 1000));
+  const bitrateStep = maxBitrateMbit <= 20 ? 2 : (maxBitrateMbit <= 50 ? 5 : 10);
+  const leftMaxMbit = Math.max(bitrateStep, Math.ceil(maxBitrateMbit * 1.12 / bitrateStep) * bitrateStep);
+  const maxCcErrors = Math.max(1, ...ccValues);
+  const niceAxis = (maxValue, targetTicks) => {
+    const rawMax = Math.max(1, Number(maxValue || 0));
+    const roughStep = rawMax / Math.max(1, targetTicks);
+    const exponent = Math.floor(Math.log10(roughStep));
+    const base = Math.pow(10, exponent);
+    const fraction = roughStep / base;
+    const niceFraction = fraction <= 1 ? 1 : (fraction <= 2 ? 2 : (fraction <= 5 ? 5 : 10));
+    const step = niceFraction * base;
+    return {max: Math.ceil(rawMax / step) * step, step};
+  };
+  const rightTickCount = Math.max(4, Math.min(8, Math.floor(plotH / 38)));
+  const rightAxis = niceAxis(Math.max(5, maxCcErrors * 1.25), rightTickCount);
+  const rightMax = Math.max(5, rightAxis.max);
+  const rightStep = Math.max(1, rightAxis.step);
+
+  ctx.fillStyle = '#cfd8ea';
+  ctx.font = '700 13px Arial';
+  ctx.textAlign = 'center';
+  let titleText = `${state.server_name || 'TVStreammerSAT5'}: ${streamName} — ${qualityOutputLabel(output, selectedIndex)}`;
+  while (ctx.measureText(titleText).width > plotW && titleText.length > 24) {
+    titleText = titleText.slice(0, -4) + '...';
+  }
+  ctx.fillText(titleText, width / 2, 18);
+
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(255,255,255,.24)';
+  ctx.beginPath();
+  ctx.moveTo(left, top - 8);
+  ctx.lineTo(left, plotBottom);
+  ctx.lineTo(plotRight, plotBottom);
+  ctx.moveTo(plotRight, top - 8);
+  ctx.lineTo(plotRight, plotBottom);
+  ctx.stroke();
+
+  ctx.strokeStyle = 'rgba(255,255,255,.13)';
+  ctx.setLineDash([2, 2]);
+  ctx.fillStyle = '#c8d0dc';
+  ctx.font = '11px Arial';
+  ctx.textAlign = 'right';
+  for (let value=0; value<=leftMaxMbit; value+=bitrateStep) {
+    const y = plotBottom - (value / leftMaxMbit) * plotH;
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(plotRight, y);
+    ctx.stroke();
+    ctx.fillText(value === 0 ? '0 bit/s' : `${value} Mbit/s`, left - 8, y + 4);
+  }
+  for (let value=0; value<=rightMax + rightStep * .5; value+=rightStep) {
+    const y = plotBottom - (value / rightMax) * plotH;
+    ctx.fillText(String(Math.round(value)), width - 8, y + 4);
+  }
+
+  ctx.textAlign = 'center';
+  const tickCount = Math.max(4, Math.min(20, Math.floor(plotW / 64)));
+  for (let i=0;i<=tickCount;i++) {
+    const correctedX = left + plotW * i / tickCount;
+    const ts = startTs + (endTs - startTs) * i / tickCount;
+    ctx.beginPath();
+    ctx.moveTo(correctedX, top);
+    ctx.lineTo(correctedX, plotBottom);
+    ctx.stroke();
+    const edge = i === 0 || i === tickCount;
+    ctx.save();
+    ctx.translate(correctedX, height - 10);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillStyle = edge ? '#ff7f7f' : '#c8d0dc';
+    ctx.textAlign = 'left';
+    ctx.fillText(edge ? edgeTime(ts) : formatTime(ts, data.period_seconds), 0, 4);
+    ctx.restore();
+  }
+  ctx.setLineDash([]);
+
+  const xFor = ts => left + ((Number(ts) - startTs) / Math.max(1, endTs - startTs)) * plotW;
+  const bitrateYFor = kbps => plotBottom - Math.min(Number(kbps || 0) / 1000, leftMaxMbit) / leftMaxMbit * plotH;
+  const ccYFor = value => plotBottom - Math.min(Number(value || 0), rightMax) / rightMax * plotH;
+  const drawSeries = (values, color, yFor, widthPx=2) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = widthPx;
+    ctx.beginPath();
+    let started = false;
+    samples.forEach((sample, sampleIndex) => {
+      const value = Number(values[sampleIndex] ?? 0);
+      const x = xFor(sample.ts);
+      const y = yFor(value);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    if (started) ctx.stroke();
+  };
+  const drawCcBars = (values, color, offset) => {
+    ctx.fillStyle = color;
+    const barWidth = Math.max(3, Math.min(8, plotW / Math.max(40, samples.length * 1.6)));
+    samples.forEach((sample, sampleIndex) => {
+      const value = Number(values[sampleIndex] ?? 0);
+      if (value <= 0) return;
+      const x = xFor(sample.ts) + offset;
+      const y = ccYFor(value);
+      ctx.fillRect(x - barWidth / 2, y, barWidth, Math.max(1, plotBottom - y));
+    });
+  };
+
+  // CC errors are interval counters, not a continuous signal. Draw bars only;
+  // connecting error counts with a line falsely creates ramps between events.
+  drawCcBars(inputCcValues, 'rgba(255,159,26,.72)', -2);
+  drawCcBars(outputCcValues, 'rgba(255,79,154,.72)', 2);
+  drawSeries(inputBitrateValues, '#26ef46', bitrateYFor, 2.5);
+  drawSeries(outputBitrateValues, '#36a3ff', bitrateYFor, 2.5);
+
+  samples.forEach((sample, sampleIndex) => {
+    const x = xFor(sample.ts);
+    const inputY = bitrateYFor(inputBitrateValues[sampleIndex] || 0);
+    const outputY = bitrateYFor(outputBitrateValues[sampleIndex] || 0);
+    ctx.fillStyle = '#26ef46';
+    ctx.beginPath();
+    ctx.arc(x, inputY, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#36a3ff';
+    ctx.beginPath();
+    ctx.arc(x, outputY, 2.2, 0, Math.PI * 2);
+    ctx.fill();
+    qualityChart.points.push({outputIndex:selectedIndex, x, y:(inputY + outputY) / 2, sample});
+  });
+  canvas.onclick = () => copyQualityChartImage(canvas);
+
   const inputBitrateStats = statsFor(inputBitrateValues);
+  const outputBitrateStats = statsFor(outputBitrateValues);
   const inputCcStats = statsFor(inputCcValues);
   const outputCcStats = statsFor(outputCcValues);
-  const outputRows = outputSeries.map(({output, index, values}) =>
-    statsRow('quality-output', `${streamName} — ${qualityOutputLabel(output, index)}`, `[out ${index + 1}]`, statsFor(values), formatMbitValue)
-  ).join('');
   details.innerHTML = `
     <div class="quality-stats">
       <div></div><div></div><div class="head">посл</div><div class="head">мин</div><div class="head">сред</div><div class="head">макс</div>
       ${statsRow('quality-input', `${streamName} — входной bitrate`, '[input]', inputBitrateStats, formatMbitValue)}
-      ${outputRows}
-      ${statsRow('quality-input-cc', `${streamName} — входные CC-errors`, '[input]', inputCcStats, value => formatMetricNumber(value))}
-      ${statsRow('quality-output-cc', `${streamName} — выходные CC-errors (общий TS до разветвления)`, '[output]', outputCcStats, value => formatMetricNumber(value))}
+      ${statsRow('quality-output', `${streamName} — ${qualityOutputLabel(output, selectedIndex)}`, `[out ${selectedIndex + 1}]`, outputBitrateStats, formatMbitValue)}
+      ${statsRow('quality-input-cc', `${streamName} — входные CC-errors за интервал`, '[input]', inputCcStats, value => formatMetricNumber(value))}
+      ${statsRow('quality-output-cc', `${streamName} — выходные CC-errors за интервал (общий TS)`, '[output]', outputCcStats, value => formatMetricNumber(value))}
     </div>
   `;
-  const bad = samples.filter(s => s.level !== 'ok' || (s.input_cc_errors ?? s.cc_errors ?? 0) > 0 || (s.output_cc_errors || 0) > 0).slice(-30).reverse();
+  const bad = samples.filter(s => s.level !== 'ok' || Number(s.input_cc_errors ?? s.cc_errors ?? 0) > 0 || Number(s.output_cc_errors || 0) > 0).slice(-30).reverse();
   errors.innerHTML = bad.length
     ? bad.map(s => {
-        const inputCc = s.input_cc_errors ?? s.cc_errors ?? 0;
-        const outputCc = s.output_cc_errors || 0;
+        const inputCc = Number(s.input_cc_errors ?? s.cc_errors ?? 0);
+        const outputCc = Number(s.output_cc_errors || 0);
         const markerColor = outputCc > 0 ? '#ff4f9a' : (inputCc > 0 ? '#ff9f1a' : qualityColor(s.level));
         return `<div><span style="color:${markerColor}">●</span><span>${formatTime(s.ts, data.period_seconds)}</span><span>${s.message} · CC input: ${inputCc} · CC output: ${outputCc}</span></div>`;
       }).join('')
     : '<div><span style="color:#17c261">●</span><span>За выбранный период входных и выходных CC-errors и других ошибок нет</span></div>';
 }
+
 function copyQualityChartImage(canvas) {
   const notice = document.getElementById('qualityCopyNotice');
   const show = message => {

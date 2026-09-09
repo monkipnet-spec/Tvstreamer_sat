@@ -37,6 +37,12 @@ private:
         uint64_t targetKbps = 0;
         uint64_t inputCcErrors = 0;
         uint64_t outputCcErrors = 0;
+        // 203.16: keep cumulative continuity counters alongside the per-history
+        // interval deltas. The StreamManager delta fields are ~1-second windows,
+        // while quality history is sampled every 30 seconds; storing totals lets
+        // us derive the complete CC-error count for every graph interval.
+        uint64_t inputCcErrorsTotal = 0;
+        uint64_t outputCcErrorsTotal = 0;
         std::string status;
         std::string level;
         std::string message;
