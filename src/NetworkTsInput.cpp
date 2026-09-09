@@ -1,4 +1,5 @@
 #include "NetworkTsInput.h"
+#include "HlsSegmentScheduler.h"
 
 #include "StreamManager.h"
 #include "protocols/inputs/GstHlsInputProtocol.h"
@@ -339,116 +340,82 @@ GstElement* buildHls(
     GCallback hlsPadAddedCallback,
     tvs::network_input::ConfigureTsMuxFn configureTsMux,
     std::string& error) {
+    (void)hlsPadAddedCallback;
+    (void)configureTsMux;
     if (!state) {
         error = "HLS input: missing stream state";
         return nullptr;
     }
-    // 203.05: restore the proven 202.74 HLS topology. Prefer the complete
-    // MPEG-TS pad from hlsdemux and preserve the provider transport byte-for-byte.
-    // Keep tsdemux/parser/mpegtsmux only as a compatibility fallback for HLS
-    // variants that expose elementary A/V pads.
-    if (!hasElementFactory("souphttpsrc") || !hasElementFactory("hlsdemux") ||
-        !hasElementFactory("mpegtsmux") || !hasElementFactory("input-selector")) {
-        error = "HLS input: missing souphttpsrc/hlsdemux/mpegtsmux/input-selector";
-        return nullptr;
-    }
-    if (!hlsPadAddedCallback || !configureTsMux) {
-        error = "HLS input: missing integration callback";
+    if (!hasElementFactory("appsrc")) {
+        error = "HLS input: missing appsrc";
         return nullptr;
     }
 
+    // 203.17: own duration-controlled HLS downloader.  Do not let hlsdemux
+    // prefetch an arbitrary number of complete segments.  The scheduler fetches
+    // each segment at full HTTP speed only when downstream consumed-duration
+    // falls below the low watermark, then stops again at the target/high water.
+    // MPEG-TS payload bytes are preserved byte-for-byte.
     StreamConfig& cfg = state->runtimeConfig;
-    GstElement* src = gst_element_factory_make("souphttpsrc", "input_src");
-    GstElement* demux = gst_element_factory_make("hlsdemux", "hls_demux");
-    GstElement* mux = gst_element_factory_make("mpegtsmux", "input_hls_ts_mux");
-    GstElement* selector =
-        gst_element_factory_make("input-selector", "input_hls_transport_selector");
+    GstElement* src = gst_element_factory_make("appsrc", "input_hls_scheduler_src");
     GstElement* queue = addQueue(
         pipeline, "input_queue", kHlsInputQueue, kHlsQueueHardMaxBytes);
-    if (!src || !demux || !mux || !selector || !queue ||
-        !addElementOrFail(pipeline, src) ||
-        !addElementOrFail(pipeline, demux) ||
-        !addElementOrFail(pipeline, mux) ||
-        !addElementOrFail(pipeline, selector)) {
+    if (!src || !queue || !addElementOrFail(pipeline, src)) {
         if (src && !GST_OBJECT_PARENT(src)) gst_object_unref(src);
-        if (demux && !GST_OBJECT_PARENT(demux)) gst_object_unref(demux);
-        if (mux && !GST_OBJECT_PARENT(mux)) gst_object_unref(mux);
-        if (selector && !GST_OBJECT_PARENT(selector)) gst_object_unref(selector);
-        error = "HLS input: failed to create 202.74 transport chain";
+        error = "HLS input: failed to create duration scheduler appsrc/queue";
         return nullptr;
     }
 
-    std::string location = appendAccessQuery(
-        tvs::protocols::inputs::hlsInputUri(cfg), cfg);
-    g_object_set(src,
-        "location", location.c_str(),
-        "is-live", TRUE,
-        "do-timestamp", TRUE,
+    GstCaps* caps = gst_caps_new_simple(
+        "video/mpegts",
+        "systemstream", G_TYPE_BOOLEAN, TRUE,
+        "packetsize", G_TYPE_INT, 188,
         nullptr);
-    configureHttpCredentials(src, cfg);
-    setBooleanPropertyIfPresent(src, "compress", TRUE);
+    g_object_set(src,
+        "is-live", TRUE,
+        "format", GST_FORMAT_TIME,
+        "block", TRUE,
+        "do-timestamp", FALSE,
+        "caps", caps,
+        nullptr);
+    gst_caps_unref(caps);
 
-    // 202.74 behaviour: hlsdemux gets the configured service/output scale, but
-    // there is no application-side variant prefetch or extra HLS pacing stage.
-    setIntPropertyIfPresent(demux, "connection-speed",
-        static_cast<gint>(std::max<uint64_t>(cfg.targetBitrate / 1000ULL, 1ULL)));
-    configureTsMux(mux, cfg);
-    setBooleanPropertyIfPresent(selector, "sync-streams", FALSE);
-    setBooleanPropertyIfPresent(selector, "cache-buffers", FALSE);
+    // Bound appsrc itself as a final safety valve.  The actual download policy
+    // is duration based and normally stays well below these limits.
+    if (hasProperty(src, "max-bytes")) {
+        g_object_set(src, "max-bytes", static_cast<guint64>(16ULL * 1024ULL * 1024ULL), nullptr);
+    }
+    if (hasProperty(src, "max-time")) {
+        g_object_set(src, "max-time", static_cast<guint64>(12ULL * GST_SECOND), nullptr);
+    }
 
-    if (!gst_element_link(src, demux) || !gst_element_link(selector, queue)) {
-        error = "HLS input: failed to link HTTP/demux/selector queue";
+    if (!gst_element_link(src, queue)) {
+        error = "HLS input: failed to link scheduler appsrc -> queue";
         return nullptr;
     }
 
-    if (!state->sourceContext) state->sourceContext = std::make_unique<RemapContext>();
-    auto* ctx = state->sourceContext.get();
-    ctx->mux = mux;
-    ctx->hlsInputSelector = selector;
-    ctx->config = cfg;
-    ctx->flvMux = false;
-
-    // Start with the elementary remux fallback. As soon as hlsdemux exposes a
-    // complete MPEG-TS pad, onDemuxPadAdded() switches the selector to direct TS.
-    GstPad* muxSrcPad = gst_element_get_static_pad(mux, "src");
-    GstPad* muxSelectorPad = gst_element_request_pad_simple(selector, "sink_%u");
-    if (!muxSrcPad || !muxSelectorPad ||
-        gst_pad_link(muxSrcPad, muxSelectorPad) != GST_PAD_LINK_OK) {
-        if (muxSrcPad) gst_object_unref(muxSrcPad);
-        if (muxSelectorPad) {
-            gst_element_release_request_pad(selector, muxSelectorPad);
-            gst_object_unref(muxSelectorPad);
-        }
-        error = "HLS input: failed to connect fallback remux selector pad";
+    auto* scheduler = new tvs::hls_scheduler::Scheduler(src, queue, cfg);
+    if (!scheduler->start(error)) {
+        delete scheduler;
         return nullptr;
     }
-    gst_object_unref(muxSrcPad);
-    ctx->hlsMuxSelectorPad = muxSelectorPad;
-    g_object_set(selector, "active-pad", muxSelectorPad, nullptr);
-
-    configureHlsChildSource(src, ctx->config);
-    g_signal_connect(demux, "deep-element-added",
-        G_CALLBACK(onHlsDeepElementAdded), ctx);
-    g_signal_connect_data(
-        demux, "pad-added", hlsPadAddedCallback, ctx, nullptr,
-        static_cast<GConnectFlags>(0));
-
-    const std::string inputInterface = configuredInputInterfaceAddress(cfg);
-    if (!inputInterface.empty()) {
-        std::cerr << "HLS input: input_iface=" << inputInterface
-                  << " selected; souphttpsrc follows the kernel HTTP route" << std::endl;
-    }
+    g_object_set_data_full(
+        G_OBJECT(pipeline), "tvs-duration-hls-scheduler", scheduler,
+        [](gpointer data) {
+            delete static_cast<tvs::hls_scheduler::Scheduler*>(data);
+        });
 
     terminalElement = queue;
-    std::cerr << "Network TS input 203.06: protocol=HLS compatibility=202.74"
-              << " source=souphttpsrc+hlsdemux"
-              << " queue_ms=10000 queue_max_mb=40 leaky=off prebuffer=off do_timestamp=on"
-              << " direct_mpegts=preferred remux=fallback-only input_pacing=off"
-              << " http_retries=infinite watchdog_rebuild_ms=15000"
+    std::cerr << "Network TS input 203.17: protocol=HLS"
+              << " source=duration-controlled-segment-scheduler+appsrc"
+              << " low_ahead_ms=6000 target_ahead_ms=8000 high_ahead_ms=12000"
+              << " min_start_segments=2 segment_fetch=full-speed-on-demand"
+              << " queue_ms=10000 queue_max_mb=40 leaky=off"
+              << " direct_mpegts=always remux=off hlsdemux=off input_pacing=segment-demand"
+              << " watchdog_rebuild_ms=15000"
               << std::endl;
     return src;
 }
-
 } // namespace
 
 namespace tvs::network_input {
