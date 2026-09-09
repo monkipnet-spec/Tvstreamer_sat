@@ -4,6 +4,7 @@
 
 #include <gst/gst.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -14,6 +15,11 @@ inline constexpr const char* kPipelineDataKey = "tvs-duration-hls-scheduler";
 // confirmed that the HLS control resource is persistently unavailable.
 inline constexpr const char* kPipelineSourceUnavailableKey =
     "tvs-duration-hls-source-unavailable";
+// 203.22: wall-clock lower bound for media already admitted by the HLS
+// scheduler. StreamManager uses this only to suppress a false no-input watchdog
+// while already-buffered HLS media is still guaranteed to cover playback.
+inline constexpr const char* kPipelineBufferedUntilSecKey =
+    "tvs-duration-hls-buffered-until-sec";
 
 // Own HLS segment downloader used instead of hlsdemux prefetching.  Segments are
 // downloaded quickly, but only when the duration already admitted downstream
@@ -39,5 +45,10 @@ private:
 // Returns 404/410 while the scheduler deliberately keeps the pipeline alive
 // and probes the source in the background. Zero means normal recovery policy.
 int sourceUnavailableHttpStatus(GstElement* pipeline);
+
+// Conservative wall-clock amount of HLS media already pushed into the pipeline.
+// It reaches zero automatically as real time advances even when no new segment
+// is downloaded, so a dead source cannot be hidden indefinitely.
+uint64_t guaranteedBufferedAheadMilliseconds(GstElement* pipeline);
 
 } // namespace tvs::hls_scheduler

@@ -386,6 +386,11 @@ public:
 
     void stop(bool sendEos = true) {
         const bool wasStopping = stopping_.exchange(true, std::memory_order_relaxed);
+        // 203.22: teardown/recovery must never inherit a stale buffered-ahead
+        // guard from the retiring scheduler generation.
+        if (pipeline_) {
+            g_object_set_data(G_OBJECT(pipeline_), kPipelineBufferedUntilSecKey, nullptr);
+        }
         wake_.notify_all();
         if (sendEos && !wasStopping && appsrc_ && GST_IS_APP_SRC(appsrc_)) {
             gst_app_src_end_of_stream(GST_APP_SRC(appsrc_));
@@ -765,6 +770,23 @@ private:
         }
         if (stopping_.load(std::memory_order_relaxed)) return false;
         pushedDurationNs_ += segmentDurationNs;
+        // 203.22: publish a conservative wall-clock reservoir deadline.
+        // Capture the scheduler's exact ahead immediately after the push. The
+        // whole-second value is rounded DOWN, so the monitor never claims more
+        // guaranteed media than the scheduler actually had. Between publishes
+        // effective consumption can advance no faster than wall clock.
+        // GUINT_TO_POINTER keeps the cross-thread marker allocation-free; a
+        // 32-bit monotonic-second deadline wraps only after ~136 years uptime.
+        if (pipeline_) {
+            const uint64_t nowSec = monotonicNanoseconds() / kNsPerSecond;
+            const uint64_t publishedAheadSec = aheadNs() / kNsPerSecond;
+            const guint bufferedUntilSec = static_cast<guint>(
+                std::min<uint64_t>(nowSec + publishedAheadSec,
+                                   std::numeric_limits<guint>::max()));
+            g_object_set_data(
+                G_OBJECT(pipeline_), kPipelineBufferedUntilSecKey,
+                GUINT_TO_POINTER(bufferedUntilSec));
+        }
         ++segmentsPushed_;
         return true;
     }
@@ -957,6 +979,17 @@ int sourceUnavailableHttpStatus(GstElement* pipeline) {
     if (!pipeline) return 0;
     return GPOINTER_TO_INT(g_object_get_data(
         G_OBJECT(pipeline), kPipelineSourceUnavailableKey));
+}
+
+uint64_t guaranteedBufferedAheadMilliseconds(GstElement* pipeline) {
+    if (!pipeline) return 0;
+    const uint64_t bufferedUntilSec = static_cast<uint64_t>(GPOINTER_TO_UINT(
+        g_object_get_data(G_OBJECT(pipeline), kPipelineBufferedUntilSecKey)));
+    if (bufferedUntilSec == 0) return 0;
+    const uint64_t nowSec = monotonicNanoseconds() / kNsPerSecond;
+    return bufferedUntilSec > nowSec
+        ? (bufferedUntilSec - nowSec) * 1000ULL
+        : 0;
 }
 
 } // namespace tvs::hls_scheduler

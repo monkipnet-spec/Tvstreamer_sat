@@ -406,14 +406,14 @@ GstElement* buildHls(
         });
 
     terminalElement = queue;
-    std::cerr << "Network TS input 203.21: protocol=HLS"
+    std::cerr << "Network TS input 203.22: protocol=HLS"
               << " source=duration-controlled-segment-scheduler+appsrc"
               << " low_ahead_ms=6000 target_ahead_ms=8000 high_ahead_ms=12000"
               << " min_start_segments=2 segment_fetch=full-speed-on-demand"
               << " queue_ms=10000 queue_max_mb=40 leaky=off"
               << " direct_mpegts=always remux=off hlsdemux=off input_pacing=segment-demand"
               << " gst_buffer_timestamps=unset provider_pcr_pts=authoritative"
-              << " watchdog_rebuild_ms=15000"
+              << " watchdog_rebuild_ms=15000 buffered_ahead_guard=on"
               << std::endl;
     return src;
 }

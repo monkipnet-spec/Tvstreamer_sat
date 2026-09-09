@@ -106,6 +106,11 @@ constexpr auto kNetworkRecoveryJitterMax = std::chrono::milliseconds(2500);
 // loss for HLS.  Fifteen seconds matches the existing HLS session TTL and is
 // long enough to span normal segment boundaries without hiding a real outage.
 constexpr auto kHlsInputFailoverDelay = std::chrono::seconds(15);
+// 203.22: scheduler appsrc can legally push two long HLS segments in a burst
+// (e.g. SOUZ 10 s + 10 s) and then stay silent while ~20 s of already-admitted
+// media drains. Do not rebuild while at least one second of that guaranteed
+// wall-clock reservoir remains. The 15 s detector itself is unchanged.
+constexpr uint64_t kHlsWatchdogBufferedAheadFloorMs = 1000ULL;
 constexpr auto kHlsPrimaryProbeTimeout = std::chrono::seconds(15);
 constexpr auto kHlsErrorRecoveryDelay = std::chrono::seconds(1);
 // 202.66: HLS rebuild success only means that a new pipeline reached PLAYING;
@@ -10294,7 +10299,8 @@ void StreamManager::monitorBus(const std::string& id) {
                   << " pipeline_retry_ms=5000 recovery=source-only-first recovery_jitter_ms=0..2500"
                   << " queue_ms=3000 queue_max_mb=32" << std::endl;
     } else if (configuredInputKind == tvs::stream_protocols::InputProtocolKind::Hls) {
-        std::cerr << "HLS input watchdog 202.66: loss_wait_ms=15000"
+        std::cerr << "HLS input watchdog 203.22: loss_wait_ms=15000"
+                  << " buffered_ahead_guard=on buffered_floor_ms=1000"
                   << " primary_probe_ms=15000 generic_live_watchdog_ms=6000"
                   << " recovery=serialized startup_grace_ms=15000,30000,60000"
                   << " retry_backoff_ms=15000,30000,60000"
@@ -10310,6 +10316,7 @@ void StreamManager::monitorBus(const std::string& id) {
     unsigned transcoderAutoRestartFailures = 0;
     auto transcoderAutoRestartDue = std::chrono::steady_clock::time_point::min();
     int lastHlsSourceUnavailableStatus = 0;
+    bool hlsBufferedAheadSuppressionLogged = false;
 
     while (state->running.load()) {
         const auto now = std::chrono::steady_clock::now();
@@ -10873,6 +10880,15 @@ void StreamManager::monitorBus(const std::string& id) {
             const bool inputTimedOut =
                 !networkRecoveryGraceActive && !sourceReconnectInFlight &&
                 now - state->lastInputActivity >= inputFailoverDelay;
+            // Read this as close as possible to the watchdog decision. The HLS
+            // worker can publish a newly downloaded segment concurrently.
+            const uint64_t hlsGuaranteedBufferedAheadMs = hlsInput
+                ? tvs::hls_scheduler::guaranteedBufferedAheadMilliseconds(state->pipeline)
+                : 0;
+            const bool hlsBufferedAheadProtects =
+                hlsInput &&
+                hlsGuaranteedBufferedAheadMs >= kHlsWatchdogBufferedAheadFloorMs;
+            if (!inputTimedOut) hlsBufferedAheadSuppressionLogged = false;
 
             // After the grace window, rebuild once. Deterministic per-stream
             // jitter spreads a common network outage over 0..2.5 s instead of
@@ -11001,6 +11017,23 @@ void StreamManager::monitorBus(const std::string& id) {
                                     "probing every 30 seconds without rebuilding the channel") +
                                 "\nURL: " + state->activeInputUri);
                     }
+                // 203.22: duration-controlled HLS can push long segments in a
+                // burst. lastInputActivity then remains quiet even though media
+                // already admitted to appsrc/queue is still legitimately
+                // draining. Suppress only the no-input rebuild while the
+                // scheduler's conservative wall-clock reservoir is >1 s.
+                } else if (hlsBufferedAheadProtects) {
+                    state->active = true;
+                    state->statusMessage = "HLS buffered media draining";
+                    if (!hlsBufferedAheadSuppressionLogged) {
+                        hlsBufferedAheadSuppressionLogged = true;
+                        std::cerr << "HLS WATCHDOG 203.22: stream=" << id
+                                  << " reason=no-input-15s buffered_ahead_ms="
+                                  << hlsGuaranteedBufferedAheadMs
+                                  << " floor_ms=" << kHlsWatchdogBufferedAheadFloorMs
+                                  << " action=suppress-pipeline-rebuild"
+                                  << std::endl;
+                    }
                 // 202.66: if a freshly rebuilt HLS pipeline is still inside its
                 // startup grace, count the no-input event but do not rebuild it
                 // again. Once grace expires, schedule one serialized retry.
@@ -11016,7 +11049,7 @@ void StreamManager::monitorBus(const std::string& id) {
                               << " reason=no-input-15s action=schedule-serialized-rebuild"
                               << std::endl;
                 }
-                if (!state->inputLossNotified) {
+                if (!hlsBufferedAheadProtects && !state->inputLossNotified) {
                     state->inputLossNotified = true;
                     state->statusMessage = "HLS input stalled - reconnecting";
                     notifyStreamState(
