@@ -9,6 +9,8 @@
 
 namespace tvs::hls_scheduler {
 
+inline constexpr const char* kPipelineDataKey = "tvs-duration-hls-scheduler";
+
 // Own HLS segment downloader used instead of hlsdemux prefetching.  Segments are
 // downloaded quickly, but only when the duration already admitted downstream
 // falls below the low watermark.  The scheduler preserves MPEG-TS bytes and
@@ -23,7 +25,7 @@ public:
     Scheduler& operator=(const Scheduler&) = delete;
 
     bool start(std::string& error);
-    void stop();
+    void stop(bool sendEos = true);
 
 private:
     class Impl;

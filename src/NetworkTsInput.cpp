@@ -400,13 +400,13 @@ GstElement* buildHls(
         return nullptr;
     }
     g_object_set_data_full(
-        G_OBJECT(pipeline), "tvs-duration-hls-scheduler", scheduler,
+        G_OBJECT(pipeline), tvs::hls_scheduler::kPipelineDataKey, scheduler,
         [](gpointer data) {
             delete static_cast<tvs::hls_scheduler::Scheduler*>(data);
         });
 
     terminalElement = queue;
-    std::cerr << "Network TS input 203.18: protocol=HLS"
+    std::cerr << "Network TS input 203.20: protocol=HLS"
               << " source=duration-controlled-segment-scheduler+appsrc"
               << " low_ahead_ms=6000 target_ahead_ms=8000 high_ahead_ms=12000"
               << " min_start_segments=2 segment_fetch=full-speed-on-demand"

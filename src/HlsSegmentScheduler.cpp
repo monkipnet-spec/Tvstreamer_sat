@@ -36,7 +36,11 @@ constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kPushChunkBytes = 64 * kTsPacketSize; // 12032 bytes
 constexpr long kHttpConnectTimeoutMs = 3000;
 constexpr long kHttpTransferTimeoutMs = 12000;
-constexpr uint64_t kPlaylistPollNs = 500ULL * 1000ULL * 1000ULL;
+// 203.20: playlist reloads are tiny control requests. Never let one stalled
+// playlist GET consume the whole 6/8/12-second media reservoir.
+constexpr long kPlaylistHttpTransferTimeoutMs = 2500;
+constexpr uint64_t kPlaylistPollMinNs = 500ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kPlaylistPollMaxNs = 2ULL * kNsPerSecond;
 
 std::once_flag gCurlInitOnce;
 
@@ -135,7 +139,8 @@ bool httpGet(const std::string& rawUrl,
              std::vector<uint8_t>& body,
              long& status,
              std::string& effectiveUrl,
-             std::string& error) {
+             std::string& error,
+             long transferTimeoutMs) {
     std::call_once(gCurlInitOnce, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
     CURL* curl = curl_easy_init();
     if (!curl) {
@@ -158,8 +163,9 @@ bool httpGet(const std::string& rawUrl,
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 8L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, kHttpConnectTimeoutMs);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, kHttpTransferTimeoutMs);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
+        std::min<long>(kHttpConnectTimeoutMs, transferTimeoutMs));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, transferTimeoutMs);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeVector);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
@@ -212,6 +218,14 @@ struct MediaPlaylist {
     std::vector<Variant> variants;
     std::vector<Segment> segments;
 };
+
+uint64_t playlistPollIntervalNs(const MediaPlaylist& playlist) {
+    const double halfTarget = std::max(0.1, playlist.targetDurationSeconds * 0.5);
+    const uint64_t candidate = static_cast<uint64_t>(
+        halfTarget * static_cast<double>(kNsPerSecond));
+    return std::clamp<uint64_t>(
+        candidate, kPlaylistPollMinNs, kPlaylistPollMaxNs);
+}
 
 uint64_t parseUnsignedAttribute(const std::string& line, const std::string& name) {
     const auto pos = line.find(name + "=");
@@ -365,10 +379,10 @@ public:
         return true;
     }
 
-    void stop() {
+    void stop(bool sendEos = true) {
         const bool wasStopping = stopping_.exchange(true, std::memory_order_relaxed);
         wake_.notify_all();
-        if (!wasStopping && appsrc_ && GST_IS_APP_SRC(appsrc_)) {
+        if (sendEos && !wasStopping && appsrc_ && GST_IS_APP_SRC(appsrc_)) {
             gst_app_src_end_of_stream(GST_APP_SRC(appsrc_));
         }
         if (worker_.joinable()) worker_.join();
@@ -469,20 +483,29 @@ private:
     bool fetchBytesWithRetry(const std::string& url,
                              std::vector<uint8_t>& body,
                              std::string& effectiveUrl,
-                             const char* what) {
+                             const char* what,
+                             long transferTimeoutMs,
+                             unsigned maxAttempts = 0) {
         unsigned attempt = 0;
         while (!stopping_.load(std::memory_order_relaxed)) {
             long status = 0;
             std::string error;
-            if (httpGet(url, config_, stopping_, body, status, effectiveUrl, error)) return true;
+            if (httpGet(url, config_, stopping_, body, status, effectiveUrl, error,
+                        transferTimeoutMs)) return true;
             if (stopping_.load(std::memory_order_relaxed)) return false;
             ++attempt;
-            const uint64_t backoffMs = std::min<uint64_t>(2000, 250ULL << std::min<unsigned>(attempt - 1, 3));
-            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " " << what
+            const bool defer = maxAttempts != 0 && attempt >= maxAttempts;
+            const uint64_t backoffMs = defer ? 0 :
+                std::min<uint64_t>(2000, 250ULL << std::min<unsigned>(attempt - 1, 3));
+            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " " << what
                       << " fetch failed attempt=" << attempt
                       << " url=" << url
                       << " error=" << error
-                      << " retry_ms=" << backoffMs << std::endl;
+                      << " timeout_ms=" << transferTimeoutMs
+                      << " retry_ms=" << backoffMs
+                      << (defer ? " action=defer-refresh" : "")
+                      << std::endl;
+            if (defer) return false;
             std::unique_lock<std::mutex> lock(wakeMutex_);
             wake_.wait_for(lock, std::chrono::milliseconds(backoffMs), [&] {
                 return stopping_.load(std::memory_order_relaxed);
@@ -491,28 +514,31 @@ private:
         return false;
     }
 
-    bool loadPlaylist(MediaPlaylist& playlist) {
+    bool loadPlaylist(MediaPlaylist& playlist, bool runtimeRefresh = false) {
         std::vector<uint8_t> bytes;
         std::string effective;
-        if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "playlist")) return false;
+        const unsigned playlistAttempts = runtimeRefresh ? 1U : 0U;
+        if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "playlist",
+                                 kPlaylistHttpTransferTimeoutMs, playlistAttempts)) return false;
         const std::string text(bytes.begin(), bytes.end());
         const std::string base = effective.empty() ? activePlaylistUrl_ : effective;
         playlist = parsePlaylist(text, base);
         if (playlist.master) {
             const auto variant = chooseVariant(playlist.variants, config_.targetBitrate);
             if (!variant) {
-                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
+                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
                 return false;
             }
             if (variant->url != activePlaylistUrl_) {
-                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
+                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
                           << " target=" << config_.targetBitrate
                           << " url=" << variant->url << std::endl;
                 activePlaylistUrl_ = variant->url;
             }
             bytes.clear();
             effective.clear();
-            if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "media-playlist")) return false;
+            if (!fetchBytesWithRetry(activePlaylistUrl_, bytes, effective, "media-playlist",
+                                     kPlaylistHttpTransferTimeoutMs, playlistAttempts)) return false;
             const std::string mediaText(bytes.begin(), bytes.end());
             playlist = parsePlaylist(mediaText, effective.empty() ? activePlaylistUrl_ : effective);
         }
@@ -545,7 +571,7 @@ private:
     bool decryptSegmentIfNeeded(const Segment& segment, std::vector<uint8_t>& bytes) {
         if (segment.keyUri.empty()) return true;
         if (segment.keyUri.rfind("unsupported:", 0) == 0) {
-            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " unsupported encryption method="
+            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " unsupported encryption method="
                       << segment.keyUri.substr(12) << " sequence=" << segment.sequence << std::endl;
             return false;
         }
@@ -553,9 +579,10 @@ private:
         if (cachedKeyUri_ != segment.keyUri || cachedKey_.size() != 16) {
             std::vector<uint8_t> keyBody;
             std::string effective;
-            if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key")) return false;
+            if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key",
+                                     kHttpTransferTimeoutMs)) return false;
             if (keyBody.size() < 16) {
-                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
+                std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
                 return false;
             }
             cachedKey_.assign(keyBody.begin(), keyBody.begin() + 16);
@@ -590,7 +617,7 @@ private:
                   EVP_DecryptFinal_ex(ctx, plain.data() + out1, &out2) == 1;
         EVP_CIPHER_CTX_free(ctx);
         if (!ok) {
-            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
+            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
             return false;
         }
         plain.resize(static_cast<std::size_t>(out1 + out2));
@@ -607,7 +634,7 @@ private:
         while (start < bytes.size() && bytes[start] != 0x47) ++start;
         if (start >= bytes.size()) return true;
         if (start != 0) {
-            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " segment resync discarded=" << start
+            std::cerr << "HLS scheduler 203.20: stream=" << streamLabel() << " segment resync discarded=" << start
                       << " sequence=" << segment.sequence << std::endl;
         }
         const std::size_t usable = ((bytes.size() - start) / kTsPacketSize) * kTsPacketSize;
@@ -644,7 +671,7 @@ private:
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
             if (flow != GST_FLOW_OK) {
                 if (!stopping_.load(std::memory_order_relaxed)) {
-                    std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                    std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
                               << " appsrc push stopped flow=" << flow
                               << " sequence=" << segment.sequence << std::endl;
                 }
@@ -662,12 +689,13 @@ private:
     bool downloadAndPush(const Segment& segment) {
         std::vector<uint8_t> bytes;
         std::string effective;
-        if (!fetchBytesWithRetry(segment.url, bytes, effective, "segment")) return false;
+        if (!fetchBytesWithRetry(segment.url, bytes, effective, "segment",
+                                 kHttpTransferTimeoutMs)) return false;
         if (!decryptSegmentIfNeeded(segment, bytes)) return false;
         if (!pushSegment(segment, bytes)) return false;
         ++segmentsDownloaded_;
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
                   << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
@@ -682,7 +710,7 @@ private:
     void run() {
         activePlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
         if (activePlaylistUrl_.empty()) return;
-        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
                   << " mode=duration-controlled"
                   << " low_ms=" << kLowAheadNs / 1000000ULL
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
@@ -703,10 +731,27 @@ private:
         while (!stopping_.load(std::memory_order_relaxed)) {
             uint64_t ahead = aheadNs();
             if (!startup && ahead > kLowAheadNs) {
+                const uint64_t pollNs = playlistPollIntervalNs(playlist);
                 const uint64_t now = monotonicNanoseconds();
-                const uint64_t untilReload = now > lastPlaylistLoadNs && now - lastPlaylistLoadNs >= kPlaylistPollNs
-                    ? 1ULL : kPlaylistPollNs - std::min<uint64_t>(kPlaylistPollNs, now - lastPlaylistLoadNs);
-                if (!waitForRefillNeed(std::min<uint64_t>(untilReload, 250ULL * 1000ULL * 1000ULL))) break;
+                if (now >= lastPlaylistLoadNs &&
+                    now - lastPlaylistLoadNs >= pollNs) {
+                    MediaPlaylist refreshed;
+                    if (loadPlaylist(refreshed, true)) {
+                        playlist = std::move(refreshed);
+                    }
+                    // Success or failure, rate-limit the next control request.
+                    lastPlaylistLoadNs = monotonicNanoseconds();
+                }
+                const uint64_t afterRefresh = monotonicNanoseconds();
+                const uint64_t currentPollNs = playlistPollIntervalNs(playlist);
+                const uint64_t untilReload =
+                    afterRefresh > lastPlaylistLoadNs &&
+                    afterRefresh - lastPlaylistLoadNs >= currentPollNs
+                    ? 1ULL
+                    : currentPollNs - std::min<uint64_t>(
+                        currentPollNs, afterRefresh - lastPlaylistLoadNs);
+                if (!waitForRefillNeed(std::min<uint64_t>(
+                        untilReload, 250ULL * 1000ULL * 1000ULL))) break;
                 continue;
             }
 
@@ -727,7 +772,7 @@ private:
                     if (nextSequence_ < first) {
                         const uint64_t old = nextSequence_;
                         nextSequence_ = chooseStartupSequence(playlist);
-                        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                        std::cerr << "HLS scheduler 203.20: stream=" << streamLabel()
                                   << " fell behind live window old_sequence=" << old
                                   << " new_sequence=" << nextSequence_
                                   << " action=jump-near-live-edge" << std::endl;
@@ -753,10 +798,10 @@ private:
                 });
                 if (stopping_.load(std::memory_order_relaxed)) break;
                 MediaPlaylist refreshed;
-                if (loadPlaylist(refreshed)) {
+                if (loadPlaylist(refreshed, true)) {
                     playlist = std::move(refreshed);
-                    lastPlaylistLoadNs = monotonicNanoseconds();
                 }
+                lastPlaylistLoadNs = monotonicNanoseconds();
             }
         }
     }
@@ -787,6 +832,6 @@ Scheduler::Scheduler(GstElement* appsrc, GstElement* terminalQueue, StreamConfig
     : impl_(std::make_unique<Impl>(appsrc, terminalQueue, std::move(config))) {}
 Scheduler::~Scheduler() = default;
 bool Scheduler::start(std::string& error) { return impl_->start(error); }
-void Scheduler::stop() { impl_->stop(); }
+void Scheduler::stop(bool sendEos) { impl_->stop(sendEos); }
 
 } // namespace tvs::hls_scheduler

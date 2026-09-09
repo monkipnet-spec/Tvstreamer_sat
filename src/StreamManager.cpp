@@ -2,6 +2,7 @@
 #include "TranscoderModule.h"
 #include "StableUdpOutput.h"
 #include "NetworkTsInput.h"
+#include "HlsSegmentScheduler.h"
 #include "mpts/MptsOutputManager.h"
 #include "TsCcStageTrace.h"
 #include "UdpInput.h"
@@ -49,6 +50,27 @@
 #include <gst/app/gstappsink.h>
 
 namespace {
+
+void stopDurationHlsSchedulerForTeardown(
+    GstElement* pipeline, const std::string& streamId) {
+    if (!pipeline) return;
+    gpointer raw = g_object_steal_data(
+        G_OBJECT(pipeline), tvs::hls_scheduler::kPipelineDataKey);
+    if (!raw) return;
+
+    auto* scheduler = static_cast<tvs::hls_scheduler::Scheduler*>(raw);
+    const auto started = std::chrono::steady_clock::now();
+    // 203.20: pipeline teardown does not need an EOS. Stop the downloader first
+    // so a pending playlist GET cannot hold GstPipeline finalization and the
+    // same-id start barrier for tens of seconds.
+    scheduler->stop(false);
+    delete scheduler;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    std::cerr << "HLS TEARDOWN 203.20: stream=" << streamId
+              << " scheduler_stop_ms=" << elapsed.count()
+              << " action=stop-before-gstreamer-null" << std::endl;
+}
 
 constexpr guint kTsPacketSize = 188;
 // 202.62: continuity telemetry is diagnostic-only. Process very large GstBuffers
@@ -6236,6 +6258,10 @@ bool StreamManager::teardownStreamState(
     if (state.pipeline) {
         detachAppSinkCallbacksForTeardown(state.pipeline);
     }
+    if (state.bus) {
+        gst_bus_set_flushing(state.bus, TRUE);
+    }
+    stopDurationHlsSchedulerForTeardown(state.pipeline, id);
     stopHttpMpegTsInput(&state);
     stopExternalSrtOutputs(&state);
     releaseSharedDvbInput(&state);
@@ -7405,6 +7431,8 @@ bool StreamManager::restartPipelineWithInput(StreamState* state, const std::stri
     // existing restart/fallback semantics.
     if (strictHlsGenerationTeardown && oldPipeline) {
         detachAppSinkCallbacksForTeardown(oldPipeline);
+        if (oldBus) gst_bus_set_flushing(oldBus, TRUE);
+        stopDurationHlsSchedulerForTeardown(oldPipeline, state->config.id);
     }
 
     // 202.70: a public HTTP relay is tied to the tcpserversink generation that
