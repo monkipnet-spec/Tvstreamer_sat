@@ -379,14 +379,57 @@ private:
         return static_cast<Impl*>(userData)->onTerminalBuffer(info);
     }
 
+    struct ConsumptionSpan {
+        std::size_t remainingBytes = 0;
+        uint64_t remainingDurationNs = 0;
+    };
+
     GstPadProbeReturn onTerminalBuffer(GstPadProbeInfo* info) {
         GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-        if (buffer) {
-            const GstClockTime duration = GST_BUFFER_DURATION(buffer);
-            if (GST_CLOCK_TIME_IS_VALID(duration)) {
-                consumedDurationNs_.fetch_add(static_cast<uint64_t>(duration), std::memory_order_relaxed);
-                wake_.notify_one();
+        if (!buffer) return GST_PAD_PROBE_OK;
+
+        // 203.18: HLS TS buffers must not carry a synthetic byte-position time
+        // scale.  The provider MPEG-TS already contains the authoritative PCR
+        // and PES PTS/DTS.  Track scheduler consumption privately by accounting
+        // bytes that cross the terminal queue against the EXTINF duration ledger.
+        // This clock is used ONLY to decide when another HTTP segment may be
+        // fetched; it is never written into GstBuffer timestamps.
+        std::size_t bytes = gst_buffer_get_size(buffer);
+        uint64_t consumedNs = 0;
+        {
+            std::lock_guard<std::mutex> lock(consumptionMutex_);
+            while (bytes > 0 && !consumptionSpans_.empty()) {
+                auto& span = consumptionSpans_.front();
+                if (span.remainingBytes == 0) {
+                    consumptionSpans_.pop_front();
+                    continue;
+                }
+
+                const std::size_t take = std::min(bytes, span.remainingBytes);
+                uint64_t takeNs = 0;
+                if (take == span.remainingBytes) {
+                    // Give the final bytes the exact remaining duration so
+                    // integer rounding cannot accumulate across a segment.
+                    takeNs = span.remainingDurationNs;
+                } else if (span.remainingDurationNs > 0) {
+                    takeNs = static_cast<uint64_t>(
+                        (static_cast<__uint128_t>(span.remainingDurationNs) * take) /
+                        span.remainingBytes);
+                    if (takeNs == 0) takeNs = 1;
+                    takeNs = std::min(takeNs, span.remainingDurationNs);
+                }
+
+                span.remainingBytes -= take;
+                span.remainingDurationNs -= takeNs;
+                bytes -= take;
+                consumedNs += takeNs;
+                if (span.remainingBytes == 0) consumptionSpans_.pop_front();
             }
+        }
+
+        if (consumedNs > 0) {
+            consumedDurationNs_.fetch_add(consumedNs, std::memory_order_relaxed);
+            wake_.notify_one();
         }
         return GST_PAD_PROBE_OK;
     }
@@ -417,6 +460,12 @@ private:
         return !stopping_.load(std::memory_order_relaxed);
     }
 
+    std::string streamLabel() const {
+        if (!config_.name.empty()) return config_.name;
+        if (!config_.id.empty()) return config_.id;
+        return "unnamed";
+    }
+
     bool fetchBytesWithRetry(const std::string& url,
                              std::vector<uint8_t>& body,
                              std::string& effectiveUrl,
@@ -429,7 +478,7 @@ private:
             if (stopping_.load(std::memory_order_relaxed)) return false;
             ++attempt;
             const uint64_t backoffMs = std::min<uint64_t>(2000, 250ULL << std::min<unsigned>(attempt - 1, 3));
-            std::cerr << "HLS scheduler 203.17: " << what
+            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " " << what
                       << " fetch failed attempt=" << attempt
                       << " url=" << url
                       << " error=" << error
@@ -452,11 +501,11 @@ private:
         if (playlist.master) {
             const auto variant = chooseVariant(playlist.variants, config_.targetBitrate);
             if (!variant) {
-                std::cerr << "HLS scheduler 203.17: master playlist has no variants" << std::endl;
+                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " master playlist has no variants" << std::endl;
                 return false;
             }
             if (variant->url != activePlaylistUrl_) {
-                std::cerr << "HLS scheduler 203.17: master selected bandwidth=" << variant->bandwidth
+                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " master selected bandwidth=" << variant->bandwidth
                           << " target=" << config_.targetBitrate
                           << " url=" << variant->url << std::endl;
                 activePlaylistUrl_ = variant->url;
@@ -496,7 +545,7 @@ private:
     bool decryptSegmentIfNeeded(const Segment& segment, std::vector<uint8_t>& bytes) {
         if (segment.keyUri.empty()) return true;
         if (segment.keyUri.rfind("unsupported:", 0) == 0) {
-            std::cerr << "HLS scheduler 203.17: unsupported encryption method="
+            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " unsupported encryption method="
                       << segment.keyUri.substr(12) << " sequence=" << segment.sequence << std::endl;
             return false;
         }
@@ -506,7 +555,7 @@ private:
             std::string effective;
             if (!fetchBytesWithRetry(segment.keyUri, keyBody, effective, "AES-128-key")) return false;
             if (keyBody.size() < 16) {
-                std::cerr << "HLS scheduler 203.17: AES-128 key too short bytes=" << keyBody.size() << std::endl;
+                std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " AES-128 key too short bytes=" << keyBody.size() << std::endl;
                 return false;
             }
             cachedKey_.assign(keyBody.begin(), keyBody.begin() + 16);
@@ -541,7 +590,7 @@ private:
                   EVP_DecryptFinal_ex(ctx, plain.data() + out1, &out2) == 1;
         EVP_CIPHER_CTX_free(ctx);
         if (!ok) {
-            std::cerr << "HLS scheduler 203.17: AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
+            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " AES-128 decrypt failed sequence=" << segment.sequence << std::endl;
             return false;
         }
         plain.resize(static_cast<std::size_t>(out1 + out2));
@@ -558,7 +607,7 @@ private:
         while (start < bytes.size() && bytes[start] != 0x47) ++start;
         if (start >= bytes.size()) return true;
         if (start != 0) {
-            std::cerr << "HLS scheduler 203.17: segment resync discarded=" << start
+            std::cerr << "HLS scheduler 203.18: stream=" << streamLabel() << " segment resync discarded=" << start
                       << " sequence=" << segment.sequence << std::endl;
         }
         const std::size_t usable = ((bytes.size() - start) / kTsPacketSize) * kTsPacketSize;
@@ -566,7 +615,15 @@ private:
 
         const uint64_t segmentDurationNs = std::max<uint64_t>(
             1ULL, static_cast<uint64_t>(std::llround(segment.durationSeconds * static_cast<double>(kNsPerSecond))));
-        uint64_t assignedNs = 0;
+
+        // Register the segment in the scheduler's private consumption ledger
+        // BEFORE pushing its first buffer. The terminal queue may drain on a
+        // different thread immediately after gst_app_src_push_buffer().
+        {
+            std::lock_guard<std::mutex> lock(consumptionMutex_);
+            consumptionSpans_.push_back({usable, segmentDurationNs});
+        }
+
         std::size_t offset = 0;
         bool first = true;
         while (offset < usable && !stopping_.load(std::memory_order_relaxed)) {
@@ -575,31 +632,28 @@ private:
             if (!buffer) return false;
             gst_buffer_fill(buffer, 0, bytes.data() + start + offset, chunkBytes);
 
-            const bool last = offset + chunkBytes >= usable;
-            const uint64_t nextAssigned = last
-                ? segmentDurationNs
-                : static_cast<uint64_t>((static_cast<__uint128_t>(segmentDurationNs) *
-                    static_cast<uint64_t>(offset + chunkBytes)) / static_cast<uint64_t>(usable));
-            const uint64_t chunkDuration = nextAssigned > assignedNs ? nextAssigned - assignedNs : 1ULL;
-            GST_BUFFER_PTS(buffer) = pushedTimelineNs_ + assignedNs;
-            GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
-            GST_BUFFER_DURATION(buffer) = chunkDuration;
+            // 203.18: DO NOT derive timestamps from byte position inside EXTINF.
+            // VBR MPEG-TS byte density is not linear in media time. Leaving these
+            // unset makes StableUDP ignore the appsrc clock and use the provider
+            // PCR carried inside the TS, while AAC/H264 PES PTS/DTS stay untouched.
+            GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
+            GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
+            GST_BUFFER_DURATION(buffer) = GST_CLOCK_TIME_NONE;
             if (first && segment.discontinuity) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DISCONT);
 
             const GstFlowReturn flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
             if (flow != GST_FLOW_OK) {
                 if (!stopping_.load(std::memory_order_relaxed)) {
-                    std::cerr << "HLS scheduler 203.17: appsrc push stopped flow=" << flow
+                    std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                              << " appsrc push stopped flow=" << flow
                               << " sequence=" << segment.sequence << std::endl;
                 }
                 return false;
             }
-            assignedNs = nextAssigned;
             offset += chunkBytes;
             first = false;
         }
         if (stopping_.load(std::memory_order_relaxed)) return false;
-        pushedTimelineNs_ += segmentDurationNs;
         pushedDurationNs_ += segmentDurationNs;
         ++segmentsPushed_;
         return true;
@@ -613,7 +667,8 @@ private:
         if (!pushSegment(segment, bytes)) return false;
         ++segmentsDownloaded_;
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.17: segment=" << segment.sequence
+        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                  << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
                   << " ahead_ms=" << ahead / 1000000ULL
@@ -627,13 +682,16 @@ private:
     void run() {
         activePlaylistUrl_ = tvs::protocols::inputs::hlsInputUri(config_);
         if (activePlaylistUrl_.empty()) return;
-        std::cerr << "HLS scheduler 203.17: mode=duration-controlled"
+        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                  << " mode=duration-controlled"
                   << " low_ms=" << kLowAheadNs / 1000000ULL
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
                   << " high_ms=" << kHighAheadNs / 1000000ULL
                   << " min_start_segments=" << kMinimumStartupSegments
                   << " fetch_policy=fast-segment-on-demand"
                   << " provider_ts=byte-preserved"
+                  << " gst_timestamps=provider-ts-only"
+                  << " consumption_clock=private-byte-duration-ledger"
                   << std::endl;
 
         MediaPlaylist playlist;
@@ -669,7 +727,8 @@ private:
                     if (nextSequence_ < first) {
                         const uint64_t old = nextSequence_;
                         nextSequence_ = chooseStartupSequence(playlist);
-                        std::cerr << "HLS scheduler 203.17: fell behind live window old_sequence=" << old
+                        std::cerr << "HLS scheduler 203.18: stream=" << streamLabel()
+                                  << " fell behind live window old_sequence=" << old
                                   << " new_sequence=" << nextSequence_
                                   << " action=jump-near-live-edge" << std::endl;
                         continue;
@@ -710,7 +769,8 @@ private:
     std::atomic<bool> stopping_{false};
     std::atomic<uint64_t> consumedDurationNs_{0};
     uint64_t pushedDurationNs_ = 0;
-    uint64_t pushedTimelineNs_ = 0;
+    std::mutex consumptionMutex_;
+    std::deque<ConsumptionSpan> consumptionSpans_;
     uint64_t firstPushMonotonicNs_ = 0;
     uint64_t nextSequence_ = 0;
     uint64_t segmentsDownloaded_ = 0;
