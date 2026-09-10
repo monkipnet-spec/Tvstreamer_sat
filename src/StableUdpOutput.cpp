@@ -90,16 +90,18 @@ constexpr std::size_t kHlsPreSendPacketLowWater = 64;
 constexpr uint64_t kPeriodicPatIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicPmtIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicSdtIntervalNanoseconds = 500ULL * 1000ULL * 1000ULL;
-// 203.38: manual provider-PCR soft phase PLL. Unlike 203.37, never hold a real
-// TS packet waiting for a future PCR anchor. Provider PCR is observed only after
-// the packet has naturally won a token-paced output slot, then a bounded/slewed
-// correction is applied to the useful-packet bitrate. This preserves continuous
-// CBR output while reducing slow PCR/PTS phase excursions without freeze/catch-up.
-constexpr int64_t kHlsSoftPhaseMaximumCorrectionPermille = 50; // +/-5.0%
-constexpr int64_t kHlsSoftPhaseMaximumStepPermille = 3;        // 0.3% / 100 ms
-constexpr int64_t kHlsSoftPhaseNanosecondsPerPermille = 4LL * 1000LL * 1000LL; // 4 ms -> 0.1%
-constexpr uint64_t kHlsSoftPhaseSampleTimeoutNanoseconds = 1000ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kHlsSoftPhaseMaximumAcceptedErrorNanoseconds = 750ULL * 1000ULL * 1000ULL;
+// 203.40: manual pre-buffered provider-PCR interval pacing. The rejected 203.37
+// scheduler waited for future PCR in the output path and 203.38 fed phase error
+// back into a global PLL. 203.40 does neither. While HLS data is already buffered,
+// ingest groups packets between two *known* provider-PCR anchors, derives the
+// interval's local TS byte-density, and annotates those packets before they enter
+// the normal real-packet ring. fillDatagram() remains a non-blocking token sender.
+constexpr uint64_t kHlsPcrIntervalMinimumAnchorGapNanoseconds = 2ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsPcrIntervalMaximumAnchorGapNanoseconds = 1000ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kHlsPcrIntervalMaximumPendingPackets = 4096;
+constexpr uint64_t kHlsPcrIntervalMaximumPendingFallbackNanoseconds =
+    1250ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsPcrIntervalMinimumBitrate = 100000ULL;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
@@ -316,8 +318,10 @@ struct TimedTsPacket {
     bool hasPcr = false;
     bool discontinuity = false;
     uint64_t sourcePcrTicks = 0;
-    // 203.38 soft phase PLL never assigns a future release time to packets.
-    // Keep no per-packet pacing state here: all useful packets stay token-paced.
+    // 203.40 feed-forward pacing metadata. A non-zero value is computed only
+    // after both provider-PCR anchors of this interval are already buffered.
+    // It is a token rate, never a release timestamp or a wait condition.
+    uint64_t hlsIntervalPaceBitrate = 0;
 };
 
 struct HlsTimestampRatePoint {
@@ -752,8 +756,8 @@ public:
           // continuous SRT/HTTP retain the TVStreamer5 network profile.
           segmentedHlsInput(
               isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
-          // 203.38: soft phase PLL is a separate manual per-stream mode. When enabled
-          // it only slews token bitrate from provider-PCR phase feedback; it never waits packets.
+          // 203.40: this existing per-stream flag now selects pre-buffered
+          // provider-PCR interval feed-forward pacing. The output sender never waits.
           hlsPcrPhasePacingEnabled(
               cfg.hlsPcrPhasePacing && isSegmentedHlsInput(cfg) &&
               udpShapingMode(cfg) == UdpShapingMode::Cbr &&
@@ -1612,86 +1616,151 @@ private:
                packet.pid == declaredPcrPid;
     }
 
-    static int64_t signedPcrTickDifference(uint64_t value, uint64_t reference) {
-        const uint64_t forward = value >= reference
+    static uint64_t forwardPcrTickDifference(uint64_t value, uint64_t reference) {
+        return value >= reference
             ? value - reference
             : (kPcrTicksModulus - reference) + value;
-        const uint64_t backward = reference >= value
-            ? reference - value
-            : (kPcrTicksModulus - value) + reference;
-        if (forward <= backward) {
-            return static_cast<int64_t>(forward);
-        }
-        return -static_cast<int64_t>(backward);
     }
 
-    void resetHlsSoftPhasePll(const char* reason) {
-        hlsSoftPhaseErrorNanoseconds = 0;
-        hlsSoftPhaseSampleNanoseconds = 0;
-        hlsSoftPhaseCorrectionPermille = 0;
-        hlsSoftPhaseSamples = 0;
-        hlsSoftPhaseControllerAnnounced = false;
-        if (reason && *reason) {
-            std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
-                      << " action=reset-soft-phase-pll reason=" << reason
+    void resetHlsPcrIntervalPacing(const char* reason, bool flushPending) {
+        if (flushPending && !hlsPcrIntervalPending.empty()) {
+            for (auto& pending : hlsPcrIntervalPending) {
+                pending.hlsIntervalPaceBitrate = 0;
+                pushRealPacket(std::move(pending));
+            }
+            ++hlsPcrIntervalFallbacks;
+        }
+        const std::size_t pendingCount = hlsPcrIntervalPending.size();
+        hlsPcrIntervalPending.clear();
+        hlsPcrIntervalAnchorValid = false;
+        hlsPcrIntervalAnchorTicks = 0;
+        hlsPcrIntervalAnchorPid = 0x1FFF;
+        hlsPcrIntervalInvalidAnnounced = false;
+        if (reason && *reason && (pendingCount > 0 || hlsPcrIntervalAnnounced)) {
+            std::cerr << "HLS PCR interval 203.40: stream=" << streamId
+                      << " action=reset-prebuffered-interval"
+                      << " reason=" << reason
+                      << " flushed_packets=" << pendingCount
+                      << " output_wait=never"
                       << std::endl;
         }
     }
 
-    void observeHlsSoftPhaseError(const TimedTsPacket& packet, uint64_t slotTimeNanoseconds) {
-        if (!isSelectedHlsPhasePcr(packet) || !periodicPcrInitialized ||
-            packet.pid != periodicPcrPid || slotTimeNanoseconds < periodicPcrOriginNanoseconds) {
+    void queueRealPacket(TimedTsPacket packet) {
+        if (!hlsPcrPhasePacingEnabled) {
+            pushRealPacket(std::move(packet));
             return;
         }
 
-        const uint64_t elapsedNanoseconds = slotTimeNanoseconds - periodicPcrOriginNanoseconds;
-        const uint64_t syntheticPcrTicks =
-            (periodicPcrOriginTicks + nanosecondsToPcrTicks(elapsedNanoseconds)) %
-            kPcrTicksModulus;
-        const int64_t deltaTicks = signedPcrTickDifference(
-            packet.sourcePcrTicks, syntheticPcrTicks);
-        const uint64_t absoluteTicks = deltaTicks >= 0
-            ? static_cast<uint64_t>(deltaTicks)
-            : static_cast<uint64_t>(-deltaTicks);
-        const uint64_t absoluteNanoseconds = multiplyDivide(
-            absoluteTicks, 1000000000ULL, kPcrClockHz);
+        if (packet.discontinuity) {
+            resetHlsPcrIntervalPacing("source-discontinuity", true);
+        }
 
-        if (absoluteNanoseconds > kHlsSoftPhaseMaximumAcceptedErrorNanoseconds) {
-            // Do not let a discontinuity/wrap mistake command a large speed change.
-            // Ignore this sample and let the existing correction decay smoothly.
-            if (!hlsSoftPhaseOutlierAnnounced) {
-                std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
-                          << " phase_error_ms="
-                          << (deltaTicks >= 0
-                                  ? static_cast<int64_t>(absoluteNanoseconds / 1000000ULL)
-                                  : -static_cast<int64_t>(absoluteNanoseconds / 1000000ULL))
-                          << " action=ignore-outlier"
-                          << std::endl;
-                hlsSoftPhaseOutlierAnnounced = true;
+        const bool selectedPcr = isSelectedHlsPhasePcr(packet);
+        if (!hlsPcrIntervalAnchorValid) {
+            // Before the first selected PCR there is no completed interval to
+            // measure. Pass transport through at the normal duration fallback.
+            pushRealPacket(std::move(packet));
+            if (selectedPcr) {
+                const TimedTsPacket& anchor = realPackets.back();
+                hlsPcrIntervalAnchorValid = true;
+                hlsPcrIntervalAnchorTicks = anchor.sourcePcrTicks;
+                hlsPcrIntervalAnchorPid = anchor.pid;
             }
             return;
         }
 
-        const int64_t sampleNanoseconds = deltaTicks >= 0
-            ? static_cast<int64_t>(absoluteNanoseconds)
-            : -static_cast<int64_t>(absoluteNanoseconds);
-        // Mild low-pass filtering prevents one PCR packet from steering the pace,
-        // but still follows the ~10 s phase excursions measured on SOUZ.
-        hlsSoftPhaseErrorNanoseconds = hlsSoftPhaseSamples == 0
-            ? sampleNanoseconds
-            : (hlsSoftPhaseErrorNanoseconds * 3LL + sampleNanoseconds) / 4LL;
-        hlsSoftPhaseSampleNanoseconds = slotTimeNanoseconds;
-        ++hlsSoftPhaseSamples;
-        hlsSoftPhaseOutlierAnnounced = false;
-    }
-
-    void queueRealPacket(TimedTsPacket packet) {
-        if (hlsPcrPhasePacingEnabled && packet.discontinuity) {
-            resetHlsSoftPhasePll("source-discontinuity");
+        if (!selectedPcr) {
+            hlsPcrIntervalPending.push_back(std::move(packet));
+            const uint64_t fallbackRate = realPaceBitrate.load(std::memory_order_relaxed);
+            const uint64_t pendingFallbackNanoseconds = fallbackRate > 0
+                ? multiplyDivide(
+                    static_cast<uint64_t>(hlsPcrIntervalPending.size()) *
+                        kTsPacketSize * 8ULL,
+                    1000000000ULL,
+                    fallbackRate)
+                : 0;
+            if (hlsPcrIntervalPending.size() > kHlsPcrIntervalMaximumPendingPackets ||
+                (pendingFallbackNanoseconds >
+                    kHlsPcrIntervalMaximumPendingFallbackNanoseconds)) {
+                resetHlsPcrIntervalPacing("pending-limit-without-next-PCR", true);
+            }
+            return;
         }
-        // 203.38: no packet is held for PCR interpolation. Every real TS packet
-        // enters the same ring and is emitted only by the normal token bucket.
-        pushRealPacket(std::move(packet));
+
+        const uint64_t deltaTicks = forwardPcrTickDifference(
+            packet.sourcePcrTicks, hlsPcrIntervalAnchorTicks);
+        const uint64_t deltaNanoseconds = multiplyDivide(
+            deltaTicks, 1000000000ULL, kPcrClockHz);
+        const uint64_t distancePackets =
+            static_cast<uint64_t>(hlsPcrIntervalPending.size()) + 1ULL;
+        const uint64_t intervalBitrate = deltaTicks > 0
+            ? multiplyDivide(
+                distancePackets * kTsPacketSize * 8ULL,
+                kPcrClockHz,
+                deltaTicks)
+            : 0;
+        const uint64_t paceCeiling = maxRealPaceBitrate();
+        const bool validInterval =
+            packet.pid == hlsPcrIntervalAnchorPid &&
+            deltaNanoseconds >= kHlsPcrIntervalMinimumAnchorGapNanoseconds &&
+            deltaNanoseconds <= kHlsPcrIntervalMaximumAnchorGapNanoseconds &&
+            intervalBitrate >= kHlsPcrIntervalMinimumBitrate &&
+            intervalBitrate <= paceCeiling;
+
+        if (validInterval) {
+            for (auto& pending : hlsPcrIntervalPending) {
+                pending.hlsIntervalPaceBitrate = intervalBitrate;
+                pushRealPacket(std::move(pending));
+            }
+            packet.hlsIntervalPaceBitrate = intervalBitrate;
+            pushRealPacket(std::move(packet));
+            ++hlsPcrIntervalCompleted;
+            hlsPcrIntervalInvalidAnnounced = false;
+            hlsPcrIntervalLastBitrate = intervalBitrate;
+            hlsPcrIntervalLastDurationNanoseconds = deltaNanoseconds;
+            hlsPcrIntervalLastPacketDistance = distancePackets;
+            if (!hlsPcrIntervalAnnounced) {
+                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
+                          << " action=lock-prebuffered-feedforward"
+                          << " pcr_pid=" << hlsPcrIntervalAnchorPid
+                          << " interval_ms=" << (deltaNanoseconds / 1000000ULL)
+                          << " interval_packets=" << distancePackets
+                          << " interval_bitrate=" << intervalBitrate
+                          << " packet_schedule=token-feedforward"
+                          << " output_wait=never"
+                          << " PCR=continuous-20ms-clock"
+                          << std::endl;
+                hlsPcrIntervalAnnounced = true;
+            }
+        } else {
+            for (auto& pending : hlsPcrIntervalPending) {
+                pending.hlsIntervalPaceBitrate = 0;
+                pushRealPacket(std::move(pending));
+            }
+            packet.hlsIntervalPaceBitrate = 0;
+            pushRealPacket(std::move(packet));
+            ++hlsPcrIntervalFallbacks;
+            if (!hlsPcrIntervalInvalidAnnounced) {
+                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
+                          << " action=fallback-invalid-interval"
+                          << " pcr_pid=" << hlsPcrIntervalAnchorPid
+                          << " next_pcr_pid=" << realPackets.back().pid
+                          << " interval_ms=" << (deltaNanoseconds / 1000000ULL)
+                          << " interval_packets=" << distancePackets
+                          << " interval_bitrate=" << intervalBitrate
+                          << " pace_ceiling=" << paceCeiling
+                          << " packet_schedule=duration-token-fallback"
+                          << " output_wait=never"
+                          << std::endl;
+                hlsPcrIntervalInvalidAnnounced = true;
+            }
+        }
+
+        hlsPcrIntervalPending.clear();
+        hlsPcrIntervalAnchorValid = true;
+        hlsPcrIntervalAnchorTicks = realPackets.back().sourcePcrTicks;
+        hlsPcrIntervalAnchorPid = realPackets.back().pid;
     }
 
     void queueChunk(TimedChunk chunk) {
@@ -2137,6 +2206,9 @@ private:
         if (pcrPid >= 0x1FFF) return;
 
         if (!declaredPcrPidValid || declaredPcrPid != pcrPid || declaredPcrProgram != programNumber) {
+            if (hlsPcrPhasePacingEnabled && declaredPcrPidValid && declaredPcrPid != pcrPid) {
+                resetHlsPcrIntervalPacing("PMT-PCR-PID-change", true);
+            }
             declaredPcrPid = pcrPid;
             declaredPcrProgram = programNumber;
             declaredPcrPidValid = true;
@@ -2318,50 +2390,15 @@ private:
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
 
-        // 203.38: manual soft phase PLL keeps the proven duration/token sender as
-        // the only packet scheduler. Provider PCR supplies feedback only: if the
-        // preserved media clock is behind synthetic output PCR, pace useful bytes
-        // slightly faster; if it is ahead, pace slightly slower. The correction is
-        // bounded to +/-5% and slewed by at most 0.3% per 100 ms, so there is no
-        // packet wait, pause, or catch-up burst as in the rejected 203.37 mode.
+        // 203.40: pre-buffered provider-PCR interval pacing is feed-forward.
+        // updateRateController supplies only the duration/PCR fallback rate used
+        // before the first complete interval or for rejected intervals. Valid
+        // intervals carry their own already-known token rate in TimedTsPacket.
         if (segmentedHlsInput && hlsPcrPhasePacingEnabled) {
             const uint64_t baseRate = std::min<uint64_t>(
                 hlsSourceRate > 0 ? hlsSourceRate : estimate, maxRealPaceBitrate());
-            const bool phaseFresh = hlsSoftPhaseSampleNanoseconds != 0 &&
-                nowNanoseconds >= hlsSoftPhaseSampleNanoseconds &&
-                nowNanoseconds - hlsSoftPhaseSampleNanoseconds <=
-                    kHlsSoftPhaseSampleTimeoutNanoseconds;
-
-            int64_t targetCorrectionPermille = 0;
-            if (phaseFresh) {
-                // phase_error = provider PCR - synthetic PCR. Negative means the
-                // media timeline is late and useful packets must be emitted faster.
-                targetCorrectionPermille = -hlsSoftPhaseErrorNanoseconds /
-                    kHlsSoftPhaseNanosecondsPerPermille;
-                targetCorrectionPermille = std::clamp<int64_t>(
-                    targetCorrectionPermille,
-                    -kHlsSoftPhaseMaximumCorrectionPermille,
-                    kHlsSoftPhaseMaximumCorrectionPermille);
-            }
-
-            const int64_t correctionDelta = targetCorrectionPermille -
-                hlsSoftPhaseCorrectionPermille;
-            const int64_t correctionStep = std::clamp<int64_t>(
-                correctionDelta,
-                -kHlsSoftPhaseMaximumStepPermille,
-                kHlsSoftPhaseMaximumStepPermille);
-            hlsSoftPhaseCorrectionPermille += correctionStep;
-
-            const int64_t scalePermille = 1000LL + hlsSoftPhaseCorrectionPermille;
-            uint64_t correctedRate = baseRate;
-            if (scalePermille > 0) {
-                correctedRate = multiplyDivide(
-                    baseRate, static_cast<uint64_t>(scalePermille), 1000ULL);
-            }
-            correctedRate = std::min<uint64_t>(correctedRate, maxRealPaceBitrate());
-
-            currentRealPaceBitrate = correctedRate;
-            realPaceBitrate.store(correctedRate, std::memory_order_relaxed);
+            currentRealPaceBitrate = baseRate;
+            realPaceBitrate.store(baseRate, std::memory_order_relaxed);
             updateTransportBitrate();
             const uint64_t targetBytes = std::max<uint64_t>(
                 kUdpPayloadSize * 32ULL,
@@ -2374,36 +2411,31 @@ private:
                 std::memory_order_relaxed);
             hlsPllCorrectionBitrate = 0;
 
-            if (!hlsSoftPhaseControllerAnnounced) {
-                std::cerr << "HLS UDP pacing 203.38: stream=" << streamId
-                          << " source_rate=duration+soft-provider-PCR-phase-PLL"
-                          << " base_rate_bitrate=" << baseRate
-                          << " effective_media_clock_bitrate=" << correctedRate
-                          << " max_correction_permille="
-                          << kHlsSoftPhaseMaximumCorrectionPermille
-                          << " max_step_permille=" << kHlsSoftPhaseMaximumStepPermille
-                          << " packet_schedule=token-only-no-wait"
+            if (!hlsPcrIntervalControllerAnnounced) {
+                std::cerr << "HLS UDP pacing 203.40: stream=" << streamId
+                          << " source_rate=prebuffered-provider-PCR-interval"
+                          << " fallback_rate_bitrate=" << baseRate
+                          << " packet_schedule=token-feedforward-no-wait"
+                          << " interval_source=adjacent-PCR-known-before-enqueue"
                           << " reservoir_pll=disabled"
                           << " PCR=continuous-20ms-clock"
                           << std::endl;
-                hlsSoftPhaseControllerAnnounced = true;
+                hlsPcrIntervalControllerAnnounced = true;
             }
-            if (hlsSoftPhaseLastLogNanoseconds == 0 ||
-                nowNanoseconds - hlsSoftPhaseLastLogNanoseconds >= kStatsIntervalNanoseconds) {
-                const uint64_t sampleAgeMs = phaseFresh
-                    ? (nowNanoseconds - hlsSoftPhaseSampleNanoseconds) / 1000000ULL
-                    : 0;
-                std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
-                          << " phase_sample=" << (phaseFresh ? "fresh" : "stale")
-                          << " phase_error_ms=" << (hlsSoftPhaseErrorNanoseconds / 1000000LL)
-                          << " correction_permille=" << hlsSoftPhaseCorrectionPermille
-                          << " target_correction_permille=" << targetCorrectionPermille
-                          << " base_rate_bitrate=" << baseRate
-                          << " effective_media_clock_bitrate=" << correctedRate
-                          << " sample_age_ms=" << sampleAgeMs
-                          << " packet_schedule=token-only-no-wait"
+            if (hlsPcrIntervalLastLogNanoseconds == 0 ||
+                nowNanoseconds - hlsPcrIntervalLastLogNanoseconds >= kStatsIntervalNanoseconds) {
+                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
+                          << " completed_intervals=" << hlsPcrIntervalCompleted
+                          << " fallbacks=" << hlsPcrIntervalFallbacks
+                          << " pending_packets=" << hlsPcrIntervalPending.size()
+                          << " last_interval_ms="
+                          << (hlsPcrIntervalLastDurationNanoseconds / 1000000ULL)
+                          << " last_interval_packets=" << hlsPcrIntervalLastPacketDistance
+                          << " last_interval_bitrate=" << hlsPcrIntervalLastBitrate
+                          << " fallback_rate_bitrate=" << baseRate
+                          << " packet_schedule=token-feedforward-no-wait"
                           << std::endl;
-                hlsSoftPhaseLastLogNanoseconds = nowNanoseconds;
+                hlsPcrIntervalLastLogNanoseconds = nowNanoseconds;
             }
             return;
         }
@@ -2756,7 +2788,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.38: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-soft-phase-PLL+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.40: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-prebuffered-provider-pcr-interval+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2856,12 +2888,23 @@ private:
             return counts;
         }
 
-        const uint64_t pace = realPaceBitrate.load(std::memory_order_relaxed);
+        const uint64_t fallbackPace = realPaceBitrate.load(std::memory_order_relaxed);
         for (std::size_t slot = 0; slot < kTsPacketsPerDatagram; ++slot) {
             const uint64_t slotOffset = multiplyDivide(
                 slot * kTsPacketSize * 8ULL, 1000000000ULL, activeTransportBitrate);
             const uint64_t slotTime = datagramMediaNanoseconds + slotOffset;
             guint8* outputPacket = destination + slot * kTsPacketSize;
+
+            // 203.40: if the front packet belongs to a completed provider-PCR
+            // interval, its local byte-density was computed before enqueue. Use
+            // that rate directly as token feed-forward. There is never a due-time
+            // check and never a wait for a future anchor in this output path.
+            uint64_t pace = fallbackPace;
+            if (hlsPcrPhasePacingEnabled && !realPackets.empty() &&
+                realPackets.front().hlsIntervalPaceBitrate > 0) {
+                pace = realPackets.front().hlsIntervalPaceBitrate;
+            }
+            hlsPcrIntervalActiveBitrate = pace;
 
             // Accumulate useful-data entitlement on every transport slot,
             // including slots reserved for periodic PCR-only packets.
@@ -2890,9 +2933,9 @@ private:
             }
 
             bool sendReal = false;
-            // 203.38: all useful packets, including soft-phase mode, stay on the
-            // normal token bucket. Provider PCR can change only the token rate;
-            // it can never hold the front packet waiting for a future timestamp.
+            // 203.40: every useful packet stays on the normal token bucket.
+            // Pre-buffered PCR intervals only select the token rate; no packet
+            // has a release timestamp and the sender never waits for PCR.
             if (realTokenAccumulator >= activeTransportBitrate) {
                 realTokenAccumulator -= activeTransportBitrate;
                 sendReal = !realPackets.empty();
@@ -2909,12 +2952,6 @@ private:
                 realPackets.pop_front();
 
                 if (packet.hasPcr) {
-                    // Observe provider-vs-synthetic PCR phase at the packet's
-                    // natural token-paced output slot. This is feedback only;
-                    // observeHlsSoftPhaseError never delays or releases packets.
-                    if (hlsPcrPhasePacingEnabled && periodicPcrInitialized) {
-                        observeHlsSoftPhaseError(packet, slotTime);
-                    }
                     if (!periodicPcrInitialized) {
                         // Never lock the WISI output clock to an arbitrary PCR
                         // seen during shared-DVB full-TS warmup.  The PMT for the
@@ -3356,15 +3393,23 @@ private:
     std::atomic<uint64_t> processingChunkCount{0};
     std::atomic<uint64_t> processingChunkMaxCapacityBytes{0};
     boost::circular_buffer<TimedTsPacket> realPackets;
-    // 203.38 soft provider-PCR phase PLL state. No packet queue or due-time
-    // scheduler exists here; this state can only slew the scalar token pace.
-    int64_t hlsSoftPhaseErrorNanoseconds = 0;
-    int64_t hlsSoftPhaseCorrectionPermille = 0;
-    uint64_t hlsSoftPhaseSampleNanoseconds = 0;
-    uint64_t hlsSoftPhaseLastLogNanoseconds = 0;
-    uint64_t hlsSoftPhaseSamples = 0;
-    bool hlsSoftPhaseControllerAnnounced = false;
-    bool hlsSoftPhaseOutlierAnnounced = false;
+    // 203.40 ingest-side pre-buffering for one provider-PCR interval. These
+    // packets are not visible to fillDatagram until the next anchor is already
+    // known and their feed-forward token rate has been calculated.
+    std::vector<TimedTsPacket> hlsPcrIntervalPending;
+    bool hlsPcrIntervalAnchorValid = false;
+    uint64_t hlsPcrIntervalAnchorTicks = 0;
+    uint16_t hlsPcrIntervalAnchorPid = 0x1FFF;
+    uint64_t hlsPcrIntervalCompleted = 0;
+    uint64_t hlsPcrIntervalFallbacks = 0;
+    uint64_t hlsPcrIntervalLastBitrate = 0;
+    uint64_t hlsPcrIntervalLastDurationNanoseconds = 0;
+    uint64_t hlsPcrIntervalLastPacketDistance = 0;
+    uint64_t hlsPcrIntervalLastLogNanoseconds = 0;
+    uint64_t hlsPcrIntervalActiveBitrate = 0;
+    bool hlsPcrIntervalAnnounced = false;
+    bool hlsPcrIntervalControllerAnnounced = false;
+    bool hlsPcrIntervalInvalidAnnounced = false;
     bool memoryAccountingRegistered = false;
     bool diagnosticRegistryRegistered = false;
     std::vector<guint8> inputRemainder;
