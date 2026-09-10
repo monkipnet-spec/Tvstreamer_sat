@@ -83,6 +83,13 @@ constexpr uint64_t kMaximumTransportBitrate = 200000000ULL;
 // private StableUdpSender members. Functional values are unchanged.
 constexpr std::size_t kHlsIngestChunksPerSenderTick = 16;
 constexpr std::size_t kHlsPreSendPacketLowWater = 64;
+// 203.35: remapped HLS segments can carry PAT/PMT only in a short burst at the
+// segment boundary and may contain no SDT at all. Keep PSI repetition in the
+// continuous output transport domain instead of inheriting the HLS segment
+// cadence. Periodic copies are inserted only into otherwise-NULL CBR slots.
+constexpr uint64_t kPeriodicPatIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kPeriodicPmtIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kPeriodicSdtIntervalNanoseconds = 500ULL * 1000ULL * 1000ULL;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
@@ -1347,7 +1354,8 @@ private:
             sendDatagram(datagram.data(), datagram.size());
             totalDatagrams.fetch_add(1, std::memory_order_relaxed);
             totalRealPackets.fetch_add(filled.real, std::memory_order_relaxed);
-            const std::size_t occupied = filled.real + filled.periodicPcr;
+            const std::size_t occupied =
+                filled.real + filled.periodicPcr + filled.periodicPsi;
             totalNullPackets.fetch_add(
                 occupied < kTsPacketsPerDatagram ? kTsPacketsPerDatagram - occupied : 0,
                 std::memory_order_relaxed);
@@ -1643,6 +1651,7 @@ private:
             std::copy_n(bytes.data() + offset, kTsPacketSize, packet.bytes.data());
             normalizeRemappedPsi(packet.bytes);
             observeDeclaredPcrFromPmt(packet.bytes);
+            cachePeriodicRemappedPsi(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
             if (segmentedHlsInput || continuousNetworkMpegTsInput) {
@@ -1874,6 +1883,124 @@ private:
                       << std::endl;
             finalSdtAnnounced = true;
         }
+    }
+
+    void cachePeriodicRemappedPsi(const std::array<guint8, kTsPacketSize>& packet) {
+        if (!segmentedHlsInput || mode != UdpShapingMode::Cbr ||
+            !remapPsiNormalization || remapOutputServiceId == 0 || packet[0] != 0x47) {
+            return;
+        }
+
+        const uint16_t pid = packetPid(packet);
+        std::size_t available = 0;
+        const guint8* section = tsPayloadStart(packet, available, true);
+        if (!section || available < 8) return;
+
+        const uint16_t sectionLength = static_cast<uint16_t>(
+            ((section[1] & 0x0F) << 8) | section[2]);
+        const std::size_t totalSectionBytes = static_cast<std::size_t>(sectionLength) + 3U;
+        const bool completeSinglePacketSection =
+            sectionLength >= 4 && totalSectionBytes <= available;
+
+        if (pid == 0x0000 && section[0] == 0x00 && completeSinglePacketSection) { // PAT
+            periodicPatPacket = packet;
+            periodicPatValid = true;
+            return;
+        }
+
+        if (section[0] == 0x02 && completeSinglePacketSection) { // PMT
+            const uint16_t programNumber = static_cast<uint16_t>(
+                (static_cast<uint16_t>(section[3]) << 8) | section[4]);
+            if (expectedProgramId != 0 && programNumber != expectedProgramId) return;
+            periodicPmtPacket = packet;
+            periodicPmtPid = pid;
+            periodicPmtValid = true;
+            return;
+        }
+
+        if (pid == 0x0011 && (section[0] == 0x42 || section[0] == 0x46)) {
+            periodicSdtPacket = packet;
+            periodicSdtValid = true;
+        }
+    }
+
+    void ensurePeriodicSdtPacket() {
+        if (!segmentedHlsInput || mode != UdpShapingMode::Cbr ||
+            !remapPsiNormalization || remapOutputServiceId == 0 || periodicSdtValid) return;
+
+        std::array<guint8, kTsPacketSize> packet {};
+        packet.fill(0xFF);
+        packet[0] = 0x47;
+        packet[1] = 0x40;
+        packet[2] = 0x11;
+        packet[3] = 0x10;
+        writeRemappedSdtPacket(
+            packet,
+            remapOutputServiceId,
+            remapServiceName,
+            remapServiceProvider,
+            sdtTransportStreamId,
+            sdtOriginalNetworkId,
+            sdtVersion);
+        periodicSdtPacket = packet;
+        periodicSdtValid = true;
+    }
+
+    bool writePeriodicPsiIfDue(guint8* destination, uint64_t slotTimeNanoseconds) {
+        if (!destination || !segmentedHlsInput || mode != UdpShapingMode::Cbr ||
+            !remapPsiNormalization || remapOutputServiceId == 0) return false;
+
+        ensurePeriodicSdtPacket();
+
+        // Arm each table only after a usable packet exists. The first periodic
+        // copy is emitted immediately into the next available NULL slot; later
+        // copies follow the continuous sender clock rather than HLS segment time.
+        if (periodicPatValid && nextPeriodicPatNanoseconds == 0) {
+            nextPeriodicPatNanoseconds = slotTimeNanoseconds;
+        }
+        if (periodicPmtValid && nextPeriodicPmtNanoseconds == 0) {
+            nextPeriodicPmtNanoseconds = slotTimeNanoseconds;
+        }
+        if (periodicSdtValid && nextPeriodicSdtNanoseconds == 0) {
+            nextPeriodicSdtNanoseconds = slotTimeNanoseconds;
+        }
+
+        const std::array<guint8, kTsPacketSize>* source = nullptr;
+        uint64_t* next = nullptr;
+        uint64_t interval = 0;
+
+        if (periodicPatValid && slotTimeNanoseconds >= nextPeriodicPatNanoseconds) {
+            source = &periodicPatPacket;
+            next = &nextPeriodicPatNanoseconds;
+            interval = kPeriodicPatIntervalNanoseconds;
+        } else if (periodicPmtValid && slotTimeNanoseconds >= nextPeriodicPmtNanoseconds) {
+            source = &periodicPmtPacket;
+            next = &nextPeriodicPmtNanoseconds;
+            interval = kPeriodicPmtIntervalNanoseconds;
+        } else if (periodicSdtValid && slotTimeNanoseconds >= nextPeriodicSdtNanoseconds) {
+            source = &periodicSdtPacket;
+            next = &nextPeriodicSdtNanoseconds;
+            interval = kPeriodicSdtIntervalNanoseconds;
+        }
+
+        if (!source || !next || interval == 0) return false;
+
+        std::copy(source->begin(), source->end(), destination);
+        do {
+            *next += interval;
+        } while (*next <= slotTimeNanoseconds);
+
+        ++insertedPeriodicPsiPackets;
+        if (!periodicPsiAnnounced && periodicPatValid && periodicPmtValid && periodicSdtValid) {
+            std::cerr << "UDP periodic PSI 203.35: program=" << remapOutputServiceId
+                      << " pmt_pid=" << periodicPmtPid
+                      << " PAT=100ms PMT=100ms SDT=500ms"
+                      << " scheduling=continuous-output-clock insertion=NULL-slots-only"
+                      << " media_payload=untouched PCR=untouched"
+                      << std::endl;
+            periodicPsiAnnounced = true;
+        }
+        return true;
     }
 
     void observeDeclaredPcrFromPmt(const std::array<guint8, kTsPacketSize>& packet) {
@@ -2544,6 +2671,7 @@ private:
     struct FillCounts {
         std::size_t real = 0;
         std::size_t periodicPcr = 0;
+        std::size_t periodicPsi = 0;
     };
 
     FillCounts fillDatagram(
@@ -2656,6 +2784,8 @@ private:
                 std::copy(packet.bytes.begin(), packet.bytes.end(), outputPacket);
                 bufferedBytes.fetch_sub(kTsPacketSize, std::memory_order_relaxed);
                 ++counts.real;
+            } else if (writePeriodicPsiIfDue(outputPacket, slotTime)) {
+                ++counts.periodicPsi;
             } else {
                 makeNullPacket(outputPacket);
             }
@@ -3000,6 +3130,19 @@ private:
     uint16_t sdtOriginalNetworkId = 1;
     guint8 sdtVersion = 0;
     bool finalSdtAnnounced = false;
+    // 203.35 periodic PSI cache. PAT/PMT are captured after remap; SDT is either
+    // captured after normalization or synthesized from the configured service.
+    std::array<guint8, kTsPacketSize> periodicPatPacket {};
+    std::array<guint8, kTsPacketSize> periodicPmtPacket {};
+    std::array<guint8, kTsPacketSize> periodicSdtPacket {};
+    bool periodicPatValid = false;
+    bool periodicPmtValid = false;
+    bool periodicSdtValid = false;
+    bool periodicPsiAnnounced = false;
+    uint16_t periodicPmtPid = 0x1FFF;
+    uint64_t nextPeriodicPatNanoseconds = 0;
+    uint64_t nextPeriodicPmtNanoseconds = 0;
+    uint64_t nextPeriodicSdtNanoseconds = 0;
     std::array<guint8, 8192> finalContinuity {};
     std::array<bool, 8192> finalContinuityValid {};
     std::array<guint8, 8192> finalVerifyContinuity {};
@@ -3009,6 +3152,7 @@ private:
     std::atomic<uint64_t> finalDiscontinuitiesCleared{0};
     std::atomic<uint64_t> finalContinuityVerifyErrors{0};
     std::atomic<uint64_t> finalSdtRewrites{0};
+    std::atomic<uint64_t> insertedPeriodicPsiPackets{0};
     std::atomic<uint64_t> transportBitrate{0};
     sockaddr_in destinationAddress {};
 
