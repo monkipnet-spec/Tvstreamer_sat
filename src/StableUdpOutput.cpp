@@ -741,7 +741,7 @@ public:
           // continuous SRT/HTTP retain the TVStreamer5 network profile.
           segmentedHlsInput(
               isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
-          // 203.34: slow-provider-PCR is a manual per-stream opt-in. Existing
+          // 203.36: provider-PCR media clock is a manual per-stream opt-in. Existing
           // HLS channels keep the 203.31/203.32 duration+near-PCR behaviour.
           hlsSlowPcrAssistEnabled(cfg.hlsSlowPcrAssist),
           // Continuous network MPEG-TS keeps its existing network controller.
@@ -1216,20 +1216,19 @@ private:
     // 203.24 startup assist: before a provider PCR clock is validated, allow
     // only the proven +0..2% upward floor.
     static constexpr uint64_t kHlsNearPcrAssistTolerancePermille = 20ULL; // +2.0% max
-    // 203.34: manual targeted downward provider-PCR assist for selected HLS channels.
-    // TV3 Minsk output diagnostics showed that duration bytes/EXTINF could pace
-    // useful packets ~1.8% faster than the provider media timeline while the
-    // generated 7 Mbit/s transport/PCR clock itself remained exact. Acquire only
-    // when provider PCR is persistently 1..4% BELOW duration-rate for five seconds.
-    // The controller runs only when cfg.hlsSlowPcrAssist is explicitly enabled;
-    // all existing/unselected channels retain the 203.31 duration+near-PCR profile.
-    static constexpr uint64_t kHlsSlowPcrAssistMinimumGapPermille = 10ULL; // >=1.0% slower
-    static constexpr uint64_t kHlsSlowPcrAssistMaximumGapPermille = 40ULL; // <=4.0% slower
+    // 203.36: true manual provider-PCR clock for explicitly selected HLS channels.
+    // 203.34 only permitted an automatic *downward* assist when PCR happened to be
+    // 1..4% below bytes/EXTINF, so the checkbox could have no effect or repeatedly
+    // lock/release as the rolling duration estimate crossed the provider rate.
+    // Manual ON now means what the UI says: after enough PCR evidence and a short
+    // acquisition hold, freeze the provider-PCR byte-density as the media clock in
+    // either direction. Release only on a gross provider-rate change; discontinuity
+    // handling below also clears the lock. Manual OFF keeps the 203.31/203.32
+    // duration+near-PCR+slow-reservoir-PLL path unchanged.
     static constexpr uint64_t kHlsSlowPcrAssistAcquireHoldNanoseconds =
         5ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsSlowPcrAssistMinimumSamples = 64ULL;
-    static constexpr uint64_t kHlsSlowPcrAssistReleaseTolerancePermille = 80ULL; // gross +/-8%
-    static constexpr uint64_t kHlsSlowPcrAssistRateDriftReleasePermille = 30ULL; // PCR +/-3%
+    static constexpr uint64_t kHlsManualPcrClockRateDriftReleasePermille = 100ULL; // PCR +/-10%
     // 203.26: once enough provider-PCR samples have accumulated, a CBR-like HLS
     // service may lock its useful-packet pace to that provider clock in BOTH
     // directions. TV3 Minsk measured ~+1.65 s PTS-vs-PCR drift in 180 s because
@@ -2260,78 +2259,53 @@ private:
             const uint64_t pcrRateSamples =
                 pcrDerivedBitrateSamples.load(std::memory_order_relaxed);
 
-            // 203.33: duration-rate can be biased high on long 10/11-second HLS
-            // segments even when provider PCR is stable. TV3 Minsk proved this
-            // directly: output PCR stayed exactly 1.000x while audio/video PTS
-            // advanced ~1.8% faster. Track only a sustained DOWNWARD disagreement
-            // and freeze the provider-PCR rate once acquired so EWMA noise cannot
-            // continuously rebase token pacing.
+            // 203.36: manual ON is a real provider-PCR media clock, not another
+            // relation-to-EXTINF heuristic. Wait for enough PCR evidence and a
+            // five-second hold, then freeze that rate so per-segment VBR does not
+            // rebase token pacing. Only a gross provider-PCR rate change releases
+            // the lock; normal duration-rate movement is intentionally ignored.
             if (segmentedHlsInput && hlsSlowPcrAssistEnabled &&
-                durationRateLimited > 0 && pcrDerivedInputBitrate > 0 &&
+                pcrDerivedInputBitrate > 0 &&
                 pcrRateSamples >= kHlsSlowPcrAssistMinimumSamples) {
                 if (hlsSlowPcrClockBitrate == 0) {
-                    const uint64_t acquireLow = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL - kHlsSlowPcrAssistMaximumGapPermille,
-                        1000ULL);
-                    const uint64_t acquireHigh = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL - kHlsSlowPcrAssistMinimumGapPermille,
-                        1000ULL);
-                    const bool candidate =
-                        pcrDerivedInputBitrate >= acquireLow &&
-                        pcrDerivedInputBitrate <= acquireHigh;
-                    if (candidate) {
-                        if (hlsSlowPcrCandidateSinceNanoseconds == 0) {
-                            hlsSlowPcrCandidateSinceNanoseconds = nowNanoseconds;
-                        } else if (nowNanoseconds >= hlsSlowPcrCandidateSinceNanoseconds &&
-                                   nowNanoseconds - hlsSlowPcrCandidateSinceNanoseconds >=
-                                       kHlsSlowPcrAssistAcquireHoldNanoseconds) {
-                            hlsSlowPcrClockBitrate = std::min<uint64_t>(
-                                pcrDerivedInputBitrate, hlsPaceCeiling);
-                            hlsSlowPcrCandidateSinceNanoseconds = 0;
-                            hlsSlowPcrAssistAnnounced = false;
-                        }
-                    } else {
+                    if (hlsSlowPcrCandidateSinceNanoseconds == 0) {
+                        hlsSlowPcrCandidateSinceNanoseconds = nowNanoseconds;
+                    } else if (nowNanoseconds >= hlsSlowPcrCandidateSinceNanoseconds &&
+                               nowNanoseconds - hlsSlowPcrCandidateSinceNanoseconds >=
+                                   kHlsSlowPcrAssistAcquireHoldNanoseconds) {
+                        hlsSlowPcrClockBitrate = std::min<uint64_t>(
+                            pcrDerivedInputBitrate, hlsPaceCeiling);
                         hlsSlowPcrCandidateSinceNanoseconds = 0;
+                        hlsSlowPcrAssistAnnounced = false;
                     }
                 } else {
-                    const uint64_t durationLow = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL - kHlsSlowPcrAssistReleaseTolerancePermille,
-                        1000ULL);
-                    const uint64_t durationHigh = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL + kHlsSlowPcrAssistReleaseTolerancePermille,
-                        1000ULL);
                     const uint64_t pcrLow = multiplyDivide(
                         hlsSlowPcrClockBitrate,
-                        1000ULL - kHlsSlowPcrAssistRateDriftReleasePermille,
+                        1000ULL - kHlsManualPcrClockRateDriftReleasePermille,
                         1000ULL);
                     const uint64_t pcrHigh = multiplyDivide(
                         hlsSlowPcrClockBitrate,
-                        1000ULL + kHlsSlowPcrAssistRateDriftReleasePermille,
+                        1000ULL + kHlsManualPcrClockRateDriftReleasePermille,
                         1000ULL);
-                    if (hlsSlowPcrClockBitrate < durationLow ||
-                        hlsSlowPcrClockBitrate > durationHigh ||
-                        pcrDerivedInputBitrate < pcrLow ||
+                    if (pcrDerivedInputBitrate < pcrLow ||
                         pcrDerivedInputBitrate > pcrHigh) {
-                        std::cerr << "HLS UDP pacing 203.34: source_rate=duration-segment-media-clock"
+                        std::cerr << "HLS UDP pacing 203.36: stream=" << streamId
+                                  << " source_rate=duration-segment-media-clock"
                                   << " duration_rate_bitrate=" << durationRateLimited
-                                  << " slow_pcr_mode=manual-on"
-                                  << " slow_pcr_bitrate=" << hlsSlowPcrClockBitrate
-                                  << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
+                                  << " provider_pcr_mode=manual-on"
+                                  << " frozen_pcr_bitrate=" << hlsSlowPcrClockBitrate
+                                  << " current_pcr_bitrate=" << pcrDerivedInputBitrate
                                   << " pcr_samples=" << pcrRateSamples
-                                  << " action=release-slow-provider-pcr-assist"
+                                  << " action=release-manual-provider-pcr-clock"
                                   << std::endl;
                         hlsSlowPcrClockBitrate = 0;
-                        hlsSlowPcrCandidateSinceNanoseconds = 0;
+                        hlsSlowPcrCandidateSinceNanoseconds = nowNanoseconds;
                         hlsSlowPcrAssistAnnounced = false;
                     }
                 }
             } else {
-                // Manual mode off (or not enough evidence): never carry a
-                // slow-PCR lock/candidate into the standard HLS pacing path.
+                // Manual OFF: never carry a provider-PCR lock/candidate into the
+                // standard 203.31/203.32 duration+near-PCR pacing path.
                 hlsSlowPcrClockBitrate = 0;
                 hlsSlowPcrCandidateSinceNanoseconds = 0;
                 hlsSlowPcrAssistAnnounced = false;
@@ -2390,10 +2364,10 @@ private:
                 }
             }
 
-            // 203.24 remains the startup/fallback rule. 203.34 may manually cap a
-            // persistently over-fast duration estimate with a frozen, slower
-            // provider-PCR clock for explicitly selected streams. The old 203.26 bidirectional controller remains
-            // disabled and can only take precedence if explicitly re-enabled.
+            // 203.24 remains the startup/fallback rule. 203.36 manual mode gives an
+            // explicitly selected stream a frozen provider-PCR media clock in
+            // either direction. The old global 203.26 controller remains disabled
+            // and can only take precedence if explicitly re-enabled.
             const uint64_t mediaClockRateLimited = hlsSlowPcrClockBitrate > 0
                 ? hlsSlowPcrClockBitrate
                 : (hlsValidatedPcrClockBitrate > 0
@@ -2415,16 +2389,16 @@ private:
                 if (firstDurationLock) {
                     realTokenAccumulator = 0;
                     if (hlsSlowPcrClockBitrate > 0) {
-                        std::cerr << "HLS UDP pacing 203.34: source_rate=slow-provider-PCR-assist"
+                        std::cerr << "HLS UDP pacing 203.36: stream=" << streamId << " source_rate=manual-provider-PCR"
                                   << " duration_rate_bitrate=" << durationRateLimited
                                   << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                                  << " slow_pcr_bitrate=" << hlsSlowPcrClockBitrate
+                                  << " provider_pcr_bitrate=" << hlsSlowPcrClockBitrate
                                   << " effective_media_clock_bitrate=" << mediaClockRateLimited
                                   << " pcr_samples=" << pcrRateSamples
                                   << " token_phase=initial-lock"
                                   << " reservoir_pll=clock-rate-correction-disabled"
                                   << " transport_bitrate=" << currentTargetBitrate()
-                                  << " action=lock-slow-provider-pcr-media-clock"
+                                  << " action=lock-manual-provider-pcr-media-clock"
                                   << std::endl;
                         hlsSlowPcrAssistAnnounced = true;
                     } else if (hlsValidatedPcrClockBitrate > 0) {
@@ -2453,15 +2427,15 @@ private:
                     }
                 } else if (hlsSlowPcrClockBitrate > 0 &&
                            !hlsSlowPcrAssistAnnounced) {
-                    std::cerr << "HLS UDP pacing 203.34: source_rate=slow-provider-PCR-assist"
+                    std::cerr << "HLS UDP pacing 203.36: stream=" << streamId << " source_rate=manual-provider-PCR"
                               << " duration_rate_bitrate=" << durationRateLimited
                               << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                              << " slow_pcr_bitrate=" << hlsSlowPcrClockBitrate
+                              << " provider_pcr_bitrate=" << hlsSlowPcrClockBitrate
                               << " effective_media_clock_bitrate=" << mediaClockRateLimited
                               << " pcr_samples=" << pcrRateSamples
                               << " token_phase=preserved"
                               << " reservoir_pll=clock-rate-correction-disabled"
-                              << " action=lock-slow-provider-pcr-media-clock"
+                              << " action=lock-manual-provider-pcr-media-clock"
                               << std::endl;
                     hlsSlowPcrAssistAnnounced = true;
                 } else if (hlsValidatedPcrClockBitrate > 0 &&
@@ -2583,7 +2557,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.34: mode=duration-segment-media-clock+near-pcr-assist+manual-slow-provider-pcr-assist+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.36: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2593,11 +2567,11 @@ private:
                           << (segmentedHlsInput ? mediaClockRateLimited : playoutSourceRate)
                           << " pcr_assist="
                           << (segmentedHlsInput && nearPcrAssistRate > 0 ? "on" : "off")
-                          << " slow_pcr_mode="
+                          << " provider_pcr_mode="
                           << (segmentedHlsInput && hlsSlowPcrAssistEnabled ? "manual-on" : "manual-off")
-                          << " slow_pcr_assist="
+                          << " provider_pcr_lock="
                           << (segmentedHlsInput && hlsSlowPcrClockBitrate > 0 ? "on" : "off")
-                          << " slow_pcr_bitrate="
+                          << " provider_pcr_bitrate="
                           << (segmentedHlsInput ? hlsSlowPcrClockBitrate : 0)
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " target_reservoir_ms="
@@ -3391,11 +3365,11 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.34: compatibility=202.74"
+        std::cerr << "HLS timing 203.36: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-slow-provider-pcr-assist+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
-                  << " slow_pcr_mode=" << (config.hlsSlowPcrAssist ? "manual-on" : "manual-off")
+                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
+                  << " provider_pcr_mode=" << (config.hlsSlowPcrAssist ? "manual-on" : "manual-off")
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
