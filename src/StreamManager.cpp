@@ -6628,17 +6628,41 @@ Json::Value StreamManager::queueMemorySnapshot() const {
                         gst_iterator_free(padIterator);
                     }
                 }
-                if (element &&
-                    g_object_class_find_property(G_OBJECT_GET_CLASS(element), "current-level-bytes")) {
-                    guint bytes = 0;
-                    g_object_get(element, "current-level-bytes", &bytes, nullptr);
-                    totalBytes += static_cast<uint64_t>(bytes);
-                    ++queueCount;
-                    if (static_cast<uint64_t>(bytes) > maxQueueBytes) {
-                        maxQueueBytes = static_cast<uint64_t>(bytes);
-                        maxStreamId = streamId;
-                        const gchar* name = GST_OBJECT_NAME(element);
-                        maxQueueName = name ? name : "queue";
+                if (element) {
+                    // 203.32: current-level-bytes is not one universal GObject type.
+                    // GstQueue exposes guint, while GstAppSrc exposes guint64. The old
+                    // variadic g_object_get() always passed guint*, so reading an HLS
+                    // appsrc wrote eight bytes into a four-byte stack slot and corrupted
+                    // the adjacent iterator GValue. The next g_value_reset() then crashed
+                    // in g_type_value_table_peek(). Read according to the property's
+                    // declared GType and ignore unexpected future types safely.
+                    GParamSpec* levelBytesSpec = g_object_class_find_property(
+                        G_OBJECT_GET_CLASS(element), "current-level-bytes");
+                    uint64_t bytes = 0;
+                    bool haveBytes = false;
+                    if (levelBytesSpec) {
+                        const GType valueType = G_PARAM_SPEC_VALUE_TYPE(levelBytesSpec);
+                        if (valueType == G_TYPE_UINT) {
+                            guint value32 = 0;
+                            g_object_get(element, "current-level-bytes", &value32, nullptr);
+                            bytes = static_cast<uint64_t>(value32);
+                            haveBytes = true;
+                        } else if (valueType == G_TYPE_UINT64) {
+                            guint64 value64 = 0;
+                            g_object_get(element, "current-level-bytes", &value64, nullptr);
+                            bytes = static_cast<uint64_t>(value64);
+                            haveBytes = true;
+                        }
+                    }
+                    if (haveBytes) {
+                        totalBytes += bytes;
+                        ++queueCount;
+                        if (bytes > maxQueueBytes) {
+                            maxQueueBytes = bytes;
+                            maxStreamId = streamId;
+                            const gchar* name = GST_OBJECT_NAME(element);
+                            maxQueueName = name ? name : "queue";
+                        }
                     }
                 }
                 g_value_reset(&value);
