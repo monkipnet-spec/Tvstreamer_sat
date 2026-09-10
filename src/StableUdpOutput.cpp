@@ -90,18 +90,22 @@ constexpr std::size_t kHlsPreSendPacketLowWater = 64;
 constexpr uint64_t kPeriodicPatIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicPmtIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicSdtIntervalNanoseconds = 500ULL * 1000ULL * 1000ULL;
-// 203.40: manual pre-buffered provider-PCR interval pacing. The rejected 203.37
-// scheduler waited for future PCR in the output path and 203.38 fed phase error
-// back into a global PLL. 203.40 does neither. While HLS data is already buffered,
-// ingest groups packets between two *known* provider-PCR anchors, derives the
-// interval's local TS byte-density, and annotates those packets before they enter
-// the normal real-packet ring. fillDatagram() remains a non-blocking token sender.
-constexpr uint64_t kHlsPcrIntervalMinimumAnchorGapNanoseconds = 2ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kHlsPcrIntervalMaximumAnchorGapNanoseconds = 1000ULL * 1000ULL * 1000ULL;
-constexpr std::size_t kHlsPcrIntervalMaximumPendingPackets = 4096;
-constexpr uint64_t kHlsPcrIntervalMaximumPendingFallbackNanoseconds =
+// 203.41: bounded-lookahead provider-PCR deadline shaper. Raw SOUZ captures
+// proved that 40 ms PCR intervals can legitimately contain 500-700 TS packets
+// (20-25 Mbit/s instantaneous density) while the long-term service stays near
+// 2 Mbit/s. A 5 Mbit/s CBR output cannot reproduce those bursts at their source
+// rate. Buffer a short provider-time horizon and propagate the required lead
+// backwards from future PCR deadlines. Each completed interval is then released
+// with a feasible token rate <= the useful CBR ceiling. fillDatagram() remains
+// non-blocking: no packet deadline, sleep, PCR wait, feedback PLL, or catch-up.
+constexpr uint64_t kHlsPcrDeadlineLookaheadNanoseconds = 750ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsPcrDeadlineMinimumAnchorGapNanoseconds = 2ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsPcrDeadlineMaximumAnchorGapNanoseconds = 1000ULL * 1000ULL * 1000ULL;
+constexpr std::size_t kHlsPcrDeadlineMaximumBufferedPackets = 8192;
+constexpr std::size_t kHlsPcrDeadlineMaximumIntervals = 64;
+constexpr uint64_t kHlsPcrDeadlineMaximumPendingFallbackNanoseconds =
     1250ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kHlsPcrIntervalMinimumBitrate = 100000ULL;
+constexpr uint64_t kHlsPcrDeadlineMaximumRawBitrate = kMaximumTransportBitrate;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
@@ -301,6 +305,31 @@ uint64_t multiplyDivide(uint64_t value, uint64_t multiplier, uint64_t divisor) {
 #endif
 }
 
+uint64_t multiplyDivideCeil(uint64_t value, uint64_t multiplier, uint64_t divisor) {
+    if (divisor == 0) {
+        return 0;
+    }
+#if defined(__SIZEOF_INT128__)
+    const unsigned __int128 product =
+        static_cast<unsigned __int128>(value) * static_cast<unsigned __int128>(multiplier);
+    const unsigned __int128 quotient =
+        (product + static_cast<unsigned __int128>(divisor) - 1U) /
+        static_cast<unsigned __int128>(divisor);
+    return quotient > std::numeric_limits<uint64_t>::max()
+        ? std::numeric_limits<uint64_t>::max()
+        : static_cast<uint64_t>(quotient);
+#else
+    const long double quotient =
+        (static_cast<long double>(value) * static_cast<long double>(multiplier)) /
+        static_cast<long double>(divisor);
+    if (quotient >= static_cast<long double>(std::numeric_limits<uint64_t>::max())) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    const uint64_t floor = static_cast<uint64_t>(quotient);
+    return static_cast<long double>(floor) < quotient ? floor + 1ULL : floor;
+#endif
+}
+
 uint64_t nanosecondsToPcrTicks(uint64_t nanoseconds) {
     return multiplyDivide(nanoseconds, kPcrClockHz, 1000000000ULL);
 }
@@ -318,10 +347,16 @@ struct TimedTsPacket {
     bool hasPcr = false;
     bool discontinuity = false;
     uint64_t sourcePcrTicks = 0;
-    // 203.40 feed-forward pacing metadata. A non-zero value is computed only
-    // after both provider-PCR anchors of this interval are already buffered.
-    // It is a token rate, never a release timestamp or a wait condition.
-    uint64_t hlsIntervalPaceBitrate = 0;
+    // 203.41 feed-forward pacing metadata. A non-zero value is computed while
+    // this packet is still inside the bounded ingest lookahead. It is only a
+    // token rate; the output path never receives a release timestamp/deadline.
+    uint64_t hlsDeadlinePaceBitrate = 0;
+};
+
+struct HlsPcrDeadlineInterval {
+    std::size_t packetCount = 0;
+    uint64_t durationNanoseconds = 0;
+    uint64_t rawBitrate = 0;
 };
 
 struct HlsTimestampRatePoint {
@@ -756,9 +791,9 @@ public:
           // continuous SRT/HTTP retain the TVStreamer5 network profile.
           segmentedHlsInput(
               isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
-          // 203.40: this existing per-stream flag now selects pre-buffered
-          // provider-PCR interval feed-forward pacing. The output sender never waits.
-          hlsPcrPhasePacingEnabled(
+          // 203.41: the existing per-stream flag selects bounded-lookahead
+          // provider-PCR deadline shaping. The output sender never waits on PCR.
+          hlsPcrDeadlineShaperEnabled(
               cfg.hlsPcrPhasePacing && isSegmentedHlsInput(cfg) &&
               udpShapingMode(cfg) == UdpShapingMode::Cbr &&
               !useTvStreamer5IpShaperProfile(cfg)),
@@ -1611,8 +1646,8 @@ private:
         realPackets.push_back(std::move(packet));
     }
 
-    bool isSelectedHlsPhasePcr(const TimedTsPacket& packet) const {
-        return hlsPcrPhasePacingEnabled && packet.hasPcr && declaredPcrPidValid &&
+    bool isSelectedHlsDeadlinePcr(const TimedTsPacket& packet) const {
+        return hlsPcrDeadlineShaperEnabled && packet.hasPcr && declaredPcrPidValid &&
                packet.pid == declaredPcrPid;
     }
 
@@ -1622,145 +1657,333 @@ private:
             : (kPcrTicksModulus - reference) + value;
     }
 
-    void resetHlsPcrIntervalPacing(const char* reason, bool flushPending) {
-        if (flushPending && !hlsPcrIntervalPending.empty()) {
-            for (auto& pending : hlsPcrIntervalPending) {
-                pending.hlsIntervalPaceBitrate = 0;
-                pushRealPacket(std::move(pending));
-            }
-            ++hlsPcrIntervalFallbacks;
+    std::size_t hlsPcrDeadlineBufferedPacketCount() const {
+        return hlsPcrDeadlinePackets.size() >= hlsPcrDeadlinePacketHead
+            ? hlsPcrDeadlinePackets.size() - hlsPcrDeadlinePacketHead
+            : 0;
+    }
+
+    void compactHlsPcrDeadlinePackets() {
+        if (hlsPcrDeadlinePacketHead == 0) return;
+        if (hlsPcrDeadlinePacketHead >= hlsPcrDeadlinePackets.size()) {
+            hlsPcrDeadlinePackets.clear();
+            hlsPcrDeadlinePacketHead = 0;
+            return;
         }
-        const std::size_t pendingCount = hlsPcrIntervalPending.size();
-        hlsPcrIntervalPending.clear();
-        hlsPcrIntervalAnchorValid = false;
-        hlsPcrIntervalAnchorTicks = 0;
-        hlsPcrIntervalAnchorPid = 0x1FFF;
-        hlsPcrIntervalInvalidAnnounced = false;
-        if (reason && *reason && (pendingCount > 0 || hlsPcrIntervalAnnounced)) {
-            std::cerr << "HLS PCR interval 203.40: stream=" << streamId
-                      << " action=reset-prebuffered-interval"
+        // Avoid a memmove every 40 ms. Compact only after a sizeable prefix has
+        // been released; the bounded lookahead keeps the live tail small.
+        if (hlsPcrDeadlinePacketHead >= 4096 &&
+            hlsPcrDeadlinePacketHead * 2 >= hlsPcrDeadlinePackets.size()) {
+            hlsPcrDeadlinePackets.erase(
+                hlsPcrDeadlinePackets.begin(),
+                hlsPcrDeadlinePackets.begin() +
+                    static_cast<std::ptrdiff_t>(hlsPcrDeadlinePacketHead));
+            hlsPcrDeadlinePacketHead = 0;
+        }
+    }
+
+    uint64_t hlsPcrDeadlineTransmissionNanoseconds(
+        std::size_t packetCount,
+        uint64_t bitrate) const {
+        if (packetCount == 0 || bitrate == 0) return 0;
+        const uint64_t bits = static_cast<uint64_t>(packetCount) *
+            kTsPacketSize * 8ULL;
+        return multiplyDivideCeil(bits, 1000000000ULL, bitrate);
+    }
+
+    uint64_t hlsPcrDeadlineRequiredLeadFrom(
+        std::size_t intervalIndex,
+        uint64_t paceCeiling) const {
+        if (paceCeiling == 0 || intervalIndex >= hlsPcrDeadlineIntervals.size()) {
+            return 0;
+        }
+        uint64_t leadNanoseconds = 0;
+        for (std::size_t i = hlsPcrDeadlineIntervals.size(); i > intervalIndex; --i) {
+            const auto& interval = hlsPcrDeadlineIntervals[i - 1];
+            const uint64_t txNanoseconds = hlsPcrDeadlineTransmissionNanoseconds(
+                interval.packetCount, paceCeiling);
+            const uint64_t needed = leadNanoseconds >
+                    std::numeric_limits<uint64_t>::max() - txNanoseconds
+                ? std::numeric_limits<uint64_t>::max()
+                : leadNanoseconds + txNanoseconds;
+            leadNanoseconds = needed > interval.durationNanoseconds
+                ? needed - interval.durationNanoseconds
+                : 0;
+        }
+        return leadNanoseconds;
+    }
+
+    void flushHlsPcrDeadlineBuffer(const char* reason, bool countFallback) {
+        const std::size_t bufferedCount = hlsPcrDeadlineBufferedPacketCount();
+        for (std::size_t i = hlsPcrDeadlinePacketHead;
+             i < hlsPcrDeadlinePackets.size(); ++i) {
+            hlsPcrDeadlinePackets[i].hlsDeadlinePaceBitrate = 0;
+            pushRealPacket(std::move(hlsPcrDeadlinePackets[i]));
+        }
+        if (countFallback && bufferedCount > 0) {
+            ++hlsPcrDeadlineFallbacks;
+        }
+        hlsPcrDeadlinePackets.clear();
+        hlsPcrDeadlinePacketHead = 0;
+        hlsPcrDeadlineIntervals.clear();
+        hlsPcrDeadlineBufferedDurationNanoseconds = 0;
+        hlsPcrDeadlineOpenIntervalPackets = 0;
+        hlsPcrDeadlineCurrentLeadNanoseconds = 0;
+        hlsPcrDeadlineAnchorValid = false;
+        hlsPcrDeadlineAnchorTicks = 0;
+        hlsPcrDeadlineAnchorPid = 0x1FFF;
+        if (reason && *reason && (bufferedCount > 0 || hlsPcrDeadlineAnnounced)) {
+            std::cerr << "HLS PCR deadline 203.41: stream=" << streamId
+                      << " action=reset-bounded-lookahead"
                       << " reason=" << reason
-                      << " flushed_packets=" << pendingCount
+                      << " flushed_packets=" << bufferedCount
+                      << " packet_schedule=duration-token-fallback"
                       << " output_wait=never"
                       << std::endl;
         }
     }
 
+    bool releaseOneHlsPcrDeadlineInterval(uint64_t paceCeiling) {
+        if (hlsPcrDeadlineIntervals.empty() || paceCeiling == 0) return false;
+        const HlsPcrDeadlineInterval interval = hlsPcrDeadlineIntervals.front();
+        if (interval.packetCount == 0 ||
+            interval.packetCount > hlsPcrDeadlineBufferedPacketCount()) {
+            flushHlsPcrDeadlineBuffer("interval-packet-accounting", true);
+            return false;
+        }
+
+        // Lead means how far this provider-PCR anchor is intentionally ahead of
+        // the synthetic output PCR. Walk backwards over the *future* intervals
+        // and find the minimum lead required at the next anchor so every burst
+        // in the 750 ms horizon can still meet its PCR deadline at paceCeiling.
+        const uint64_t desiredNextLeadNanoseconds =
+            hlsPcrDeadlineRequiredLeadFrom(1, paceCeiling);
+        const uint64_t availableBeforeNextAnchor =
+            interval.durationNanoseconds >
+                    std::numeric_limits<uint64_t>::max() -
+                        hlsPcrDeadlineCurrentLeadNanoseconds
+                ? std::numeric_limits<uint64_t>::max()
+                : interval.durationNanoseconds + hlsPcrDeadlineCurrentLeadNanoseconds;
+
+        uint64_t scheduleNanoseconds = 0;
+        if (availableBeforeNextAnchor > desiredNextLeadNanoseconds) {
+            scheduleNanoseconds = availableBeforeNextAnchor - desiredNextLeadNanoseconds;
+        }
+
+        const uint64_t bits = static_cast<uint64_t>(interval.packetCount) *
+            kTsPacketSize * 8ULL;
+        uint64_t plannedBitrate = 0;
+        if (scheduleNanoseconds > 0) {
+            plannedBitrate = multiplyDivideCeil(
+                bits, 1000000000ULL, scheduleNanoseconds);
+        }
+
+        bool capacityShortfall = scheduleNanoseconds == 0 || plannedBitrate > paceCeiling;
+        if (capacityShortfall) {
+            plannedBitrate = paceCeiling;
+            ++hlsPcrDeadlineCapacityShortfalls;
+        }
+        if (plannedBitrate == 0) {
+            plannedBitrate = std::min<uint64_t>(
+                realPaceBitrate.load(std::memory_order_relaxed), paceCeiling);
+        }
+        if (plannedBitrate == 0) {
+            flushHlsPcrDeadlineBuffer("zero-planned-rate", true);
+            return false;
+        }
+
+        const uint64_t actualTransmitNanoseconds =
+            hlsPcrDeadlineTransmissionNanoseconds(interval.packetCount, plannedBitrate);
+        uint64_t actualNextLeadNanoseconds = 0;
+        if (availableBeforeNextAnchor >= actualTransmitNanoseconds) {
+            actualNextLeadNanoseconds =
+                availableBeforeNextAnchor - actualTransmitNanoseconds;
+        } else {
+            hlsPcrDeadlineMissNanoseconds +=
+                actualTransmitNanoseconds - availableBeforeNextAnchor;
+            ++hlsPcrDeadlineMisses;
+        }
+
+        for (std::size_t n = 0; n < interval.packetCount; ++n) {
+            TimedTsPacket& pending =
+                hlsPcrDeadlinePackets[hlsPcrDeadlinePacketHead + n];
+            pending.hlsDeadlinePaceBitrate = plannedBitrate;
+            pushRealPacket(std::move(pending));
+        }
+        hlsPcrDeadlinePacketHead += interval.packetCount;
+        compactHlsPcrDeadlinePackets();
+
+        hlsPcrDeadlineIntervals.pop_front();
+        hlsPcrDeadlineBufferedDurationNanoseconds =
+            hlsPcrDeadlineBufferedDurationNanoseconds >= interval.durationNanoseconds
+                ? hlsPcrDeadlineBufferedDurationNanoseconds - interval.durationNanoseconds
+                : 0;
+        hlsPcrDeadlineCurrentLeadNanoseconds = actualNextLeadNanoseconds;
+        ++hlsPcrDeadlineReleasedIntervals;
+        hlsPcrDeadlineLastRawBitrate = interval.rawBitrate;
+        hlsPcrDeadlineLastPlannedBitrate = plannedBitrate;
+        hlsPcrDeadlineLastDurationNanoseconds = interval.durationNanoseconds;
+        hlsPcrDeadlineLastPacketDistance = interval.packetCount;
+        hlsPcrDeadlineLastDesiredLeadNanoseconds = desiredNextLeadNanoseconds;
+
+        if (interval.rawBitrate > paceCeiling) {
+            ++hlsPcrDeadlineSourceBursts;
+            if (hlsPcrDeadlineLastBurstLogNanoseconds == 0 ||
+                monotonicNanoseconds() - hlsPcrDeadlineLastBurstLogNanoseconds >=
+                    1000ULL * 1000ULL * 1000ULL) {
+                std::cerr << "HLS PCR deadline 203.41: stream=" << streamId
+                          << " action=pre-shape-source-burst"
+                          << " interval_ms=" << (interval.durationNanoseconds / 1000000ULL)
+                          << " interval_packets=" << interval.packetCount
+                          << " raw_interval_bitrate=" << interval.rawBitrate
+                          << " planned_bitrate=" << plannedBitrate
+                          << " pace_ceiling=" << paceCeiling
+                          << " actual_next_lead_ms="
+                          << (hlsPcrDeadlineCurrentLeadNanoseconds / 1000000ULL)
+                          << " desired_next_lead_ms="
+                          << (desiredNextLeadNanoseconds / 1000000ULL)
+                          << " capacity_shortfall=" << (capacityShortfall ? 1 : 0)
+                          << " output_wait=never"
+                          << std::endl;
+                hlsPcrDeadlineLastBurstLogNanoseconds = monotonicNanoseconds();
+            }
+        }
+
+        if (!hlsPcrDeadlineAnnounced) {
+            std::cerr << "HLS PCR deadline 203.41: stream=" << streamId
+                      << " action=lock-bounded-lookahead-shaper"
+                      << " lookahead_ms="
+                      << (kHlsPcrDeadlineLookaheadNanoseconds / 1000000ULL)
+                      << " pace_ceiling=" << paceCeiling
+                      << " packet_schedule=prebuffered-deadline-token-no-wait"
+                      << " output_wait=never"
+                      << " PCR=continuous-20ms-clock"
+                      << std::endl;
+            hlsPcrDeadlineAnnounced = true;
+        }
+        return true;
+    }
+
+    void releaseReadyHlsPcrDeadlineIntervals() {
+        const uint64_t paceCeiling = maxRealPaceBitrate();
+        if (paceCeiling == 0) return;
+        // Keep approximately 750 ms of *future provider time* behind the head
+        // interval. Once that horizon is known, only the oldest interval is
+        // committed; later intervals remain revisable as new PCR anchors arrive.
+        while (!hlsPcrDeadlineIntervals.empty() &&
+               hlsPcrDeadlineBufferedDurationNanoseconds >=
+                   kHlsPcrDeadlineLookaheadNanoseconds) {
+            if (!releaseOneHlsPcrDeadlineInterval(paceCeiling)) break;
+        }
+    }
+
     void queueRealPacket(TimedTsPacket packet) {
-        if (!hlsPcrPhasePacingEnabled) {
+        if (!hlsPcrDeadlineShaperEnabled) {
             pushRealPacket(std::move(packet));
             return;
         }
 
+        const bool selectedPcr = isSelectedHlsDeadlinePcr(packet);
         if (packet.discontinuity) {
-            resetHlsPcrIntervalPacing("source-discontinuity", true);
+            flushHlsPcrDeadlineBuffer("source-discontinuity", true);
         }
 
-        const bool selectedPcr = isSelectedHlsPhasePcr(packet);
-        if (!hlsPcrIntervalAnchorValid) {
-            // Before the first selected PCR there is no completed interval to
-            // measure. Pass transport through at the normal duration fallback.
+        if (!hlsPcrDeadlineAnchorValid) {
+            // The first selected PCR establishes the output clock. Packets before
+            // it use the normal duration fallback; shaping begins only after the
+            // source and synthetic PCR domains have a common anchor.
             pushRealPacket(std::move(packet));
             if (selectedPcr) {
                 const TimedTsPacket& anchor = realPackets.back();
-                hlsPcrIntervalAnchorValid = true;
-                hlsPcrIntervalAnchorTicks = anchor.sourcePcrTicks;
-                hlsPcrIntervalAnchorPid = anchor.pid;
+                hlsPcrDeadlineAnchorValid = true;
+                hlsPcrDeadlineAnchorTicks = anchor.sourcePcrTicks;
+                hlsPcrDeadlineAnchorPid = anchor.pid;
             }
             return;
         }
 
+        const uint64_t selectedTicks = packet.sourcePcrTicks;
+        const uint16_t selectedPid = packet.pid;
+        hlsPcrDeadlinePackets.push_back(std::move(packet));
+        ++hlsPcrDeadlineOpenIntervalPackets;
+
         if (!selectedPcr) {
-            hlsPcrIntervalPending.push_back(std::move(packet));
             const uint64_t fallbackRate = realPaceBitrate.load(std::memory_order_relaxed);
-            const uint64_t pendingFallbackNanoseconds = fallbackRate > 0
-                ? multiplyDivide(
-                    static_cast<uint64_t>(hlsPcrIntervalPending.size()) *
-                        kTsPacketSize * 8ULL,
-                    1000000000ULL,
-                    fallbackRate)
+            const std::size_t bufferedCount = hlsPcrDeadlineBufferedPacketCount();
+            const uint64_t fallbackNanoseconds = fallbackRate > 0
+                ? hlsPcrDeadlineTransmissionNanoseconds(bufferedCount, fallbackRate)
                 : 0;
-            if (hlsPcrIntervalPending.size() > kHlsPcrIntervalMaximumPendingPackets ||
-                (pendingFallbackNanoseconds >
-                    kHlsPcrIntervalMaximumPendingFallbackNanoseconds)) {
-                resetHlsPcrIntervalPacing("pending-limit-without-next-PCR", true);
+            if (bufferedCount > kHlsPcrDeadlineMaximumBufferedPackets ||
+                fallbackNanoseconds > kHlsPcrDeadlineMaximumPendingFallbackNanoseconds) {
+                flushHlsPcrDeadlineBuffer("pending-limit-without-next-PCR", true);
             }
             return;
         }
 
         const uint64_t deltaTicks = forwardPcrTickDifference(
-            packet.sourcePcrTicks, hlsPcrIntervalAnchorTicks);
+            selectedTicks, hlsPcrDeadlineAnchorTicks);
         const uint64_t deltaNanoseconds = multiplyDivide(
             deltaTicks, 1000000000ULL, kPcrClockHz);
-        const uint64_t distancePackets =
-            static_cast<uint64_t>(hlsPcrIntervalPending.size()) + 1ULL;
+        const std::size_t distancePackets = hlsPcrDeadlineOpenIntervalPackets;
         const uint64_t intervalBitrate = deltaTicks > 0
             ? multiplyDivide(
-                distancePackets * kTsPacketSize * 8ULL,
+                static_cast<uint64_t>(distancePackets) * kTsPacketSize * 8ULL,
                 kPcrClockHz,
                 deltaTicks)
             : 0;
-        const uint64_t paceCeiling = maxRealPaceBitrate();
         const bool validInterval =
-            packet.pid == hlsPcrIntervalAnchorPid &&
-            deltaNanoseconds >= kHlsPcrIntervalMinimumAnchorGapNanoseconds &&
-            deltaNanoseconds <= kHlsPcrIntervalMaximumAnchorGapNanoseconds &&
-            intervalBitrate >= kHlsPcrIntervalMinimumBitrate &&
-            intervalBitrate <= paceCeiling;
+            selectedPid == hlsPcrDeadlineAnchorPid &&
+            deltaNanoseconds >= kHlsPcrDeadlineMinimumAnchorGapNanoseconds &&
+            deltaNanoseconds <= kHlsPcrDeadlineMaximumAnchorGapNanoseconds &&
+            intervalBitrate > 0 &&
+            intervalBitrate <= kHlsPcrDeadlineMaximumRawBitrate;
 
-        if (validInterval) {
-            for (auto& pending : hlsPcrIntervalPending) {
-                pending.hlsIntervalPaceBitrate = intervalBitrate;
-                pushRealPacket(std::move(pending));
-            }
-            packet.hlsIntervalPaceBitrate = intervalBitrate;
-            pushRealPacket(std::move(packet));
-            ++hlsPcrIntervalCompleted;
-            hlsPcrIntervalInvalidAnnounced = false;
-            hlsPcrIntervalLastBitrate = intervalBitrate;
-            hlsPcrIntervalLastDurationNanoseconds = deltaNanoseconds;
-            hlsPcrIntervalLastPacketDistance = distancePackets;
-            if (!hlsPcrIntervalAnnounced) {
-                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
-                          << " action=lock-prebuffered-feedforward"
-                          << " pcr_pid=" << hlsPcrIntervalAnchorPid
-                          << " interval_ms=" << (deltaNanoseconds / 1000000ULL)
-                          << " interval_packets=" << distancePackets
-                          << " interval_bitrate=" << intervalBitrate
-                          << " packet_schedule=token-feedforward"
-                          << " output_wait=never"
-                          << " PCR=continuous-20ms-clock"
-                          << std::endl;
-                hlsPcrIntervalAnnounced = true;
-            }
-        } else {
-            for (auto& pending : hlsPcrIntervalPending) {
-                pending.hlsIntervalPaceBitrate = 0;
-                pushRealPacket(std::move(pending));
-            }
-            packet.hlsIntervalPaceBitrate = 0;
-            pushRealPacket(std::move(packet));
-            ++hlsPcrIntervalFallbacks;
-            if (!hlsPcrIntervalInvalidAnnounced) {
-                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
-                          << " action=fallback-invalid-interval"
-                          << " pcr_pid=" << hlsPcrIntervalAnchorPid
-                          << " next_pcr_pid=" << realPackets.back().pid
-                          << " interval_ms=" << (deltaNanoseconds / 1000000ULL)
-                          << " interval_packets=" << distancePackets
-                          << " interval_bitrate=" << intervalBitrate
-                          << " pace_ceiling=" << paceCeiling
-                          << " packet_schedule=duration-token-fallback"
-                          << " output_wait=never"
-                          << std::endl;
-                hlsPcrIntervalInvalidAnnounced = true;
-            }
+        if (!validInterval) {
+            ++hlsPcrDeadlineInvalidIntervals;
+            std::cerr << "HLS PCR deadline 203.41: stream=" << streamId
+                      << " action=fallback-invalid-PCR-interval"
+                      << " pcr_pid=" << hlsPcrDeadlineAnchorPid
+                      << " next_pcr_pid=" << selectedPid
+                      << " interval_ms=" << (deltaNanoseconds / 1000000ULL)
+                      << " interval_packets=" << distancePackets
+                      << " raw_interval_bitrate=" << intervalBitrate
+                      << " packet_schedule=duration-token-fallback"
+                      << " output_wait=never"
+                      << std::endl;
+            flushHlsPcrDeadlineBuffer("invalid-PCR-interval", true);
+            // The rejected interval's terminating PCR is still a valid candidate
+            // for the next source anchor, and has already been released by the
+            // fallback flush above.
+            hlsPcrDeadlineAnchorValid = true;
+            hlsPcrDeadlineAnchorTicks = selectedTicks;
+            hlsPcrDeadlineAnchorPid = selectedPid;
+            return;
         }
 
-        hlsPcrIntervalPending.clear();
-        hlsPcrIntervalAnchorValid = true;
-        hlsPcrIntervalAnchorTicks = realPackets.back().sourcePcrTicks;
-        hlsPcrIntervalAnchorPid = realPackets.back().pid;
+        hlsPcrDeadlineIntervals.push_back({
+            distancePackets,
+            deltaNanoseconds,
+            intervalBitrate
+        });
+        hlsPcrDeadlineBufferedDurationNanoseconds += deltaNanoseconds;
+        ++hlsPcrDeadlineCompletedIntervals;
+        hlsPcrDeadlineOpenIntervalPackets = 0;
+        hlsPcrDeadlineAnchorValid = true;
+        hlsPcrDeadlineAnchorTicks = selectedTicks;
+        hlsPcrDeadlineAnchorPid = selectedPid;
+
+        if (hlsPcrDeadlineIntervals.size() > kHlsPcrDeadlineMaximumIntervals ||
+            hlsPcrDeadlineBufferedPacketCount() >
+                kHlsPcrDeadlineMaximumBufferedPackets) {
+            flushHlsPcrDeadlineBuffer("lookahead-bound-exceeded", true);
+            // Keep the just-observed PCR as a fresh anchor after the fallback.
+            hlsPcrDeadlineAnchorValid = true;
+            hlsPcrDeadlineAnchorTicks = selectedTicks;
+            hlsPcrDeadlineAnchorPid = selectedPid;
+            return;
+        }
+
+        releaseReadyHlsPcrDeadlineIntervals();
     }
 
     void queueChunk(TimedChunk chunk) {
@@ -2206,8 +2429,8 @@ private:
         if (pcrPid >= 0x1FFF) return;
 
         if (!declaredPcrPidValid || declaredPcrPid != pcrPid || declaredPcrProgram != programNumber) {
-            if (hlsPcrPhasePacingEnabled && declaredPcrPidValid && declaredPcrPid != pcrPid) {
-                resetHlsPcrIntervalPacing("PMT-PCR-PID-change", true);
+            if (hlsPcrDeadlineShaperEnabled && declaredPcrPidValid && declaredPcrPid != pcrPid) {
+                flushHlsPcrDeadlineBuffer("PMT-PCR-PID-change", true);
             }
             declaredPcrPid = pcrPid;
             declaredPcrProgram = programNumber;
@@ -2390,11 +2613,11 @@ private:
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
 
-        // 203.40: pre-buffered provider-PCR interval pacing is feed-forward.
-        // updateRateController supplies only the duration/PCR fallback rate used
-        // before the first complete interval or for rejected intervals. Valid
-        // intervals carry their own already-known token rate in TimedTsPacket.
-        if (segmentedHlsInput && hlsPcrPhasePacingEnabled) {
+        // 203.41: the deadline shaper is pure feed-forward. The controller
+        // maintains only a safe duration/PCR fallback rate for startup/reset.
+        // Shaped packets already carry the rate solved from a bounded 750 ms
+        // future-PCR window before they are visible to fillDatagram().
+        if (segmentedHlsInput && hlsPcrDeadlineShaperEnabled) {
             const uint64_t baseRate = std::min<uint64_t>(
                 hlsSourceRate > 0 ? hlsSourceRate : estimate, maxRealPaceBitrate());
             currentRealPaceBitrate = baseRate;
@@ -2411,31 +2634,48 @@ private:
                 std::memory_order_relaxed);
             hlsPllCorrectionBitrate = 0;
 
-            if (!hlsPcrIntervalControllerAnnounced) {
-                std::cerr << "HLS UDP pacing 203.40: stream=" << streamId
-                          << " source_rate=prebuffered-provider-PCR-interval"
+            if (!hlsPcrDeadlineControllerAnnounced) {
+                std::cerr << "HLS UDP pacing 203.41: stream=" << streamId
+                          << " source_rate=prebuffered-provider-PCR-deadline-shaper"
                           << " fallback_rate_bitrate=" << baseRate
-                          << " packet_schedule=token-feedforward-no-wait"
-                          << " interval_source=adjacent-PCR-known-before-enqueue"
+                          << " lookahead_ms="
+                          << (kHlsPcrDeadlineLookaheadNanoseconds / 1000000ULL)
+                          << " packet_schedule=prebuffered-deadline-token-no-wait"
+                          << " burst_policy=backward-lead-propagation"
                           << " reservoir_pll=disabled"
                           << " PCR=continuous-20ms-clock"
                           << std::endl;
-                hlsPcrIntervalControllerAnnounced = true;
+                hlsPcrDeadlineControllerAnnounced = true;
             }
-            if (hlsPcrIntervalLastLogNanoseconds == 0 ||
-                nowNanoseconds - hlsPcrIntervalLastLogNanoseconds >= kStatsIntervalNanoseconds) {
-                std::cerr << "HLS PCR interval 203.40: stream=" << streamId
-                          << " completed_intervals=" << hlsPcrIntervalCompleted
-                          << " fallbacks=" << hlsPcrIntervalFallbacks
-                          << " pending_packets=" << hlsPcrIntervalPending.size()
+            if (hlsPcrDeadlineLastLogNanoseconds == 0 ||
+                nowNanoseconds - hlsPcrDeadlineLastLogNanoseconds >= kStatsIntervalNanoseconds) {
+                std::cerr << "HLS PCR deadline 203.41: stream=" << streamId
+                          << " completed_intervals=" << hlsPcrDeadlineCompletedIntervals
+                          << " released_intervals=" << hlsPcrDeadlineReleasedIntervals
+                          << " source_bursts=" << hlsPcrDeadlineSourceBursts
+                          << " fallbacks=" << hlsPcrDeadlineFallbacks
+                          << " invalid_intervals=" << hlsPcrDeadlineInvalidIntervals
+                          << " capacity_shortfalls=" << hlsPcrDeadlineCapacityShortfalls
+                          << " deadline_misses=" << hlsPcrDeadlineMisses
+                          << " deadline_miss_ms="
+                          << (hlsPcrDeadlineMissNanoseconds / 1000000ULL)
+                          << " buffered_intervals=" << hlsPcrDeadlineIntervals.size()
+                          << " buffered_packets=" << hlsPcrDeadlineBufferedPacketCount()
+                          << " buffered_provider_ms="
+                          << (hlsPcrDeadlineBufferedDurationNanoseconds / 1000000ULL)
+                          << " current_lead_ms="
+                          << (hlsPcrDeadlineCurrentLeadNanoseconds / 1000000ULL)
+                          << " last_desired_next_lead_ms="
+                          << (hlsPcrDeadlineLastDesiredLeadNanoseconds / 1000000ULL)
                           << " last_interval_ms="
-                          << (hlsPcrIntervalLastDurationNanoseconds / 1000000ULL)
-                          << " last_interval_packets=" << hlsPcrIntervalLastPacketDistance
-                          << " last_interval_bitrate=" << hlsPcrIntervalLastBitrate
+                          << (hlsPcrDeadlineLastDurationNanoseconds / 1000000ULL)
+                          << " last_interval_packets=" << hlsPcrDeadlineLastPacketDistance
+                          << " last_raw_bitrate=" << hlsPcrDeadlineLastRawBitrate
+                          << " last_planned_bitrate=" << hlsPcrDeadlineLastPlannedBitrate
                           << " fallback_rate_bitrate=" << baseRate
-                          << " packet_schedule=token-feedforward-no-wait"
+                          << " packet_schedule=prebuffered-deadline-token-no-wait"
                           << std::endl;
-                hlsPcrIntervalLastLogNanoseconds = nowNanoseconds;
+                hlsPcrDeadlineLastLogNanoseconds = nowNanoseconds;
             }
             return;
         }
@@ -2788,7 +3028,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.40: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-prebuffered-provider-pcr-interval+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.41: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-deadline-shaper+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2895,16 +3135,15 @@ private:
             const uint64_t slotTime = datagramMediaNanoseconds + slotOffset;
             guint8* outputPacket = destination + slot * kTsPacketSize;
 
-            // 203.40: if the front packet belongs to a completed provider-PCR
-            // interval, its local byte-density was computed before enqueue. Use
-            // that rate directly as token feed-forward. There is never a due-time
-            // check and never a wait for a future anchor in this output path.
+            // 203.41: shaped packets already carry a feasible rate computed
+            // from the bounded future-PCR deadline window. The output path only
+            // consumes that token rate; it has no timestamp/deadline wait logic.
             uint64_t pace = fallbackPace;
-            if (hlsPcrPhasePacingEnabled && !realPackets.empty() &&
-                realPackets.front().hlsIntervalPaceBitrate > 0) {
-                pace = realPackets.front().hlsIntervalPaceBitrate;
+            if (hlsPcrDeadlineShaperEnabled && !realPackets.empty() &&
+                realPackets.front().hlsDeadlinePaceBitrate > 0) {
+                pace = realPackets.front().hlsDeadlinePaceBitrate;
             }
-            hlsPcrIntervalActiveBitrate = pace;
+            hlsPcrDeadlineActiveBitrate = pace;
 
             // Accumulate useful-data entitlement on every transport slot,
             // including slots reserved for periodic PCR-only packets.
@@ -2933,9 +3172,9 @@ private:
             }
 
             bool sendReal = false;
-            // 203.40: every useful packet stays on the normal token bucket.
-            // Pre-buffered PCR intervals only select the token rate; no packet
-            // has a release timestamp and the sender never waits for PCR.
+            // 203.41: every useful packet stays on the normal token bucket.
+            // Bounded lookahead changes only the token rate of already-buffered
+            // packets; no packet can block the sender waiting for provider PCR.
             if (realTokenAccumulator >= activeTransportBitrate) {
                 realTokenAccumulator -= activeTransportBitrate;
                 sendReal = !realPackets.empty();
@@ -3309,7 +3548,7 @@ private:
     const bool conditionalAccessInput = false;
     const bool hlsInput = false;
     const bool segmentedHlsInput = false;
-    const bool hlsPcrPhasePacingEnabled = false;
+    const bool hlsPcrDeadlineShaperEnabled = false;
     const bool hlsSlowPcrAssistEnabled = false;
     const bool continuousNetworkMpegTsInput = false;
     const bool forceSyntheticPcr = false;
@@ -3393,23 +3632,36 @@ private:
     std::atomic<uint64_t> processingChunkCount{0};
     std::atomic<uint64_t> processingChunkMaxCapacityBytes{0};
     boost::circular_buffer<TimedTsPacket> realPackets;
-    // 203.40 ingest-side pre-buffering for one provider-PCR interval. These
-    // packets are not visible to fillDatagram until the next anchor is already
-    // known and their feed-forward token rate has been calculated.
-    std::vector<TimedTsPacket> hlsPcrIntervalPending;
-    bool hlsPcrIntervalAnchorValid = false;
-    uint64_t hlsPcrIntervalAnchorTicks = 0;
-    uint16_t hlsPcrIntervalAnchorPid = 0x1FFF;
-    uint64_t hlsPcrIntervalCompleted = 0;
-    uint64_t hlsPcrIntervalFallbacks = 0;
-    uint64_t hlsPcrIntervalLastBitrate = 0;
-    uint64_t hlsPcrIntervalLastDurationNanoseconds = 0;
-    uint64_t hlsPcrIntervalLastPacketDistance = 0;
-    uint64_t hlsPcrIntervalLastLogNanoseconds = 0;
-    uint64_t hlsPcrIntervalActiveBitrate = 0;
-    bool hlsPcrIntervalAnnounced = false;
-    bool hlsPcrIntervalControllerAnnounced = false;
-    bool hlsPcrIntervalInvalidAnnounced = false;
+    // 203.41 ingest-side bounded lookahead. Finalized provider-PCR intervals
+    // remain here for ~750 ms of provider time, allowing future VBR bursts to
+    // propagate the minimum required lead backwards before any rate is committed.
+    std::vector<TimedTsPacket> hlsPcrDeadlinePackets;
+    std::size_t hlsPcrDeadlinePacketHead = 0;
+    std::deque<HlsPcrDeadlineInterval> hlsPcrDeadlineIntervals;
+    std::size_t hlsPcrDeadlineOpenIntervalPackets = 0;
+    uint64_t hlsPcrDeadlineBufferedDurationNanoseconds = 0;
+    uint64_t hlsPcrDeadlineCurrentLeadNanoseconds = 0;
+    bool hlsPcrDeadlineAnchorValid = false;
+    uint64_t hlsPcrDeadlineAnchorTicks = 0;
+    uint16_t hlsPcrDeadlineAnchorPid = 0x1FFF;
+    uint64_t hlsPcrDeadlineCompletedIntervals = 0;
+    uint64_t hlsPcrDeadlineReleasedIntervals = 0;
+    uint64_t hlsPcrDeadlineSourceBursts = 0;
+    uint64_t hlsPcrDeadlineFallbacks = 0;
+    uint64_t hlsPcrDeadlineInvalidIntervals = 0;
+    uint64_t hlsPcrDeadlineCapacityShortfalls = 0;
+    uint64_t hlsPcrDeadlineMisses = 0;
+    uint64_t hlsPcrDeadlineMissNanoseconds = 0;
+    uint64_t hlsPcrDeadlineLastRawBitrate = 0;
+    uint64_t hlsPcrDeadlineLastPlannedBitrate = 0;
+    uint64_t hlsPcrDeadlineLastDurationNanoseconds = 0;
+    uint64_t hlsPcrDeadlineLastPacketDistance = 0;
+    uint64_t hlsPcrDeadlineLastDesiredLeadNanoseconds = 0;
+    uint64_t hlsPcrDeadlineLastLogNanoseconds = 0;
+    uint64_t hlsPcrDeadlineLastBurstLogNanoseconds = 0;
+    uint64_t hlsPcrDeadlineActiveBitrate = 0;
+    bool hlsPcrDeadlineAnnounced = false;
+    bool hlsPcrDeadlineControllerAnnounced = false;
     bool memoryAccountingRegistered = false;
     bool diagnosticRegistryRegistered = false;
     std::vector<guint8> inputRemainder;
@@ -3628,17 +3880,21 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.38: compatibility=202.74"
+        std::cerr << "HLS timing 203.41: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-soft-phase-PLL+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-deadline-shaper+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
                   << " provider_pcr_mode=" << (config.hlsSlowPcrAssist && !config.hlsPcrPhasePacing ? "manual-on" : "manual-off")
-                  << " provider_pcr_phase_mode=" << (config.hlsPcrPhasePacing ? "manual-on" : "manual-off")
+                  << " provider_pcr_deadline_mode=" << (config.hlsPcrPhasePacing ? "manual-on" : "manual-off")
+                  << " deadline_lookahead_ms="
+                  << (config.hlsPcrPhasePacing
+                          ? (kHlsPcrDeadlineLookaheadNanoseconds / 1000000ULL)
+                          : 0ULL)
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
                   << " pcr_phase=" << (config.hlsPcrPhasePacing
-                          ? "soft-provider-PCR-feedback-token-only-no-wait"
+                          ? "prebuffered-PCR-deadline-backward-lead-no-wait"
                           : "fixed-zero-no-pre-send-calibration")
                   << std::endl;
     }
