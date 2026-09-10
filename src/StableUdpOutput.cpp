@@ -1216,6 +1216,11 @@ private:
     static constexpr uint64_t kHlsValidatedPcrAcquireTolerancePermille = 40ULL;  // +/-4%
     static constexpr uint64_t kHlsValidatedPcrReleaseTolerancePermille = 100ULL; // +/-10%
     static constexpr uint64_t kHlsValidatedPcrMinimumSamples = 64ULL;
+    // 203.31: keep the 203.26 fields/object layout intact, but disable the
+    // validated-provider-PCR clock controller. Direct same-content capture
+    // showed that it introduced output PTS-PCR drift absent at the HLS source.
+    // Keeping the storage/layout avoids the layout-sensitive 203.29 crash.
+    static constexpr bool kHlsValidatedPcrClockControlEnabled = false;
     // 203.13: HLS segments arrive as bursts of small TS GstBuffers. Parsing an
     // entire downloaded segment inside the real-time UDP sender thread can hold
     // that thread long enough to bunch AAC PES packets even though the final UDP
@@ -2107,7 +2112,8 @@ private:
             // normal per-segment VBR variation.
             const uint64_t pcrRateSamples =
                 pcrDerivedBitrateSamples.load(std::memory_order_relaxed);
-            if (segmentedHlsInput && durationRateLimited > 0 &&
+            if (kHlsValidatedPcrClockControlEnabled &&
+                segmentedHlsInput && durationRateLimited > 0 &&
                 pcrDerivedInputBitrate > 0) {
                 if (hlsValidatedPcrClockBitrate == 0 &&
                     pcrRateSamples >= kHlsValidatedPcrMinimumSamples) {
@@ -2321,7 +2327,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.26: mode=duration-segment-media-clock+validated-provider-pcr-lock+near-pcr-startup-assist sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.31: mode=duration-segment-media-clock+near-pcr-assist+slow-reservoir-pll validated-provider-pcr-control=disabled-layout-preserved sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -3102,10 +3108,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.26: compatibility=202.74"
+        std::cerr << "HLS timing 203.31: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+validated-provider-pcr-lock+near-pcr-startup-assist periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+near-pcr-assist+slow-reservoir-pll validated-provider-pcr-control=disabled-layout-preserved periodic_pcr=20ms"
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
