@@ -64,6 +64,9 @@ struct StreamConfig {
     std::string hlsAccessKeyName = "Authorization";
     std::string hlsAccessKeyValue;
     std::string hlsUserAgent = "Mozilla/5.0 TVStreammerSAT5";
+    // Manual per-stream opt-in. When enabled, HLS pacing may lock downward to
+    // a stable provider PCR that is 1..4% below the duration-derived media rate.
+    bool hlsSlowPcrAssist = false;
     bool testPattern = false;
     bool autoStart = false;
     bool remapEnabled = false;

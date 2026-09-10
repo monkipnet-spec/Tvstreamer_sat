@@ -383,6 +383,7 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
         config.hlsAccessKeyMode == "query" ? "token" : "Authorization").asString();
     config.hlsAccessKeyValue = root.get("hls_access_key_value", "").asString();
     config.hlsUserAgent = root.get("hls_user_agent", "Mozilla/5.0 TVStreammerSAT5").asString();
+    config.hlsSlowPcrAssist = root.get("hls_slow_pcr_assist", false).asBool();
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -461,6 +462,7 @@ Json::Value StreamConfig::toJson() const {
     root["hls_access_key_name"] = hlsAccessKeyName;
     root["hls_access_key_value"] = hlsAccessKeyValue;
     root["hls_user_agent"] = hlsUserAgent;
+    root["hls_slow_pcr_assist"] = hlsSlowPcrAssist;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;
