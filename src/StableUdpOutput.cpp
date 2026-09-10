@@ -90,13 +90,16 @@ constexpr std::size_t kHlsPreSendPacketLowWater = 64;
 constexpr uint64_t kPeriodicPatIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicPmtIntervalNanoseconds = 100ULL * 1000ULL * 1000ULL;
 constexpr uint64_t kPeriodicSdtIntervalNanoseconds = 500ULL * 1000ULL * 1000ULL;
-// 203.37: manual provider-PCR phase pacing. Keep at most a bounded amount of
-// not-yet-interpolated transport while waiting for the next PCR anchor. Normal
-// services provide PCR roughly every 20-100 ms; the generous limits below only
-// protect malformed/discontinuous inputs from stalling the sender.
-constexpr std::size_t kHlsPhasePendingPacketLimit = 4096;
-constexpr uint64_t kHlsPhaseMaximumAnchorGapNanoseconds = 2000ULL * 1000ULL * 1000ULL;
-constexpr uint64_t kHlsPhaseResetGapNanoseconds = 1000ULL * 1000ULL;
+// 203.38: manual provider-PCR soft phase PLL. Unlike 203.37, never hold a real
+// TS packet waiting for a future PCR anchor. Provider PCR is observed only after
+// the packet has naturally won a token-paced output slot, then a bounded/slewed
+// correction is applied to the useful-packet bitrate. This preserves continuous
+// CBR output while reducing slow PCR/PTS phase excursions without freeze/catch-up.
+constexpr int64_t kHlsSoftPhaseMaximumCorrectionPermille = 50; // +/-5.0%
+constexpr int64_t kHlsSoftPhaseMaximumStepPermille = 3;        // 0.3% / 100 ms
+constexpr int64_t kHlsSoftPhaseNanosecondsPerPermille = 4LL * 1000LL * 1000LL; // 4 ms -> 0.1%
+constexpr uint64_t kHlsSoftPhaseSampleTimeoutNanoseconds = 1000ULL * 1000ULL * 1000ULL;
+constexpr uint64_t kHlsSoftPhaseMaximumAcceptedErrorNanoseconds = 750ULL * 1000ULL * 1000ULL;
 
 std::atomic<uint64_t> gRealPacketRingCapacityBytes{0};
 std::atomic<uint64_t> gStableUdpSenderCount{0};
@@ -313,10 +316,8 @@ struct TimedTsPacket {
     bool hasPcr = false;
     bool discontinuity = false;
     uint64_t sourcePcrTicks = 0;
-    // 203.37: relative provider-PCR timeline used only by the manual HLS phase
-    // pacing mode. Other streams keep the legacy token-paced path unchanged.
-    uint64_t dueNanoseconds = 0;
-    bool phaseDueValid = false;
+    // 203.38 soft phase PLL never assigns a future release time to packets.
+    // Keep no per-packet pacing state here: all useful packets stay token-paced.
 };
 
 struct HlsTimestampRatePoint {
@@ -751,8 +752,8 @@ public:
           // continuous SRT/HTTP retain the TVStreamer5 network profile.
           segmentedHlsInput(
               isSegmentedHlsInput(cfg) && !useTvStreamer5IpShaperProfile(cfg)),
-          // 203.37: phase pacing is a separate manual per-stream mode. When enabled
-          // it owns useful-packet timing from adjacent provider-PCR anchors.
+          // 203.38: soft phase PLL is a separate manual per-stream mode. When enabled
+          // it only slews token bitrate from provider-PCR phase feedback; it never waits packets.
           hlsPcrPhasePacingEnabled(
               cfg.hlsPcrPhasePacing && isSegmentedHlsInput(cfg) &&
               udpShapingMode(cfg) == UdpShapingMode::Cbr &&
@@ -1611,119 +1612,86 @@ private:
                packet.pid == declaredPcrPid;
     }
 
-    void flushHlsPhasePendingUnscheduled(const char* reason) {
-        if (hlsPhasePendingPackets.empty()) return;
-        for (auto& packet : hlsPhasePendingPackets) {
-            packet.phaseDueValid = false;
-            pushRealPacket(std::move(packet));
+    static int64_t signedPcrTickDifference(uint64_t value, uint64_t reference) {
+        const uint64_t forward = value >= reference
+            ? value - reference
+            : (kPcrTicksModulus - reference) + value;
+        const uint64_t backward = reference >= value
+            ? reference - value
+            : (kPcrTicksModulus - value) + reference;
+        if (forward <= backward) {
+            return static_cast<int64_t>(forward);
         }
-        hlsPhasePendingPackets.clear();
-        hlsPhaseAnchorValid = false;
-        if (!hlsPhaseFallbackAnnounced) {
-            std::cerr << "HLS PCR phase 203.37: stream=" << streamId
-                      << " action=fallback-token-pacing reason=" << (reason ? reason : "unknown")
+        return -static_cast<int64_t>(backward);
+    }
+
+    void resetHlsSoftPhasePll(const char* reason) {
+        hlsSoftPhaseErrorNanoseconds = 0;
+        hlsSoftPhaseSampleNanoseconds = 0;
+        hlsSoftPhaseCorrectionPermille = 0;
+        hlsSoftPhaseSamples = 0;
+        hlsSoftPhaseControllerAnnounced = false;
+        if (reason && *reason) {
+            std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
+                      << " action=reset-soft-phase-pll reason=" << reason
                       << std::endl;
-            hlsPhaseFallbackAnnounced = true;
         }
     }
 
+    void observeHlsSoftPhaseError(const TimedTsPacket& packet, uint64_t slotTimeNanoseconds) {
+        if (!isSelectedHlsPhasePcr(packet) || !periodicPcrInitialized ||
+            packet.pid != periodicPcrPid || slotTimeNanoseconds < periodicPcrOriginNanoseconds) {
+            return;
+        }
+
+        const uint64_t elapsedNanoseconds = slotTimeNanoseconds - periodicPcrOriginNanoseconds;
+        const uint64_t syntheticPcrTicks =
+            (periodicPcrOriginTicks + nanosecondsToPcrTicks(elapsedNanoseconds)) %
+            kPcrTicksModulus;
+        const int64_t deltaTicks = signedPcrTickDifference(
+            packet.sourcePcrTicks, syntheticPcrTicks);
+        const uint64_t absoluteTicks = deltaTicks >= 0
+            ? static_cast<uint64_t>(deltaTicks)
+            : static_cast<uint64_t>(-deltaTicks);
+        const uint64_t absoluteNanoseconds = multiplyDivide(
+            absoluteTicks, 1000000000ULL, kPcrClockHz);
+
+        if (absoluteNanoseconds > kHlsSoftPhaseMaximumAcceptedErrorNanoseconds) {
+            // Do not let a discontinuity/wrap mistake command a large speed change.
+            // Ignore this sample and let the existing correction decay smoothly.
+            if (!hlsSoftPhaseOutlierAnnounced) {
+                std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
+                          << " phase_error_ms="
+                          << (deltaTicks >= 0
+                                  ? static_cast<int64_t>(absoluteNanoseconds / 1000000ULL)
+                                  : -static_cast<int64_t>(absoluteNanoseconds / 1000000ULL))
+                          << " action=ignore-outlier"
+                          << std::endl;
+                hlsSoftPhaseOutlierAnnounced = true;
+            }
+            return;
+        }
+
+        const int64_t sampleNanoseconds = deltaTicks >= 0
+            ? static_cast<int64_t>(absoluteNanoseconds)
+            : -static_cast<int64_t>(absoluteNanoseconds);
+        // Mild low-pass filtering prevents one PCR packet from steering the pace,
+        // but still follows the ~10 s phase excursions measured on SOUZ.
+        hlsSoftPhaseErrorNanoseconds = hlsSoftPhaseSamples == 0
+            ? sampleNanoseconds
+            : (hlsSoftPhaseErrorNanoseconds * 3LL + sampleNanoseconds) / 4LL;
+        hlsSoftPhaseSampleNanoseconds = slotTimeNanoseconds;
+        ++hlsSoftPhaseSamples;
+        hlsSoftPhaseOutlierAnnounced = false;
+    }
+
     void queueRealPacket(TimedTsPacket packet) {
-        if (!hlsPcrPhasePacingEnabled) {
-            pushRealPacket(std::move(packet));
-            return;
+        if (hlsPcrPhasePacingEnabled && packet.discontinuity) {
+            resetHlsSoftPhasePll("source-discontinuity");
         }
-
-        // A declared PCR PID is required before phase interpolation. Until PMT is
-        // known, keep only a bounded pending interval and fall back safely if the
-        // source does not provide a usable PCR anchor.
-        hlsPhasePendingPackets.push_back(std::move(packet));
-        TimedTsPacket& tail = hlsPhasePendingPackets.back();
-
-        if (tail.discontinuity) {
-            flushHlsPhasePendingUnscheduled("source-discontinuity");
-            hlsPhaseAnchorValid = false;
-            return;
-        }
-
-        if (!isSelectedHlsPhasePcr(tail)) {
-            if (hlsPhasePendingPackets.size() >= kHlsPhasePendingPacketLimit) {
-                flushHlsPhasePendingUnscheduled("no-pcr-anchor");
-            }
-            return;
-        }
-
-        hlsPhaseFallbackAnnounced = false;
-
-        if (!hlsPhaseAnchorValid) {
-            // Packets before the first selected PCR have no preceding anchor and
-            // therefore cannot be interpolated honestly. Preserve their legacy
-            // token pacing, then make this PCR packet the zero/continuation anchor.
-            while (hlsPhasePendingPackets.size() > 1) {
-                TimedTsPacket pre = std::move(hlsPhasePendingPackets.front());
-                hlsPhasePendingPackets.pop_front();
-                pre.phaseDueValid = false;
-                pushRealPacket(std::move(pre));
-            }
-
-            TimedTsPacket anchorPacket = std::move(hlsPhasePendingPackets.front());
-            hlsPhasePendingPackets.pop_front();
-            const uint64_t anchorDue = hlsPhaseEverAnchored
-                ? hlsPhaseLastAssignedDueNanoseconds + kHlsPhaseResetGapNanoseconds
-                : 0;
-            anchorPacket.dueNanoseconds = anchorDue;
-            anchorPacket.phaseDueValid = true;
-            hlsPhaseAnchorPcrTicks = anchorPacket.sourcePcrTicks;
-            hlsPhaseAnchorDueNanoseconds = anchorDue;
-            hlsPhaseLastAssignedDueNanoseconds = anchorDue;
-            hlsPhaseAnchorValid = true;
-            hlsPhaseEverAnchored = true;
-            pushRealPacket(std::move(anchorPacket));
-            return;
-        }
-
-        const uint64_t currentPcrTicks = tail.sourcePcrTicks;
-        const uint64_t deltaTicks = currentPcrTicks >= hlsPhaseAnchorPcrTicks
-            ? currentPcrTicks - hlsPhaseAnchorPcrTicks
-            : (kPcrTicksModulus - hlsPhaseAnchorPcrTicks) + currentPcrTicks;
-        const uint64_t deltaNanoseconds = multiplyDivide(
-            deltaTicks, 1000000000ULL, kPcrClockHz);
-
-        if (deltaNanoseconds == 0 ||
-            deltaNanoseconds > kHlsPhaseMaximumAnchorGapNanoseconds) {
-            const uint64_t badDelta = deltaNanoseconds;
-            const uint64_t restartPcr = currentPcrTicks;
-            flushHlsPhasePendingUnscheduled("implausible-pcr-gap");
-            hlsPhaseAnchorValid = true;
-            hlsPhaseEverAnchored = true;
-            hlsPhaseAnchorPcrTicks = restartPcr;
-            hlsPhaseAnchorDueNanoseconds =
-                hlsPhaseLastAssignedDueNanoseconds + kHlsPhaseResetGapNanoseconds;
-            hlsPhaseLastAssignedDueNanoseconds = hlsPhaseAnchorDueNanoseconds;
-            if (badDelta > 0) {
-                std::cerr << "HLS PCR phase 203.37: stream=" << streamId
-                          << " pcr_gap_ms=" << (badDelta / 1000000ULL)
-                          << " action=reanchor" << std::endl;
-            }
-            return;
-        }
-
-        const std::size_t packetCount = hlsPhasePendingPackets.size();
-        for (std::size_t index = 0; index < packetCount; ++index) {
-            TimedTsPacket scheduled = std::move(hlsPhasePendingPackets.front());
-            hlsPhasePendingPackets.pop_front();
-            const uint64_t offset = multiplyDivide(
-                deltaNanoseconds, static_cast<uint64_t>(index + 1),
-                static_cast<uint64_t>(packetCount));
-            scheduled.dueNanoseconds = hlsPhaseAnchorDueNanoseconds + offset;
-            scheduled.phaseDueValid = true;
-            hlsPhaseLastAssignedDueNanoseconds = scheduled.dueNanoseconds;
-            pushRealPacket(std::move(scheduled));
-        }
-
-        hlsPhaseAnchorPcrTicks = currentPcrTicks;
-        hlsPhaseAnchorDueNanoseconds += deltaNanoseconds;
-        hlsPhaseLastAssignedDueNanoseconds = hlsPhaseAnchorDueNanoseconds;
-        ++hlsPhaseInterpolatedAnchors;
+        // 203.38: no packet is held for PCR interpolation. Every real TS packet
+        // enters the same ring and is emitted only by the normal token bucket.
+        pushRealPacket(std::move(packet));
     }
 
     void queueChunk(TimedChunk chunk) {
@@ -2350,35 +2318,92 @@ private:
         const bool networkArrivalLocked =
             continuousNetworkMpegTsInput && networkLongTermArrivalBitrate > 0;
 
-        // 203.37: in manual phase mode the useful-packet release time comes from
-        // adjacent provider-PCR anchors, not from a scalar bitrate/PLL controller.
-        // Keep a sane bitrate estimate only for startup fallback and telemetry.
+        // 203.38: manual soft phase PLL keeps the proven duration/token sender as
+        // the only packet scheduler. Provider PCR supplies feedback only: if the
+        // preserved media clock is behind synthetic output PCR, pace useful bytes
+        // slightly faster; if it is ahead, pace slightly slower. The correction is
+        // bounded to +/-5% and slewed by at most 0.3% per 100 ms, so there is no
+        // packet wait, pause, or catch-up burst as in the rejected 203.37 mode.
         if (segmentedHlsInput && hlsPcrPhasePacingEnabled) {
-            const uint64_t fallbackRate = std::min<uint64_t>(
+            const uint64_t baseRate = std::min<uint64_t>(
                 hlsSourceRate > 0 ? hlsSourceRate : estimate, maxRealPaceBitrate());
-            currentRealPaceBitrate = fallbackRate;
-            realPaceBitrate.store(fallbackRate, std::memory_order_relaxed);
+            const bool phaseFresh = hlsSoftPhaseSampleNanoseconds != 0 &&
+                nowNanoseconds >= hlsSoftPhaseSampleNanoseconds &&
+                nowNanoseconds - hlsSoftPhaseSampleNanoseconds <=
+                    kHlsSoftPhaseSampleTimeoutNanoseconds;
+
+            int64_t targetCorrectionPermille = 0;
+            if (phaseFresh) {
+                // phase_error = provider PCR - synthetic PCR. Negative means the
+                // media timeline is late and useful packets must be emitted faster.
+                targetCorrectionPermille = -hlsSoftPhaseErrorNanoseconds /
+                    kHlsSoftPhaseNanosecondsPerPermille;
+                targetCorrectionPermille = std::clamp<int64_t>(
+                    targetCorrectionPermille,
+                    -kHlsSoftPhaseMaximumCorrectionPermille,
+                    kHlsSoftPhaseMaximumCorrectionPermille);
+            }
+
+            const int64_t correctionDelta = targetCorrectionPermille -
+                hlsSoftPhaseCorrectionPermille;
+            const int64_t correctionStep = std::clamp<int64_t>(
+                correctionDelta,
+                -kHlsSoftPhaseMaximumStepPermille,
+                kHlsSoftPhaseMaximumStepPermille);
+            hlsSoftPhaseCorrectionPermille += correctionStep;
+
+            const int64_t scalePermille = 1000LL + hlsSoftPhaseCorrectionPermille;
+            uint64_t correctedRate = baseRate;
+            if (scalePermille > 0) {
+                correctedRate = multiplyDivide(
+                    baseRate, static_cast<uint64_t>(scalePermille), 1000ULL);
+            }
+            correctedRate = std::min<uint64_t>(correctedRate, maxRealPaceBitrate());
+
+            currentRealPaceBitrate = correctedRate;
+            realPaceBitrate.store(correctedRate, std::memory_order_relaxed);
             updateTransportBitrate();
             const uint64_t targetBytes = std::max<uint64_t>(
                 kUdpPayloadSize * 32ULL,
-                bytesForDuration(std::max<uint64_t>(1ULL, fallbackRate),
+                bytesForDuration(std::max<uint64_t>(1ULL, baseRate),
                                  kHlsTargetReservoirNanoseconds));
             targetReservoirBytes.store(targetBytes, std::memory_order_relaxed);
             reservoirMilliseconds.store(
                 multiplyDivide(bufferNow * 8ULL, 1000ULL,
-                               std::max<uint64_t>(1ULL, fallbackRate)),
+                               std::max<uint64_t>(1ULL, baseRate)),
                 std::memory_order_relaxed);
             hlsPllCorrectionBitrate = 0;
-            if (!hlsPhaseControllerAnnounced) {
-                std::cerr << "HLS UDP pacing 203.37: stream=" << streamId
-                          << " source_rate=provider-PCR-phase"
-                          << " fallback_rate_bitrate=" << fallbackRate
-                          << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                          << " packet_schedule=adjacent-PCR-interpolation"
+
+            if (!hlsSoftPhaseControllerAnnounced) {
+                std::cerr << "HLS UDP pacing 203.38: stream=" << streamId
+                          << " source_rate=duration+soft-provider-PCR-phase-PLL"
+                          << " base_rate_bitrate=" << baseRate
+                          << " effective_media_clock_bitrate=" << correctedRate
+                          << " max_correction_permille="
+                          << kHlsSoftPhaseMaximumCorrectionPermille
+                          << " max_step_permille=" << kHlsSoftPhaseMaximumStepPermille
+                          << " packet_schedule=token-only-no-wait"
                           << " reservoir_pll=disabled"
                           << " PCR=continuous-20ms-clock"
                           << std::endl;
-                hlsPhaseControllerAnnounced = true;
+                hlsSoftPhaseControllerAnnounced = true;
+            }
+            if (hlsSoftPhaseLastLogNanoseconds == 0 ||
+                nowNanoseconds - hlsSoftPhaseLastLogNanoseconds >= kStatsIntervalNanoseconds) {
+                const uint64_t sampleAgeMs = phaseFresh
+                    ? (nowNanoseconds - hlsSoftPhaseSampleNanoseconds) / 1000000ULL
+                    : 0;
+                std::cerr << "HLS PCR soft phase 203.38: stream=" << streamId
+                          << " phase_sample=" << (phaseFresh ? "fresh" : "stale")
+                          << " phase_error_ms=" << (hlsSoftPhaseErrorNanoseconds / 1000000LL)
+                          << " correction_permille=" << hlsSoftPhaseCorrectionPermille
+                          << " target_correction_permille=" << targetCorrectionPermille
+                          << " base_rate_bitrate=" << baseRate
+                          << " effective_media_clock_bitrate=" << correctedRate
+                          << " sample_age_ms=" << sampleAgeMs
+                          << " packet_schedule=token-only-no-wait"
+                          << std::endl;
+                hlsSoftPhaseLastLogNanoseconds = nowNanoseconds;
             }
             return;
         }
@@ -2731,7 +2756,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.37: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-phase+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.38: mode=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-soft-phase-PLL+slow-reservoir-pll validated-provider-pcr-control=disabled sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2865,32 +2890,10 @@ private:
             }
 
             bool sendReal = false;
-            const bool phaseScheduledFront = hlsPcrPhasePacingEnabled &&
-                !realPackets.empty() && realPackets.front().phaseDueValid;
-            if (phaseScheduledFront) {
-                // Scheduled PCR-phase packets do not use the scalar bitrate token
-                // bucket; prevent entitlement from accumulating behind a due-time wait.
-                realTokenAccumulator = 0;
-                const TimedTsPacket& front = realPackets.front();
-                if (!hlsPhaseOutputOriginValid) {
-                    hlsPhaseOutputOriginNanoseconds = slotTime >= front.dueNanoseconds
-                        ? slotTime - front.dueNanoseconds : 0;
-                    hlsPhaseOutputOriginValid = true;
-                    realTokenAccumulator = 0;
-                    std::cerr << "HLS PCR phase 203.37: stream=" << streamId
-                              << " action=lock-output-phase"
-                              << " pcr_pid=" << declaredPcrPid
-                              << " interpolation=adjacent-PCR"
-                              << " transport=CBR-null-stuffed"
-                              << std::endl;
-                }
-                const uint64_t absoluteDue =
-                    hlsPhaseOutputOriginNanoseconds + front.dueNanoseconds;
-                sendReal = slotTime >= absoluteDue;
-                if (sendReal) {
-                    realTokenAccumulator = 0;
-                }
-            } else if (realTokenAccumulator >= activeTransportBitrate) {
+            // 203.38: all useful packets, including soft-phase mode, stay on the
+            // normal token bucket. Provider PCR can change only the token rate;
+            // it can never hold the front packet waiting for a future timestamp.
+            if (realTokenAccumulator >= activeTransportBitrate) {
                 realTokenAccumulator -= activeTransportBitrate;
                 sendReal = !realPackets.empty();
                 if (!sendReal) {
@@ -2906,6 +2909,12 @@ private:
                 realPackets.pop_front();
 
                 if (packet.hasPcr) {
+                    // Observe provider-vs-synthetic PCR phase at the packet's
+                    // natural token-paced output slot. This is feedback only;
+                    // observeHlsSoftPhaseError never delays or releases packets.
+                    if (hlsPcrPhasePacingEnabled && periodicPcrInitialized) {
+                        observeHlsSoftPhaseError(packet, slotTime);
+                    }
                     if (!periodicPcrInitialized) {
                         // Never lock the WISI output clock to an arbitrary PCR
                         // seen during shared-DVB full-TS warmup.  The PMT for the
@@ -3347,19 +3356,15 @@ private:
     std::atomic<uint64_t> processingChunkCount{0};
     std::atomic<uint64_t> processingChunkMaxCapacityBytes{0};
     boost::circular_buffer<TimedTsPacket> realPackets;
-    // 203.37 phase interpolator holds only the interval since the previous PCR
-    // anchor; it is not a second reservoir.
-    std::deque<TimedTsPacket> hlsPhasePendingPackets;
-    bool hlsPhaseAnchorValid = false;
-    bool hlsPhaseEverAnchored = false;
-    bool hlsPhaseOutputOriginValid = false;
-    bool hlsPhaseControllerAnnounced = false;
-    bool hlsPhaseFallbackAnnounced = false;
-    uint64_t hlsPhaseAnchorPcrTicks = 0;
-    uint64_t hlsPhaseAnchorDueNanoseconds = 0;
-    uint64_t hlsPhaseLastAssignedDueNanoseconds = 0;
-    uint64_t hlsPhaseOutputOriginNanoseconds = 0;
-    uint64_t hlsPhaseInterpolatedAnchors = 0;
+    // 203.38 soft provider-PCR phase PLL state. No packet queue or due-time
+    // scheduler exists here; this state can only slew the scalar token pace.
+    int64_t hlsSoftPhaseErrorNanoseconds = 0;
+    int64_t hlsSoftPhaseCorrectionPermille = 0;
+    uint64_t hlsSoftPhaseSampleNanoseconds = 0;
+    uint64_t hlsSoftPhaseLastLogNanoseconds = 0;
+    uint64_t hlsSoftPhaseSamples = 0;
+    bool hlsSoftPhaseControllerAnnounced = false;
+    bool hlsSoftPhaseOutlierAnnounced = false;
     bool memoryAccountingRegistered = false;
     bool diagnosticRegistryRegistered = false;
     std::vector<guint8> inputRemainder;
@@ -3578,17 +3583,17 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.37: compatibility=202.74"
+        std::cerr << "HLS timing 203.38: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-phase+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+near-pcr-assist+manual-provider-pcr-clock+manual-provider-pcr-soft-phase-PLL+slow-reservoir-pll validated-provider-pcr-control=disabled periodic_pcr=20ms"
                   << " provider_pcr_mode=" << (config.hlsSlowPcrAssist && !config.hlsPcrPhasePacing ? "manual-on" : "manual-off")
                   << " provider_pcr_phase_mode=" << (config.hlsPcrPhasePacing ? "manual-on" : "manual-off")
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
                   << " pcr_phase=" << (config.hlsPcrPhasePacing
-                          ? "provider-PCR-adjacent-anchor-interpolation"
+                          ? "soft-provider-PCR-feedback-token-only-no-wait"
                           : "fixed-zero-no-pre-send-calibration")
                   << std::endl;
     }

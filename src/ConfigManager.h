@@ -66,9 +66,9 @@ struct StreamConfig {
     std::string hlsUserAgent = "Mozilla/5.0 TVStreammerSAT5";
     // Manual per-stream provider-PCR rate clock (203.36). Existing streams default off.
     bool hlsSlowPcrAssist = false;
-    // 203.37: manual HLS packet-phase pacing. Packets between adjacent provider-PCR
-    // anchors are released on that PCR timeline instead of being spread uniformly
-    // by segment bytes/EXTINF. Intended for measured segment-boundary phase wobble.
+    // 203.38: manual HLS soft provider-PCR phase PLL. Real TS packets remain on
+    // the normal token scheduler; provider PCR only slews useful-packet rate to
+    // reduce measured segment-boundary phase wobble. Off by default.
     bool hlsPcrPhasePacing = false;
     bool testPattern = false;
     bool autoStart = false;
