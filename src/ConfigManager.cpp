@@ -384,6 +384,10 @@ StreamConfig StreamConfig::fromJson(const Json::Value& root) {
     config.hlsAccessKeyValue = root.get("hls_access_key_value", "").asString();
     config.hlsUserAgent = root.get("hls_user_agent", "Mozilla/5.0 TVStreammerSAT5").asString();
     config.hlsSlowPcrAssist = root.get("hls_slow_pcr_assist", false).asBool();
+    config.hlsPcrPhasePacing = root.get("hls_pcr_phase_pacing", false).asBool();
+    // The two manual HLS timing modes are mutually exclusive. Phase pacing wins
+    // if an old API client accidentally submits both flags.
+    if (config.hlsPcrPhasePacing) config.hlsSlowPcrAssist = false;
     config.testPattern = root.get("test_pattern", false).asBool();
     config.autoStart = root.get("auto_start", false).asBool();
     config.remapEnabled = root.get("remap_enabled", false).asBool();
@@ -463,6 +467,7 @@ Json::Value StreamConfig::toJson() const {
     root["hls_access_key_value"] = hlsAccessKeyValue;
     root["hls_user_agent"] = hlsUserAgent;
     root["hls_slow_pcr_assist"] = hlsSlowPcrAssist;
+    root["hls_pcr_phase_pacing"] = hlsPcrPhasePacing;
     root["test_pattern"] = testPattern;
     root["auto_start"] = autoStart;
     root["remap_enabled"] = remapEnabled;
