@@ -312,6 +312,60 @@ struct NetworkArrivalRatePoint {
     uint64_t cumulativeBytes = 0;
 };
 
+struct HlsProviderTimelineRatePoint {
+    uint64_t timestamp90k = 0;
+    uint64_t cumulativeBytes = 0;
+};
+
+bool parsePesTimestamp90k(const std::array<guint8, kTsPacketSize>& packet,
+                           uint64_t& timestamp90k,
+                           bool& usedDts) {
+    timestamp90k = 0;
+    usedDts = false;
+    if (packet[0] != 0x47 || (packet[1] & 0x40U) == 0) return false;
+
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03);
+    if (adaptationControl == 0 || adaptationControl == 2) return false;
+    std::size_t offset = 4;
+    if (adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (5 + adaptationLength >= kTsPacketSize) return false;
+        offset = 5 + adaptationLength;
+    }
+    if (offset + 14 > kTsPacketSize) return false;
+
+    const guint8* payload = packet.data() + offset;
+    if (payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01) return false;
+    const guint8 streamId = payload[3];
+    if (!((streamId >= 0xC0 && streamId <= 0xEF) || streamId == 0xBD)) return false;
+
+    const guint8 ptsDtsFlags = static_cast<guint8>((payload[7] >> 6) & 0x03);
+    const guint8* field = nullptr;
+    if (ptsDtsFlags == 0x03 && offset + 19 <= kTsPacketSize) {
+        field = payload + 14;
+        usedDts = true;
+    } else if ((ptsDtsFlags == 0x02 || ptsDtsFlags == 0x03) &&
+               offset + 14 <= kTsPacketSize) {
+        field = payload + 9;
+    } else {
+        return false;
+    }
+
+    // ISO/IEC 13818-1 PTS/DTS 33-bit field. Reject malformed marker bits so a
+    // random PES payload cannot become a clock sample.
+    if ((field[0] & 0x01U) == 0 || (field[2] & 0x01U) == 0 ||
+        (field[4] & 0x01U) == 0) {
+        return false;
+    }
+    timestamp90k =
+        ((static_cast<uint64_t>((field[0] >> 1) & 0x07U)) << 30) |
+        (static_cast<uint64_t>(field[1]) << 22) |
+        (static_cast<uint64_t>((field[2] >> 1) & 0x7FU) << 15) |
+        (static_cast<uint64_t>(field[3]) << 7) |
+        static_cast<uint64_t>((field[4] >> 1) & 0x7FU);
+    return true;
+}
+
 bool parsePcr(const std::array<guint8, kTsPacketSize>& packet,
               uint64_t& pcrTicks,
               bool& discontinuity) {
@@ -1203,19 +1257,26 @@ private:
     static constexpr uint64_t kHlsTargetReservoirNanoseconds = 8ULL * 1000ULL * 1000ULL * 1000ULL;
     static constexpr uint64_t kHlsPllMaximumCorrectionPermille = 15ULL; // +/-1.5%
     static constexpr uint64_t kHlsPllMaximumStepPermille = 2ULL;       // 0.2% / 5 s
-    // 203.24 startup assist: before a provider PCR clock is validated, allow
-    // only the proven +0..2% upward floor.
+    // 203.24: EXTINF/segment bytes stays authoritative, but when the provider
+    // PCR byte-density clock is only slightly faster (<=2%) it is a useful
+    // lower-bound for deadline-safe playout. This prevents small under-pacing
+    // on services such as Detsky_mir while still rejecting the grossly wrong
+    // PCR estimates that caused the old media-burst/null-gap cycle.
     static constexpr uint64_t kHlsNearPcrAssistTolerancePermille = 20ULL; // +2.0% max
-    // 203.26: once enough provider-PCR samples have accumulated, a CBR-like HLS
-    // service may lock its useful-packet pace to that provider clock in BOTH
-    // directions. TV3 Minsk measured ~+1.65 s PTS-vs-PCR drift in 180 s because
-    // rolling bytes/EXTINF occasionally paced ~1% above its stable ~2.98 Mbit/s
-    // PCR clock. Acquire only when duration and PCR byte-density agree within 4%;
-    // release only on a gross >10% disagreement. Large mismatches such as the
-    // historical SOUZ ~2.05 vs ~2.98 Mbit/s case therefore remain duration-clocked.
-    static constexpr uint64_t kHlsValidatedPcrAcquireTolerancePermille = 40ULL;  // +/-4%
-    static constexpr uint64_t kHlsValidatedPcrReleaseTolerancePermille = 100ULL; // +/-10%
-    static constexpr uint64_t kHlsValidatedPcrMinimumSamples = 64ULL;
+    // 203.27: some HLS providers publish EXTINF/PCR clocks that disagree with
+    // the elementary-stream media timeline. TV3 Minsk was measured with DTS/PTS
+    // advancing ~0.9% faster than PCR, while Detsky_mir is clean on 203.25.
+    // Measure the provider PES decode timeline over a long window and only take
+    // control when the mismatch is both material and persistent. The lock paces
+    // to provider DTS (PTS fallback), not to PCR, so it corrects the measured
+    // media timeline without retimestamping provider packets.
+    static constexpr uint64_t kHlsProviderTimelineWindow90k = 90ULL * 90000ULL;
+    static constexpr uint64_t kHlsProviderTimelineMinimum90k = 60ULL * 90000ULL;
+    static constexpr uint64_t kHlsProviderTimelineMaximumJump90k = 15ULL * 90000ULL;
+    static constexpr uint64_t kHlsProviderTimelineLockMinimumDriftPermille = 6ULL;  // 0.6%
+    static constexpr uint64_t kHlsProviderTimelineLockMaximumDriftPermille = 25ULL; // 2.5%
+    static constexpr uint64_t kHlsProviderTimelineValidationNanoseconds =
+        20ULL * 1000ULL * 1000ULL * 1000ULL;
     // 203.13: HLS segments arrive as bursts of small TS GstBuffers. Parsing an
     // entire downloaded segment inside the real-time UDP sender thread can hold
     // that thread long enough to bunch AAC PES packets even though the final UDP
@@ -1623,6 +1684,9 @@ private:
             observeDeclaredPcrFromPmt(packet.bytes);
             packet.pid = packetPid(packet.bytes);
             packet.hasPcr = parsePcr(packet.bytes, packet.sourcePcrTicks, packet.discontinuity);
+            if (segmentedHlsInput) {
+                observeHlsProviderTimelineRate(packet);
+            }
             if (segmentedHlsInput || continuousNetworkMpegTsInput) {
                 observePcrRate(packet);
             }
@@ -1753,6 +1817,130 @@ private:
         }
     }
 
+    void resetHlsProviderTimelineClock() {
+        hlsProviderTimelineRateWindow.clear();
+        hlsProviderTimelineRateBitrate = 0;
+        hlsProviderTimelineTimestampValid = false;
+        hlsProviderTimelineTimestampPid = 0x1FFF;
+        hlsProviderTimelineUsesDts = false;
+        hlsProviderTimelineLastRaw90k = 0;
+        hlsProviderTimelineLastUnwrapped90k = 0;
+        hlsProviderTimelineCandidateSinceNanoseconds = 0;
+        hlsProviderTimelineLockActive = false;
+        hlsProviderTimelineLockBitrate = 0;
+        ++hlsProviderTimelineRateResets;
+    }
+
+    void observeHlsProviderTimelineRate(const TimedTsPacket& packet) {
+        if (!segmentedHlsInput) return;
+        hlsProviderTimelineBytesSeen += kTsPacketSize;
+
+        if (packet.discontinuity) {
+            resetHlsProviderTimelineClock();
+            return;
+        }
+
+        uint64_t raw90k = 0;
+        bool usedDts = false;
+        if (!parsePesTimestamp90k(packet.bytes, raw90k, usedDts)) return;
+
+        // Prefer the PMT-declared PCR PID. For normal H.264/H.265 services this
+        // is the video PID and supplies monotonic DTS even with B-frame PTS
+        // reordering. Before PMT acquisition, provisionally use the first media
+        // timestamp PID and reset cleanly if the declared PCR PID later differs.
+        const uint16_t wantedPid = declaredPcrPidValid
+            ? declaredPcrPid : (hlsProviderTimelineTimestampValid
+                ? hlsProviderTimelineTimestampPid : packet.pid);
+        if (packet.pid != wantedPid) return;
+
+        if (hlsProviderTimelineTimestampValid &&
+            hlsProviderTimelineTimestampPid != wantedPid) {
+            resetHlsProviderTimelineClock();
+        }
+
+        constexpr uint64_t kPtsModulus = (1ULL << 33);
+        if (!hlsProviderTimelineTimestampValid) {
+            hlsProviderTimelineTimestampValid = true;
+            hlsProviderTimelineTimestampPid = wantedPid;
+            hlsProviderTimelineLastRaw90k = raw90k;
+            hlsProviderTimelineLastUnwrapped90k = raw90k;
+            hlsProviderTimelineUsesDts = usedDts;
+            hlsProviderTimelineRateWindow.push_back(
+                {hlsProviderTimelineLastUnwrapped90k, hlsProviderTimelineBytesSeen});
+            return;
+        }
+
+        uint64_t delta90k = 0;
+        if (raw90k >= hlsProviderTimelineLastRaw90k) {
+            delta90k = raw90k - hlsProviderTimelineLastRaw90k;
+        } else {
+            const uint64_t backward = hlsProviderTimelineLastRaw90k - raw90k;
+            if (backward > kPtsModulus / 2ULL) {
+                delta90k = (kPtsModulus - hlsProviderTimelineLastRaw90k) + raw90k;
+            } else {
+                // PTS fallback can legitimately move backwards by a few frames
+                // with B pictures. DTS is preferred; ignore a reordered fallback
+                // sample instead of turning it into a false long-term rate.
+                return;
+            }
+        }
+
+        if (delta90k == 0) return;
+        if (delta90k > kHlsProviderTimelineMaximumJump90k) {
+            resetHlsProviderTimelineClock();
+            hlsProviderTimelineTimestampValid = true;
+            hlsProviderTimelineTimestampPid = wantedPid;
+            hlsProviderTimelineLastRaw90k = raw90k;
+            hlsProviderTimelineLastUnwrapped90k = raw90k;
+            hlsProviderTimelineUsesDts = usedDts;
+            hlsProviderTimelineRateWindow.push_back(
+                {hlsProviderTimelineLastUnwrapped90k, hlsProviderTimelineBytesSeen});
+            return;
+        }
+
+        hlsProviderTimelineLastRaw90k = raw90k;
+        hlsProviderTimelineLastUnwrapped90k += delta90k;
+        hlsProviderTimelineUsesDts = hlsProviderTimelineUsesDts || usedDts;
+        hlsProviderTimelineRateWindow.push_back(
+            {hlsProviderTimelineLastUnwrapped90k, hlsProviderTimelineBytesSeen});
+
+        while (hlsProviderTimelineRateWindow.size() > 2 &&
+               hlsProviderTimelineLastUnwrapped90k >
+                   hlsProviderTimelineRateWindow.front().timestamp90k &&
+               hlsProviderTimelineLastUnwrapped90k -
+                   hlsProviderTimelineRateWindow.front().timestamp90k >
+                   kHlsProviderTimelineWindow90k) {
+            hlsProviderTimelineRateWindow.pop_front();
+        }
+
+        if (hlsProviderTimelineRateWindow.size() < 2) return;
+        const auto& first = hlsProviderTimelineRateWindow.front();
+        const auto& last = hlsProviderTimelineRateWindow.back();
+        if (last.timestamp90k <= first.timestamp90k ||
+            last.cumulativeBytes <= first.cumulativeBytes) return;
+        const uint64_t timeline90k = last.timestamp90k - first.timestamp90k;
+        if (timeline90k < kHlsProviderTimelineMinimum90k) return;
+
+        const uint64_t bytes = last.cumulativeBytes - first.cumulativeBytes;
+        const uint64_t sampleBitrate = multiplyDivide(bytes * 8ULL, 90000ULL, timeline90k);
+        if (sampleBitrate < 100000ULL || sampleBitrate > kMaximumTransportBitrate) return;
+
+        const bool firstRate = hlsProviderTimelineRateBitrate == 0;
+        hlsProviderTimelineRateBitrate = firstRate
+            ? sampleBitrate
+            : (hlsProviderTimelineRateBitrate * 7ULL + sampleBitrate) / 8ULL;
+        ++hlsProviderTimelineRateSamples;
+        if (firstRate) {
+            std::cerr << "HLS provider timeline 203.27: source_rate="
+                      << (hlsProviderTimelineUsesDts ? "PES-DTS-90s-window" : "PES-PTS-90s-window")
+                      << " pid=" << wantedPid
+                      << " bitrate=" << hlsProviderTimelineRateBitrate
+                      << " min_window_s=60"
+                      << " action=observe-only-until-drift-validated"
+                      << std::endl;
+        }
+    }
+
     void observePcrRate(const TimedTsPacket& packet) {
         // Count transport bytes independently of delivery timing. HLS segments,
         // TCP reads and SRT recovery windows all arrive in bursts; PCR does not.
@@ -1761,8 +1949,6 @@ private:
             if (packet.discontinuity) {
                 hlsPcrSampleValid = false;
                 hlsPcrBytesSinceSample = 0;
-                hlsValidatedPcrClockBitrate = 0;
-                hlsValidatedPcrLockAnnounced = false;
             }
             return;
         }
@@ -2098,73 +2284,72 @@ private:
                 }
             }
 
-            // 203.26: promote a sufficiently sampled, CBR-like provider PCR
-            // byte-density clock to the long-term HLS media clock. Unlike 203.24
-            // this is bidirectional: a nearby PCR can also cap a rolling duration
-            // estimate that is slightly too fast. Freeze the validated rate so
-            // every PCR EWMA update cannot rebase token pacing. A wide release
-            // hysteresis rejects genuine source/variant changes without following
-            // normal per-segment VBR variation.
-            const uint64_t pcrRateSamples =
-                pcrDerivedBitrateSamples.load(std::memory_order_relaxed);
-            if (segmentedHlsInput && durationRateLimited > 0 &&
-                pcrDerivedInputBitrate > 0) {
-                if (hlsValidatedPcrClockBitrate == 0 &&
-                    pcrRateSamples >= kHlsValidatedPcrMinimumSamples) {
-                    const uint64_t acquireLow = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL - kHlsValidatedPcrAcquireTolerancePermille,
-                        1000ULL);
-                    const uint64_t acquireHigh = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL + kHlsValidatedPcrAcquireTolerancePermille,
-                        1000ULL);
-                    if (pcrDerivedInputBitrate >= acquireLow &&
-                        pcrDerivedInputBitrate <= acquireHigh) {
-                        hlsValidatedPcrClockBitrate = std::min<uint64_t>(
-                            pcrDerivedInputBitrate, hlsPaceCeiling);
-                        hlsValidatedPcrLockAnnounced = false;
-                    }
-                } else if (hlsValidatedPcrClockBitrate > 0) {
-                    const uint64_t releaseLow = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL - kHlsValidatedPcrReleaseTolerancePermille,
-                        1000ULL);
-                    const uint64_t releaseHigh = multiplyDivide(
-                        durationRateLimited,
-                        1000ULL + kHlsValidatedPcrReleaseTolerancePermille,
-                        1000ULL);
-                    const uint64_t currentPcrLow = multiplyDivide(
-                        hlsValidatedPcrClockBitrate,
-                        1000ULL - kHlsValidatedPcrReleaseTolerancePermille,
-                        1000ULL);
-                    const uint64_t currentPcrHigh = multiplyDivide(
-                        hlsValidatedPcrClockBitrate,
-                        1000ULL + kHlsValidatedPcrReleaseTolerancePermille,
-                        1000ULL);
-                    if (hlsValidatedPcrClockBitrate < releaseLow ||
-                        hlsValidatedPcrClockBitrate > releaseHigh ||
-                        pcrDerivedInputBitrate < currentPcrLow ||
-                        pcrDerivedInputBitrate > currentPcrHigh) {
-                        std::cerr << "HLS UDP pacing 203.26: source_rate=duration-segment-media-clock"
+            // 203.24 startup/default: never pace below a trustworthy nearby
+            // provider PCR clock. 203.27 adds a much narrower long-term override:
+            // only a directly measured PES DTS/PTS-vs-PCR clock mismatch may select
+            // the provider media timeline. No stream-name or URL special-casing.
+            uint64_t mediaClockRateLimited = std::max<uint64_t>(
+                durationRateLimited, nearPcrAssistRate);
+
+            uint64_t providerTimelineDriftPermille = 0;
+            bool providerTimelineCandidate = false;
+            if (segmentedHlsInput && hlsProviderTimelineRateBitrate > 0 &&
+                pcrDerivedInputBitrate > hlsProviderTimelineRateBitrate &&
+                pcrDerivedBitrateSamples.load(std::memory_order_relaxed) >= 64 &&
+                hlsProviderTimelineRateSamples >= 16) {
+                providerTimelineDriftPermille = multiplyDivide(
+                    pcrDerivedInputBitrate - hlsProviderTimelineRateBitrate,
+                    1000ULL, pcrDerivedInputBitrate);
+                providerTimelineCandidate =
+                    providerTimelineDriftPermille >=
+                        kHlsProviderTimelineLockMinimumDriftPermille &&
+                    providerTimelineDriftPermille <=
+                        kHlsProviderTimelineLockMaximumDriftPermille;
+            }
+
+            if (!hlsProviderTimelineLockActive) {
+                if (providerTimelineCandidate) {
+                    if (hlsProviderTimelineCandidateSinceNanoseconds == 0) {
+                        hlsProviderTimelineCandidateSinceNanoseconds = nowNanoseconds;
+                    } else if (nowNanoseconds >= hlsProviderTimelineCandidateSinceNanoseconds &&
+                               nowNanoseconds - hlsProviderTimelineCandidateSinceNanoseconds >=
+                                   kHlsProviderTimelineValidationNanoseconds) {
+                        hlsProviderTimelineLockActive = true;
+                        hlsProviderTimelineLockBitrate = std::min<uint64_t>(
+                            hlsProviderTimelineRateBitrate, hlsPaceCeiling);
+                        hlsProviderTimelineCandidateSinceNanoseconds = 0;
+                        std::cerr << "HLS UDP pacing 203.27: source_rate=validated-provider-timeline"
                                   << " duration_rate_bitrate=" << durationRateLimited
-                                  << " validated_pcr_bitrate=" << hlsValidatedPcrClockBitrate
                                   << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                                  << " pcr_samples=" << pcrRateSamples
-                                  << " action=release-validated-provider-pcr-lock"
+                                  << " provider_timeline_bitrate="
+                                  << hlsProviderTimelineRateBitrate
+                                  << " provider_timeline="
+                                  << (hlsProviderTimelineUsesDts ? "DTS" : "PTS")
+                                  << " timeline_vs_pcr_drift_permille="
+                                  << providerTimelineDriftPermille
+                                  << " validation_ms="
+                                  << (kHlsProviderTimelineValidationNanoseconds / 1000000ULL)
+                                  << " effective_media_clock_bitrate="
+                                  << hlsProviderTimelineLockBitrate
+                                  << " token_phase=preserved"
+                                  << " reservoir_pll=clock-rate-correction-disabled"
+                                  << " action=lock-provider-timeline-media-clock"
                                   << std::endl;
-                        hlsValidatedPcrClockBitrate = 0;
-                        hlsValidatedPcrLockAnnounced = false;
                     }
+                } else {
+                    hlsProviderTimelineCandidateSinceNanoseconds = 0;
                 }
             }
 
-            // 203.24 remains the startup/fallback rule. 203.26 supersedes it only
-            // after validation and then uses the frozen provider-PCR clock in both
-            // directions.
-            const uint64_t mediaClockRateLimited = hlsValidatedPcrClockBitrate > 0
-                ? hlsValidatedPcrClockBitrate
-                : std::max<uint64_t>(durationRateLimited, nearPcrAssistRate);
+            if (hlsProviderTimelineLockActive && hlsProviderTimelineRateBitrate > 0) {
+                const uint64_t latestTimelineRate = std::min<uint64_t>(
+                    hlsProviderTimelineRateBitrate, hlsPaceCeiling);
+                hlsProviderTimelineLockBitrate = hlsProviderTimelineLockBitrate == 0
+                    ? latestTimelineRate
+                    : (hlsProviderTimelineLockBitrate * 31ULL + latestTimelineRate) / 32ULL;
+                mediaClockRateLimited = hlsProviderTimelineLockBitrate;
+                nearPcrAssistRate = 0;
+            }
 
             if (mediaClockRateLimited > 0 &&
                 mediaClockRateLimited != hlsLastMediaClockBitrate) {
@@ -2180,45 +2365,17 @@ private:
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
                 if (firstDurationLock) {
                     realTokenAccumulator = 0;
-                    if (hlsValidatedPcrClockBitrate > 0) {
-                        std::cerr << "HLS UDP pacing 203.26: source_rate=validated-provider-PCR"
-                                  << " duration_rate_bitrate=" << durationRateLimited
-                                  << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                                  << " validated_pcr_bitrate=" << hlsValidatedPcrClockBitrate
-                                  << " effective_media_clock_bitrate=" << mediaClockRateLimited
-                                  << " pcr_samples=" << pcrRateSamples
-                                  << " token_phase=initial-lock"
-                                  << " reservoir_pll=clock-rate-correction-disabled"
-                                  << " transport_bitrate=" << currentTargetBitrate()
-                                  << " action=lock-provider-pcr-media-clock"
-                                  << std::endl;
-                        hlsValidatedPcrLockAnnounced = true;
-                    } else {
-                        std::cerr << "HLS UDP pacing 203.24: source_rate=segment-bytes/EXTINF"
-                                  << " duration_rate_bitrate=" << durationRateLimited
-                                  << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                                  << " effective_media_clock_bitrate=" << mediaClockRateLimited
-                                  << " pcr_assist=" << (nearPcrAssistRate > 0 ? "on" : "off")
-                                  << " pcr_assist_limit_permille=" << kHlsNearPcrAssistTolerancePermille
-                                  << " transport_bitrate=" << currentTargetBitrate()
-                                  << " action=lock-duration-media-clock"
-                                  << std::endl;
-                    }
-                } else if (hlsValidatedPcrClockBitrate > 0 &&
-                           !hlsValidatedPcrLockAnnounced) {
-                    std::cerr << "HLS UDP pacing 203.26: source_rate=validated-provider-PCR"
+                    std::cerr << "HLS UDP pacing 203.27: source_rate=segment-bytes/EXTINF"
                               << " duration_rate_bitrate=" << durationRateLimited
                               << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
-                              << " validated_pcr_bitrate=" << hlsValidatedPcrClockBitrate
                               << " effective_media_clock_bitrate=" << mediaClockRateLimited
-                              << " pcr_samples=" << pcrRateSamples
-                              << " token_phase=preserved"
-                              << " reservoir_pll=clock-rate-correction-disabled"
-                              << " action=lock-provider-pcr-media-clock"
+                              << " pcr_assist=" << (nearPcrAssistRate > 0 ? "on" : "off")
+                              << " pcr_assist_limit_permille=" << kHlsNearPcrAssistTolerancePermille
+                              << " transport_bitrate=" << currentTargetBitrate()
+                              << " action=lock-duration-media-clock"
                               << std::endl;
-                    hlsValidatedPcrLockAnnounced = true;
                 } else if (nearPcrAssistRate > 0 && !hlsNearPcrAssistAnnounced) {
-                    std::cerr << "HLS UDP pacing 203.24: source_rate=duration+near-PCR"
+                    std::cerr << "HLS UDP pacing 203.27: source_rate=duration+near-PCR"
                               << " duration_rate_bitrate=" << durationRateLimited
                               << " pcr_rate_bitrate=" << pcrDerivedInputBitrate
                               << " effective_media_clock_bitrate=" << mediaClockRateLimited
@@ -2245,8 +2402,17 @@ private:
                 ? multiplyDivide(bufferNow * 8ULL, 1000ULL, hlsPllBaseBitrate)
                 : 0;
 
-            if (nowNanoseconds >= hlsPllLastUpdateNanoseconds &&
-                nowNanoseconds - hlsPllLastUpdateNanoseconds >= pllUpdateNanoseconds) {
+            if (hlsProviderTimelineLockActive) {
+                // The lock rate is already derived from the provider media
+                // timeline itself. Reservoir occupancy is still measured and
+                // bounded by the existing queue/backpressure logic, but must not
+                // bend this clock again or the validated A/V-vs-PCR drift returns.
+                hlsPllBaseBitrate = mediaClockRateLimited;
+                currentRealPaceBitrate = mediaClockRateLimited;
+                hlsPllCorrectionBitrate = 0;
+                hlsPllLastUpdateNanoseconds = nowNanoseconds;
+            } else if (nowNanoseconds >= hlsPllLastUpdateNanoseconds &&
+                       nowNanoseconds - hlsPllLastUpdateNanoseconds >= pllUpdateNanoseconds) {
                 hlsPllLastUpdateNanoseconds = nowNanoseconds;
 
                 const uint64_t sourceLimited = segmentedHlsInput && mediaClockRateLimited > 0
@@ -2280,7 +2446,7 @@ private:
                 }
 
                 int64_t correction = 0;
-                if (targetBytes > 0 && hlsValidatedPcrClockBitrate == 0) {
+                if (targetBytes > 0) {
 #if defined(__SIZEOF_INT128__)
                     correction = static_cast<int64_t>(
                         (static_cast<__int128>(hlsPllBaseBitrate) * error) /
@@ -2321,7 +2487,7 @@ private:
 
             if (!hlsExactPacingAnnounced) {
                 std::cerr << (segmentedHlsInput
-                                  ? "HLS UDP pacing 203.26: mode=duration-segment-media-clock+validated-provider-pcr-lock+near-pcr-startup-assist sender_ingest=post-send-bounded"
+                                  ? "HLS UDP pacing 203.27: mode=duration-segment-media-clock+validated-provider-timeline+near-pcr-startup-assist sender_ingest=post-send-bounded"
                                   : "Network MPEG-TS UDP pacing 202.22: mode=arrival-playout-pll")
                           << " base_bitrate=" << hlsPllBaseBitrate
                           << " source_rate_bitrate=" << playoutSourceRate
@@ -2331,6 +2497,10 @@ private:
                           << (segmentedHlsInput ? mediaClockRateLimited : playoutSourceRate)
                           << " pcr_assist="
                           << (segmentedHlsInput && nearPcrAssistRate > 0 ? "on" : "off")
+                          << " provider_timeline_rate="
+                          << (segmentedHlsInput ? hlsProviderTimelineRateBitrate : 0)
+                          << " provider_timeline_lock="
+                          << (segmentedHlsInput && hlsProviderTimelineLockActive ? "on" : "off")
                           << " real_pace_bitrate=" << currentRealPaceBitrate
                           << " target_reservoir_ms="
                           << (pllTargetReservoirNanoseconds / 1000000ULL)
@@ -2771,6 +2941,22 @@ private:
                   << " hls_pts_rate=" << (segmentedHlsInput ? hlsTimestampDerivedInputBitrate : 0)
                   << " hls_pts_samples=" << hlsTimestampBitrateSamples.load(std::memory_order_relaxed)
                   << " hls_pts_resets=" << hlsTimestampRateResets.load(std::memory_order_relaxed)
+                  << " hls_provider_timeline_rate="
+                  << (segmentedHlsInput ? hlsProviderTimelineRateBitrate : 0)
+                  << " hls_provider_timeline_samples="
+                  << (segmentedHlsInput ? hlsProviderTimelineRateSamples : 0)
+                  << " hls_provider_timeline_resets="
+                  << (segmentedHlsInput ? hlsProviderTimelineRateResets : 0)
+                  << " hls_provider_timeline_pid="
+                  << (segmentedHlsInput ? hlsProviderTimelineTimestampPid : 0x1FFF)
+                  << " hls_provider_timeline_clock="
+                  << (segmentedHlsInput
+                          ? (hlsProviderTimelineUsesDts ? "DTS" : "PTS")
+                          : "off")
+                  << " hls_provider_timeline_lock="
+                  << (segmentedHlsInput && hlsProviderTimelineLockActive ? 1 : 0)
+                  << " hls_provider_timeline_lock_rate="
+                  << (segmentedHlsInput ? hlsProviderTimelineLockBitrate : 0)
                   << " hls_pll_base=" << (segmentedHlsInput ? hlsPllBaseBitrate : 0)
                   << " hls_pll_correction=" << (segmentedHlsInput ? hlsPllCorrectionBitrate : 0)
                   << " network_arrival_rate="
@@ -2825,7 +3011,6 @@ private:
     const std::size_t bufferLimitBytes = kMaxBufferedBytes;
     bool hlsExactPacingAnnounced = false;
     bool hlsNearPcrAssistAnnounced = false;
-    bool hlsValidatedPcrLockAnnounced = false;
     bool srtPrePaddedCbrAnnounced = false;
     bool caCleanStartReleased = false;
     bool caCleanStartAudioSeen = false;
@@ -2900,11 +3085,23 @@ private:
     uint64_t hlsTimestampBytesSeen = 0;
     uint64_t hlsPllBaseBitrate = 0;
     uint64_t hlsLastMediaClockBitrate = 0;
-    uint64_t hlsValidatedPcrClockBitrate = 0;
     int64_t hlsPllCorrectionBitrate = 0;
     uint64_t hlsPllLastUpdateNanoseconds = 0;
     std::deque<HlsTimestampRatePoint> hlsTimestampRateWindow;
     std::deque<NetworkArrivalRatePoint> networkArrivalRateWindow;
+    std::deque<HlsProviderTimelineRatePoint> hlsProviderTimelineRateWindow;
+    uint64_t hlsProviderTimelineBytesSeen = 0;
+    uint64_t hlsProviderTimelineRateBitrate = 0;
+    uint64_t hlsProviderTimelineRateSamples = 0;
+    uint64_t hlsProviderTimelineRateResets = 0;
+    uint64_t hlsProviderTimelineLastRaw90k = 0;
+    uint64_t hlsProviderTimelineLastUnwrapped90k = 0;
+    uint64_t hlsProviderTimelineCandidateSinceNanoseconds = 0;
+    uint64_t hlsProviderTimelineLockBitrate = 0;
+    uint16_t hlsProviderTimelineTimestampPid = 0x1FFF;
+    bool hlsProviderTimelineTimestampValid = false;
+    bool hlsProviderTimelineUsesDts = false;
+    bool hlsProviderTimelineLockActive = false;
     uint64_t hlsPcrBytesSinceSample = 0;
     uint64_t hlsLastPcrTicks = 0;
     uint16_t hlsPcrSamplePid = 0x1FFF;
@@ -3102,10 +3299,10 @@ GstElement* createSink(
                   << std::endl;
     }
     if (isSegmentedHlsInput(config)) {
-        std::cerr << "HLS timing 203.26: compatibility=202.74"
+        std::cerr << "HLS timing 203.27: compatibility=202.74"
                   << " profile=sat5-restored"
                   << " direct_mpegts=preferred remux=fallback-only"
-                  << " pacing=duration-segment-media-clock+validated-provider-pcr-lock+near-pcr-startup-assist periodic_pcr=20ms"
+                  << " pacing=duration-segment-media-clock+validated-provider-timeline+near-pcr-startup-assist periodic_pcr=20ms"
                   << " sender_ingest=post-send-bounded"
                   << " ingest_chunks_per_tick=" << kHlsIngestChunksPerSenderTick
                   << " pre_send_low_water_packets=" << kHlsPreSendPacketLowWater
