@@ -11255,6 +11255,33 @@ void StreamManager::monitorBus(const std::string& id) {
                     continue;
                 }
 
+                if (state->gstTranscoder && state->running.load()) {
+                    // 203.46: Stable-UDP transcoding uses an external gst-launch
+                    // writer feeding this in-process relay through FIFO.  When the
+                    // external watchdog/encoder exits, the FIFO relay can report
+                    // ERROR before the next child-process health check.  The old
+                    // generic handler converted that relay-side symptom into a
+                    // permanent stream STOP, so 203.11 never got a chance to
+                    // restart the transcoder.  Keep the stream enabled, force the
+                    // external child into the known-stopped state, and let the
+                    // existing 203.11 path perform the full transcoder+relay
+                    // restart (including backup/retry policy) on the next loop.
+                    gchar* sourcePath = GST_MESSAGE_SRC(msg)
+                        ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
+                    std::cerr << "Transcoder relay recovery 203.46: stream=" << id
+                              << " reason=gstreamer-error source="
+                              << (sourcePath ? sourcePath : "unknown")
+                              << " message=" << message
+                              << " action=handoff-to-203.11-whole-path-restart"
+                              << std::endl;
+                    if (sourcePath) g_free(sourcePath);
+                    state->statusMessage = "recovering transcoded relay after gstreamer error";
+                    state->active = true;
+                    state->gstTranscoder->stop();
+                    gst_message_unref(msg);
+                    continue;
+                }
+
                 state->statusMessage = "error: " + message;
                 state->active = false;
                 state->running = false;
@@ -11361,6 +11388,25 @@ void StreamManager::monitorBus(const std::string& id) {
                             "\nFile: " + loopFile);
                     return;
                 }
+                if (state->gstTranscoder && state->running.load()) {
+                    // 203.46: FIFO EOS is also a recoverable external-transcoder
+                    // failure.  Preserve the configured stream and hand recovery
+                    // to the same 203.11 whole-path restart used for child exits.
+                    gchar* sourcePath = GST_MESSAGE_SRC(msg)
+                        ? gst_object_get_path_string(GST_MESSAGE_SRC(msg)) : nullptr;
+                    std::cerr << "Transcoder relay recovery 203.46: stream=" << id
+                              << " reason=EOS source="
+                              << (sourcePath ? sourcePath : "unknown")
+                              << " action=handoff-to-203.11-whole-path-restart"
+                              << std::endl;
+                    if (sourcePath) g_free(sourcePath);
+                    state->statusMessage = "recovering transcoded relay after EOS";
+                    state->active = true;
+                    state->gstTranscoder->stop();
+                    gst_message_unref(msg);
+                    continue;
+                }
+
                 state->statusMessage = "ended";
                 state->active = false;
                 state->running = false;
