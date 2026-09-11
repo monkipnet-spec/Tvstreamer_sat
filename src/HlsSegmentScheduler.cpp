@@ -36,6 +36,16 @@ constexpr std::size_t kTsPacketSize = 188;
 constexpr std::size_t kPushChunkBytes = 64 * kTsPacketSize; // 12032 bytes
 constexpr long kHttpConnectTimeoutMs = 3000;
 constexpr long kHttpTransferTimeoutMs = 12000;
+// 203.42: some live origins publish a segment URI before the object is reliably
+// readable. TV3 was observed returning HTTP 504 or CURLE_PARTIAL_FILE for a
+// newly advertised 3.8-4.0 MiB segment, then serving the same sequence normally
+// a moment later. Keep each media attempt shorter than the remaining LOW-water
+// reservoir and retry the exact same sequence without ever pushing partial data.
+constexpr long kSegmentHttpTransferTimeoutMs = 3500;
+constexpr long kSegmentHttpMinimumRetryTimeoutMs = 750;
+constexpr uint64_t kSegmentReservoirSafetyMs = 1000ULL;
+constexpr unsigned kSegmentFastRetryAttempts = 3;
+constexpr uint64_t kSegmentRetryBackoffMs[] = {150ULL, 300ULL};
 // 203.20: playlist reloads are tiny control requests. Never let one stalled
 // playlist GET consume the whole 6/8/12-second media reservoir.
 constexpr long kPlaylistHttpTransferTimeoutMs = 2500;
@@ -663,6 +673,88 @@ private:
         return false;
     }
 
+    enum class SegmentFetchResult {
+        Success,
+        RetryLater
+    };
+
+    long segmentAttemptTimeoutMs() const {
+        if (firstPushMonotonicNs_ == 0) return kSegmentHttpTransferTimeoutMs;
+        const uint64_t aheadMs = aheadNs() / 1000000ULL;
+        const uint64_t budgetMs = aheadMs > kSegmentReservoirSafetyMs
+            ? aheadMs - kSegmentReservoirSafetyMs
+            : 0ULL;
+        return static_cast<long>(std::clamp<uint64_t>(
+            budgetMs,
+            static_cast<uint64_t>(kSegmentHttpMinimumRetryTimeoutMs),
+            static_cast<uint64_t>(kSegmentHttpTransferTimeoutMs)));
+    }
+
+    SegmentFetchResult fetchSegmentResilient(const Segment& segment,
+                                             std::vector<uint8_t>& body,
+                                             std::string& effectiveUrl) {
+        for (unsigned attempt = 1;
+             attempt <= kSegmentFastRetryAttempts &&
+             !stopping_.load(std::memory_order_relaxed);
+             ++attempt) {
+            long status = 0;
+            std::string error;
+            const long attemptTimeoutMs = segmentAttemptTimeoutMs();
+            const uint64_t beforeNs = monotonicNanoseconds();
+            if (httpGet(segment.url, config_, stopping_, body, status, effectiveUrl, error,
+                        attemptTimeoutMs)) {
+                if (attempt > 1) {
+                    std::cerr << "HLS SEGMENT 203.42: stream=" << streamLabel()
+                              << " sequence=" << segment.sequence
+                              << " result=recovered"
+                              << " attempt=" << attempt
+                              << " bytes=" << body.size()
+                              << " elapsed_ms="
+                              << (monotonicNanoseconds() - beforeNs) / 1000000ULL
+                              << " action=push-complete-segment" << std::endl;
+                }
+                return SegmentFetchResult::Success;
+            }
+            if (stopping_.load(std::memory_order_relaxed)) {
+                return SegmentFetchResult::RetryLater;
+            }
+
+            const bool lastAttempt = attempt >= kSegmentFastRetryAttempts;
+            const uint64_t retryMs = lastAttempt
+                ? 0ULL
+                : kSegmentRetryBackoffMs[attempt - 1];
+            std::cerr << "HLS SEGMENT 203.42: stream=" << streamLabel()
+                      << " sequence=" << segment.sequence
+                      << " fetch failed attempt=" << attempt
+                      << " http_status=" << status
+                      << " error=" << error
+                      << " bytes_received=" << body.size()
+                      << " timeout_ms=" << attemptTimeoutMs
+                      << " retry_ms=" << retryMs
+                      << " ahead_ms=" << aheadNs() / 1000000ULL
+                      << (lastAttempt
+                          ? " action=refresh-playlist-keep-sequence"
+                          : " action=retry-same-sequence")
+                      << std::endl;
+
+            if (lastAttempt) {
+                // Do not advance nextSequence_ and do not terminate the scheduler.
+                // The outer loop refreshes the playlist and retries this exact
+                // media sequence if it is still in the live window. Partial bytes
+                // from failed curl transfers are discarded by the next httpGet().
+                body.clear();
+                effectiveUrl.clear();
+                return SegmentFetchResult::RetryLater;
+            }
+
+            std::unique_lock<std::mutex> lock(wakeMutex_);
+            wake_.wait_for(lock, std::chrono::milliseconds(retryMs), [&] {
+                return stopping_.load(std::memory_order_relaxed);
+            });
+        }
+        return SegmentFetchResult::RetryLater;
+    }
+
     bool loadPlaylist(MediaPlaylist& playlist, bool runtimeRefresh = false) {
         std::vector<uint8_t> bytes;
         std::string effective;
@@ -854,17 +946,24 @@ private:
         return true;
     }
 
-    bool downloadAndPush(const Segment& segment) {
+    enum class DownloadResult {
+        Pushed,
+        RetryLater,
+        Fatal
+    };
+
+    DownloadResult downloadAndPush(const Segment& segment) {
         std::vector<uint8_t> bytes;
         std::string effective;
-        if (!fetchBytesWithRetry(segment.url, bytes, effective, "segment",
-                                 kHttpTransferTimeoutMs)) return false;
-        if (!decryptSegmentIfNeeded(segment, bytes)) return false;
-        if (!pushSegment(segment, bytes)) return false;
+        if (fetchSegmentResilient(segment, bytes, effective) != SegmentFetchResult::Success) {
+            return DownloadResult::RetryLater;
+        }
+        if (!decryptSegmentIfNeeded(segment, bytes)) return DownloadResult::Fatal;
+        if (!pushSegment(segment, bytes)) return DownloadResult::Fatal;
         ++segmentsDownloaded_;
         noteMediaRestored();
         const uint64_t ahead = aheadNs();
-        std::cerr << "HLS scheduler 203.25: stream=" << streamLabel()
+        std::cerr << "HLS scheduler 203.42: stream=" << streamLabel()
                   << " segment=" << segment.sequence
                   << " duration_ms=" << static_cast<uint64_t>(segment.durationSeconds * 1000.0)
                   << " bytes=" << bytes.size()
@@ -874,7 +973,7 @@ private:
                   << " consumed_effective_ms=" << effectiveConsumedNs() / 1000000ULL
                   << " consumed_downstream_ms=" << consumedDurationNs_.load(std::memory_order_relaxed) / 1000000ULL
                   << std::endl;
-        return true;
+        return DownloadResult::Pushed;
     }
 
     void run() {
@@ -887,7 +986,7 @@ private:
                   << " target_ms=" << kTargetAheadNs / 1000000ULL
                   << " high_ms=" << kHighAheadNs / 1000000ULL
                   << " min_start_segments=" << kMinimumStartupSegments
-                  << " fetch_policy=fast-segment-on-demand"
+                  << " fetch_policy=fast-segment-on-demand+203.42-same-sequence-retry"
                   << " provider_ts=byte-preserved"
                   << " gst_timestamps=provider-ts-only"
                   << " consumption_clock=private-byte-duration-ledger"
@@ -956,6 +1055,7 @@ private:
             }
 
             bool madeProgress = false;
+            bool needPlaylistRefresh = false;
             while (!stopping_.load(std::memory_order_relaxed)) {
                 ahead = aheadNs();
                 const bool haveStartupSegments = segmentsPushed_ >= kMinimumStartupSegments;
@@ -1008,14 +1108,24 @@ private:
                                   << " action=allow-one-segment-at-low-water"
                                   << std::endl;
                     }
-                    if (!downloadAndPush(segment)) return;
+                    const DownloadResult downloadResult = downloadAndPush(segment);
+                    if (downloadResult == DownloadResult::Fatal) return;
+                    if (downloadResult == DownloadResult::RetryLater) {
+                        // Keep nextSequence_ unchanged. Refresh the playlist in the
+                        // outer path, then retry the same sequence if it remains
+                        // available. This prevents a transient 504/partial transfer
+                        // from turning into a missing media segment or scheduler exit.
+                        needPlaylistRefresh = true;
+                        break;
+                    }
                     nextSequence_ = segment.sequence + 1;
                     madeProgress = true;
                 }
             }
 
             if (stopping_.load(std::memory_order_relaxed)) break;
-            if (!madeProgress || findSegmentIndex(playlist, nextSequence_) == std::nullopt) {
+            if (needPlaylistRefresh || !madeProgress ||
+                findSegmentIndex(playlist, nextSequence_) == std::nullopt) {
                 std::unique_lock<std::mutex> lock(wakeMutex_);
                 wake_.wait_for(lock, std::chrono::milliseconds(250), [&] {
                     return stopping_.load(std::memory_order_relaxed);
