@@ -35,9 +35,9 @@ private:
     mutable std::mutex childrenMutex;
     std::atomic<bool> stopping{false};
 
-    static std::vector<std::string> buildCommand(
+    static std::vector<std::string> buildSharedCommand(
         const StreamConfig& baseConfig,
-        const StreamConfig& outputConfig,
+        const std::vector<StreamConfig>& outputConfigs,
         std::string& description,
         std::string& error);
 

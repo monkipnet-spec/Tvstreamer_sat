@@ -18,6 +18,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -401,182 +402,220 @@ bool appendTranscoderDecodeInput(
     return true;
 }
 
-void addVideoBranch(std::vector<std::string>& args, const StreamConfig& cfg,
-                    const GstOutputSpec& spec, std::string& error) {
+struct SharedOutputBranch {
+    GstOutputSpec spec;
+    std::size_t index = 0;
+};
+
+void uniquifyOutputFragment(
+    std::vector<std::string>& fragment,
+    GstOutputSpec& spec,
+    std::size_t outputIndex) {
+    const std::string suffix = "_out" + std::to_string(outputIndex);
+    std::vector<std::pair<std::string, std::string>> renamed;
+
+    for (auto& token : fragment) {
+        if (token.rfind("name=", 0) != 0 || token.size() <= 5) continue;
+        const std::string oldName = token.substr(5);
+        const std::string newName = oldName + suffix;
+        renamed.emplace_back(oldName, newName);
+        token = "name=" + newName;
+    }
+
+    auto rewriteReference = [&renamed](std::string& value) {
+        for (const auto& [oldName, newName] : renamed) {
+            const std::string prefix = oldName + ".";
+            if (value.rfind(prefix, 0) == 0) {
+                value = newName + value.substr(oldName.size());
+                return;
+            }
+        }
+    };
+
+    for (auto& token : fragment) {
+        if (token.rfind("name=", 0) == 0) continue;
+        rewriteReference(token);
+    }
+    rewriteReference(spec.videoPad);
+    rewriteReference(spec.audioPad);
+}
+
+bool appendSharedVideoEncoderCore(
+    std::vector<std::string>& args,
+    const StreamConfig& cfg,
+    std::string& error) {
     int width = 1920;
     int height = 1080;
     TranscoderModule::resolutionSize(cfg.transcodeResolution, width, height);
-    const bool flv = spec.container == ContainerKind::Flv;
+
     const std::string encoderFactory = selectedVideoEncoderFactory(cfg);
     if (encoderFactory.empty()) {
         if (cfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
         else if (cfg.transcodeVideoEncoder == "intel") error = "Intel qsv/VA H.264 encoder did not pass the runtime probe";
         else if (cfg.transcodeVideoEncoder == "x264") error = "CPU x264enc is not available";
         else error = "no H.264 video encoder is available";
-        return;
+        return false;
     }
 
-    args.insert(args.end(), {"dec.", "!"});
-    addQueue(args, "transcode_video_queue", 8000000000ULL);
-    args.insert(args.end(), {
-        "!", "watchdog",
-        "name=transcode_decoded_video_watchdog",
-        "timeout=15000",
-        "!", "video/x-raw",
-        "!", "videoconvert",
-        "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
-        "!", "videoscale", "add-borders=false", "method=lanczos"
-    });
+    if (cfg.testPattern) {
+        args.insert(args.end(), {
+            "videotestsrc", "is-live=true", "pattern=smpte",
+            "!", "video/x-raw,framerate=25/1", "!"
+        });
+        addQueue(args, "transcode_video_queue", 3000000000ULL);
+        args.insert(args.end(), {
+            "!", "videoconvert",
+            "!", "videoscale", "add-borders=false", "method=lanczos",
+            "!", "videorate"
+        });
+    } else {
+        args.insert(args.end(), {"dec.", "!"});
+        addQueue(args, "transcode_video_queue", 8000000000ULL);
+        args.insert(args.end(), {
+            "!", "watchdog",
+            "name=transcode_decoded_video_watchdog",
+            "timeout=15000",
+            "!", "video/x-raw",
+            "!", "videoconvert",
+            "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
+            "!", "videoscale", "add-borders=false", "method=lanczos"
+        });
+    }
+
     if (encoderFactory == "nvh264enc" || isIntelVideoEncoder(encoderFactory)) {
-        // Hardware encoders use NV12 system-memory input. Convert after YADIF/scale so the
-        // deinterlacer can keep its proven CPU format and hand NV12 to the selected hardware encoder.
         args.insert(args.end(), {"!", "videoconvert"});
     }
     args.insert(args.end(), {"!", scaledVideoCaps(width, height, encoderFactory)});
-    if (!appendVideoEncoder(args, cfg, flv, 50, error)) return;
-    args.insert(args.end(), {
-        // Keep parameter sets on every IDR for CPU and hardware encoders. nvh264enc
-        // also enables repeat-sequence-header; h264parse normalizes the output
-        // for late SRT/UDP joins and FLV/TS stream-format requirements.
-        "!", "h264parse", property("config-interval", "-1"),
-        "!", flv
-            ? "video/x-h264,stream-format=avc,alignment=au"
-            : "video/x-h264,stream-format=byte-stream,alignment=au",
-        "!"
-    });
-    addQueue(args, "transcode_video_mux_queue", 3000000000ULL);
-    args.insert(args.end(), {"!", spec.videoPad});
 
-    std::cerr << "GStreamer transcoder video encoder: requested=" << cfg.transcodeVideoEncoder
+    // 203.45: encode H.264 once. Keep a byte-stream-friendly shared encoder
+    // output; per-output h264parse branches below convert to AVC when FLV needs it.
+    if (!appendVideoEncoder(args, cfg, false, cfg.testPattern ? 25 : 50, error)) return false;
+    args.insert(args.end(), {"!", "tee", "name=transcode_video_encoded_tee"});
+
+    std::cerr << "GStreamer shared transcoder video 203.45: requested="
+              << cfg.transcodeVideoEncoder
               << " selected=" << encoderFactory
               << " output=" << width << "x" << height
               << " bitrate=" << tvs::protocols::safeVideoBitrate(cfg)
-              << " headers=every-idr" << std::endl;
+              << " encode_instances=1"
+              << std::endl;
+    return true;
 }
 
-void addAudioBranch(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
+bool appendSharedAudioEncoderCore(
+    std::vector<std::string>& args,
+    const StreamConfig& cfg,
+    std::string& error) {
     const std::string audioCodec = toLower(cfg.transcodeAudioCodec);
     const uint64_t bitrate = tvs::protocols::safeAudioBitrate(cfg);
-    const bool flv = spec.container == ContainerKind::Flv;
-    const bool rtsp = spec.container == ContainerKind::Rtsp;
-
-    args.insert(args.end(), {"dec.", "!"});
-    addQueue(args, "transcode_audio_queue", 8000000000ULL);
-
     std::string selectedAacEncoder;
     std::string selectedMp3Encoder;
-    if (audioCodec == "mp3") {
-        selectedMp3Encoder = findMp3Encoder();
-    } else {
-        selectedAacEncoder = findAacEncoder();
+    if (audioCodec == "mp3") selectedMp3Encoder = findMp3Encoder();
+    else selectedAacEncoder = findAacEncoder();
+
+    if (audioCodec == "mp3" && selectedMp3Encoder.empty()) {
+        error = "MP3 encoder is not available";
+        return false;
+    }
+    if (audioCodec != "mp3" && selectedAacEncoder.empty()) {
+        error = "AAC encoder is not available";
+        return false;
     }
 
     const std::string rawAudioCaps = selectedAacEncoder == "avenc_aac"
         ? "audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2"
         : "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2";
 
+    if (cfg.testPattern) {
+        args.insert(args.end(), {
+            "audiotestsrc", "is-live=true", "wave=sine", "freq=1000",
+            "!", "audio/x-raw,rate=48000,channels=2", "!"
+        });
+        addQueue(args, "transcode_audio_queue", 3000000000ULL);
+    } else {
+        args.insert(args.end(), {"dec.", "!"});
+        addQueue(args, "transcode_audio_queue", 8000000000ULL);
+        args.insert(args.end(), {"!", "audio/x-raw"});
+    }
+
     args.insert(args.end(), {
-        "!", "audio/x-raw",
         "!", "audioconvert",
         "!", "audioresample", "quality=6",
-        // Keep long-running HLS audio locked to the 48 kHz clock. A small
-        // tolerance lets audiorate correct source jitter before it accumulates
-        // into audible gaps at segment boundaries.
         "!", "audiorate", "skip-to-first=true", "tolerance=20000000",
         "!", rawAudioCaps,
         "!"
     });
 
     if (audioCodec == "mp3") {
-        const std::string encoder = selectedMp3Encoder;
-        if (encoder.empty()) {
-            error = "MP3 encoder is not available";
-            return;
-        }
-        if (encoder == "lamemp3enc") {
+        if (selectedMp3Encoder == "lamemp3enc") {
             args.insert(args.end(), {
                 "lamemp3enc",
                 "target=bitrate",
                 "cbr=true",
-                property("bitrate", std::to_string(std::max<uint64_t>(bitrate / 1000, 64))),
-                "!", "mpegaudioparse",
-                "!", "audio/mpeg,mpegversion=1,layer=3"
+                property("bitrate", std::to_string(std::max<uint64_t>(bitrate / 1000, 64)))
             });
         } else {
             args.insert(args.end(), {
                 "avenc_mp3",
-                property("bitrate", std::to_string(bitrate)),
-                "!", "mpegaudioparse",
-                "!", "audio/mpeg,mpegversion=1,layer=3"
+                property("bitrate", std::to_string(bitrate))
             });
         }
     } else {
-        const std::string encoder = selectedAacEncoder;
-        if (encoder.empty()) {
-            error = "AAC encoder is not available";
-            return;
-        }
         args.insert(args.end(), {
-            encoder,
-            property("bitrate", std::to_string(bitrate)),
-            "!", "aacparse",
-            "!", (flv || rtsp)
-                ? "audio/mpeg,mpegversion=4,stream-format=raw"
-                : "audio/mpeg,mpegversion=4,stream-format=adts"
+            selectedAacEncoder,
+            property("bitrate", std::to_string(bitrate))
         });
     }
 
-    args.insert(args.end(), {"!"});
-    addQueue(args, "transcode_audio_mux_queue", 3000000000ULL);
-    args.insert(args.end(), {"!", spec.audioPad});
+    args.insert(args.end(), {"!", "tee", "name=transcode_audio_encoded_tee"});
+    std::cerr << "GStreamer shared transcoder audio 203.45: codec=" << audioCodec
+              << " bitrate=" << bitrate
+              << " encode_instances=1"
+              << std::endl;
+    return true;
 }
 
-void addTestSources(std::vector<std::string>& args, const StreamConfig& cfg, const GstOutputSpec& spec, std::string& error) {
-    StreamConfig testCfg = cfg;
-    testCfg.transcodeResolution = cfg.transcodeResolution.empty() ? "1280x720" : cfg.transcodeResolution;
-    int width = 1280;
-    int height = 720;
-    TranscoderModule::resolutionSize(testCfg.transcodeResolution, width, height);
+void appendSharedEncodedOutputBranches(
+    std::vector<std::string>& args,
+    const StreamConfig& cfg,
+    const std::vector<SharedOutputBranch>& outputs) {
+    const std::string audioCodec = toLower(cfg.transcodeAudioCodec);
 
-    const std::string testVideoEncoder = selectedVideoEncoderFactory(testCfg);
-    if (testVideoEncoder.empty()) {
-        if (testCfg.transcodeVideoEncoder == "nvenc") error = "NVIDIA NVENC nvh264enc is not available";
-        else if (testCfg.transcodeVideoEncoder == "intel") error = "Intel qsv/VA H.264 encoder did not pass the runtime probe";
-        else error = "no H.264 video encoder is available";
-        return;
+    for (const auto& output : outputs) {
+        const std::string suffix = "_out" + std::to_string(output.index);
+        const bool flv = output.spec.container == ContainerKind::Flv;
+        const bool rtsp = output.spec.container == ContainerKind::Rtsp;
+
+        args.insert(args.end(), {"transcode_video_encoded_tee.", "!"});
+        addQueue(args, "transcode_video_mux_queue" + suffix, 3000000000ULL);
+        args.insert(args.end(), {
+            "!", "h264parse", property("config-interval", "-1"),
+            "!", flv
+                ? "video/x-h264,stream-format=avc,alignment=au"
+                : "video/x-h264,stream-format=byte-stream,alignment=au",
+            "!", output.spec.videoPad
+        });
+
+        args.insert(args.end(), {"transcode_audio_encoded_tee.", "!"});
+        addQueue(args, "transcode_audio_mux_queue" + suffix, 3000000000ULL);
+        if (audioCodec == "mp3") {
+            args.insert(args.end(), {
+                "!", "mpegaudioparse",
+                "!", "audio/mpeg,mpegversion=1,layer=3",
+                "!", output.spec.audioPad
+            });
+        } else {
+            args.insert(args.end(), {
+                "!", "aacparse",
+                "!", (flv || rtsp)
+                    ? "audio/mpeg,mpegversion=4,stream-format=raw"
+                    : "audio/mpeg,mpegversion=4,stream-format=adts",
+                "!", output.spec.audioPad
+            });
+        }
     }
-    args.insert(args.end(), {
-        "videotestsrc", "is-live=true", "pattern=smpte", "!", "video/x-raw,framerate=25/1", "!"
-    });
-    addQueue(args, "test_video_queue", 3000000000ULL);
-    args.insert(args.end(), {
-        "!", "videoconvert", "!", "videoscale", "add-borders=false", "method=lanczos", "!", "videorate"
-    });
-    if (testVideoEncoder == "nvh264enc" || isIntelVideoEncoder(testVideoEncoder)) args.insert(args.end(), {"!", "videoconvert"});
-    args.insert(args.end(), {"!", scaledVideoCaps(width, height, testVideoEncoder)});
-    if (!appendVideoEncoder(args, testCfg, spec.container == ContainerKind::Flv, 25, error)) return;
-    args.insert(args.end(), {
-        "!", "h264parse", property("config-interval", "-1"),
-        "!", spec.container == ContainerKind::Flv
-            ? "video/x-h264,stream-format=avc,alignment=au"
-            : "video/x-h264,stream-format=byte-stream,alignment=au",
-        "!", spec.videoPad,
-        "audiotestsrc", "is-live=true", "wave=sine", "freq=1000", "!", "audio/x-raw,rate=48000,channels=2", "!"
-    });
-    const std::string encoder = findAacEncoder();
-    if (encoder.empty()) {
-        error = "AAC encoder is not available";
-        return;
-    }
-    args.insert(args.end(), {
-        encoder, property("bitrate", std::to_string(tvs::protocols::safeAudioBitrate(cfg))),
-        "!", "aacparse", "!",
-        (spec.container == ContainerKind::Flv || spec.container == ContainerKind::Rtsp)
-            ? "audio/mpeg,mpegversion=4,stream-format=raw"
-            : "audio/mpeg,mpegversion=4,stream-format=adts",
-        "!", spec.audioPad
-    });
 }
+
 
 } // namespace
 
@@ -593,7 +632,7 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 
     std::vector<std::string> required = tvs::protocols::requiredInputElements();
     const std::vector<std::string> common = {
-        "queue", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "queue", "tee", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
         "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
     required.insert(required.end(), common.begin(), common.end());
@@ -702,7 +741,7 @@ bool GstTranscoderProcess::spawnProcess(
 
     // Capture early gst-launch diagnostics.  SRT/relay setup can fail slightly
     // after process creation, so give SRT outputs a longer observation window.
-    const int attempts = description.rfind("srt-", 0) == 0 ? 24 : 8;
+    const int attempts = description.find("srt-") != std::string::npos ? 24 : 8;
     std::string startupStderr;
     for (int attempt = 0; attempt < attempts; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -756,54 +795,78 @@ bool GstTranscoderProcess::spawnProcess(
     return true;
 }
 
-std::vector<std::string> GstTranscoderProcess::buildCommand(
+std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
     const StreamConfig& baseConfig,
-    const StreamConfig& outputConfig,
+    const std::vector<StreamConfig>& outputConfigs,
     std::string& description,
     std::string& error) {
-    if (!validateOutputAvailability(outputConfig, error)) {
-        return {};
-    }
-
     std::vector<std::string> args = {"gst-launch-1.0", "-e"};
-    GstOutputSpec outputSpec;
-    if (!tvs::protocols::appendOutputMuxAndSink(args, outputConfig, outputSpec, error)) {
-        return {};
-    }
+    std::vector<SharedOutputBranch> outputs;
+    outputs.reserve(outputConfigs.size());
 
-    if (outputSpec.kind == tvs::protocols::OutputKind::Http ||
-        outputSpec.kind == tvs::protocols::OutputKind::Srt) {
-        std::cerr << "Transcoded HTTP/SRT post-mux A/V reservoir: output="
-                  << tvs::protocols::normalizedOutputType(outputConfig)
-                  << " reservoir_ms=1500 queue_max_ms=6000"
-                  << " placement=after-mpegtsmux-remap-and-cbr-pacer"
-                  << " remap_preserved="
-                  << (outputConfig.remapEnabled ? "yes" : "not-requested")
-                  << std::endl;
-    }
+    std::ostringstream descriptionStream;
+    descriptionStream << "shared-transcoder[";
 
-    if (baseConfig.testPattern) {
-        addTestSources(args, baseConfig, outputSpec, error);
-    } else {
+    for (std::size_t index = 0; index < outputConfigs.size(); ++index) {
+        const auto& outputConfig = outputConfigs[index];
+        if (!validateOutputAvailability(outputConfig, error)) return {};
+
+        std::vector<std::string> outputFragment;
+        GstOutputSpec outputSpec;
+        if (!tvs::protocols::appendOutputMuxAndSink(
+                outputFragment, outputConfig, outputSpec, error)) {
+            return {};
+        }
+
+        // Each protocol helper was originally designed for its own gst-launch
+        // process and therefore uses friendly names such as "mux". 203.45 keeps
+        // those proven helper chains intact, but namespaces every named element
+        // before combining all outputs into one shared process.
+        uniquifyOutputFragment(outputFragment, outputSpec, index);
+        args.insert(args.end(), outputFragment.begin(), outputFragment.end());
+
+        if (index > 0) descriptionStream << ",";
+        descriptionStream << outputSpec.description;
+
+        if (outputSpec.kind == tvs::protocols::OutputKind::Http ||
+            outputSpec.kind == tvs::protocols::OutputKind::Srt) {
+            std::cerr << "Transcoded HTTP/SRT post-mux A/V reservoir: output="
+                      << tvs::protocols::normalizedOutputType(outputConfig)
+                      << " reservoir_ms=1500 queue_max_ms=6000"
+                      << " placement=after-per-output-mpegtsmux-and-cbr-pacer"
+                      << " remap_preserved="
+                      << (outputConfig.remapEnabled ? "yes" : "not-requested")
+                      << std::endl;
+        }
+
+        SharedOutputBranch branch;
+        branch.spec = std::move(outputSpec);
+        branch.index = index;
+        outputs.push_back(std::move(branch));
+    }
+    descriptionStream << "]";
+
+    if (!baseConfig.testPattern) {
         std::cerr << "Transcoder decoded-video watchdog 203.10: timeout_ms=15000"
                   << " source=" << tvs::protocols::inputUriForGstreamer(baseConfig)
                   << " scope=post-decode action=exit-for-parent-failover"
                   << std::endl;
-        if (!appendTranscoderDecodeInput(args, baseConfig, error)) {
-            return {};
-        }
-        std::cerr << "GStreamer transcoder 203.10: video=h264"
+        if (!appendTranscoderDecodeInput(args, baseConfig, error)) return {};
+        std::cerr << "GStreamer transcoder 203.45: video=h264"
                   << " encoder_request=" << baseConfig.transcodeVideoEncoder
                   << " deinterlace=yadif-all-fields"
                   << " cadence=preserve-progressive/double-interlaced-fields"
-                  << " output=" << baseConfig.transcodeResolution << std::endl;
-        addVideoBranch(args, baseConfig, outputSpec, error);
-        if (!error.empty()) return {};
-        addAudioBranch(args, baseConfig, outputSpec, error);
+                  << " output=" << baseConfig.transcodeResolution
+                  << " architecture=shared-decode-encode+per-output-mux"
+                  << " outputs=" << outputs.size()
+                  << std::endl;
     }
-    if (!error.empty()) return {};
 
-    description = outputSpec.description;
+    if (!appendSharedVideoEncoderCore(args, baseConfig, error)) return {};
+    if (!appendSharedAudioEncoderCore(args, baseConfig, error)) return {};
+    appendSharedEncodedOutputBranches(args, baseConfig, outputs);
+
+    description = descriptionStream.str();
     return args;
 }
 
@@ -823,42 +886,24 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
         return false;
     }
 
-    std::vector<ChildProcess> started;
-    for (const auto& output : outputs) {
-        std::string description;
-        std::string commandError;
-        std::vector<std::string> args = buildCommand(config, output, description, commandError);
-        if (!commandError.empty()) {
-            error = commandError;
-            for (auto& startedChild : started) {
-                if (startedChild.pid > 0) {
-                    ::kill(startedChild.pid, SIGTERM);
-                    ::waitpid(startedChild.pid, nullptr, 0);
-                }
-            }
-            return false;
-        }
+    std::string description;
+    std::vector<std::string> args = buildSharedCommand(config, outputs, description, error);
+    if (!error.empty() || args.empty()) {
+        if (error.empty()) error = "failed to build shared transcoder command";
+        return false;
+    }
 
-        std::cerr << "GStreamer transcoder command: " << commandLineForLog(args) << std::endl;
-
-        ChildProcess child;
-        if (!spawnProcess(args, description, child, error)) {
-            for (auto& startedChild : started) {
-                if (startedChild.pid > 0) {
-                    ::kill(startedChild.pid, SIGTERM);
-                    ::waitpid(startedChild.pid, nullptr, 0);
-                }
-            }
-            return false;
-        }
-        std::cerr << "GStreamer transcoder started pid=" << child.pid
-                  << " output=" << description
-                  << " remap=" << (config.remapEnabled ? "on" : "off")
-                  << " input_sid=" << effectiveInputServiceId(config)
-                  << " service=" << config.serviceId
-                  << " vpid=" << config.videoPid
-                  << " apid=" << config.audioPid;
+    std::cerr << "GStreamer shared transcoder 203.45: outputs=" << outputs.size()
+              << " decode_instances=1 video_encode_instances=1 audio_encode_instances=1"
+              << " mux_policy=per-output"
+              << std::endl;
+    for (std::size_t index = 0; index < outputs.size(); ++index) {
+        const auto& output = outputs[index];
         const auto outputKind = tvs::protocols::outputKind(output);
+        std::cerr << "GStreamer shared transcoder output 203.45: index=" << index
+                  << " type=" << tvs::protocols::normalizedOutputType(output)
+                  << " host=" << output.outputHost
+                  << " port=" << output.outputPort;
         if (outputKind == tvs::protocols::OutputKind::FifoRelay) {
             std::cerr << " ts-relay=unpaced";
         } else if (tvs::protocols::isTsOutput(outputKind)) {
@@ -871,12 +916,26 @@ bool GstTranscoderProcess::start(const StreamConfig& config, std::string& error)
             std::cerr << " encoder-cbr-bitrate=" << tvs::protocols::safeVideoBitrate(output);
         }
         std::cerr << std::endl;
-        started.push_back(child);
     }
+
+    std::cerr << "GStreamer transcoder command: " << commandLineForLog(args) << std::endl;
+
+    ChildProcess child;
+    if (!spawnProcess(args, description, child, error)) return false;
+
+    std::cerr << "GStreamer shared transcoder started pid=" << child.pid
+              << " outputs=" << outputs.size()
+              << " remap=" << (config.remapEnabled ? "on" : "off")
+              << " input_sid=" << effectiveInputServiceId(config)
+              << " service=" << config.serviceId
+              << " vpid=" << config.videoPid
+              << " apid=" << config.audioPid
+              << std::endl;
 
     {
         std::lock_guard<std::mutex> lock(childrenMutex);
-        children = std::move(started);
+        children.clear();
+        children.push_back(std::move(child));
     }
     return true;
 }
@@ -907,23 +966,33 @@ void GstTranscoderProcess::stop() {
 
 bool GstTranscoderProcess::isRunning() {
     std::lock_guard<std::mutex> lock(childrenMutex);
-    bool anyRunning = false;
+
+    // 203.45 normally owns one shared gst-launch child for every transcoded
+    // output. Keep an all-children health rule so any future fallback or split
+    // mode still cannot mask an exited child.
+    bool allRunning = !children.empty();
     for (auto& child : children) {
-        if (child.pid <= 0) continue;
-        int status = 0;
-        pid_t done = ::waitpid(child.pid, &status, WNOHANG);
-        if (done == 0) {
-            anyRunning = true;
+        if (child.pid <= 0) {
+            allRunning = false;
             continue;
         }
-        if (done == child.pid) {
-            std::cerr << "GStreamer transcoder exited pid=" << child.pid
-                      << " output=" << child.description
-                      << " status=" << status << std::endl;
+
+        int status = 0;
+        const pid_t pid = child.pid;
+        const pid_t done = ::waitpid(pid, &status, WNOHANG);
+        if (done == 0) {
+            continue;
+        }
+        if (done == pid) {
+            std::cerr << "GStreamer shared transcoder guard 203.45: child-exited pid=" << pid
+                      << " outputs=" << child.description
+                      << " status=" << status
+                      << " action=restart-whole-transcoder" << std::endl;
             child.pid = -1;
+            allRunning = false;
         }
     }
-    return anyRunning;
+    return allRunning;
 }
 
 std::vector<pid_t> GstTranscoderProcess::childPids() const {
