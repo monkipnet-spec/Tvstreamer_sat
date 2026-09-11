@@ -19,9 +19,23 @@ A normal server build does not clone or download OSCam. The upstream revision is
 - `MODULE_NEWCAMD`
 - `READER_IRDETO`
 - `READER_VIACCESS`
+- `READER_DRE`
 - `CARDREADER_PHOENIX`
 
 The helper is invoked explicitly with `/usr/bin/env bash`, so a ZIP unpacked on Windows cannot break the build merely by losing the executable bit.
+
+
+### DRE Crypt
+
+The minimal OSCam-mini build includes `READER_DRE`, so DRE Crypt smartcards can be used through the existing Phoenix/Smartmouse reader and served to TVStreammerSAT5 clients over Newcamd. OSCam automatically enables its internal DES helper when `READER_DRE` is selected.
+
+After building, verify with:
+
+```bash
+build/oscam-mini/oscam-mini -V | grep -E 'DRE Crypt|cardreader_phoenix|newcamd'
+```
+
+Expected capabilities include `DRE Crypt: yes` and `cardreader_phoenix: yes`.
 
 ## Automatic build
 

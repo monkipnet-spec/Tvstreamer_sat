@@ -26,7 +26,7 @@ chmod +x "$WORK/config.sh"
 
 cd "$WORK"
 ./config.sh --disable all
-./config.sh --enable MODULE_NEWCAMD READER_IRDETO READER_VIACCESS CARDREADER_PHOENIX
+./config.sh --enable MODULE_NEWCAMD READER_IRDETO READER_VIACCESS READER_DRE CARDREADER_PHOENIX
 
 printf '\nEnabled OSCam-mini modules:\n'
 ./config.sh --show-enabled all
