@@ -275,7 +275,7 @@ GstElement* buildSrt(
               << " latency_ms=" << kSrtLatencyMs
               << " poll_timeout_ms=" << kSrtPollTimeoutMs
               << " auto_reconnect_property=" << (hasAutoReconnect ? "yes" : "no")
-              << " app_reconnect=full-pipeline-only"
+              << " app_reconnect=203.48-source-only-first+full-fallback"
               << " queue_ms=6000 queue_max_mb=64 leaky=off prebuffer=off"
               << " do_timestamp=on input_pacing=off" << std::endl;
     return src;
