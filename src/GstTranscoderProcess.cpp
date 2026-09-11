@@ -31,6 +31,15 @@ using tvs::protocols::GstOutputSpec;
 
 namespace {
 
+// 203.47: udpsrc passes this value to SO_RCVBUF. Linux accounts the
+// receive socket buffer at roughly 2x the requested value, so a 16 MiB
+// request yields the ~32 MiB rb value already proven stable by the native
+// TVStreammerSAT5 UDP ingest path. Keep this explicit so transcoder
+// stability does not depend on the host net.core.rmem_default setting.
+constexpr int kTranscoderUdpSocketBufferRequestBytes = 16 * 1024 * 1024;
+constexpr int kTranscoderUdpLinuxEffectiveBufferBytes =
+    2 * kTranscoderUdpSocketBufferRequestBytes;
+
 void markOpenDescriptorsCloseOnExec() {
     DIR* directory = ::opendir("/proc/self/fd");
     if (directory) {
@@ -352,13 +361,55 @@ bool appendTranscoderDecodeInput(
     std::vector<std::string>& args,
     const StreamConfig& cfg,
     std::string& error) {
+    const std::string uri = tvs::protocols::inputUriForGstreamer(cfg);
+    const bool udpInput = toLower(uri).rfind("udp://", 0) == 0;
+
+    // 203.47: uridecodebin creates udpsrc internally, which leaves the source
+    // socket on the system default SO_RCVBUF. On the production multicast
+    // ingest that produced an 8 MiB rb socket and observable per-socket drops.
+    // Use an explicit udpsrc only for UDP so we can request the same receive
+    // capacity as the native TVStreammerSAT5 UDP path. All non-UDP protocols
+    // retain the proven uridecodebin path unchanged.
+    if (udpInput && !isSidAwareMpegTsInput(cfg)) {
+        std::vector<std::string> missing;
+        validateFactories({"udpsrc", "decodebin"}, missing);
+        if (!missing.empty()) {
+            std::ostringstream ss;
+            ss << "missing UDP transcoder input elements";
+            for (size_t i = 0; i < missing.size(); ++i) {
+                ss << (i == 0 ? ": " : ", ") << missing[i];
+            }
+            error = ss.str();
+            return false;
+        }
+
+        args.insert(args.end(), {
+            "udpsrc",
+            "name=transcode_udp_src",
+            "uri=" + uri,
+            "buffer-size=" + std::to_string(kTranscoderUdpSocketBufferRequestBytes),
+            "!", "decodebin", "name=dec"
+        });
+
+        std::cerr << "GStreamer transcoder UDP input 203.47: uri=" << uri
+                  << " socket_buffer_request=" << kTranscoderUdpSocketBufferRequestBytes
+                  << " expected_linux_rb=" << kTranscoderUdpLinuxEffectiveBufferBytes
+                  << " decode=decodebin"
+                  << std::endl;
+        return true;
+    }
+
     if (!isSidAwareMpegTsInput(cfg)) {
         tvs::protocols::appendDecodeInput(args, cfg);
         return true;
     }
 
     std::vector<std::string> missing;
-    validateFactories({"urisourcebin", "tsparse", "tsdemux", "decodebin3"}, missing);
+    if (udpInput) {
+        validateFactories({"udpsrc", "tsparse", "tsdemux", "decodebin3"}, missing);
+    } else {
+        validateFactories({"urisourcebin", "tsparse", "tsdemux", "decodebin3"}, missing);
+    }
     if (!missing.empty()) {
         std::ostringstream ss;
         ss << "missing SID-aware transcoder input elements";
@@ -370,31 +421,58 @@ bool appendTranscoderDecodeInput(
     }
 
     const uint32_t inputSid = effectiveInputServiceId(cfg);
-    const std::string uri = tvs::protocols::inputUriForGstreamer(cfg);
 
     // Select the requested MPEG-TS service *before* decodebin.  The old
     // uridecodebin-only path auto-selected the first/default program, which is
     // why transcoding worked for SID 1 but produced no usable UDP output when
     // Input SID was another program.  ':' asks gst-launch to link all compatible
     // elementary pads from the selected tsdemux program into decodebin3.
-    args.insert(args.end(), {
-        "urisourcebin",
-        "name=input_uri_src",
-        "uri=" + uri,
-        "use-buffering=false",
-        "input_uri_src.", "!",
-        "queue",
-        "name=transcode_sid_input_queue",
-        "max-size-buffers=0",
-        "max-size-bytes=0",
-        "max-size-time=8000000000",
-        "!", "tsparse",
-        "!", "tsdemux",
-        "name=transcode_sid_demux",
-        "program-number=" + std::to_string(inputSid),
-        "latency=700",
-        "transcode_sid_demux.", ":", "decodebin3", "name=dec"
-    });
+    if (udpInput) {
+        args.insert(args.end(), {
+            "udpsrc",
+            "name=transcode_udp_src",
+            "uri=" + uri,
+            "buffer-size=" + std::to_string(kTranscoderUdpSocketBufferRequestBytes),
+            "!",
+            "queue",
+            "name=transcode_sid_input_queue",
+            "max-size-buffers=0",
+            "max-size-bytes=0",
+            "max-size-time=8000000000",
+            "!", "tsparse",
+            "!", "tsdemux",
+            "name=transcode_sid_demux",
+            "program-number=" + std::to_string(inputSid),
+            "latency=700",
+            "transcode_sid_demux.", ":", "decodebin3", "name=dec"
+        });
+
+        std::cerr << "GStreamer transcoder UDP input 203.47: uri=" << uri
+                  << " socket_buffer_request=" << kTranscoderUdpSocketBufferRequestBytes
+                  << " expected_linux_rb=" << kTranscoderUdpLinuxEffectiveBufferBytes
+                  << " input_sid=" << inputSid
+                  << " decode=tsdemux+decodebin3"
+                  << std::endl;
+    } else {
+        args.insert(args.end(), {
+            "urisourcebin",
+            "name=input_uri_src",
+            "uri=" + uri,
+            "use-buffering=false",
+            "input_uri_src.", "!",
+            "queue",
+            "name=transcode_sid_input_queue",
+            "max-size-buffers=0",
+            "max-size-bytes=0",
+            "max-size-time=8000000000",
+            "!", "tsparse",
+            "!", "tsdemux",
+            "name=transcode_sid_demux",
+            "program-number=" + std::to_string(inputSid),
+            "latency=700",
+            "transcode_sid_demux.", ":", "decodebin3", "name=dec"
+        });
+    }
 
     std::cerr << "GStreamer transcoder input selector: input_sid=" << inputSid
               << " method=tsdemux-program-number decode=decodebin3"
