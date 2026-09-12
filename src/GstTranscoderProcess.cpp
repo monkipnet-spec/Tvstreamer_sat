@@ -565,22 +565,6 @@ bool appendSharedVideoEncoderCore(
     }
     args.insert(args.end(), {"!", scaledVideoCaps(width, height, encoderFactory)});
 
-    if (!cfg.testPattern) {
-        // 203.54: decoded live inputs can arrive in short bursts even when their
-        // timestamps are perfectly continuous (notably HLS segment delivery).
-        // Pace the final raw video frames against the shared pipeline clock
-        // before encoding so every output receives real-time cadence without
-        // rewriting PTS/PCR in the HLS mux path.  Keep sync-to-first disabled:
-        // clocksync then uses buffer timestamps + SEGMENT running-time, which is
-        // shared with the audio branch and preserves A/V timing.
-        args.insert(args.end(), {
-            "!", "clocksync",
-            "name=transcode_video_frame_clock",
-            "sync=true",
-            "sync-to-first=false"
-        });
-    }
-
     // 203.45: encode H.264 once. Keep a byte-stream-friendly shared encoder
     // output; per-output h264parse branches below convert to AVC when FLV needs it.
     if (!appendVideoEncoder(args, cfg, false, cfg.testPattern ? 25 : 50, error)) return false;
@@ -639,19 +623,6 @@ bool appendSharedAudioEncoderCore(
         "!", rawAudioCaps,
         "!"
     });
-
-    if (!cfg.testPattern) {
-        // 203.54: pace the normalized 48 kHz raw audio on the same pipeline
-        // running-time as video.  This prevents a burst-fed decoder from
-        // letting the encoder/mux run ahead and later starving in cycles.
-        args.insert(args.end(), {
-            "clocksync",
-            "name=transcode_audio_frame_clock",
-            "sync=true",
-            "sync-to-first=false",
-            "!"
-        });
-    }
 
     if (audioCodec == "mp3") {
         if (selectedMp3Encoder == "lamemp3enc") {
@@ -739,7 +710,7 @@ bool GstTranscoderProcess::isAvailable(std::string* error) {
 
     std::vector<std::string> required = tvs::protocols::requiredInputElements();
     const std::vector<std::string> common = {
-        "queue", "tee", "watchdog", "clocksync", "videoconvert", "deinterlace", "videoscale", "videorate",
+        "queue", "tee", "watchdog", "videoconvert", "deinterlace", "videoscale", "videorate",
         "h264parse", "audioconvert", "audioresample", "audiorate", "aacparse"
     };
     required.insert(required.end(), common.begin(), common.end());
@@ -971,15 +942,6 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
 
     if (!appendSharedVideoEncoderCore(args, baseConfig, error)) return {};
     if (!appendSharedAudioEncoderCore(args, baseConfig, error)) return {};
-    if (!baseConfig.testPattern) {
-        std::cerr << "GStreamer shared transcoder cadence 203.54:"
-                  << " video=decoded-running-time-clocksync"
-                  << " audio=normalized-running-time-clocksync"
-                  << " sync_to_first=false"
-                  << " scope=pre-encode"
-                  << " hls_postmux_timestamps=unchanged"
-                  << std::endl;
-    }
     appendSharedEncodedOutputBranches(args, baseConfig, outputs);
 
     description = descriptionStream.str();
