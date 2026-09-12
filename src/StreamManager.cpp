@@ -4496,6 +4496,7 @@ void configureCbrPacer(GstElement* pacer, const StreamConfig& cfg) {
     g_object_set(pacer,
         "sync", TRUE,
         "silent", TRUE,
+        "signal-handoffs", FALSE,
         "single-segment", TRUE,
         nullptr);
 
@@ -8795,7 +8796,7 @@ bool StreamManager::buildOutputBranch(
                       << " as clean SPTS with periodic PAT/PMT/PCR"
                       << " input_service_id=" << outputConfig.inputServiceId
                       << " cbr=" << (cbrMuxEnabled(outputConfig) ? std::to_string(outputConfig.targetBitrate) : "off")
-                      << " pacing=" << (wallClockNetworkCbrEnabled(outputConfig) ? "pcr-clocksync" : "source-clock")
+                      << " pacing=" << (wallClockNetworkCbrEnabled(outputConfig) ? "byte-identity" : "source-clock")
                       << std::endl;
         }
         if (stableUdpRemux) {
@@ -9018,16 +9019,22 @@ bool StreamManager::buildRemapPipeline(
     // their tiny drift eventually moves the reservoir and shows up as periodic
     // video slowdowns even though neither clock is individually wrong.
     const bool cbrActive = wallClockNetworkCbrEnabled(cfg);
-    GstElement* cbrTsparse = cbrActive
+    // 203.51: only the strict NETUP remux uses the byte-rate pacer. Keep the
+    // legacy PCR-derived path available for any future non-NETUP caller of
+    // buildRemapPipeline instead of changing global HTTP/SRT/transcoder logic.
+    const bool netupBytePacerActive = strictTsNetworkOutput && cbrActive;
+    GstElement* cbrTsparse = cbrActive && !netupBytePacerActive
         ? gst_element_factory_make("tsparse", branchName("cbr_tsparse", branchIndex).c_str())
         : nullptr;
     GstElement* pacer = cbrActive
-        ? gst_element_factory_make("clocksync", branchName("cbr_clock", branchIndex).c_str())
+        ? gst_element_factory_make(
+            netupBytePacerActive ? "identity" : "clocksync",
+            branchName(netupBytePacerActive ? "cbr_byte_pacer" : "cbr_clock", branchIndex).c_str())
         : nullptr;
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
-        (cbrActive && (!cbrTsparse || !pacer))) {
+        (cbrActive && (!pacer || (!netupBytePacerActive && !cbrTsparse)))) {
         return false;
     }
 
@@ -9048,9 +9055,8 @@ bool StreamManager::buildRemapPipeline(
         // 203.50: GStreamer 1.20 tsdemux otherwise corrects elementary-stream
         // timing against the live input PCR. On the NETUP compatibility remux
         // path that turns a stable 48 kHz AAC cadence into persistent PES PTS
-        // jitter. Preserve the incoming elementary timestamps; the new mux and
-        // existing downstream tsparse/clocksync still generate and pace the
-        // clean output transport PCR.
+        // jitter. Preserve the incoming elementary timestamps; the new mux
+        // continues to generate the clean output transport PCR.
         setBooleanPropertyIfPresent(demux, "ignore-pcr", TRUE);
         std::cerr << "NETUP remux audio timing 203.50: stream=" << state->config.id
                   << " name=\"" << state->config.name << "\""
@@ -9058,7 +9064,20 @@ bool StreamManager::buildRemapPipeline(
                   << " tsdemux_ignore_pcr=true"
                   << std::endl;
     }
-    if (cbrActive) {
+    if (netupBytePacerActive) {
+        configureCbrPacer(pacer, cfg);
+        const uint64_t bytesPerSecond = cfg.targetBitrate / 8U;
+        std::cerr << "NETUP remux pacing 203.51: stream=" << state->config.id
+                  << " name=\"" << state->config.name << "\""
+                  << " type=" << networkType
+                  << " target_bitrate=" << cfg.targetBitrate
+                  << " bytes_per_second=" << bytesPerSecond
+                  << " pacer=identity-datarate"
+                  << " tsparse_timestamps=off"
+                  << " clocksync=off"
+                  << " reservoir=off"
+                  << std::endl;
+    } else if (cbrActive) {
         configureNetworkCbrTimestamping(cbrTsparse);
         configureNetworkCbrClock(pacer);
     }
@@ -9074,7 +9093,9 @@ bool StreamManager::buildRemapPipeline(
         std::cerr << "NETUP TS compatibility mux: type=" << networkType
                   << " alignment=7 pcr_interval=1800 pat_pmt_interval=9000"
                   << " mux_bitrate=" << (cbrMuxEnabled(cfg) ? cfg.targetBitrate : 0)
-                  << " cbr_clock=" << (cbrActive ? "pcr-tsparse+clocksync" : "off")
+                  << " cbr_clock=" << (netupBytePacerActive
+                        ? "identity-datarate"
+                        : (cbrActive ? "pcr-tsparse+clocksync" : "off"))
                   << std::endl;
     }
 
@@ -9129,9 +9150,11 @@ bool StreamManager::buildRemapPipeline(
     if (!gst_element_link_many(sourceTail, tsparse, preDemuxQueue, demux, nullptr)) {
         return false;
     }
-    const bool outputLinked = cbrActive
-        ? gst_element_link_many(mux, cbrTsparse, pacer, outputQueue, sink, nullptr)
-        : gst_element_link_many(mux, outputQueue, sink, nullptr);
+    const bool outputLinked = netupBytePacerActive
+        ? gst_element_link_many(mux, pacer, outputQueue, sink, nullptr)
+        : (cbrActive
+            ? gst_element_link_many(mux, cbrTsparse, pacer, outputQueue, sink, nullptr)
+            : gst_element_link_many(mux, outputQueue, sink, nullptr));
     if (!outputLinked) {
         return false;
     }
