@@ -555,7 +555,9 @@ bool appendSharedVideoEncoderCore(
             "timeout=15000",
             "!", "video/x-raw",
             "!", "videoconvert",
-            "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=all", "locking=passive",
+            "!", "deinterlace", "method=yadif", "mode=auto-strict", "fields=top", "locking=passive",
+            "!", "videorate",
+            "!", "video/x-raw,framerate=25/1",
             "!", "videoscale", "add-borders=false", "method=lanczos"
         });
     }
@@ -567,7 +569,7 @@ bool appendSharedVideoEncoderCore(
 
     // 203.45: encode H.264 once. Keep a byte-stream-friendly shared encoder
     // output; per-output h264parse branches below convert to AVC when FLV needs it.
-    if (!appendVideoEncoder(args, cfg, false, cfg.testPattern ? 25 : 50, error)) return false;
+    if (!appendVideoEncoder(args, cfg, false, 25, error)) return false;
     args.insert(args.end(), {"!", "tee", "name=transcode_video_encoded_tee"});
 
     std::cerr << "GStreamer shared transcoder video 203.45: requested="
@@ -930,10 +932,10 @@ std::vector<std::string> GstTranscoderProcess::buildSharedCommand(
                   << " scope=post-decode action=exit-for-parent-failover"
                   << std::endl;
         if (!appendTranscoderDecodeInput(args, baseConfig, error)) return {};
-        std::cerr << "GStreamer transcoder 203.45: video=h264"
+        std::cerr << "GStreamer transcoder 203.57: video=h264"
                   << " encoder_request=" << baseConfig.transcodeVideoEncoder
-                  << " deinterlace=yadif-all-fields"
-                  << " cadence=preserve-progressive/double-interlaced-fields"
+                  << " deinterlace=yadif-top-fields"
+                  << " cadence=fixed-25p"
                   << " output=" << baseConfig.transcodeResolution
                   << " architecture=shared-decode-encode+per-output-mux"
                   << " outputs=" << outputs.size()
