@@ -4,9 +4,19 @@
 namespace tvs::protocols::outputs {
 bool appendHttpSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_http_ts_smoother", 100000);
-    appendNetworkCbrPacer(args, cfg, "transcode_http_cbr_clock");
-    appendPostMuxAvReservoir(args, "transcode_http_av_reservoir", 250000000ULL, 2000000000ULL);
+
+    // 203.55: do not derive a second wall clock from mux PCR and then gate it
+    // through two clocksync elements.  RAW TCP capture proved that path emitted
+    // correct 20.0/21.3 ms A/V PTS in 100-160 ms wall-clock bursts.  Preserve
+    // MPEG-TS timestamps and pace CBR from byte count at muxBitrate()/8.
+    args.insert(args.end(), {
+        "tsparse",
+        "name=transcode_http_ts_align",
+        "set-timestamps=false",
+        "alignment=7",
+        "!"
+    });
+    appendCbrPacer(args, cfg, "transcode_http_byte_cbr_pacer");
     appendOutputQueueWithTime(args, "transcode_http_output_queue", 8000000000ULL, false);
     const int internalPort = static_cast<int>(transcodedHttpInternalPort(cfg));
     args.insert(args.end(), {

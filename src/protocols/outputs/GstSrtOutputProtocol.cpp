@@ -6,9 +6,20 @@ namespace tvs::protocols::outputs {
 
 bool appendSrtSink(std::vector<std::string>& args, const StreamConfig& cfg, GstOutputSpec& spec) {
     appendMpegTsMux(args, cfg);
-    appendTsSmoother(args, "transcode_srt_ts_smoother", 100000);
-    appendNetworkCbrPacer(args, cfg, "transcode_srt_cbr_clock");
-    appendPostMuxAvReservoir(args, "transcode_srt_av_reservoir", 250000000ULL, 2000000000ULL);
+
+    // 203.55: the PCR-derived tsparse+double-clocksync chain produced a
+    // repeatable pause/burst cadence on the already encoded MPEG-TS: direct
+    // socket capture showed 100-160 ms no-data gaps while consecutive video
+    // and audio PTS still advanced by exactly one frame.  Keep the mux PCR/PTS
+    // untouched and pace CBR strictly from cumulative byte count instead.
+    args.insert(args.end(), {
+        "tsparse",
+        "name=transcode_srt_ts_align",
+        "set-timestamps=false",
+        "alignment=7",
+        "!"
+    });
+    appendCbrPacer(args, cfg, "transcode_srt_byte_cbr_pacer");
     appendOutputQueueWithTime(args, "transcode_srt_output_queue", 5000000000ULL, false);
 
     const std::string mode = srtOutputMode(cfg);
