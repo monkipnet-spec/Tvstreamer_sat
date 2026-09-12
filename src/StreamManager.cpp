@@ -9044,6 +9044,20 @@ bool StreamManager::buildRemapPipeline(
     configureQueue(preDemuxQueue);
     configureOutputQueue(outputQueue, cfg, state ? &state->runtimeConfig : nullptr);
     configureTsMux(mux, cfg);
+    if (strictTsNetworkOutput) {
+        // 203.50: GStreamer 1.20 tsdemux otherwise corrects elementary-stream
+        // timing against the live input PCR. On the NETUP compatibility remux
+        // path that turns a stable 48 kHz AAC cadence into persistent PES PTS
+        // jitter. Preserve the incoming elementary timestamps; the new mux and
+        // existing downstream tsparse/clocksync still generate and pace the
+        // clean output transport PCR.
+        setBooleanPropertyIfPresent(demux, "ignore-pcr", TRUE);
+        std::cerr << "NETUP remux audio timing 203.50: stream=" << state->config.id
+                  << " name=\"" << state->config.name << "\""
+                  << " type=" << networkType
+                  << " tsdemux_ignore_pcr=true"
+                  << std::endl;
+    }
     if (cbrActive) {
         configureNetworkCbrTimestamping(cbrTsparse);
         configureNetworkCbrClock(pacer);
