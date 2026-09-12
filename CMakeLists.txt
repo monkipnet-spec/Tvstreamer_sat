@@ -52,6 +52,7 @@ add_executable(TVStreammerSAT5
     src/TelegramNotifier.cpp
     src/UdpInput.cpp
     src/StableUdpOutput.cpp
+    src/NetupOutputPacer.cpp
     src/NetworkTsInput.cpp
     src/HlsSegmentScheduler.cpp
     src/mpts/MptsOutputManager.cpp
