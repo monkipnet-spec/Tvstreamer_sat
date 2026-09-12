@@ -165,6 +165,184 @@ std::atomic<uint64_t> gManagedPipelineFinalized{0};
 // unmonitored buses so they cannot build an unbounded FIFO.
 std::atomic<uint64_t> gSharedDvbBusMessagesDropped{0};
 std::atomic<uint64_t> gExternalSrtBusMessagesDropped{0};
+
+
+// 203.49: transcoded SRT listener clean-start gate.  A full transcoder restart
+// creates a new MPEG-TS timing/continuity epoch.  Do not let an already-open
+// SRT listener feed callers the tail of the old epoch followed immediately by
+// arbitrary packets from the new one.  Each external transcoded-SRT relay is
+// recreated for the new epoch and withholds loopback TS until it has a compact
+// clean-start interval beginning at PAT and containing PMT, AAC PES and a
+// random-access video packet.  The buffered interval is then released as one
+// DISCONT buffer and normal pass-through resumes.
+struct SrtTranscoderCleanStartGate {
+    std::string streamId;
+    uint16_t videoPid = 258;
+    uint16_t audioPid = 257;
+    uint16_t pmtPid = 0x1FFF;
+    bool patSeen = false;
+    bool pmtSeen = false;
+    bool audioSeen = false;
+    bool open = false;
+    std::vector<guint8> candidate;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+};
+
+constexpr std::size_t kSrtCleanStartMaxBytes = 8 * 1024 * 1024;
+
+std::size_t tsPayloadOffset20349(const guint8* packet) {
+    if (!packet || packet[0] != 0x47) return kTsPacketSize;
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03U);
+    if (adaptationControl == 0 || adaptationControl == 2) return kTsPacketSize;
+    std::size_t offset = 4;
+    if (adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (5 + adaptationLength > kTsPacketSize) return kTsPacketSize;
+        offset = 5 + adaptationLength;
+    }
+    return offset;
+}
+
+bool parsePatPmtPid20349(const guint8* packet, uint16_t& pmtPid) {
+    if (!packet || packet[0] != 0x47 || (packet[1] & 0x40U) == 0) return false;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+    if (pid != 0x0000) return false;
+    std::size_t payload = tsPayloadOffset20349(packet);
+    if (payload >= kTsPacketSize) return false;
+    const std::size_t pointer = packet[payload];
+    payload += 1 + pointer;
+    if (payload + 12 > kTsPacketSize || packet[payload] != 0x00) return false;
+    const std::size_t sectionLength = static_cast<std::size_t>(((packet[payload + 1] & 0x0FU) << 8) | packet[payload + 2]);
+    const std::size_t sectionEnd = std::min<std::size_t>(payload + 3 + sectionLength, kTsPacketSize);
+    if (sectionEnd < payload + 12) return false;
+    for (std::size_t pos = payload + 8; pos + 4 <= sectionEnd - 4; pos += 4) {
+        const uint16_t program = static_cast<uint16_t>((packet[pos] << 8) | packet[pos + 1]);
+        if (program == 0) continue;
+        pmtPid = static_cast<uint16_t>(((packet[pos + 2] & 0x1FU) << 8) | packet[pos + 3]);
+        return pmtPid < 0x1FFF;
+    }
+    return false;
+}
+
+bool isPmtPacket20349(const guint8* packet, uint16_t pmtPid) {
+    if (!packet || packet[0] != 0x47 || pmtPid >= 0x1FFF || (packet[1] & 0x40U) == 0) return false;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+    if (pid != pmtPid) return false;
+    std::size_t payload = tsPayloadOffset20349(packet);
+    if (payload >= kTsPacketSize) return false;
+    const std::size_t pointer = packet[payload];
+    payload += 1 + pointer;
+    return payload < kTsPacketSize && packet[payload] == 0x02;
+}
+
+bool isAudioPesStart20349(const guint8* packet, uint16_t audioPid) {
+    if (!packet || packet[0] != 0x47 || (packet[1] & 0x40U) == 0) return false;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+    if (pid != audioPid) return false;
+    const std::size_t payload = tsPayloadOffset20349(packet);
+    if (payload + 4 > kTsPacketSize) return false;
+    if (packet[payload] != 0x00 || packet[payload + 1] != 0x00 || packet[payload + 2] != 0x01) return false;
+    const guint8 streamId = packet[payload + 3];
+    return (streamId >= 0xC0 && streamId <= 0xDF) || streamId == 0xBD;
+}
+
+bool isVideoRandomAccess20349(const guint8* packet, uint16_t videoPid) {
+    if (!packet || packet[0] != 0x47 || videoPid >= 0x1FFF) return false;
+    const uint16_t pid = static_cast<uint16_t>(((packet[1] & 0x1FU) << 8) | packet[2]);
+    if (pid != videoPid) return false;
+    const guint8 adaptationControl = static_cast<guint8>((packet[3] >> 4) & 0x03U);
+    if (adaptationControl == 2 || adaptationControl == 3) {
+        const std::size_t adaptationLength = packet[4];
+        if (adaptationLength >= 1 && 5 + adaptationLength <= kTsPacketSize && (packet[5] & 0x40U) != 0) {
+            return true;
+        }
+    }
+    if ((packet[1] & 0x40U) == 0) return false;
+    const std::size_t payload = tsPayloadOffset20349(packet);
+    if (payload + 9 > kTsPacketSize) return false;
+    if (packet[payload] != 0x00 || packet[payload + 1] != 0x00 || packet[payload + 2] != 0x01) return false;
+    const std::size_t pesHeaderLength = packet[payload + 8];
+    const std::size_t es = payload + 9 + pesHeaderLength;
+    if (es >= kTsPacketSize) return false;
+    for (std::size_t i = es; i + 4 < kTsPacketSize; ++i) {
+        std::size_t nal = kTsPacketSize;
+        if (packet[i] == 0x00 && packet[i + 1] == 0x00 && packet[i + 2] == 0x01) nal = i + 3;
+        else if (i + 5 < kTsPacketSize && packet[i] == 0x00 && packet[i + 1] == 0x00 &&
+                 packet[i + 2] == 0x00 && packet[i + 3] == 0x01) nal = i + 4;
+        if (nal >= kTsPacketSize) continue;
+        if ((packet[nal] & 0x1FU) == 5) return true; // H.264 IDR
+    }
+    return false;
+}
+
+GstPadProbeReturn srtTranscoderCleanStartProbe20349(
+    GstPad*, GstPadProbeInfo* info, gpointer userData) {
+    auto* gate = static_cast<SrtTranscoderCleanStartGate*>(userData);
+    if (!gate || gate->open || !(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER)) {
+        return GST_PAD_PROBE_OK;
+    }
+    GstBuffer* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer) return GST_PAD_PROBE_DROP;
+
+    GstMapInfo map {};
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ)) return GST_PAD_PROBE_DROP;
+
+    bool ready = false;
+    std::size_t start = 0;
+    while (start < map.size && map.data[start] != 0x47) ++start;
+    for (std::size_t offset = start; offset + kTsPacketSize <= map.size; offset += kTsPacketSize) {
+        const guint8* packet = map.data + offset;
+        uint16_t parsedPmt = 0x1FFF;
+        if (parsePatPmtPid20349(packet, parsedPmt)) {
+            gate->candidate.clear();
+            gate->patSeen = true;
+            gate->pmtPid = parsedPmt;
+            gate->pmtSeen = false;
+            gate->audioSeen = false;
+        }
+        if (!gate->patSeen) continue;
+
+        gate->candidate.insert(gate->candidate.end(), packet, packet + kTsPacketSize);
+        if (isPmtPacket20349(packet, gate->pmtPid)) gate->pmtSeen = true;
+        if (isAudioPesStart20349(packet, gate->audioPid)) gate->audioSeen = true;
+        if (gate->pmtSeen && gate->audioSeen && isVideoRandomAccess20349(packet, gate->videoPid)) {
+            ready = true;
+            break;
+        }
+        if (gate->candidate.size() > kSrtCleanStartMaxBytes) {
+            gate->candidate.clear();
+            gate->patSeen = false;
+            gate->pmtSeen = false;
+            gate->audioSeen = false;
+            gate->pmtPid = 0x1FFF;
+        }
+    }
+    gst_buffer_unmap(buffer, &map);
+
+    if (!ready) return GST_PAD_PROBE_DROP;
+
+    GstBuffer* replacement = gst_buffer_new_allocate(nullptr, gate->candidate.size(), nullptr);
+    if (!replacement) return GST_PAD_PROBE_DROP;
+    gst_buffer_fill(replacement, 0, gate->candidate.data(), gate->candidate.size());
+    GST_BUFFER_FLAG_SET(replacement, GST_BUFFER_FLAG_DISCONT);
+    GST_BUFFER_PTS(replacement) = GST_BUFFER_PTS(buffer);
+    GST_BUFFER_DTS(replacement) = GST_BUFFER_DTS(buffer);
+    GST_BUFFER_DURATION(replacement) = GST_BUFFER_DURATION(buffer);
+
+    gst_buffer_unref(buffer);
+    GST_PAD_PROBE_INFO_DATA(info) = replacement;
+    gate->open = true;
+    const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - gate->started).count();
+    std::cerr << "SRT transcoder clean start 203.49: stream=" << gate->streamId
+              << " pat=yes pmt=yes audio=yes video_random_access=yes"
+              << " buffered_bytes=" << gate->candidate.size()
+              << " wait_ms=" << waitedMs
+              << " action=release-new-ts-epoch" << std::endl;
+    gate->candidate.clear();
+    gate->candidate.shrink_to_fit();
+    return GST_PAD_PROBE_OK;
+}
 // 202.70: count public HTTP relay connections explicitly disconnected when a
 // stream pipeline is rebuilt/stopped. Old detached relay threads otherwise can
 // remain blocked on an obsolete tcpserversink generation.
@@ -5630,6 +5808,31 @@ GstElement* StreamManager::createExternalSrtOutputPipeline(const StreamConfig& c
         return nullptr;
     }
 
+    // 203.49: every transcoded listener relay begins closed and releases a
+    // single clean MPEG-TS epoch only after PAT/PMT, audio PES and an H.264
+    // random-access point have all been observed.  This also applies to the
+    // first start, so a caller that connects immediately cannot receive an
+    // arbitrary mid-GOP fragment before SPS/PPS/IDR become available.
+    GstPad* cleanStartPad = gst_element_get_static_pad(outputQueue, "src");
+    if (cleanStartPad) {
+        auto* gate = new SrtTranscoderCleanStartGate();
+        gate->streamId = cfg.id;
+        gate->videoPid = static_cast<uint16_t>((cfg.videoPid > 0 && cfg.videoPid < 0x1FFF) ? cfg.videoPid : 258);
+        gate->audioPid = static_cast<uint16_t>((cfg.audioPid > 0 && cfg.audioPid < 0x1FFF) ? cfg.audioPid : 257);
+        gst_pad_add_probe(
+            cleanStartPad,
+            GST_PAD_PROBE_TYPE_BUFFER,
+            srtTranscoderCleanStartProbe20349,
+            gate,
+            [](gpointer data) { delete static_cast<SrtTranscoderCleanStartGate*>(data); });
+        gst_object_unref(cleanStartPad);
+        std::cerr << "SRT transcoder clean start 203.49: stream=" << cfg.id
+                  << " state=armed video_pid=" << gate->videoPid
+                  << " audio_pid=" << gate->audioPid
+                  << " max_buffer_mb=" << (kSrtCleanStartMaxBytes / (1024 * 1024))
+                  << std::endl;
+    }
+
     std::cerr << "Transcoded SRT output relay: stream=" << cfg.id
               << " udp=127.0.0.1:" << relayPort
               << " -> srt=" << (cfg.outputHost.empty() ? "auto" : cfg.outputHost)
@@ -7745,6 +7948,7 @@ bool StreamManager::restartTranscodedInput(
     }
 
     const bool stableUdpRelay = allOutputsUseStableUdp(state->config);
+    const bool cleanRestartSrtRelay = !stableUdpRelay && !state->externalSrtOutputs.empty();
     StreamConfig nextConfig = state->config;
     nextConfig.testPattern = false;
     if (!useBackup && state->sharedDvbInput && !state->sharedDvbServiceRelayUri.empty()) {
@@ -7762,6 +7966,18 @@ bool StreamManager::restartTranscodedInput(
               << " backup=" << (useBackup ? "yes" : "no")
               << " mode=" << (stableUdpRelay ? "fifo-stable-udp" : "direct-output")
               << std::endl;
+
+    if (cleanRestartSrtRelay) {
+        std::cerr << "SRT transcoder recovery 203.49: stream=" << state->config.id
+                  << " stage=pre-restart caller_reset=yes relay_flush=yes"
+                  << " action=stop-old-listener-before-new-ts-epoch" << std::endl;
+        stopExternalSrtOutputs(state);
+        for (const auto& session : activeStreamSessions()) {
+            if (session.streamId == state->config.id && session.protocol == "srt") {
+                removeStreamSession(session.streamId, session.clientIp, session.protocol);
+            }
+        }
+    }
 
     state->gstTranscoder->stop();
 
@@ -7790,6 +8006,20 @@ bool StreamManager::restartTranscodedInput(
         state->active = false;
         std::cerr << state->statusMessage << std::endl;
         return false;
+    }
+
+    if (cleanRestartSrtRelay) {
+        std::string srtRelayError;
+        if (!startExternalSrtOutputs(state, srtRelayError)) {
+            state->gstTranscoder->stop();
+            state->statusMessage = "error: transcoded SRT clean-restart relay failed: " + srtRelayError;
+            state->active = false;
+            std::cerr << state->statusMessage << std::endl;
+            return false;
+        }
+        std::cerr << "SRT transcoder recovery 203.49: stream=" << state->config.id
+                  << " stage=post-restart listener=recreated clean_gate=armed"
+                  << " action=wait-pat-pmt-aac-video-random-access" << std::endl;
     }
 
     if (stableUdpRelay) {
