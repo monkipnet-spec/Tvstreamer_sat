@@ -8796,7 +8796,8 @@ bool StreamManager::buildOutputBranch(
                       << " as clean SPTS with periodic PAT/PMT/PCR"
                       << " input_service_id=" << outputConfig.inputServiceId
                       << " cbr=" << (cbrMuxEnabled(outputConfig) ? std::to_string(outputConfig.targetBitrate) : "off")
-                      << " pacing=" << (wallClockNetworkCbrEnabled(outputConfig) ? "byte-identity" : "source-clock")
+                      << " pacing=" << (wallClockNetworkCbrEnabled(outputConfig)
+                            ? "packetized-byte-identity" : "source-clock")
                       << std::endl;
         }
         if (stableUdpRemux) {
@@ -9026,6 +9027,13 @@ bool StreamManager::buildRemapPipeline(
     GstElement* cbrTsparse = cbrActive && !netupBytePacerActive
         ? gst_element_factory_make("tsparse", branchName("cbr_tsparse", branchIndex).c_str())
         : nullptr;
+    // 203.52: mpegtsmux may hand downstream a list/coarse buffer covering a
+    // complete GOP-sized interval. identity synchronizes one input buffer at a
+    // time, so it cannot smooth bytes inside that coarse unit. Repacketize to
+    // 7x188-byte TS buffers without deriving or changing timestamps first.
+    GstElement* netupPacketizer = netupBytePacerActive
+        ? gst_element_factory_make("tsparse", branchName("cbr_packetizer", branchIndex).c_str())
+        : nullptr;
     GstElement* pacer = cbrActive
         ? gst_element_factory_make(
             netupBytePacerActive ? "identity" : "clocksync",
@@ -9034,7 +9042,8 @@ bool StreamManager::buildRemapPipeline(
     GstElement* outputQueue = gst_element_factory_make("queue", branchName("output_queue", branchIndex).c_str());
     GstElement* sink = createOutputSink(state, cfg, pipeline, branchName("output_sink", branchIndex));
     if (!tsparse || !preDemuxQueue || !demux || !mux || !outputQueue || !sink ||
-        (cbrActive && (!pacer || (!netupBytePacerActive && !cbrTsparse)))) {
+        (cbrActive && (!pacer ||
+            (netupBytePacerActive ? !netupPacketizer : !cbrTsparse)))) {
         return false;
     }
 
@@ -9043,6 +9052,7 @@ bool StreamManager::buildRemapPipeline(
         !addElementOrFail(pipeline, demux) ||
         !addElementOrFail(pipeline, mux) ||
         (cbrTsparse && !addElementOrFail(pipeline, cbrTsparse)) ||
+        (netupPacketizer && !addElementOrFail(pipeline, netupPacketizer)) ||
         (pacer && !addElementOrFail(pipeline, pacer)) ||
         !addElementOrFail(pipeline, outputQueue)) {
         return false;
@@ -9065,6 +9075,8 @@ bool StreamManager::buildRemapPipeline(
                   << std::endl;
     }
     if (netupBytePacerActive) {
+        configureTsPacketAlignment(netupPacketizer);
+        setBooleanPropertyIfPresent(netupPacketizer, "set-timestamps", FALSE);
         configureCbrPacer(pacer, cfg);
         const uint64_t bytesPerSecond = cfg.targetBitrate / 8U;
         std::cerr << "NETUP remux pacing 203.51: stream=" << state->config.id
@@ -9076,6 +9088,15 @@ bool StreamManager::buildRemapPipeline(
                   << " tsparse_timestamps=off"
                   << " clocksync=off"
                   << " reservoir=off"
+                  << std::endl;
+        std::cerr << "NETUP remux packet pacing 203.52: stream=" << state->config.id
+                  << " name=\"" << state->config.name << "\""
+                  << " type=" << networkType
+                  << " packetizer=tsparse"
+                  << " alignment=" << kTsPacketsPerUdpBuffer
+                  << " set_timestamps=false"
+                  << " buffer_bytes=" << (kTsPacketsPerUdpBuffer * kTsPacketSize)
+                  << " pacer=identity-datarate"
                   << std::endl;
     } else if (cbrActive) {
         configureNetworkCbrTimestamping(cbrTsparse);
@@ -9094,7 +9115,7 @@ bool StreamManager::buildRemapPipeline(
                   << " alignment=7 pcr_interval=1800 pat_pmt_interval=9000"
                   << " mux_bitrate=" << (cbrMuxEnabled(cfg) ? cfg.targetBitrate : 0)
                   << " cbr_clock=" << (netupBytePacerActive
-                        ? "identity-datarate"
+                        ? "packetized-identity-datarate"
                         : (cbrActive ? "pcr-tsparse+clocksync" : "off"))
                   << std::endl;
     }
@@ -9151,7 +9172,7 @@ bool StreamManager::buildRemapPipeline(
         return false;
     }
     const bool outputLinked = netupBytePacerActive
-        ? gst_element_link_many(mux, pacer, outputQueue, sink, nullptr)
+        ? gst_element_link_many(mux, netupPacketizer, pacer, outputQueue, sink, nullptr)
         : (cbrActive
             ? gst_element_link_many(mux, cbrTsparse, pacer, outputQueue, sink, nullptr)
             : gst_element_link_many(mux, outputQueue, sink, nullptr));
